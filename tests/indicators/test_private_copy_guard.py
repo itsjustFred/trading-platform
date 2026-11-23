@@ -1,0 +1,354 @@
+"""Guard against new private indicator copies (issue #317, phase P4).
+
+``shared/indicators`` is the single home for indicator math: every ATR,
+RSI, EMA, Supertrend and friends must come from ``core``/``presets`` (or a
+``@register_indicator`` custom indicator), never a fresh ``.ewm()``/
+``.rolling()`` chain or hand-rolled recursion. The P0-P3 migrations removed
+the copies that existed when the module landed; this test keeps them from
+coming back.
+
+The scan is AST-based over first-party ``*.py`` (tests, docs, frontend,
+``shared/indicators`` itself and generated/vendored trees excluded) and
+records two kinds of signal per file:
+
+- ``ewm@<func>`` / ``rolling@<func>`` — each ``.ewm(...)``/``.rolling(...)``
+  call, attributed to its enclosing function (``<module>`` at top level).
+- ``def:<name>`` — a function whose name carries an indicator keyword
+  (``atr``, ``rsi``, ``supertrend``, ...) *and* whose body contains a
+  compute primitive (a loop, a ``np.*`` attribute, or pandas window/reduction
+  calls). Name-only matches like ``_supertrend_states`` or ``stop_atr``
+  survive only when the body actually computes something.
+
+``_ALLOWED`` pins the exact per-file signal counts of the copies that still
+exist on purpose: the ``strategies/`` entries are pre-P3 private
+implementations awaiting their one-strategy-per-PR parity migration (the
+``pine_*`` ones are being removed by the P3 draft), the ``ref_*``/agent
+strategies and parity/audit scripts are self-contained reference oracles,
+and the two non-strategy entries are reviewed non-computations kept for
+name/shape reasons. Any *new* signal — a new file, a new helper, an extra
+``.ewm()`` in an existing function — fails here; any *removed* signal fails
+too, so the roster cannot silently rot (same contract as
+``scripts/gate-tests.sh``).
+
+Third-party indicator libraries (``pandas_ta``, ``ta``) are refused
+outright: the maintainer decision on #317 removed ``pandas_ta`` and no
+supported environment may grow a dependency on it again.
+"""
+
+from __future__ import annotations
+
+import ast
+import os
+import re
+from collections import Counter
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+#: Directories never scanned: tests carry frozen reference copies on
+#: purpose, docs/frontend hold no first-party Python, and the module itself
+#: is where indicator math is allowed to live.
+_SKIP_DIRS = {
+    ".git",
+    ".venv",
+    "venv",
+    "node_modules",
+    "__pycache__",
+    ".mypy_cache",
+    ".ruff_cache",
+    ".pytest_cache",
+    "data",
+    "logs",
+    "docs",
+    "frontend",
+    "tests",
+    ".agents",
+    ".claude",
+    ".codex",
+    ".t3",
+    "dist",
+    "build",
+    ".idea",
+    ".vscode",
+}
+
+#: Function names that mark a private indicator implementation when the
+#: body also shows compute primitives. The keyword must be ``_``-delimited
+#: (or the whole name) so ``normalize``/``persist`` do not match; the
+#: optional leading token covers the repo's ``_calc_*``/``_wilder_*``/
+#: ``_mt5_*`` naming.
+_INDICATOR_NAME_RE = re.compile(
+    r"(?:^|_)(?:calc|compute|wilder|mt5|pine|ta|get|make|build|find|series"
+    r"|values|true|stop)?"
+    r"(?:atr|rsi|ema|sma|rma|macd|dema|tema|supertrend|wavetrend|adx|stoch"
+    r"|cci|vwap|donchian|keltner|bbands|bollinger|obv|mfi|willr|dpo|roc|mom"
+    r"|hull|alma|kama|true_range|trange)(?:_|$)",
+    re.IGNORECASE,
+)
+
+#: Attribute calls that make a function body "compute" something.
+_PRIMITIVE_ATTRS = {
+    "ewm",
+    "rolling",
+    "diff",
+    "cumsum",
+    "shift",
+    "pct_change",
+    "rank",
+    "expanding",
+    "apply",
+}
+
+
+def _has_compute_primitive(node: ast.AST) -> bool:
+    for sub in ast.walk(node):
+        if isinstance(sub, (ast.For, ast.While, ast.AsyncFor)):
+            return True
+        if isinstance(sub, ast.Call):
+            func = sub.func
+            if isinstance(func, ast.Attribute) and func.attr in _PRIMITIVE_ATTRS:
+                return True
+        if (
+            isinstance(sub, ast.Attribute)
+            and isinstance(sub.value, ast.Name)
+            and sub.value.id in {"np", "numpy"}
+        ):
+            return True
+    return False
+
+
+class _SignalTracker(ast.NodeVisitor):
+    """Collect ``ewm@func``/``rolling@func`` call-site tags per file."""
+
+    def __init__(self) -> None:
+        self._stack: list[str] = []
+        self.tags: Counter[str] = Counter()
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        self._stack.append(node.name)
+        self.generic_visit(node)
+        self._stack.pop()
+
+    visit_AsyncFunctionDef = visit_FunctionDef
+
+    def visit_Call(self, node: ast.Call) -> None:
+        func = node.func
+        if isinstance(func, ast.Attribute) and func.attr in {"ewm", "rolling"}:
+            owner = self._stack[-1] if self._stack else "<module>"
+            self.tags[f"{func.attr}@{owner}"] += 1
+        self.generic_visit(node)
+
+
+def _scan_file(path: Path) -> tuple[Counter[str], list[str]]:
+    """Return (private-copy signal counts, forbidden library imports)."""
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    tags: Counter[str] = Counter()
+
+    forbidden: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                root = alias.name.split(".", 1)[0]
+                if root in {"pandas_ta", "ta"}:
+                    forbidden.append(f"import {alias.name}")
+        elif isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            root = module.split(".", 1)[0]
+            if root in {"pandas_ta", "ta"}:
+                forbidden.append(f"from {module} import ...")
+
+    tracker = _SignalTracker()
+    tracker.visit(tree)
+    tags.update(tracker.tags)
+
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if _INDICATOR_NAME_RE.search(node.name) and _has_compute_primitive(node):
+                tags[f"def:{node.name}"] += 1
+
+    return tags, forbidden
+
+
+def _iter_source_files() -> list[Path]:
+    files: list[Path] = []
+    for dirpath, dirnames, filenames in os.walk(REPO_ROOT):
+        dirnames[:] = sorted(
+            name for name in dirnames if name not in _SKIP_DIRS
+        )
+        for filename in sorted(filenames):
+            if not filename.endswith(".py"):
+                continue
+            path = Path(dirpath) / filename
+            rel = path.relative_to(REPO_ROOT)
+            # Only the indicators package itself is exempt; the rest of
+            # ``shared/`` is scanned like everything else.
+            if rel.parts[:2] == ("shared", "indicators"):
+                continue
+            files.append(path)
+    return files
+
+
+#: Expected signal counts per repository-relative path. See the module
+#: docstring for what each group is and why it is still here.
+_ALLOWED: dict[str, dict[str, int]] = {
+    # Presentation reshaping of already-computed series for the viewer
+    # contract — not an indicator computation.
+    "runner/engines/_indicator_series.py": {"def:_build_supertrend_series": 1},
+    # MT5 parity analysis CLI handler (``stop_atr`` subcommand), not an
+    # indicator implementation.
+    "scripts/analyze_mt5_parity.py": {"def:stop_atr": 1},
+    # Parity reference oracles: deliberately self-contained reference
+    # implementations the differential tests compare engines against.
+    "scripts/reference_parity/reference_strategies.py": {
+        "def:true_range": 1,
+        "rolling@init": 2,
+    },
+    # Pre-P3 private implementations awaiting their one-strategy-per-PR
+    # parity migration (#317); the pine_* trio is being removed by the P3
+    # draft PR #375 — when it lands, delete its entries here.
+    "strategies/channel_breakout/channel_breakout.py": {
+        "ewm@generate_signals": 1,
+        "rolling@generate_signals": 3,
+    },
+    "strategies/cross_asset_momentum/cross_asset_momentum.py": {
+        "rolling@generate_signals": 2,
+    },
+    "strategies/custom_swings_supertrend/custom_swings_supertrend.py": {
+        "def:_calc_atr": 1,
+        "def:_calc_supertrend": 1,
+        "ewm@generate_signals": 2,
+    },
+    "strategies/demo_agent/demo_agent.py": {"rolling@generate_signals": 2},
+    "strategies/ema_crossoiver_conversion_test/ema_crossoiver_conversion_test.py": {
+        "ewm@generate_signals": 2,
+        "rolling@generate_signals": 1,
+    },
+    "strategies/example_sma/example_sma.py": {"ewm@generate_signals": 2},
+    "strategies/gold_momentum/gold_momentum.py": {"rolling@generate_signals": 2},
+    "strategies/intraday_volatility_breakout/intraday_volatility_breakout.py": {
+        "def:_mt5_atr": 1,
+        "def:_wilder_atr": 1,
+    },
+    "strategies/lab_generated_strategy/lab_generated_strategy.py": {
+        "ewm@generate_signals": 2,
+    },
+    "strategies/long_agent/long_agent.py": {"rolling@generate_signals": 2},
+    "strategies/mean_reversion_rsi_bb/mean_reversion_rsi_bb.py": {
+        "rolling@generate_signals": 1,
+    },
+    "strategies/pine_superosc_vumanchu/pine_superosc_vumanchu.py": {
+        "def:_calc_supertrend_osc": 1,
+        "def:_calc_wavetrend": 1,
+        "ewm@_calc_wavetrend": 3,
+        "rolling@_calc_supertrend_osc": 1,
+        "rolling@_calc_wavetrend": 1,
+        "rolling@generate_signals": 1,
+    },
+    "strategies/pine_supertrend_dema/pine_supertrend_dema.py": {
+        "def:_calc_dema": 1,
+        "def:_calc_supertrend": 1,
+        "ewm@_calc_dema": 2,
+        "rolling@_calc_supertrend": 1,
+    },
+    "strategies/post_vix_dip_buy/post_vix_dip_buy.py": {
+        "def:_wilder_rsi": 1,
+        "ewm@_wilder_rsi": 2,
+        "rolling@generate_signals": 1,
+    },
+    "strategies/pynecore_sma_crossover/pynecore_sma_crossover_context.py": {
+        "rolling@build_trade_context": 3,
+    },
+    "strategies/qg_30min_es_breakout_strategy/qg_30min_es_breakout_strategy.py": {
+        "def:_calc_adx": 1,
+        "def:_wilder_rma": 1,
+        "ewm@_wilder_rma": 1,
+    },
+    "strategies/ref_bracket_long/ref_bracket_long.py": {
+        "def:_true_range": 1,
+        "rolling@generate_signals": 3,
+    },
+    "strategies/ref_bracket_short/ref_bracket_short.py": {
+        "def:_true_range": 1,
+        "rolling@generate_signals": 3,
+    },
+    "strategies/ref_sma_cross_all_in/ref_sma_cross_all_in.py": {
+        "rolling@generate_signals": 2,
+    },
+    "strategies/retry_agent/retry_agent.py": {"rolling@generate_signals": 2},
+    "strategies/risk_parity/risk_parity.py": {"rolling@generate_signals": 4},
+    "strategies/sector_rotation/sector_rotation.py": {
+        "rolling@generate_signals": 1,
+    },
+    "strategies/stat_arb_pairs/stat_arb_pairs.py": {
+        "rolling@generate_signals": 2,
+    },
+    "strategies/volatility_breakout/volatility_breakout.py": {
+        "def:_wilder_rma": 1,
+        "ewm@_wilder_rma": 1,
+    },
+    # Audit script that monkeypatches a strategy's ATR for MT5 parity
+    # scoring — it patches, it does not implement an indicator.
+    "strategy-comparisons/intraday_volatility_breakout/audit/run_native_window.py": {
+        "def:_inject_atr": 1,
+    },
+}
+
+
+def test_no_third_party_indicator_libraries() -> None:
+    offenders = [
+        f"{path.relative_to(REPO_ROOT)}: {hit}"
+        for path in _iter_source_files()
+        for hit in _scan_file(path)[1]
+    ]
+    assert not offenders, (
+        "third-party indicator libraries are banned on the live path "
+        "(issue #317 maintainer decision); use shared.indicators instead:\n"
+        + "\n".join(offenders)
+    )
+
+
+def test_private_indicator_copies_match_roster() -> None:
+    actual: dict[str, dict[str, int]] = {}
+    for path in _iter_source_files():
+        tags, _forbidden = _scan_file(path)
+        if tags:
+            actual[str(path.relative_to(REPO_ROOT))] = dict(sorted(tags.items()))
+
+    expected = {name: dict(sorted(counts.items())) for name, counts in _ALLOWED.items()}
+
+    stale_entries = sorted(
+        name for name in expected if not (REPO_ROOT / name).exists()
+    )
+    missing_signals = sorted(
+        name
+        for name in expected
+        if (REPO_ROOT / name).exists() and name not in actual
+    )
+    unexpected = {
+        name: counts for name, counts in actual.items() if name not in expected
+    }
+    mismatched = {
+        name: {"expected": expected[name], "actual": actual[name]}
+        for name in expected.keys() & actual.keys()
+        if expected[name] != actual[name]
+    }
+
+    problems: list[str] = [
+        f"{name}: allowlisted file no longer exists — drop the entry"
+        for name in stale_entries
+    ]
+    problems.extend(
+        f"{name}: allowlisted signals no longer found — shrink or drop the entry"
+        for name in missing_signals
+    )
+    problems.extend(
+        f"{name}: new private indicator copy {counts} — "
+        "use shared.indicators instead of adding to _ALLOWED"
+        for name, counts in unexpected.items()
+    )
+    problems.extend(
+        f"{name}: signal counts changed {diff}"
+        for name, diff in mismatched.items()
+    )
+
+    assert not problems, "\n".join(problems)
