@@ -5030,6 +5030,18 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             return None, "no_opening_order"
         return None, "ambiguous_parent"
 
+    async def opening_signal_id_for_position(self, position_id: int) -> str | None:
+        """Public provenance read for the flip manager's first-sight bind (#168).
+
+        Reuses the broker-close attribution path: exactly one persisted
+        opening signal may claim the position. Zero (manual position,
+        foreign order) and several (ambiguous book) both prove nothing.
+        """
+        signal_id, _cause = await self._resolve_position_parent_signal(
+            int(position_id)
+        )
+        return signal_id
+
     @staticmethod
     def _broker_close_dedupe_key(deal: Any | None) -> str | None:
         """The one dedupe derivation every path shares for one deal.

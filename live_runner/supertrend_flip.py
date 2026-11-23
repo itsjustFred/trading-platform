@@ -623,6 +623,35 @@ class LiveSupertrendFlipManager:
                     "signal; refusing to manage it",
                     permanent=True,
                 )
+            if state.get("_verify_entry_qty") and not (
+                await self._position_proven_for_entry(adapter, position, entry)
+            ):
+                # First sight (#168): adopt ONLY a position the broker proves
+                # this entry's order opened. A foreign position that merely
+                # matches the ledgered quantity - a manual trade, another
+                # deployment's entry, or a later long after the own position
+                # already closed unseen - is never managed: persist ``done``
+                # so a restart cannot adopt it later, alert once, take no
+                # action.
+                clean_state = {
+                    key: value
+                    for key, value in state.items()
+                    if not str(key).startswith("_")
+                }
+                await self._mark_position_done(entry, clean_state)
+                self._surface(
+                    "Live supertrend-flip first sight could not prove the "
+                    "broker position was opened by the entry's order; "
+                    "marking done and taking no action on it",
+                    _FlipFailure(
+                        "position provenance unproven at first sight",
+                        permanent=True,
+                    ),
+                    context,
+                    critical=True,
+                )
+                self._workflows.pop(key, None)
+                return
             workflow = self._workflow_for(key, str(entry["signal_id"]))
             if workflow.outage.probe_blocked(moment) or (
                 workflow.retry_at is not None and moment < workflow.retry_at
@@ -811,6 +840,14 @@ class LiveSupertrendFlipManager:
             metadata.get(self._state_key),
             context=f"{symbol} (signal {entry.get('signal_id')})",
         )
+        if state is not None and state.get("phase") in {PHASE_DONE, PHASE_HALTED}:
+            # A finished plan is never ours again: after ``done`` the bound
+            # position is expected to be gone, so ANY later position on the
+            # symbol - the normal case once the flip trade ended and
+            # someone else opened a long - must not raise the identity
+            # mismatch below every pass. Returning ``None`` ("not ours")
+            # alerts only on the transition that set ``done``.
+            return None
         position_id = self._position_id(position)
         if state is None:
             state = _fresh_state(qty, entry_price)
@@ -1087,6 +1124,46 @@ class LiveSupertrendFlipManager:
             raise _FlipFailure(
                 f"could not persist supertrend_flip state on signal {signal_id}"
             )
+
+    async def _position_proven_for_entry(
+        self,
+        adapter: BaseLiveAdapter,
+        position: Mapping[str, Any],
+        entry: Mapping[str, Any],
+    ) -> bool:
+        """True only when broker evidence ties ``position`` to ``entry``.
+
+        First sight must never bind by size: the position's opening order
+        has to resolve to the persisted entry signal id (cTrader proves it
+        through ``clientOrderId``/order-id attribution, the same mechanism
+        the exit path uses). An adapter that cannot prove, an unreadable
+        order list and a foreign opener all return ``False`` - fail closed.
+        """
+        position_id = self._position_id(position)
+        signal_id = str(entry.get("signal_id") or "").strip()
+        if position_id is None or not signal_id:
+            return False
+        provenance = getattr(adapter, "opening_signal_id_for_position", None)
+        if not callable(provenance):
+            return False
+        try:
+            opened_by = await provenance(int(position_id))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # except-kind: money-decision
+            logger.warning(
+                "Flip first-sight provenance read failed; treating the "
+                "position as unproven",
+                extra={
+                    "data": {
+                        "position_id": position_id,
+                        "signal_id": signal_id,
+                        "error": repr(exc),
+                    }
+                },
+            )
+            return False
+        return str(opened_by or "").strip() == signal_id
 
     # ── one position ─────────────────────────────────────────────────────
 

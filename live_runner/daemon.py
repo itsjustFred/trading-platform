@@ -49,6 +49,7 @@ from live_runner.base_adapter import (
     QUOTE_TIME_RULE_INVALID,
     QUOTE_TIME_RULE_MISSING,
     QUOTE_TIME_RULE_STALE,
+    UNBOUNDED_TP_POLICY,
     BaseLiveAdapter,
     LivePipValue,
     LiveQuote,
@@ -240,6 +241,7 @@ from shared.trailing import (
     TRAILING_MODE_SUPERTREND_FLIP,
     TRAILING_SL_CONFIG_METADATA_KEY,
     deployment_supertrend_flip_enabled,
+    normalize_trailing_mode,
     validate_live_deployment_trailing_mode,
     validate_trailing_sl_config,
 )
@@ -1658,6 +1660,39 @@ def _live_signal_trailing_modes(
     return modes - {TRAILING_MODE_SUPERTREND_FLIP}
 
 
+def _flip_managed_entry(
+    adapter: BaseLiveAdapter | None,
+    deployment: LiveDeploymentConfig,
+    metadata: Mapping[str, Any],
+) -> bool:
+    """Whether this entry is managed by the live ``supertrend_flip`` workflow.
+
+    The same predicate ``_live_signal_trailing_modes`` uses to admit the
+    mode, plus the signal actually requesting it through its trailing
+    config. Only then is the broker take-profit stripped at submission:
+    the signal's ``take_profit`` IS TP1 - the level the manager itself
+    closes part of - so sending it as the order's broker TP would close
+    the whole position at TP1 and the workflow (breakeven, await-green,
+    flip exit) would never run (#168 maintainer default: the entry goes
+    to the broker stop-only, the manager owns TP1).
+    """
+    try:
+        trailing_cfg = metadata.get(TRAILING_SL_CONFIG_METADATA_KEY)
+        if not isinstance(trailing_cfg, Mapping):
+            return False
+        if (
+            normalize_trailing_mode(trailing_cfg.get("mode"))
+            != TRAILING_MODE_SUPERTREND_FLIP
+        ):
+            return False
+        return (
+            TRAILING_MODE_SUPERTREND_FLIP
+            in _live_signal_trailing_modes(adapter, deployment)
+        )
+    except Exception:  # except-kind: money-decision
+        return False
+
+
 async def _flip_exit_in_flight_check(
     adapter: BaseLiveAdapter, deployment: LiveDeploymentConfig, symbol: str
 ) -> bool:
@@ -2498,6 +2533,7 @@ async def prepare_order_with_risk(
         stop_loss=stop_loss,
         take_profit=take_profit,
     )
+    flip_managed_entry = _flip_managed_entry(adapter, deployment, metadata)
     if take_profit is None and unbounded_tp:
         logger.warning(
             "Submitting live order with explicitly unbounded take profit "
@@ -2513,7 +2549,19 @@ async def prepare_order_with_risk(
     metadata["entry_price"] = float(entry_price)
     metadata["stop_loss"] = float(stop_loss)
     metadata["resolved_stop_loss"] = float(stop_loss)
-    if take_profit is not None:
+    if flip_managed_entry:
+        # #168 maintainer default: the broker order is STOP-ONLY. The
+        # signal's take_profit is TP1, which the flip manager closes part
+        # of itself - a broker TP at that level would flatten the whole
+        # position before breakeven/await-green/the flip exit can run.
+        # ``tp1_price`` stays in metadata for the manager; the explicit
+        # unbounded policy is what the adapters already honour as "no TP
+        # leg". ``take_profit`` itself is dropped so neither the order nor
+        # the persisted signal claims a full-position target.
+        metadata["take_profit_policy"] = UNBOUNDED_TP_POLICY
+        metadata.pop("take_profit", None)
+        metadata.pop("tp_price", None)
+    elif take_profit is not None:
         metadata["take_profit"] = float(take_profit)
     else:
         metadata.pop("take_profit", None)
@@ -2549,6 +2597,12 @@ async def prepare_order_with_risk(
         for key, value in {**sized_metadata, **preserved_metadata}.items()
         if key not in _ENTRY_STRIPPED_METADATA_KEYS
     }
+    if flip_managed_entry:
+        # The sized metadata is a copy of the incoming payload and can
+        # carry the TP aliases back in; the broker order must stay
+        # stop-only regardless of which alias the signal used.
+        final_metadata.pop("take_profit", None)
+        final_metadata.pop("tp_price", None)
     # The gate's and the pip value's figures are written last: a payload value
     # under one of these keys can neither shadow nor survive them.
     final_metadata.update(quote_metadata)

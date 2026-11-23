@@ -28,6 +28,7 @@ from live_runner.supertrend_flip import (
     FLIP_STATE_METADATA_KEY,
     PHASE_AWAIT_GREEN,
     PHASE_BEFORE_TP1,
+    PHASE_DONE,
     PHASE_EXIT_PENDING,
     PHASE_HALTED,
     PHASE_TP1_PENDING,
@@ -74,6 +75,7 @@ class _FakeFlipAdapter(BaseLiveAdapter):
     """The broker contract the flip workflow needs, in memory."""
 
     broker_name = "ctrader"
+    demo = True
 
     def __init__(self) -> None:
         self.positions: list[dict] = []
@@ -87,6 +89,9 @@ class _FakeFlipAdapter(BaseLiveAdapter):
         self.amends: list[float] = []
         self.submit_error: Exception | None = None
         self.quote_error: Exception | None = None
+        # position_id -> persisted entry signal id the broker can prove
+        # opened it. Empty means "cannot prove" (fail closed).
+        self.opening_signal_ids: dict[int, str] = {}
 
     # ── BaseLiveAdapter abstracts ────────────────────────────────────────
 
@@ -98,6 +103,24 @@ class _FakeFlipAdapter(BaseLiveAdapter):
 
     async def get_balance(self) -> tuple[float, float]:
         return (100_000.0, 100_000.0)
+
+    async def get_equity(self) -> float:
+        return 100_000.0
+
+    async def get_used_margin(self) -> float:
+        return 0.0
+
+    async def get_pip_value(self, symbol: str):
+        from live_runner.base_adapter import LivePipValue
+
+        return LivePipValue(
+            value=1.0,
+            units_per_qty=1.0,
+            conversion_rate=1.0,
+            quote_asset="USD",
+            account_asset="USD",
+            source="test",
+        )
 
     @property
     def supports_stop_amendment(self) -> bool:
@@ -142,7 +165,13 @@ class _FakeFlipAdapter(BaseLiveAdapter):
     async def get_quote(self, symbol: str) -> LiveQuote:
         if self.quote_error is not None:
             raise self.quote_error
-        return LiveQuote(bid=self.bid, ask=self.bid + 0.0001)
+        return LiveQuote(
+            bid=self.bid,
+            ask=self.bid + 0.0001,
+            timestamp=datetime.now(timezone.utc),
+            source="test",
+            timestamp_source="broker",
+        )
 
     def supports_market_data_timeframe(self, timeframe: str) -> bool:
         return True
@@ -155,6 +184,9 @@ class _FakeFlipAdapter(BaseLiveAdapter):
 
     def position_qty_tolerance(self, symbol: str) -> float:
         return 1e-9
+
+    async def opening_signal_id_for_position(self, position_id: int):
+        return self.opening_signal_ids.get(int(position_id))
 
     async def submit_order(self, signal: LiveSignal, *, qty: float | None = None) -> str:
         if self.submit_error is not None:
@@ -217,6 +249,8 @@ class _Live:
             }
         ]
         self.entry = self.add_signal(qty)
+        # The broker proves position 4242 was opened by this entry's order.
+        self.adapter.opening_signal_ids[4242] = str(self.entry.id)
 
     def add_signal(self, qty: float = POSITION_QTY) -> LiveSignal:
         metadata = {
@@ -857,8 +891,288 @@ def test_breakeven_never_loosens_a_tighter_stop(live: _Live) -> None:
         str(live.entry.id),
         {FLIP_STATE_METADATA_KEY: state},
     )
-    # Force the entry metadata refresh path: re-add via state()
+    # A closed green bar after the TP1 bar keeps the bar step healthy so the
+    # pass reaches its persist.
+    live.adapter.frame = _bars([(5.0, 100.0, 101.0)])
     live.tick(manager, _at(10.0))
-    assert ENTRY_PRICE + 3.0 not in live.adapter.amends or all(
-        a <= ENTRY_PRICE + 1e-9 for a in live.adapter.amends
+    # The pass must have reached the breakeven branch (it marks itself done
+    # without amending), and must not have loosened the tighter stop.
+    assert live.state()["breakeven_done"] is True
+    assert live.adapter.amends == []
+
+    # And it must actually be non-vacuous: with the stop at entry the same
+    # pass DOES amend - proving the comparison above decided, not skipped.
+    live2 = _Live(live.database)
+    # A stop BELOW entry is exactly what breakeven exists to fix: the same
+    # pass must amend it up to the entry price.
+    live2.adapter.stop_price = ENTRY_PRICE - 3.0
+    state2 = live2.state()
+    state2["phase"] = "active"
+    state2["tp1_bar_open"] = _at(0.0).isoformat()
+    state2["breakeven_done"] = False
+    live2.database.merge_live_signal_metadata(
+        str(live2.entry.id),
+        {FLIP_STATE_METADATA_KEY: state2},
     )
+    live2.adapter.frame = _bars([(5.0, 100.0, 101.0)])
+    live2.tick(LiveSupertrendFlipManager(), _at(10.0))
+    assert live2.adapter.amends == [ENTRY_PRICE]
+
+
+# ── First-sight provenance (#168) ────────────────────────────────────────────
+
+
+def test_first_sight_rejects_a_same_size_foreign_position(
+    live: _Live, surfaced
+) -> None:
+    """Quantity coincidence never binds: only proven opening order does."""
+    # The position has exactly the ledgered size, but the broker attributes
+    # its opening order to somebody else's signal.
+    live.adapter.opening_signal_ids[4242] = str(uuid4())
+    manager = LiveSupertrendFlipManager()
+
+    live.tick(manager, _at(0.1))
+
+    assert live.state().get("phase") == PHASE_DONE
+    assert live.adapter.orders == []
+    assert live.adapter.amends == []
+    assert any("first sight" in msg for msg, _ in surfaced)
+
+
+def test_first_sight_rejects_when_provenance_is_unreadable(
+    live: _Live, surfaced
+) -> None:
+    """No mapping, no callable, or a raising read all fail closed to done."""
+    live.adapter.opening_signal_ids.clear()
+
+    async def _raise(position_id: int) -> str | None:
+        raise RuntimeError("order list unreadable")
+
+    live.adapter.opening_signal_id_for_position = _raise  # type: ignore[method-assign]
+    manager = LiveSupertrendFlipManager()
+
+    live.tick(manager, _at(0.1))
+
+    assert live.state().get("phase") == PHASE_DONE
+    assert live.adapter.orders == []
+    assert any("first sight" in msg for msg, _ in surfaced)
+
+
+def test_done_plan_alerts_once_not_every_pass(live: _Live, surfaced) -> None:
+    """A finished plan facing a foreign position must not re-alert."""
+    live.adapter.opening_signal_ids.clear()
+    manager = LiveSupertrendFlipManager()
+
+    live.tick(manager, _at(0.1))
+    live.tick(manager, _at(0.2))
+    live.tick(manager, _at(0.3))
+
+    assert live.state().get("phase") == PHASE_DONE
+    assert len(surfaced) == 1
+
+
+def test_first_sight_accepts_the_proven_position(live: _Live) -> None:
+    """The happy path still manages: provenance proves, workflow proceeds."""
+    manager = LiveSupertrendFlipManager()
+    live.adapter.bid = 106.0
+
+    live.tick(manager, _at(0.1))
+    live.tick(manager, _at(0.2))
+
+    # TP1 tranche went out - the workflow is live, not done.
+    assert live.state().get("phase") != PHASE_DONE
+    assert len(live.adapter.orders) == 1
+
+
+# ── Gate matrix: who may run supertrend_flip at all (#168) ──────────────────
+
+
+def _flip_gate_deployment(*, opted: bool) -> LiveDeploymentConfig:
+    return LiveDeploymentConfig(
+        id=uuid4(),
+        strategy_name="flip-gate",
+        account_id=ACCOUNT,
+        symbols=[SYMBOL],
+        timeframe="1m",
+        status="ACTIVE",
+        signal_source="internal",
+        settings={"live_supertrend_flip": True} if opted else {},
+    )
+
+
+def _flip_gate_adapter(**overrides):
+    from types import SimpleNamespace
+
+    # The gates read plain attributes; a namespace keeps each case honest
+    # (a property on the fake would make "capability removed" untestable).
+    attrs = {
+        "broker_name": "ctrader",
+        "supports_supertrend_flip": True,
+        "supports_stop_amendment": True,
+        "demo": True,
+    }
+    attrs.update(overrides)
+    return SimpleNamespace(**attrs)
+
+
+@pytest.mark.parametrize(
+    ("opted", "demo", "broker", "flip_capable", "amend", "expected"),
+    [
+        # Only the full combination admits the mode.
+        (True, True, "ctrader", True, True, True),
+        # Deployment opt-in removed -> mode refused.
+        (False, True, "ctrader", True, True, False),
+        # Demo-only gate removed -> live account refused.
+        (True, False, "ctrader", True, True, False),
+        # Broker table gate: alpaca can never run it.
+        (True, True, "alpaca", True, True, False),
+        # Adapter capability gate removed -> refused.
+        (True, True, "ctrader", False, True, False),
+        # cTrader deliberately declares no ``supports_stop_amendment`` (the
+        # flip workflow uses its own position-addressed amend primitives),
+        # so the mode is still admitted - pinned so a future "fix" that
+        # couples them breaks loudly here.
+        (True, True, "ctrader", True, False, True),
+    ],
+)
+def test_flip_mode_admission_matrix(
+    opted: bool,
+    demo: bool,
+    broker: str,
+    flip_capable: bool,
+    amend: bool,
+    expected: bool,
+) -> None:
+    """Each gate independently refuses; removing any one must fail here."""
+    import live_runner.daemon as daemon
+    from shared.trailing import TRAILING_MODE_SUPERTREND_FLIP
+
+    adapter = _flip_gate_adapter(
+        broker_name=broker,
+        supports_supertrend_flip=flip_capable,
+        supports_stop_amendment=amend,
+        demo=demo,
+    )
+    deployment = _flip_gate_deployment(opted=opted)
+
+    modes = daemon._live_signal_trailing_modes(adapter, deployment)
+
+    assert (TRAILING_MODE_SUPERTREND_FLIP in modes) is expected
+
+
+# ── Stop-only flip entries (#168 maintainer default) ────────────────────────
+
+
+def _flip_entry_parts(database, *, opted: bool = True, flip: bool = True):
+    database.ensure_live_account(ACCOUNT, "ctrader")
+    settings = {"live_supertrend_flip": True} if opted else {}
+    deployment = LiveDeploymentConfig(
+        id=uuid4(),
+        strategy_name="flip-entry",
+        account_id=ACCOUNT,
+        symbols=[SYMBOL],
+        timeframe="1m",
+        status="ACTIVE",
+        signal_source="internal",
+        settings=settings,
+    )
+    database.create_live_deployment(deployment)
+    metadata = {
+        "stop_loss": STOP_PRICE,
+        "take_profit": TP1_PRICE,
+        "tp1_price": TP1_PRICE,
+        "tp1_exit_percent": TP1_FRACTION,
+    }
+    if flip:
+        metadata["trailing_sl_config"] = {
+            "mode": "supertrend_flip",
+            "breakeven_after_tp1": True,
+            "activation_phase": "wait_for_first_green_after_tp1",
+            "exit_phase": "exit_on_first_red_after_activation",
+            "supertrend_period": 2,
+            "supertrend_multiplier": 2.0,
+        }
+    signal = LiveSignal(
+        deployment_id=str(deployment.id),
+        symbol=SYMBOL,
+        action="buy",
+        theoretical_price=ENTRY_PRICE,
+        timestamp=T0,
+        metadata=metadata,
+    )
+    database.save_live_signal(signal)
+    return deployment, signal
+
+
+def test_flip_entry_submits_stop_only_with_unbounded_policy(
+    isolated_db,
+) -> None:
+    """An admitted flip entry carries NO broker TP; the manager owns TP1."""
+    import live_runner.daemon as daemon
+    from live_runner.base_adapter import UNBOUNDED_TP_POLICY
+
+    database, _engine, _data_dir = isolated_db
+    deployment, signal = _flip_entry_parts(database)
+    adapter = _FakeFlipAdapter()
+    adapter.positions = []
+
+    prepared, _qty = asyncio.run(
+        daemon.prepare_order_with_risk(adapter, deployment, signal)
+    )
+
+    metadata = prepared.metadata
+    assert "take_profit" not in metadata
+    assert "tp_price" not in metadata
+    assert metadata.get("take_profit_policy") == UNBOUNDED_TP_POLICY
+    # The manager's own levels survive: protective stop and TP1 metadata.
+    assert metadata.get("stop_loss") == STOP_PRICE
+    assert metadata.get("tp1_price") == TP1_PRICE
+    assert metadata.get("tp1_exit_percent") == TP1_FRACTION
+    assert "supertrend_flip" in str(metadata.get("trailing_sl_config"))
+
+
+def test_non_flip_entry_keeps_its_broker_take_profit(isolated_db) -> None:
+    """Control: a plain entry is untouched by the flip stop-only rule."""
+    import live_runner.daemon as daemon
+
+    database, _engine, _data_dir = isolated_db
+    deployment, signal = _flip_entry_parts(database, flip=False)
+    adapter = _FakeFlipAdapter()
+    adapter.positions = []
+
+    prepared, _qty = asyncio.run(
+        daemon.prepare_order_with_risk(adapter, deployment, signal)
+    )
+
+    assert prepared.metadata.get("take_profit") == TP1_PRICE
+
+
+def test_flip_entry_refused_without_opt_in(isolated_db) -> None:
+    """The opt-in gate also guards submission, not only the manager."""
+    import live_runner.daemon as daemon
+
+    database, _engine, _data_dir = isolated_db
+    deployment, signal = _flip_entry_parts(database, opted=False)
+    adapter = _FakeFlipAdapter()
+    adapter.positions = []
+
+    with pytest.raises(ValueError):
+        asyncio.run(
+            daemon.prepare_order_with_risk(adapter, deployment, signal)
+        )
+
+
+def test_flip_entry_refused_on_live_account(isolated_db) -> None:
+    """The demo-only gate refuses a flip entry on a live cTrader account."""
+    import live_runner.daemon as daemon
+
+    database, _engine, _data_dir = isolated_db
+    deployment, signal = _flip_entry_parts(database)
+    adapter = _FakeFlipAdapter()
+    adapter.demo = False
+    adapter.positions = []
+
+    with pytest.raises(ValueError):
+        asyncio.run(
+            daemon.prepare_order_with_risk(adapter, deployment, signal)
+        )
