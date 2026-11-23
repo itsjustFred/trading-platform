@@ -7,6 +7,7 @@ so the Runner CLI can invoke any of them uniformly.
 
 from __future__ import annotations
 
+import ast
 import math
 import warnings
 from abc import ABC, abstractmethod
@@ -100,6 +101,71 @@ def warn_if_engine_frozen(name: str, *, stacklevel: int = 2) -> None:
         DeprecationWarning,
         stacklevel=stacklevel,
     )
+
+
+NATIVE_TRAILING_SL_PARAM = "use_trailing_sl"
+_TRAILING_SL_TRUE_STRINGS = frozenset({"1", "true", "yes", "on"})
+
+
+def _parameter_requests_trailing_sl(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in _TRAILING_SL_TRUE_STRINGS
+    return bool(value)
+
+
+def _literal_default(node: ast.AST) -> Any:
+    try:
+        return ast.literal_eval(node)
+    except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError):
+        return None
+
+
+def strategy_parameter_default(strategy_path: str | Path, name: str) -> Any:
+    """Return a literal ``generate_signals`` default without executing the file.
+
+    Returns ``None`` when the parameter has no literal default; the adapter's
+    imported-signature check remains the authority for non-literal defaults.
+    """
+    try:
+        tree = ast.parse(Path(strategy_path).read_text(encoding="utf-8"))
+    except (OSError, SyntaxError, UnicodeDecodeError):
+        return None
+    for node in tree.body:
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if node.name != "generate_signals":
+            continue
+        args = node.args
+        positional = list(args.posonlyargs) + list(args.args)
+        defaults: list[ast.AST | None] = [None] * (
+            len(positional) - len(args.defaults)
+        ) + list(args.defaults)
+        for arg, default in zip(positional, defaults, strict=True):
+            if arg.arg == name and default is not None:
+                return _literal_default(default)
+        for arg, default in zip(args.kwonlyargs, args.kw_defaults, strict=True):
+            if arg.arg == name and default is not None:
+                return _literal_default(default)
+        return None
+    return None
+
+
+def native_parameter_errors(parameters: dict[str, Any] | None) -> list[str]:
+    """Return errors for strategy parameters the native engine cannot model.
+
+    Maintainer decision (2026-11-23): until the strategies are rebuilt, native
+    must refuse ``use_trailing_sl=true`` rather than compute a fixed stop and
+    call it a trailing stop.
+    """
+    if _parameter_requests_trailing_sl((parameters or {}).get(NATIVE_TRAILING_SL_PARAM)):
+        return [
+            "parameters.use_trailing_sl=true requests a trailing stop, but "
+            "trailing stops are not modelled by the native engine; set "
+            "use_trailing_sl=false or choose a path that models trailing stops"
+        ]
+    return []
 
 
 class BacktestConfig(BaseModel):
@@ -277,6 +343,25 @@ def resolve_strategy_parameters(
     merged = dict(defaults)
     merged.update(overrides or {})
     return merged
+
+
+def native_strategy_parameter_errors(
+    strategy_path: str | Path,
+    parameters: dict[str, Any] | None,
+) -> list[str]:
+    """Native parameter errors for a strategy path plus explicit parameters.
+
+    Merges ``STRATEGY_META.parameters`` defaults and a literal
+    ``generate_signals`` default so callers can fail before queueing work or
+    downloading market data. Non-literal signature defaults remain the native
+    adapter's imported-signature check.
+    """
+    effective = dict(resolve_strategy_parameters(strategy_path, parameters))
+    if NATIVE_TRAILING_SL_PARAM not in effective:
+        default = strategy_parameter_default(strategy_path, NATIVE_TRAILING_SL_PARAM)
+        if default is not None:
+            effective[NATIVE_TRAILING_SL_PARAM] = default
+    return native_parameter_errors(effective)
 
 
 class EngineAdapter(ABC):

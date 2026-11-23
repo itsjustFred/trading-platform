@@ -29,6 +29,7 @@ from runner.approval_gate import require_generated_strategy_approval
 from runner.daily_equity import attach_daily_equity
 from runner.engines.base import (
     BacktestConfig,
+    native_strategy_parameter_errors,
     resolve_legacy_max_position_kwarg,
     resolve_strategy_parameters,
     warn_if_engine_frozen,
@@ -916,6 +917,10 @@ def run_backtest_grid(
     # believes slippage was applied (grid/walk-forward/matrix default to
     # vectorbt, which has no slippage code path).
     assert_slippage_supported(engine, params)
+    if str(engine).strip().lower() == "native":
+        parameter_errors = native_strategy_parameter_errors(strategy, params)
+        if parameter_errors:
+            raise ValueError("; ".join(parameter_errors))
 
     summary: dict[str, Any] = {
         "started_at": datetime.now(timezone.utc).isoformat(),

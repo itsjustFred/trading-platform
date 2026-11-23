@@ -3284,6 +3284,44 @@ def test_backtest_run_registers_task_manager_progress(viewer_client, monkeypatch
     assert "Completed - " in log_text
 
 
+def test_backtest_run_rejects_native_use_trailing_sl(viewer_client, monkeypatch, tmp_path):
+    """Native backtests must refuse ``use_trailing_sl=true`` at the API edge.
+
+    The maintainer decision (2026-11-23) makes the parameter unsupported on
+    native; the viewer must return 400 instead of queueing a child run that
+    would compute a fixed stop.
+    """
+    import viewer.main as viewer_app_module
+
+    strategies_dir = tmp_path / "strategies"
+    strategies_dir.mkdir(parents=True, exist_ok=True)
+    (strategies_dir / "custom_swings_supertrend.py").write_text(
+        "STRATEGY_META = {'name': 'custom_swings_supertrend'}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(viewer_app_module, "STRATEGIES_DIR", strategies_dir)
+    monkeypatch.setattr(viewer_app_module.legacy_viewer, "STRATEGIES_DIR", strategies_dir)
+    monkeypatch.setattr(viewer_app_module, "_dolthub_pull", lambda: None)
+
+    response = viewer_client.post(
+        "/api/backtests/run",
+        json={
+            "strategy": "custom_swings_supertrend.py",
+            "engine": "native",
+            "symbols": ["AAPL"],
+            "timeframe": "1d",
+            "capital": 100000,
+            "parameters": {"use_trailing_sl": True},
+        },
+    )
+
+    assert response.status_code == 400
+    assert "trailing stops are not modelled by the native engine" in str(
+        response.json()["detail"]
+    )
+    assert viewer_app_module.DATA_TASKS == {}
+
+
 def test_backtest_run_signals_registers_task_manager_progress(viewer_client, monkeypatch, tmp_path):
     import viewer.main as viewer_app_module
 

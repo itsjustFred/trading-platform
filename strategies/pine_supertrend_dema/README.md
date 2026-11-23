@@ -24,6 +24,7 @@ Formel: `sl_price = supertrend_lower_band`.
 ### Trailing Stop (falls vorhanden)
 Ja. Das untere Supertrend-Band fungiert als aktiver Trailing Stop; fuer Long-Trades wird das Stop-Level nur nach oben nachgezogen (`max(previous_stop, lower_band)`).
 Das verwendete Exit-Level wird in `trailing_stop_at_exit` festgehalten.
+`use_trailing_sl` ist kein Parameter dieser Strategie; wird er dennoch gesetzt, lehnt native die Konfiguration ab (Decision 2026-11-23).
 
 ### Partial Exits (falls vorhanden)
 Keine Partial Exits implementiert.

@@ -31,6 +31,7 @@ from runner.daily_equity import attach_daily_equity
 from runner.engines.base import (
     BacktestConfig,
     EngineAdapter,
+    native_strategy_parameter_errors,
     resolve_strategy_parameters,
     warn_if_engine_frozen,
 )
@@ -230,6 +231,10 @@ def cmd_run(args):
     # #130: an engine outside the slippage scope must refuse a declared
     # model rather than run gross while the user believes it applied.
     assert_slippage_supported(engine.name, resolved_parameters)
+    if engine.name == "native":
+        parameter_errors = native_strategy_parameter_errors(args.strategy, resolved_parameters)
+        if parameter_errors:
+            raise ValueError("; ".join(parameter_errors))
 
     normalized_timeframe = normalize_timeframe(args.timeframe)
 

@@ -131,6 +131,25 @@ parent Cleanup 16 record.
   containment (`_normalize_trade_exits`, §5) restates a level-violating leg
   to the recorded level only — frozen engines get no behaviour changes.
 
+### Unsupported native strategy parameters
+
+Maintainer decision (2026-11-23): until the strategies are rebuilt, the native
+engine **refuses** a resolved strategy parameter `use_trailing_sl` that
+requests trailing stops (`true`, `"true"`, `"1"`, `"yes"`, `"on"`, or a
+non-string truthy value; `false`, `"false"`, and absent keep the legacy
+fixed-stop behaviour). The shared
+check is `runner.engines.base.native_parameter_errors`, wrapped for strategy
+paths by `native_strategy_parameter_errors` and enforced by
+`NativeAdapter.validate_config`/`run`, `runner.cli run`,
+`runner.backtest_grid`, and the viewer `/api/backtests/run` (HTTP 400). The
+preflight also reads a literal `generate_signals` default without executing
+the strategy; non-literal signature defaults remain enforced by
+`NativeAdapter.run` before market data loads. This is
+a config guard, not a claim that every strategy-internal trailing mechanism is
+modelled: a strategy that trails inside `generate_signals` without exposing the
+parameter (for example `pine_supertrend_dema`) still only gets the initial
+protective stop unless it emits `exit_order_type="level"` (§2).
+
 ### Slippage (fill-price cost model, #130)
 
 Slippage is applied to the **fill price** in the adverse direction —
