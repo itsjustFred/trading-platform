@@ -1451,6 +1451,11 @@ class BacktestRunSignalsRequest(SQLModel):
     max_position_pct: float | None = None
     max_positions: int | None = None
     auto_download: bool = True
+    # #130: optional fill-price slippage declaration (same spellings as the
+    # CLI); absent means the per-asset-class auto model.
+    slippage: str | None = None
+    slippage_bps: float | None = None
+    slippage_default_bps: float | None = None
     # #361/#84: the replay adapter fails closed without an explicit fee
     # declaration; the viewer requires the caller to declare costs up front —
     # fees_zero for a conscious no-cost run, or fee_rate/fee_flat_per_trade.
@@ -1472,6 +1477,9 @@ class BacktestRunFromSignalsRequest(SQLModel):
     max_position_pct: float | None = None
     max_positions: int | None = None
     auto_download: bool = True
+    slippage: str | None = None
+    slippage_bps: float | None = None
+    slippage_default_bps: float | None = None
     fee_rate: float | None = None
     fee_flat_per_trade: float | None = None
     fees_zero: bool = False
@@ -11776,6 +11784,23 @@ async def run_backtest_signals(payload: BacktestRunSignalsRequest) -> dict[str, 
                 ]
                 report_stage(handle, percent=60.0, message="Replaying signals...")
 
+                # #130: classify each replayed symbol from its OHLCV path
+                # (same convention as the native adapter) and forward any
+                # declared slippage params, so viewer replays price fills
+                # with the same model a CLI run would.
+                asset_class_by_symbol = {
+                    symbol: legacy_viewer.ohlcv_asset_class(symbol, timeframe)
+                    for symbol in symbols
+                }
+                slippage_params: dict[str, Any] = {}
+                if payload.slippage is not None:
+                    slippage_params["slippage"] = str(payload.slippage)
+                if payload.slippage_bps is not None:
+                    slippage_params["slippage_bps"] = float(payload.slippage_bps)
+                if payload.slippage_default_bps is not None:
+                    slippage_params["slippage_default_bps"] = float(
+                        payload.slippage_default_bps
+                    )
                 adapter = SignalReplayAdapter(
                     risk_config=RiskConfig(
                         max_risk_per_trade=risk_per_trade_pct,
@@ -11786,6 +11811,8 @@ async def run_backtest_signals(payload: BacktestRunSignalsRequest) -> dict[str, 
                     initial_capital=float(payload.capital or 100000.0),
                     default_timeframe=timeframe,
                     signal_processor_name=signal_processor_name or None,
+                    slippage_params=slippage_params,
+                    asset_class_by_symbol=asset_class_by_symbol,
                     fee_params=fee_params,
                 )
                 result = adapter.run(
@@ -11961,6 +11988,9 @@ async def run_backtest_from_signals(payload: BacktestRunFromSignalsRequest) -> d
             max_position_pct=payload.max_position_pct,
             max_positions=payload.max_positions,
             auto_download=payload.auto_download,
+            slippage=payload.slippage,
+            slippage_bps=payload.slippage_bps,
+            slippage_default_bps=payload.slippage_default_bps,
             fee_rate=payload.fee_rate,
             fee_flat_per_trade=payload.fee_flat_per_trade,
             fees_zero=payload.fees_zero,
@@ -12011,6 +12041,9 @@ async def run_backtest_from_signals(payload: BacktestRunFromSignalsRequest) -> d
         max_position_pct=payload.max_position_pct,
         max_positions=payload.max_positions,
         auto_download=payload.auto_download,
+        slippage=payload.slippage,
+        slippage_bps=payload.slippage_bps,
+        slippage_default_bps=payload.slippage_default_bps,
         fee_rate=payload.fee_rate,
         fee_flat_per_trade=payload.fee_flat_per_trade,
         fees_zero=payload.fees_zero,
