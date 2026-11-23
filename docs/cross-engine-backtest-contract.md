@@ -352,6 +352,23 @@ Implementation:
   margin open positions already use — and clamps the quantity (floored to
   `lot_step` when the leverage cap binds) instead of refusing; an unknown
   broker maximum means 1x.
+- **`entry` is the price the order actually fills at**, for every order type
+  (MARKET: the next bar's open, plus the configured spread for a LONG;
+  LIMIT/STOP: their trigger price). Pre-fill
+  creation sizing is only a pending-order estimate and must never survive into
+  the position: because the caps are evaluated against the fill price, a
+  quantity derived from the signal bar's close sizes a position *beyond* the
+  cap whenever the next open gaps (repro: 103.4k notional on 100k equity at a
+  1x cap). Native's `_fill_pending_orders` re-sizes at the fill for every
+  order type, the no-explicit-stop fallback included.
+- **The sizing `equity` is realized cash in the native engine** (`initial_capital
+  +` realized PnL, net of fees — Cleanup 16-D1 F21/D2; cash from a partial exit
+  is reduced by the round-trip fees the open position still owes), never the
+  mark-to-market reporting equity of the curve: an open position's paper profit
+  is not spendable and a paper drawdown must not deflate new sizes. The native
+  engine records that same figure as `equity_at_entry`. **Exception:**
+  `SignalReplayAdapter` deliberately marks open positions to market when sizing
+  (D9, `docs/cleanup-16d1-money-path-semantics.md`).
 - Native additionally supports `fixed_risk_amount` sizing with MT5 tick
   metadata (`tick_size`, `tick_value`, `lot_step`, `min_lot`, `max_lot`);
   the result is still capped by `max_leverage` (free margin, #347) unless
@@ -415,8 +432,12 @@ Implementation:
 - **Equity sizing** (no risk config): `qty = equity / entry_price`, capped by
   `max_leverage`.
 - Without an explicit stop, engines fall back to a documented default stop
-  distance (native/risk engine: `fallback_stop_pct = 2%`; vectorbt: 2% of
-  entry) — the fallback must be visible in the trade meta, not silent.
+  distance — **2% of the fill price** (native/risk engine:
+  `fallback_stop_pct = 2%`, applied to the entry the risk engine is handed;
+  vectorbt: `entry_price * 0.02`) — the fallback must be visible in the trade
+  meta, not silent. It is a real fill-time risk input, so a stopless order is
+  sized from it like any other order (this supersedes the 16-D1 stopless-MARKET
+  exception recorded in `docs/cleanup-16d1-money-path-semantics.md` D4).
 - **Multi-symbol shared equity (D5, A-M4):** per-symbol engines size each
   trade from the full starting capital; on multi-symbol runs the adapters
   replay all trades onto ONE running portfolio equity
@@ -551,3 +572,48 @@ intrabar resolution (native + vectorbt), sizing from the actual stop (including
 cap behavior), the canonical stats key set per engine, `total_bars` semantics,
 market-entry fill parity, signal-replay's documented same-bar-close exception,
 and the pynecore restatement containment property.
+
+`tests/test_differential_reference_strategies.py` complements the conformance
+suite with differential tests: three textbook strategies (SMA crossover with
+all-in sizing, Donchian breakout with ATR stop/target and fixed-risk sizing,
+RSI mean reversion with a time exit) are run on the native and vectorbt engines
+and compared trade by trade with small independent reference simulators written
+in the test module (synthetic edge-case series and one real EURUSD 15m slice,
+zero and non-zero costs). Known engine deviations are recorded there as
+`xfail(strict=True)` with the exact location and reproducer.
+
+### The real-data slice is downloaded, not committed
+
+The one real slice (600 EURUSD 15m bars: real gaps, a weekend, irregular ranges)
+used to be a committed fixture under `tests/fixtures/differential/`. It is
+generated on demand instead, because this repository is public and vendor market
+data is licensed to be *queried*, not redistributed through a history anyone can
+clone - and because a fixture inside the test tree reads as a source of truth.
+
+```bash
+# writes $DATA_DIR/differential_reference/eurusd_15m_slice.csv
+python -m scripts.fetch_differential_slice
+```
+
+* `DIFFERENTIAL_REAL_SLICE_CSV` overrides that path (CI points it at a path it
+  restores from `actions/cache`, keyed on the fetch script and `data_tools/`).
+* `REQUIRE_REAL_DATA_SLICE=1` turns a missing slice into a test failure. On pull
+  requests CI sets it only after the fetch step succeeds, so a Dukascopy
+  download failure warns and skips the real-data scenarios instead of failing
+  the job; on push to main the fetch step fails on a download error, so the
+  slice is always required there. Locally a missing slice skips them with a
+  message naming the script.
+* A slice that is present but malformed (wrong row count, non-monotonic stamps,
+  non-finite OHLC, `high < max(open, close)`, `low > min(open, close)`) always
+  fails - see `data_tools/differential_slice.py`, which owns the window, the
+  15m aggregation rules (the platform's own, via `data_tools/resample.py`) and
+  the validation.
+* The committed fixture's provenance was mislabelled: bar for bar it was an
+  **MT5 export**, not Dukascopy bid data, so it could not be regenerated from any
+  downloader. The slice is now fetched from Dukascopy's bid minute candles for
+  the same window; the values therefore differ from the removed file (prices by
+  ~0.0008 on average, volumes more, since Dukascopy reports float volumes where
+  the MT5 export carried integer tick counts). The contract these tests check is
+  engine-versus-reference on one frame, so a different quote series validates
+  the same thing - and `tests/test_differential_slice_contract.py` pins the
+  window, the rules and the CSV schema without a network.
