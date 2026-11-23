@@ -3557,6 +3557,13 @@ async def _prepare_claim_and_submit_signal(
         await _persist_submission_rejection(
             deployment, live_signal, stage="prepare", exc=exc
         )
+        if decision is not None:
+            decision.refused(
+                "halt_refused",
+                detail=str(exc),
+                halt_mode=exc.mode.value if exc.mode is not None else None,
+                halt_state_unreadable=exc.state_unreadable,
+            )
         return SUBMIT_OUTCOME_REFUSED
     except LossBreakerBreachError as exc:
         # The loss circuit breaker (#301) refused this entry. Nothing was sent,
@@ -3654,6 +3661,13 @@ async def _prepare_claim_and_submit_signal(
             await _persist_submission_rejection(
                 deployment, live_signal, stage="prepare", exc=exc
             )
+            if decision is not None:
+                decision.refused(
+                    "halt_refused",
+                    detail=str(exc),
+                    halt_mode=exc.mode.value if exc.mode is not None else None,
+                    halt_state_unreadable=exc.state_unreadable,
+                )
             return SUBMIT_OUTCOME_REFUSED
 
     # Shutdown gate + in-flight registration happen in one synchronous step, so
@@ -3803,6 +3817,13 @@ async def _claim_and_submit_prepared_signal(
             await _persist_submission_rejection(
                 deployment, live_signal, stage="prepare", exc=exc
             )
+            if decision is not None:
+                decision.refused(
+                    "halt_refused",
+                    detail=str(exc),
+                    halt_mode=exc.mode.value if exc.mode is not None else None,
+                    halt_state_unreadable=exc.state_unreadable,
+                )
             return SUBMIT_OUTCOME_REFUSED
 
     renew_task = asyncio.create_task(

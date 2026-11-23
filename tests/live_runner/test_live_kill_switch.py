@@ -18,6 +18,7 @@ that cannot be read halts rather than trades.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import uuid
 from datetime import datetime, timezone
@@ -205,6 +206,40 @@ def account(isolated_db_sandbox):
     database, _engine, _data_dir = isolated_db_sandbox
     database.init_db()
     return _add_account(database, ACCOUNT)
+
+
+@pytest.fixture
+def decision_archive(tmp_path, monkeypatch):
+    """A SignalArchive writing into tmp_path, for decision-record assertions."""
+    import live_runner.signal_archive as sa
+    from live_runner.signal_archive import SignalArchive
+
+    monkeypatch.setattr(sa._constants, "DATA_DIR", tmp_path)
+    arch = SignalArchive(queue_size=64)
+    yield arch
+    arch.close(timeout=2.0)
+
+
+def _decision_recorder(account_id, deployment, live_signal, archive):
+    from live_runner.signal_archive import SignalDecisionRecorder
+
+    return SignalDecisionRecorder(
+        trade_signal=live_signal,
+        account_id=account_id,
+        deployment=deployment,
+        archive=archive,
+    )
+
+
+def _decision_records() -> list[dict]:
+    import live_runner.signal_archive as sa
+
+    records: list[dict] = []
+    for path in sorted(sa.archive_dir().glob("*.jsonl")):
+        records.extend(
+            json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()
+        )
+    return [r for r in records if r.get("type") == "discord_signal_decision"]
 
 
 def _patch_exit_ledger(monkeypatch, deployment: LiveDeploymentConfig, qty: float) -> None:
@@ -948,6 +983,7 @@ def _run_submit_path(
     *,
     is_exit: bool,
     monkeypatch: pytest.MonkeyPatch,
+    decision=None,
 ) -> list[str]:
     """Run one signal through ``_prepare_claim_and_submit_signal``.
 
@@ -985,6 +1021,7 @@ def _run_submit_path(
             ),
             live_signal,
             is_exit=is_exit,
+            decision=decision,
         )
     )
     return events
@@ -1135,6 +1172,156 @@ def test_a_halt_written_during_the_claim_still_stops_the_entry(
 
     assert adapter.submitted == []
     assert events == ["claimed", "released"]
+
+
+def _assert_halt_refused_record(
+    decision_archive, *, mode: str, state_unreadable: bool = False
+) -> None:
+    """One ``discord_signal_decision`` record: refused by the kill switch (#386)."""
+    assert decision_archive.flush(timeout=5.0)
+    records = _decision_records()
+    assert len(records) == 1
+    record = records[0]
+    assert record["outcome"] == "refused"
+    assert record["reason"] == "halt_refused"
+    assert record["halt_mode"] == mode
+    assert record["halt_state_unreadable"] is state_unreadable
+
+
+def test_a_halt_refusal_during_prepare_records_a_decision(
+    isolated_db_sandbox, account, monkeypatch, decision_archive
+) -> None:
+    """Site 1: the halt gate inside ``prepare_order_with_risk`` refuses (#386).
+
+    Every other pre-submission refusal writes a ``decision.refused`` record;
+    the kill-switch refusal logged a warning but left the decision audit
+    trail empty, so an operator could not see the halt in the archive.
+    """
+    deployment = _deployment()
+    adapter = _EntryAdapter()
+    set_live_kill_switch(account, "flatten", actor="operator")
+    live_signal = _entry_signal(deployment)
+    decision = _decision_recorder(
+        account, deployment, live_signal, decision_archive
+    )
+
+    events = _run_submit_path(
+        account,
+        adapter,
+        deployment,
+        live_signal,
+        is_exit=False,
+        monkeypatch=monkeypatch,
+        decision=decision,
+    )
+
+    assert adapter.submitted == []
+    assert events == []
+    _assert_halt_refused_record(decision_archive, mode="flatten")
+
+
+def test_a_halt_refusal_at_the_pre_claim_gate_records_a_decision(
+    isolated_db_sandbox, account, monkeypatch, decision_archive
+) -> None:
+    """Site 2: the last-moment gate before the claim refuses (#386).
+
+    The halt lands while the entry is being prepared: the first read (inside
+    ``prepare_order_with_risk``) passes, the pre-claim recheck refuses.
+    """
+    import live_runner.daemon as daemon
+    from live_runner.kill_switch import LiveHaltError
+
+    deployment = _deployment()
+    adapter = _EntryAdapter()
+    real_refuse = daemon.refuse_entry_while_halted
+    reads = {"count": 0}
+
+    async def _refuse(*args: Any, **kwargs: Any) -> None:
+        reads["count"] += 1
+        if reads["count"] > 1:
+            raise LiveHaltError(
+                "halted", account_id=account, mode=KillSwitchMode.ORDERS
+            )
+        return await real_refuse(*args, **kwargs)
+
+    monkeypatch.setattr(daemon, "refuse_entry_while_halted", _refuse)
+    live_signal = _entry_signal(deployment)
+    decision = _decision_recorder(
+        account, deployment, live_signal, decision_archive
+    )
+
+    events = _run_submit_path(
+        account,
+        adapter,
+        deployment,
+        live_signal,
+        is_exit=False,
+        monkeypatch=monkeypatch,
+        decision=decision,
+    )
+
+    assert adapter.submitted == []
+    assert events == []
+    _assert_halt_refused_record(decision_archive, mode="orders")
+
+
+def test_a_halt_refusal_after_the_claim_records_a_decision(
+    isolated_db_sandbox, account, monkeypatch, decision_archive
+) -> None:
+    """Site 3: the post-claim recheck refuses and releases the lease (#386).
+
+    The halt lands while the submission claim is in flight - after every
+    gate that ran before it - so only the post-claim read sees it. The
+    refusal still owes the decision audit trail a record.
+    """
+    import live_runner.daemon as daemon
+    from risk import TradeSignal
+
+    deployment = _deployment()
+    adapter = _EntryAdapter()
+    events: list[str] = []
+
+    def _claim(*_args: Any, **_kwargs: Any) -> str:
+        set_live_kill_switch(account, "entries", actor="operator")
+        events.append("claimed")
+        return "token"
+
+    monkeypatch.setattr(
+        daemon, "claim_live_deployment_submission", _claim, raising=False
+    )
+    monkeypatch.setattr(
+        daemon,
+        "release_live_deployment_submission",
+        lambda *a, **k: events.append("released") or True,
+        raising=False,
+    )
+    live_signal = _entry_signal(deployment)
+    decision = _decision_recorder(
+        account, deployment, live_signal, decision_archive
+    )
+
+    asyncio.run(
+        daemon._prepare_claim_and_submit_signal(
+            account,
+            adapter,
+            deployment,
+            TradeSignal(
+                action=live_signal.action,
+                symbol=live_signal.symbol,
+                entry_price=float(live_signal.theoretical_price),
+                stop_loss=95.0,
+                take_profit=110.0,
+                timeframe="1h",
+            ),
+            live_signal,
+            is_exit=False,
+            decision=decision,
+        )
+    )
+
+    assert adapter.submitted == []
+    assert events == ["claimed", "released"]
+    _assert_halt_refused_record(decision_archive, mode="entries")
 
 
 def test_submit_order_with_risk_rechecks_the_halt_before_submitting(
