@@ -1,0 +1,21 @@
+runner/engine_pkg/trading_engine.py
+  s_848119cad695c8::t_bf0fb41615372c 1116-1120,1366-1371,1375-1376
+tests/test_engine_behavior.py
+  s_848119cad695c8::t_da124bafd813c1 2716-2720,2760-2765
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "896ba0601ca6a34f4d38ac2c45f26f4c99ee47f6",
+  "prompts": {},
+  "sessions": {
+    "s_848119cad695c8": {
+      "agent_id": {
+        "tool": "devin",
+        "id": "s_848119cad695c8",
+        "model": "unknown"
+      },
+      "human_author": "itsjustFred <justfred.business@gmail.com>"
+    }
+  }
+}
