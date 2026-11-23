@@ -1,0 +1,37 @@
+tests/live_runner/test_loss_breaker.py
+  s_3b40271b62d3e9::t_14f41107e437e9 1790
+tests/live_runner/test_signal_archive.py
+  s_3b40271b62d3e9::t_5c88650bb13678 513
+live_runner/ctrader_adapter.py
+  s_e9bb4a46b3244e::t_73812de4f6b286 290-337,353-367,369-373,4463-4465,4468-4529,4621-4634,4650-4653,4655-4660,4674-4675,4677-4686
+live_runner/supertrend_flip.py
+  s_e9bb4a46b3244e::t_c0601533178caf 129,273-319,439-440,472-501,529,531-578,580-589,591-632,713,741-756,965,967,970-971,983,988-1008,1010-1086,1089-1100,1102-1134,1160,1163-1165,1168,1172-1222,1224-1268,1270-1274,1276-1290,1310,1322,1683-1690
+tests/test_ctrader_stop_amendment.py
+  s_e9bb4a46b3244e::t_d53c2c507cccf8 162,164,186,188,262,264,288,290,329,331,352,354,364,366,377,379
+tests/test_ctrader_trendbars.py
+  s_e9bb4a46b3244e::t_a8d5387c39ad07 214,216,224,226,231,233
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "a07fd50b26370fabef2f17e5654e960e7f157485",
+  "prompts": {},
+  "sessions": {
+    "s_3b40271b62d3e9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "53e1d97d-88ff-4a0e-93da-4a653d8f739e",
+        "model": "unknown"
+      },
+      "human_author": "itsjustFred <justfred.business@gmail.com>"
+    },
+    "s_e9bb4a46b3244e": {
+      "agent_id": {
+        "tool": "devin",
+        "id": "s_e9bb4a46b3244e",
+        "model": "unknown"
+      },
+      "human_author": "itsjustFred <justfred.business@gmail.com>"
+    }
+  }
+}
