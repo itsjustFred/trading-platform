@@ -275,8 +275,13 @@ def main(
     parser.add_argument("--osv-url", default=DEFAULT_OSV_URL)
     args = parser.parse_args(argv)
 
+    report_path = args.report.expanduser().resolve()
+    if report_path.suffix.lower() != ".json":
+        print(f"pip-audit report must be a .json file: {args.report}", file=sys.stderr)
+        return 2
+
     try:
-        report = json.loads(args.report.read_text(encoding="utf-8"))
+        report = json.loads(report_path.read_text(encoding="utf-8"))
         findings = _findings_from_report(report)
     except (OSError, ValueError) as exc:
         print(f"pip-audit report unreadable: {exc}", file=sys.stderr)
