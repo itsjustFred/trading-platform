@@ -5810,14 +5810,16 @@ def _log_live_endpoint_request(endpoint: str, **params: Any) -> None:
     )
 
 
-def _calculate_realized_live_pnl(
+def _iter_live_position_fills(
     rows: list[dict[str, Any]],
-) -> tuple[float, int, int]:
-    positions: dict[str, dict[str, float]] = {}
-    total_pnl = 0.0
-    wins = 0
-    losses = 0
+) -> Iterator[tuple[str, float, float, float, dict[str, Any]]]:
+    """Position-moving fills in execution order: ``(symbol, direction, qty, price, row)``.
 
+    The shared preamble of the realised-PnL walk and the closed-round-trip
+    commission walk (#149): buy/sell rows with a usable quantity and price,
+    sorted by the serialized execution timestamp, symbol upper-cased, and
+    direction ``+1`` for buys / ``-1`` for sells.
+    """
     ordered_rows = sorted(
         rows,
         key=lambda row: _serialize_live_timestamp(row.get("execution_timestamp"))[1],
@@ -5836,7 +5838,18 @@ def _calculate_realized_live_pnl(
         price = _safe_float(row.get("actual_price"), 0.0)
         if quantity <= 0.0 or price <= 0.0:
             continue
+        yield symbol, direction, quantity, price, row
 
+
+def _calculate_realized_live_pnl(
+    rows: list[dict[str, Any]],
+) -> tuple[float, int, int]:
+    positions: dict[str, dict[str, float]] = {}
+    total_pnl = 0.0
+    wins = 0
+    losses = 0
+
+    for symbol, direction, quantity, price, _row in _iter_live_position_fills(rows):
         delta = quantity * direction
         state = positions.setdefault(symbol, {"qty": 0.0, "avg": 0.0})
         current_qty = state["qty"]
@@ -5914,28 +5927,10 @@ def _closed_round_trip_commission(rows: list[dict[str, Any]]) -> float | None:
     An unknown fee on a still-open lot does not block the result: it is
     simply not part of any closed round trip yet.
     """
-    ordered_rows = sorted(
-        rows,
-        key=lambda row: _serialize_live_timestamp(row.get("execution_timestamp"))[1],
-    )
     state: dict[str, dict[str, Any]] = {}
     closed_fees = 0.0
     fees_known = True
-    for row in ordered_rows:
-        symbol = str(row.get("symbol") or "UNKNOWN").upper()
-        action = str(row.get("action") or "").strip().lower()
-        if action == "buy":
-            direction = 1.0
-        elif action == "sell":
-            direction = -1.0
-        else:
-            continue
-
-        quantity = abs(_safe_float(row.get("filled_qty"), 0.0))
-        price = _safe_float(row.get("actual_price"), 0.0)
-        if quantity <= 0.0 or price <= 0.0:
-            continue
-
+    for symbol, direction, quantity, _price, row in _iter_live_position_fills(rows):
         commission = row.get("commission")
         rate = (
             None if commission is None else _safe_float(commission, 0.0) / quantity
