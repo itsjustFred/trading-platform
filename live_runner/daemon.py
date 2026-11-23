@@ -32,6 +32,11 @@ if __name__ == "__main__":
 
 import pandas as pd
 
+from live_runner.account_order_lock import (
+    AccountOrderLockTimeoutError,
+    account_order_lock,
+    account_order_placement,
+)
 from live_runner.account_routing import (
     ctrader_account_identifier,
     validate_live_account_routes,
@@ -1734,6 +1739,14 @@ def _exit_lock(account_id: str, symbol: str) -> asyncio.Lock:
     return locks.setdefault((str(account_id), str(symbol).upper()), asyncio.Lock())
 
 
+#: The per-account order-placement lock lives in ``live_runner.account_order_lock``
+#: so broker adapters can take the same critical section as the daemon's submit
+#: chokepoints (#362). These aliases keep the daemon's call sites and tests on
+#: the names they already use.
+_account_order_lock = account_order_lock
+_account_order_placement = account_order_placement
+
+
 async def _alert_ledger_mismatch(
     deployment: LiveDeploymentConfig,
     symbol: str,
@@ -2524,35 +2537,43 @@ async def submit_order_with_risk(
                 "order submission refused: the daemon is shutting down; nothing "
                 "was sent to the broker and its outcome is not unknown"
             )
-        prepared_signal, prepared_qty = await prepare_order_with_risk(
-            adapter,
-            deployment,
-            signal,
-            current_exposure=current_exposure,
-            account_balance=account_balance,
-            pip_value=pip_value,
-        )
-        # The same last-moment halt gate the leased submission path runs: this
-        # caller has no claim to protect, but a halt written while the order was
-        # being sized must still stop it. Entries only - an exit is never blocked.
-        if not is_exit_order(signal.action, signal.metadata or {}):
-            await refuse_entry_while_halted(
-                deployment.account_id,
-                deployment_id=str(deployment.id),
-                symbol=signal.symbol,
-            )
-        # #302: the last check before the broker sees the order, independent of
-        # the sizing code that produced it. Inside order_not_submitted so a
-        # refusal is provably pre-request.
-        with order_not_submitted():
-            prepared_qty = await enforce_pre_submit_caps(
+        # #362: the position reads sizing and the caps make, and the submit
+        # they feed, are one serialized section per account - another of this
+        # daemon's submissions, or a STOPPED/kill-switch flatten, can never
+        # interleave between them. A bounded wait that expires refuses with
+        # AccountOrderLockTimeoutError: never submit on a read that may be
+        # stale. Broker-side fills can still move the book inside the section;
+        # reconciliation is the backstop for that residual race.
+        async with _account_order_placement(deployment.account_id):
+            prepared_signal, prepared_qty = await prepare_order_with_risk(
                 adapter,
                 deployment,
-                prepared_signal,
-                qty=prepared_qty,
-                risk_config=_risk_config_for_deployment(deployment),
+                signal,
+                current_exposure=current_exposure,
+                account_balance=account_balance,
+                pip_value=pip_value,
             )
-        return await adapter.submit_order(prepared_signal, qty=prepared_qty)
+            # The same last-moment halt gate the leased submission path runs: this
+            # caller has no claim to protect, but a halt written while the order was
+            # being sized must still stop it. Entries only - an exit is never blocked.
+            if not is_exit_order(signal.action, signal.metadata or {}):
+                await refuse_entry_while_halted(
+                    deployment.account_id,
+                    deployment_id=str(deployment.id),
+                    symbol=signal.symbol,
+                )
+            # #302: the last check before the broker sees the order, independent of
+            # the sizing code that produced it. Inside order_not_submitted so a
+            # refusal is provably pre-request.
+            with order_not_submitted():
+                prepared_qty = await enforce_pre_submit_caps(
+                    adapter,
+                    deployment,
+                    prepared_signal,
+                    qty=prepared_qty,
+                    risk_config=_risk_config_for_deployment(deployment),
+                )
+            return await adapter.submit_order(prepared_signal, qty=prepared_qty)
 
 
 def _mint_signal_idempotency_key(
@@ -3541,6 +3562,15 @@ async def _prepare_claim_and_submit_signal(
     before the broker saw anything, ``unknown`` means the broker may have the
     order. Callers that only fan out (Discord) ignore the value; the internal
     strategy runner counts non-clean outcomes toward its escalation.
+
+    The whole prepare -> claim -> caps -> submit section runs under the
+    account's order-placement lock (#362): the broker position reads sizing
+    and the caps make, and the submit they feed, are atomic with respect to
+    every other signal submission of the same account and to STOPPED/
+    kill-switch flattens. Broker-side fills can still move the book inside
+    the section; reconciliation is the backstop. A bounded wait that expires
+    refuses with ``account_order_lock_timeout`` - the order is never sized or
+    submitted on a read that may be stale.
     """
     # This chokepoint serves Discord and internal-strategy signals alike;
     # refusal logs name the actual metadata source, not a hardcoded "Discord".
@@ -3550,6 +3580,193 @@ async def _prepare_claim_and_submit_signal(
         if str(_metadata.get("source") or "").strip().lower() == "internal"
         else "Discord"
     )
+    try:
+        async with _account_order_placement(account_id):
+            # The lock wait is bounded but can still be long: re-run the age
+            # gate now that the section has started, so a signal that was fresh
+            # at dispatch cannot be sized and submitted after it expired (#362).
+            # ``received_at`` absent means the gate is a no-op anyway
+            # (require_producer_timestamp=False), so skip the call rather than
+            # touch attributes a minimal signal stand-in may not have.
+            normalized_metadata = getattr(normalized_signal, "metadata", None)
+            if isinstance(normalized_metadata, Mapping) and normalized_metadata.get(
+                "received_at"
+            ):
+                try:
+                    _validate_signal_age_before_wait(
+                        normalized_signal,
+                        deployment,
+                        timeframe=(
+                            getattr(normalized_signal, "timeframe", None)
+                            or str(
+                                (live_signal.metadata or {}).get("timeframe")
+                                or deployment.timeframe
+                            )
+                        ),
+                        require_producer_timestamp=False,
+                    )
+                except ValueError as exc:
+                    return await _refuse_signal_aged_out_after_lock(
+                        account_id,
+                        deployment,
+                        live_signal,
+                        is_exit=is_exit,
+                        decision=decision,
+                        exc=exc,
+                        source_label=source_label,
+                    )
+            return await _prepare_claim_and_submit_signal_locked(
+                account_id,
+                adapter,
+                deployment,
+                normalized_signal,
+                live_signal,
+                is_exit=is_exit,
+                decision=decision,
+                source_label=source_label,
+            )
+    except AccountOrderLockTimeoutError as exc:
+        return await _refuse_account_order_lock_timeout(
+            account_id,
+            deployment,
+            live_signal,
+            is_exit=is_exit,
+            decision=decision,
+            exc=exc,
+            source_label=source_label,
+        )
+
+
+async def _refuse_account_order_lock_timeout(
+    account_id: str,
+    deployment: LiveDeploymentConfig,
+    live_signal: LiveSignal,
+    *,
+    is_exit: bool,
+    decision: SignalDecisionRecorder | None,
+    exc: AccountOrderLockTimeoutError,
+    source_label: str,
+) -> str:
+    """Record the fail-closed refusal of an order that could not take the lock.
+
+    Nothing was sent to the broker and no broker state was read for sizing, so
+    this is a plain pre-submission refusal - but for an exit it leaves the
+    position open, which is an operator-visible error like every other refused
+    exit (#121).
+    """
+    if is_exit:
+        logger.error(
+            "Exit signal refused: the account's order-placement lock could not "
+            "be acquired in time; nothing was sent to the broker and the "
+            "position stays open",
+            extra={
+                "data": {
+                    "account_id": account_id,
+                    "deployment_id": str(deployment.id),
+                    "symbol": live_signal.symbol,
+                    "action": live_signal.action,
+                    "reason": str(exc),
+                }
+            },
+        )
+        await _persist_submission_rejection(
+            deployment, live_signal, stage="prepare_exit", exc=exc
+        )
+    else:
+        logger.warning(
+            f"{source_label} signal refused: the account's order-placement "
+            "lock could not be acquired in time; nothing was sent to the broker",
+            extra={
+                "data": {
+                    "account_id": account_id,
+                    "deployment_id": str(deployment.id),
+                    "symbol": live_signal.symbol,
+                    "reason": str(exc),
+                }
+            },
+        )
+        await _persist_submission_rejection(
+            deployment, live_signal, stage="prepare", exc=exc
+        )
+    if decision is not None:
+        decision.refused("account_order_lock_timeout", detail=str(exc))
+    return SUBMIT_OUTCOME_REFUSED
+
+
+async def _refuse_signal_aged_out_after_lock(
+    account_id: str,
+    deployment: LiveDeploymentConfig,
+    live_signal: LiveSignal,
+    *,
+    is_exit: bool,
+    decision: SignalDecisionRecorder | None,
+    exc: ValueError,
+    source_label: str,
+) -> str:
+    """Record a signal that expired while it waited for the account lock.
+
+    The age gate ran before dispatch and again inside the order-placement
+    section; this is the second refusal, so it gets its own reason rather than
+    looking like a sizing failure. Nothing reached the broker.
+    """
+    reason = "signal_aged_out_during_lock_wait"
+    if is_exit:
+        logger.error(
+            "Exit signal refused after the order-placement lock wait: the "
+            "signal aged out before the section started; nothing was sent to "
+            "the broker and the position stays open",
+            extra={
+                "data": {
+                    "account_id": account_id,
+                    "deployment_id": str(deployment.id),
+                    "symbol": live_signal.symbol,
+                    "action": live_signal.action,
+                    "reason": str(exc),
+                }
+            },
+        )
+        await _persist_submission_rejection(
+            deployment, live_signal, stage="prepare_exit", exc=exc
+        )
+    else:
+        logger.warning(
+            f"{source_label} signal refused after the order-placement lock "
+            "wait: the signal aged out before the section started; nothing "
+            "was sent to the broker",
+            extra={
+                "data": {
+                    "account_id": account_id,
+                    "deployment_id": str(deployment.id),
+                    "symbol": live_signal.symbol,
+                    "reason": str(exc),
+                }
+            },
+        )
+        await _persist_submission_rejection(
+            deployment, live_signal, stage="prepare", exc=exc
+        )
+    if decision is not None:
+        decision.refused(reason, detail=str(exc))
+    return SUBMIT_OUTCOME_REFUSED
+
+
+async def _prepare_claim_and_submit_signal_locked(
+    account_id: str,
+    adapter: BaseLiveAdapter,
+    deployment: LiveDeploymentConfig,
+    normalized_signal: TradeSignal,
+    live_signal: LiveSignal,
+    *,
+    is_exit: bool,
+    decision: SignalDecisionRecorder | None,
+    source_label: str,
+) -> str:
+    """The claim-and-submit body, run under the account order-placement lock.
+
+    Split from :func:`_prepare_claim_and_submit_signal` so the bounded lock
+    wait wraps exactly the section that reads broker position state and
+    submits; ``source_label`` is computed once by the wrapper.
+    """
     # Prepare before claiming. Sizing and the fail-closed SL/TP validation run
     # here, and every failure in them happens before an order can reach the
     # broker. Claiming first (as this used to) held the lease for the whole TTL
@@ -5971,7 +6188,26 @@ async def _enforce_stopped_deployments(
                     },
                 )
                 continue
-            if not await _enforce_one_stopped_deployment(deployment, adapter):
+            try:
+                async with _account_order_placement(deployment.account_id):
+                    enforced = await _enforce_one_stopped_deployment(
+                        deployment, adapter
+                    )
+            except AccountOrderLockTimeoutError as exc:
+                logger.error(
+                    "STOPPED enforcement refused: the account's order-placement "
+                    "lock could not be acquired in time; the deployment stays "
+                    "unenforced and the cancel/flatten is retried",
+                    extra={
+                        "data": {
+                            "deployment_id": deployment_id,
+                            "account_id": deployment.account_id,
+                            "reason": str(exc),
+                        }
+                    },
+                )
+                continue
+            if not enforced:
                 continue
             already_enforced.add(deployment_id)
 
