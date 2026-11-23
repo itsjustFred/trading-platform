@@ -581,16 +581,8 @@ case "${STUB_OPENCODE_MODE:-ok}" in
     ;;
   kilo-400) printf '\\033[91mError: \\033[0mProvider returned error\\n' >&2; exit 1 ;;
   nvidia-429)
-    for n in 1 2 3; do
-      printf '! retrying (attempt %s): HTTP 429: Too Many Requests\\n' "$n" >&2
-    done
     printf 'Error: Provider request failed with HTTP 429: Too Many Requests\\n' >&2
     exit 1
-    ;;
-  nvidia-retry-ok)
-    printf '! retrying (attempt 1): Provider request failed with HTTP 429: Too Many Requests\\n' >&2
-    printf 'OK\\n'
-    exit 0
     ;;
 esac
 """
