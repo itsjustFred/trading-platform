@@ -36,6 +36,7 @@ from data_tools.differential_slice import (
     SLICE_PATH_ENV,
     SLICE_WINDOW_END,
     SLICE_WINDOW_START,
+    SliceDownloadError,
     SliceValidationError,
     default_slice_path,
     fetch_slice_frame,
@@ -287,19 +288,33 @@ def test_the_require_flag_is_read_from_the_environment(monkeypatch):
 # ───────────────────────────── the download entry point ────────────────────────
 
 
-def _minute_grid_frame() -> pd.DataFrame:
-    """Enough minute bars inside the window to yield one 15m bar."""
-    stamps = pd.date_range("2026-02-20 00:00", periods=15, freq="1min", tz="UTC")
+def _minute_bars_for(grid: pd.DatetimeIndex) -> pd.DataFrame:
+    """The 1m bars that resample into ``grid``'s 15m buckets."""
+    stamps = [
+        stamp + pd.Timedelta(minutes=minute)
+        for stamp in grid
+        for minute in range(15)
+    ]
     return pd.DataFrame(
         {
-            "timestamp": stamps,
-            "open": [1.18] * 15,
-            "high": [1.1805] * 15,
-            "low": [1.1795] * 15,
-            "close": [1.18] * 15,
-            "volume": [1.0] * 15,
+            "timestamp": pd.DatetimeIndex(stamps),
+            "open": [1.18] * len(stamps),
+            "high": [1.1805] * len(stamps),
+            "low": [1.1795] * len(stamps),
+            "close": [1.18] * len(stamps),
+            "volume": [1.0] * len(stamps),
         }
     )
+
+
+def _minute_grid_frame() -> pd.DataFrame:
+    """A complete minute-bar window: enough bars to yield the whole slice."""
+    return _minute_bars_for(slice_grid())
+
+
+def _partial_minute_frame() -> pd.DataFrame:
+    """Only the first 15m bucket's minute bars: a truncated download."""
+    return _minute_bars_for(slice_grid()[:1])
 
 
 def test_the_minute_candle_entry_point_refuses_a_both_sided_fetch():
@@ -341,7 +356,25 @@ def test_the_outer_retry_recovers_from_a_throttled_window(monkeypatch):
     frame = asyncio.run(fetch_slice_frame(attempts=4, retry_pause_seconds=0))
 
     assert len(calls) == 3, "two throttled attempts, then the recovery"
-    assert len(frame) == 1
+    assert len(frame) == EXPECTED_SLICE_ROWS
+
+
+def test_a_partial_download_is_retried_before_it_can_fail(monkeypatch):
+    """A truncated window is a failed attempt, not a slice: validate inside the loop."""
+    calls: list[int] = []
+
+    async def _download(*_args, **_kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            return _partial_minute_frame()
+        return _minute_grid_frame()
+
+    monkeypatch.setattr(dukascopy_native, "download_minute_candles", _download)
+
+    frame = asyncio.run(fetch_slice_frame(attempts=2, retry_pause_seconds=0))
+
+    assert len(calls) == 2, "the partial frame must be retried, not returned"
+    assert len(frame) == EXPECTED_SLICE_ROWS
 
 
 def test_the_outer_retry_is_bounded_and_raises(monkeypatch):
@@ -352,10 +385,39 @@ def test_the_outer_retry_is_bounded_and_raises(monkeypatch):
         dukascopy_native, "download_minute_candles", _throttled_downloader(99, calls)
     )
 
-    with pytest.raises(SliceValidationError, match="could not generate the slice"):
+    with pytest.raises(SliceDownloadError, match="could not generate the slice"):
         asyncio.run(fetch_slice_frame(attempts=3, retry_pause_seconds=0))
 
     assert len(calls) == 3, "exactly three attempts, no more"
+
+
+def test_a_complete_but_invalid_slice_fails_instead_of_becoming_a_download_error(
+    monkeypatch,
+):
+    """A full row count with broken quotes is corruption, not an outage.
+
+    Retrying it into ``SliceDownloadError`` would turn a real validation failure
+    into CI's warn-and-skip path, which is exactly the confusion this contract
+    exists to prevent.
+    """
+    calls: list[int] = []
+
+    async def _download(*_args, **_kwargs):
+        calls.append(1)
+        return _minute_grid_frame()
+
+    broken, fragment = violations()["zero_close"]
+    assert len(broken) == EXPECTED_SLICE_ROWS
+    monkeypatch.setattr(dukascopy_native, "download_minute_candles", _download)
+    monkeypatch.setattr(
+        "data_tools.differential_slice.slice_from_minute_bars", lambda _minute: broken
+    )
+
+    with pytest.raises(SliceValidationError, match=re.escape(fragment)) as excinfo:
+        asyncio.run(fetch_slice_frame(attempts=3, retry_pause_seconds=0))
+
+    assert not isinstance(excinfo.value, SliceDownloadError)
+    assert len(calls) == 1, "a contract violation is not a retryable download failure"
 
 
 # ───────────────────────────── nothing is committed again ─────────────────────
@@ -458,14 +520,52 @@ def test_an_invalid_cache_is_replaced_by_a_fresh_download(tmp_path, monkeypatch,
     assert len(read_slice(path)) == EXPECTED_SLICE_ROWS
 
 
-def test_a_failed_generation_exits_one_and_writes_nothing(tmp_path, monkeypatch, capsys):
+def test_a_failed_download_exits_three_and_writes_nothing(tmp_path, monkeypatch, capsys):
+    """Exit 3 is the CI contract for "Dukascopy failed, no usable cache"."""
     path = tmp_path / "out.csv"
 
     async def _failing_download(**_kwargs):
-        raise SliceValidationError("no m1 bid candles for EURUSD")
+        raise SliceDownloadError("could not generate the slice: HTTP 429 storm")
 
     monkeypatch.setattr(fetch_script, "fetch_slice_frame", _failing_download)
 
+    assert fetch_script.main(["--out", str(path), "--quiet"]) == 3
+    assert not path.exists()
+    err = capsys.readouterr().err
+    assert "Dukascopy" in err and "skip" in err
+
+
+def test_an_invalid_generated_slice_exits_one_and_writes_nothing(
+    tmp_path, monkeypatch, capsys
+):
+    """A frame that fails the write-side contract is not a download outage."""
+    path = tmp_path / "out.csv"
+
+    async def _invalid_download(**_kwargs):
+        return slice_like_frame(rows=EXPECTED_SLICE_ROWS - 1)
+
+    monkeypatch.setattr(fetch_script, "fetch_slice_frame", _invalid_download)
+
     assert fetch_script.main(["--out", str(path), "--quiet"]) == 1
     assert not path.exists()
-    assert "no m1 bid candles" in capsys.readouterr().err
+    assert "599 rows, expected 600" in capsys.readouterr().err
+
+
+def test_ci_requires_the_slice_only_when_the_fetch_succeeded():
+    """A Dukascopy outage may skip the real-data scenarios on PRs; on main it may not.
+
+    Pull requests warn and skip a failed download, but a push to main must fail
+    the fetch step itself so the real-data slice is always required there and a
+    permanent outage is noticed.
+    """
+    workflow = (REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+
+    assert "id: fetch-slice" in workflow
+    assert '"$status" -eq 3' in workflow
+    assert "download_failed=true" in workflow
+    assert "steps.fetch-slice.outputs.download_failed" in workflow
+    assert "REQUIRE_REAL_DATA_SLICE" in workflow
+    assert 'REQUIRE_REAL_DATA_SLICE: "1"' not in workflow
+    # The skip is conditional on the event: only non-push runs may swallow exit 3.
+    assert 'github.event_name' in workflow
+    assert '!= "push"' in workflow
