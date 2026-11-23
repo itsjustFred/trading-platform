@@ -14,6 +14,7 @@ import logging
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -183,6 +184,9 @@ class _PositionsAdapter(BaseLiveAdapter):
 
     async def get_positions(self) -> list[dict[str, Any]]:
         return list(self.positions)
+
+    async def get_used_margin(self) -> float | None:
+        return 0.0
 
     async def get_pip_value(self, symbol):
         # #146: a USD-quoted share in a USD account moves 1.0 per 1.0.
@@ -1064,6 +1068,225 @@ def test_submit_order_with_risk_rejects_zero_size_when_budget_exhausted():
     assert adapter.submitted_signal is None
 
 
+@pytest.fixture
+def live_runner_logs(caplog):
+    """Capture ``live-runner`` records: that logger does not propagate (#263 alert)."""
+    target = logging.getLogger("trading.live-runner")
+    target.addHandler(caplog.handler)
+    caplog.set_level(logging.DEBUG, logger="trading.live-runner")
+    try:
+        yield caplog
+    finally:
+        target.removeHandler(caplog.handler)
+
+
+# ── #263: a broker quantity that cannot be read is never "no position" ────────
+#
+# `_count_open_broker_positions` is the broker-truth half of the entry gates: it
+# feeds max_positions and the risk-at-stake exposure estimate. It used to coerce
+# an unreadable `qty` to 0.0, so a position the broker described badly read as
+# "flat" and the next signal was sized as if the account were empty - a new
+# position on top of a cap that may already be full. Every unreadable quantity
+# now stops the count and refuses the entry.
+
+
+def test_count_open_broker_positions_ignores_readable_flat_rows():
+    """A *readable* zero is a position that is not open; it is not an error."""
+    from live_runner.daemon import _count_open_broker_positions
+
+    assert _count_open_broker_positions([]) == 0
+    assert _count_open_broker_positions([{"symbol": "AAPL", "qty": 0.0}]) == 0
+    assert _count_open_broker_positions([{"symbol": "AAPL", "qty": "0"}]) == 0
+    assert _count_open_broker_positions([{"symbol": "AAPL", "qty": -0.0}]) == 0
+
+
+@pytest.mark.parametrize(
+    "qty",
+    [
+        None,
+        "abc",
+        "",
+        float("nan"),
+        float("inf"),
+        float("-inf"),
+        True,
+        Decimal("sNaN"),
+        10**400,
+    ],
+)
+def test_count_open_broker_positions_fails_closed_on_an_unreadable_qty(qty):
+    from live_runner.daemon import UnreadableBrokerPositionQtyError, _count_open_broker_positions
+
+    with pytest.raises(UnreadableBrokerPositionQtyError, match="refusing to read the account"):
+        _count_open_broker_positions([{"symbol": "AAPL", "qty": qty}])
+
+
+def test_count_open_broker_positions_fails_closed_when_the_qty_key_is_absent():
+    from live_runner.daemon import UnreadableBrokerPositionQtyError, _count_open_broker_positions
+
+    with pytest.raises(UnreadableBrokerPositionQtyError, match="states no qty"):
+        _count_open_broker_positions([{"symbol": "AAPL"}])
+
+
+def test_count_open_broker_positions_fails_closed_on_alpacas_unparseable_marker():
+    """Alpaca marks a row whose REST qty string it could not parse, keeping the
+    coerced 0.0 as the displayed qty: only the marker says it is not flat."""
+    from live_runner.daemon import UnreadableBrokerPositionQtyError, _count_open_broker_positions
+
+    with pytest.raises(UnreadableBrokerPositionQtyError, match="unparseable qty"):
+        _count_open_broker_positions(
+            [{"symbol": "AAPL", "qty": 0.0, "qty_unparseable": True, "qty_raw": "n/a"}]
+        )
+
+
+@pytest.mark.parametrize("qty", ["10", "0.5", "-3.5", 2.0, "  7  "])
+def test_count_open_broker_positions_accepts_string_quantities(qty):
+    """A quantity the broker sent as a string is a quantity, not an error."""
+    from live_runner.daemon import _count_open_broker_positions
+
+    assert _count_open_broker_positions([{"symbol": "AAPL", "qty": qty}]) == 1
+
+
+def test_count_open_broker_positions_counts_string_quantities_in_a_mixed_book():
+    """A readable "0" is a flat row; the other two rows are open positions."""
+    from live_runner.daemon import _count_open_broker_positions
+
+    positions = [
+        {"symbol": "AAPL", "qty": "10"},
+        {"symbol": "MSFT", "qty": "0"},
+        {"symbol": "TSLA", "qty": "-3.5"},
+    ]
+
+    assert _count_open_broker_positions(positions) == 2
+
+
+def test_count_open_broker_positions_names_the_symbol_and_row_of_the_bad_quantity():
+    from live_runner.daemon import UnreadableBrokerPositionQtyError, _count_open_broker_positions
+
+    with pytest.raises(UnreadableBrokerPositionQtyError) as excinfo:
+        _count_open_broker_positions(
+            [
+                {"symbol": "AAPL", "qty": 1.0},
+                {"symbol": "MSFT", "qty": float("nan")},
+            ]
+        )
+
+    assert excinfo.value.symbol == "MSFT"
+    assert excinfo.value.row_index == 1
+    assert excinfo.value.log_data() == {
+        "position_symbol": "MSFT",
+        "position_qty_raw": "nan",
+        "position_row_index": 1,
+    }
+
+
+def test_submit_order_with_risk_refuses_an_entry_when_a_broker_qty_is_unreadable():
+    """The dependent decision is skipped, not taken: nothing reaches the broker."""
+    from live_runner.daemon import UnreadableBrokerPositionQtyError, submit_order_with_risk
+
+    # max_positions is already full, so an entry is refused anyway: this pins
+    # that the unreadable row refuses it first and not as "one open position".
+    deployment = _deployment(max_positions=1)
+    adapter = _PositionsAdapter(positions=[{"symbol": "AAPL", "qty": "abc"}])
+    signal = _live_signal(deployment)
+
+    # One throwing invocation inside the block, so the assertion cannot pass on
+    # a failure to build the signal.
+    with pytest.raises(UnreadableBrokerPositionQtyError):
+        asyncio.run(submit_order_with_risk(adapter, deployment, signal))
+
+    assert adapter.submitted_signal is None
+    assert adapter.submitted_qty is None
+
+
+def test_submit_order_with_risk_refuses_an_entry_when_a_broker_qty_is_missing():
+    from live_runner.daemon import UnreadableBrokerPositionQtyError, submit_order_with_risk
+
+    deployment = _deployment(max_positions=5)
+    adapter = _PositionsAdapter(positions=[{"symbol": "AAPL"}])
+    signal = _live_signal(deployment)
+
+    with pytest.raises(UnreadableBrokerPositionQtyError):
+        asyncio.run(submit_order_with_risk(adapter, deployment, signal))
+
+    assert adapter.submitted_signal is None
+
+
+def test_the_dispatcher_skips_and_logs_an_entry_when_a_broker_qty_is_unreadable(
+    live_runner_logs,
+):
+    """The dispatcher's own handling: no submission, one warning, no crash.
+
+    The refusal happens inside ``prepare_order_with_risk``, so this runs the real
+    path and pins only what the caller does with it.
+    """
+    from live_runner.daemon import _prepare_claim_and_submit_signal
+    from risk.models import TradeSignal
+
+    deployment = _deployment()
+    adapter = _PositionsAdapter(positions=[{"symbol": "AAPL", "qty": "abc"}])
+    normalized_signal = TradeSignal(
+        action="buy",
+        symbol="EURUSD",
+        entry_price=100.0,
+        stop_loss=95.0,
+        take_profit=110.0,
+        timeframe="1h",
+        metadata={},
+    )
+
+    asyncio.run(
+        _prepare_claim_and_submit_signal(
+            "acc-1",
+            adapter,
+            deployment,
+            normalized_signal,
+            _live_signal(deployment),
+            is_exit=False,
+        )
+    )
+
+    assert adapter.submitted_signal is None
+    refusals = [
+        record
+        for record in live_runner_logs.records
+        if record.levelno == logging.WARNING
+        and "refused before submission" in record.getMessage()
+    ]
+    assert len(refusals) == 1, [r.getMessage() for r in live_runner_logs.records]
+    assert refusals[0].data["deployment_id"] == str(deployment.id)
+
+
+def test_an_unreadable_broker_qty_alerts_an_operator_and_skips_the_entry(live_runner_logs):
+    from live_runner.daemon import UnreadableBrokerPositionQtyError, prepare_order_with_risk
+
+    deployment = _deployment(max_positions=5)
+    adapter = _PositionsAdapter(positions=[{"symbol": "AAPL", "qty": float("inf")}])
+    signal = _live_signal(deployment)
+
+    with pytest.raises(UnreadableBrokerPositionQtyError):
+        asyncio.run(prepare_order_with_risk(adapter, deployment, signal))
+
+    alerts = [
+        record
+        for record in live_runner_logs.records
+        if record.levelno == logging.ERROR
+        and getattr(record, "data", {}).get("alert") == "broker_position_qty_unreadable"
+    ]
+    assert len(alerts) == 1, [r.getMessage() for r in live_runner_logs.records]
+    assert "refusing the entry" in alerts[0].getMessage()
+    alert_data = alerts[0].data
+    # The deployment and the entry signal at stake ...
+    assert alert_data["account_id"] == deployment.account_id
+    assert alert_data["deployment_id"] == str(deployment.id)
+    assert alert_data["signal_symbol"] == "EURUSD"
+    # ... and the row that could not be read, named with its raw value.
+    assert alert_data["position_symbol"] == "AAPL"
+    assert alert_data["position_qty_raw"] == "inf"
+    assert alert_data["position_row_index"] == 0
+    assert adapter.submitted_signal is None
+
+
 # ── B-7: one cTrader volume contract ──────────────────────────────────────────
 
 def test_ctrader_volume_contract_uses_qty_units_only():
@@ -1382,7 +1605,7 @@ def test_ctrader_reconcile_sparse_deal_uses_order_executed_volume():
 
 def test_ctrader_get_positions_qty_matches_volume_contract():
     """get_positions qty must use the same unit as signal metadata qty."""
-    module, adapter = _make_ctrader_adapter()
+    _module, adapter = _make_ctrader_adapter()
     adapter._authenticated = True
     adapter._symbol_name_to_id = {"EURUSD": 1}
 
@@ -2136,7 +2359,9 @@ def test_live_signal_timestamp_lookup_normalizes_to_utc(isolated_db):
     assert database.get_live_signal_timestamp("") is None
     assert database.get_live_signal_timestamp(str(uuid4())) is None
 
-    naive_timestamp = datetime(2026, 7, 15, 10, 30)
+    # Deliberately naive: this is the timestamp the normalisation under test
+    # exists to stamp, so the fixture has to stay naive.
+    naive_timestamp = datetime(2026, 7, 15, 10, 30)  # noqa: DTZ001
     naive_signal = LiveSignal(
         deployment_id="dep-naive",
         symbol="EURUSD",
@@ -3339,7 +3564,7 @@ def test_ctrader_order_recovery_fails_closed_when_match_is_not_unique(
     orders, has_more
 ):
     """Zero, duplicate, or incomplete broker results must never select an order."""
-    module, adapter = _make_ctrader_adapter()
+    _module, adapter = _make_ctrader_adapter()
 
     class _OrderListReq:
         def __init__(self) -> None:
@@ -3564,7 +3789,7 @@ def test_alpaca_build_order_request_rejects_unknown_signal_action():
 
 
 def test_ctrader_rejects_unknown_signal_action_instead_of_selling():
-    module, adapter = _make_ctrader_adapter()
+    _module, adapter = _make_ctrader_adapter()
     adapter._client = object()
     adapter._connected = True
     adapter._authenticated = True
@@ -3606,7 +3831,7 @@ def test_ctrader_rejects_unknown_signal_action_instead_of_selling():
 
 def test_ctrader_new_order_request_carries_sl_tp_prices():
     """The computed SL/TP must land on the broker request, not just metadata."""
-    module, adapter = _make_ctrader_request_builder_adapter()
+    _module, adapter = _make_ctrader_request_builder_adapter()
 
     signal = LiveSignal(
         deployment_id="dep-1",
@@ -3623,8 +3848,8 @@ def test_ctrader_new_order_request_carries_sl_tp_prices():
     # MARKET orders ignore the absolute stopLoss/takeProfit fields; the
     # distances must arrive via the relative int64 fields (1/100000 units):
     # BUY stop = entry - relativeStopLoss, take = entry + relativeTakeProfit.
-    assert request.relativeStopLoss == int(round(abs(1.1 - 1.05) * 100_000))
-    assert request.relativeTakeProfit == int(round(abs(1.2 - 1.1) * 100_000))
+    assert request.relativeStopLoss == round(abs(1.1 - 1.05) * 100_000)
+    assert request.relativeTakeProfit == round(abs(1.2 - 1.1) * 100_000)
 
 
 @pytest.mark.parametrize(
@@ -3662,12 +3887,12 @@ def test_ctrader_relative_sl_tp_direction_and_rejections():
         )
 
     buy_request = adapter._build_new_order_request(_signal("buy", 1.05, 1.2), symbol_id=7)
-    assert buy_request.relativeStopLoss == int(round(0.05 * 100_000))
-    assert buy_request.relativeTakeProfit == int(round(0.1 * 100_000))
+    assert buy_request.relativeStopLoss == round(0.05 * 100_000)
+    assert buy_request.relativeTakeProfit == round(0.1 * 100_000)
 
     sell_request = adapter._build_new_order_request(_signal("sell", 1.2, 1.0), symbol_id=7)
-    assert sell_request.relativeStopLoss == int(round(0.1 * 100_000))
-    assert sell_request.relativeTakeProfit == int(round(0.1 * 100_000))
+    assert sell_request.relativeStopLoss == round(0.1 * 100_000)
+    assert sell_request.relativeTakeProfit == round(0.1 * 100_000)
 
     wrong_side = adapter._build_new_order_request
     wrong_side_signal = _signal("buy", 1.2, 1.05)
@@ -3685,7 +3910,7 @@ def test_ctrader_relative_sl_tp_direction_and_rejections():
 
 
 def test_ctrader_new_order_request_fails_closed_without_sl_tp():
-    module, adapter = _make_ctrader_request_builder_adapter()
+    _module, adapter = _make_ctrader_request_builder_adapter()
 
     signal = LiveSignal(
         deployment_id="dep-1",
@@ -3703,7 +3928,7 @@ def test_ctrader_new_order_request_fails_closed_without_sl_tp():
 
 def test_ctrader_build_new_order_request_rejects_unknown_signal_action():
     """The request-builder guard must hold even when submit_order is bypassed."""
-    module, adapter = _make_ctrader_request_builder_adapter()
+    _module, adapter = _make_ctrader_request_builder_adapter()
     bad_signal = _live_signal_with_action("close")
 
     with pytest.raises(ValueError, match=r"[Uu]nsupported .*action: close"):
@@ -3726,6 +3951,31 @@ def test_alpaca_rejects_non_finite_sl_tp_prices():
             metadata={"stop_loss": bad, "take_profit": 110.0},
         )
         with pytest.raises(ValueError, match="Invalid stop_loss price"):
+            adapter._resolve_broker_sl_tp(signal)
+
+
+def test_alpaca_rejects_zero_sl_tp_prices():
+    """A zero bracket price is not a price: it must fail closed, not submit.
+
+    The guard is ``value <= 0``, not ``< 0``: a zero stop or take-profit is a
+    level at the fill's own price, which the broker accepts as an unbounded
+    position instead of a bounded one.
+    """
+    from live_runner import alpaca_adapter as module
+
+    adapter = module.AlpacaLiveAdapter(api_key="k", secret_key="s", paper=True)
+    for name in ("stop_loss", "take_profit"):
+        metadata = {"stop_loss": 95.0, "take_profit": 110.0}
+        metadata[name] = 0.0
+        signal = LiveSignal(
+            deployment_id="dep-1",
+            symbol="AAPL",
+            action="buy",
+            theoretical_price=100.0,
+            timestamp=datetime.now(timezone.utc),
+            metadata=metadata,
+        )
+        with pytest.raises(ValueError, match=f"Invalid {name} price"):
             adapter._resolve_broker_sl_tp(signal)
 
 
@@ -4040,7 +4290,7 @@ def test_alpaca_unbounded_tp_rejects_invalid_stop() -> None:
 
 
 def test_ctrader_exit_only_uses_position_addressed_close():
-    module, adapter = _make_ctrader_request_builder_adapter()
+    _module, adapter = _make_ctrader_request_builder_adapter()
 
     class _CloseReq:
         def __init__(self) -> None:
@@ -4196,7 +4446,7 @@ def test_ctrader_exit_only_with_multiple_position_ids_fails_closed() -> None:
 
 def test_ctrader_entry_guard_still_blocks_naked_non_exit_orders():
     """The exit-only bypass must not open a hole on cTrader either."""
-    module, adapter = _make_ctrader_request_builder_adapter()
+    _module, adapter = _make_ctrader_request_builder_adapter()
     signal = LiveSignal(
         deployment_id="dep-1",
         symbol="AAPL",
@@ -4373,7 +4623,7 @@ def test_ctrader_index_fallback_class() -> None:
 def test_ctrader_unknown_symbol_fails_closed() -> None:
     """No broker props + no fallback class = no trade, never a guessed size."""
     _module, adapter = _make_ctrader_adapter()
-    with pytest.raises(ValueError, match="[Uu]nknown cTrader symbol"):
+    with pytest.raises(ValueError, match=r"[Uu]nknown cTrader symbol"):
         adapter._resolve_order_volume(_ctrader_signal("NOTASYMBOLXYZ", {"qty": 5.0}))
 
 
@@ -4505,7 +4755,7 @@ def test_ctrader_sub_tick_stop_loss_is_refused_not_widened() -> None:
     stop to a full tick would exceed the per-trade risk, so it fails closed."""
     module, adapter = _make_ctrader_request_builder_adapter()
     _seed_digits(module, adapter, 2)
-    with pytest.raises(ValueError, match="SL distance .* below one tick"):
+    with pytest.raises(ValueError, match=r"SL distance .* below one tick"):
         adapter._build_new_order_request(_ethusd_signal(1925.496, 1925.50 + 5.0), symbol_id=9)
     # Exactly one tick is accepted.
     request = adapter._build_new_order_request(_ethusd_signal(1925.49, 1925.60), symbol_id=9)
@@ -4523,7 +4773,7 @@ def test_ctrader_sub_tick_stop_loss_is_refused_for_each_sub_tick_price(stop: flo
 def test_ctrader_sub_tick_stop_loss_is_refused_on_stop_only_order() -> None:
     module, adapter = _make_ctrader_request_builder_adapter()
     _seed_digits(module, adapter, 2)
-    with pytest.raises(ValueError, match="SL distance .* below one tick"):
+    with pytest.raises(ValueError, match=r"SL distance .* below one tick"):
         adapter._build_new_order_request(_ethusd_signal(1925.50 - 0.004, None), symbol_id=9)
     request = adapter._build_new_order_request(_ethusd_signal(1925.49, None), symbol_id=9)
     assert request.relativeStopLoss == 1000
@@ -4599,7 +4849,7 @@ def test_ctrader_non_fx_six_letter_symbols_fail_closed(symbol: str) -> None:
     from live_runner import ctrader_adapter as module
 
     assert module._fallback_scale_class(symbol) is None
-    with pytest.raises(ValueError, match="[Uu]nknown cTrader symbol"):
+    with pytest.raises(ValueError, match=r"[Uu]nknown cTrader symbol"):
         module._fallback_symbol_scale(symbol)
 
 
@@ -4609,7 +4859,7 @@ def test_ctrader_crypto_symbols_fail_closed_not_fx() -> None:
 
     assert module._fallback_scale_class("BTCUSD") is None
     assert module._fallback_scale_class("ETHUSD") is None
-    with pytest.raises(ValueError, match="[Uu]nknown cTrader symbol"):
+    with pytest.raises(ValueError, match=r"[Uu]nknown cTrader symbol"):
         module._fallback_symbol_scale("BTCUSD")
 
 

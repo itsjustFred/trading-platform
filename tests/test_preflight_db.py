@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from pathlib import Path
 from textwrap import dedent
@@ -448,6 +449,39 @@ def test_resolve_db_path_drops_a_query_string_from_the_url(tmp_path: Path, monke
     assert resolve_db_path() == path
 
 
+def test_resolve_db_path_normalizes_the_sqlite_uri_form(tmp_path: Path, monkeypatch) -> None:
+    """``sqlite:///file:/abs/db.db?uri=true`` addresses the same file as ``sqlite:////abs/db.db``.
+
+    The ``file:`` prefix is URI syntax the SQLite driver parses, not a directory: a working
+    database was reported as "Database file not found" while the parser kept the prefix in the
+    path.
+    """
+    path = tmp_path / "backtests.db"
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///file:{path.as_posix()}?uri=true")
+
+    assert resolve_db_path() == path
+
+
+def test_sqlite_url_file_strips_the_slash_before_a_windows_drive_letter(monkeypatch) -> None:
+    """``file:///C:/x.db?uri=true`` is ``C:/x.db`` on Windows.
+
+    SQLite drops the leading slash before a drive letter on Windows only; keeping it would
+    resolve the database - and the daemon's single-instance lock beside it - to ``/C:/x.db``,
+    a file the engine never opens.
+    """
+    from shared.database import sqlite_url_file
+
+    monkeypatch.setattr(os, "name", "nt")
+    assert sqlite_url_file("sqlite:///file:///C:/data/live.db?uri=true") == "C:/data/live.db"
+
+
+def test_sqlite_url_file_keeps_the_slash_before_a_drive_letter_on_posix() -> None:
+    """On POSIX ``/C:/x.db`` is a literal absolute path, not a drive letter."""
+    from shared.database import sqlite_url_file
+
+    assert sqlite_url_file("sqlite:///file:///C:/data/live.db?uri=true") == "/C:/data/live.db"
+
+
 def test_resolve_db_path_decodes_a_percent_encoded_url(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("DATABASE_URL", f"sqlite:///{tmp_path.as_posix()}/my%20db.db")
 
@@ -794,3 +828,76 @@ def test_symbol_filter_is_normalized_on_write_and_on_read(isolated_db) -> None:
     read_back = database.get_live_deployment(str(created.id))
     assert read_back is not None
     assert read_back.symbol_filter == ["AAPL"]
+
+
+# ── ACTIVE rows nothing can trade (#242) ─────────────────────────────────────
+
+
+def test_active_internal_db_row_without_yaml_twin_warns_no_runner(isolated_db) -> None:
+    """A DB-only internal row gets the same no-runner warning the daemon logs."""
+    database = isolated_db[0]
+    _seed(database)
+
+    report = run_db_preflight([], db_path=_db_path(database))
+
+    assert any("no live strategy runner" in w for w in report.warnings), report.warnings
+
+
+def test_active_discord_db_row_does_not_warn_no_runner(isolated_db) -> None:
+    database = isolated_db[0]
+    _seed(database, signal_source="discord", signal_source_id="news-svc")
+
+    report = run_db_preflight(
+        [
+            LiveDeploymentConfig(
+                strategy_name="equity_momentum",
+                account_id="alpaca-paper",
+                symbols=["AAPL"],
+                timeframe="1h",
+                signal_source="discord",
+                signal_source_id="news-svc",
+                signal_config={"channel_id": "123456789012345678"},
+            )
+        ],
+        db_path=_db_path(database),
+    )
+
+    assert not any("no live strategy runner" in w for w in report.warnings), report.warnings
+
+
+def test_internal_db_row_with_yaml_twin_is_not_double_warned(isolated_db) -> None:
+    """The YAML-side check reports it once; the DB diff does not repeat it."""
+    database = isolated_db[0]
+    _seed(database)
+
+    report = run_db_preflight([_yaml_one()], db_path=_db_path(database))
+
+    assert not any("no live strategy runner" in w for w in report.warnings), report.warnings
+
+
+def test_internal_db_row_with_a_tradeable_yaml_twin_warns(isolated_db) -> None:
+    """The row is missed by both preflights unless the DB side reports it.
+
+    ``_validate_deployments`` warns for an ACTIVE non-Discord *YAML* deployment,
+    so a Discord twin it is silent about, and the DB diff used to skip the warning
+    whenever a twin existed at all: the DB row's own value went unreported except
+    as ``signal_source`` drift, which is a comparison, not a warning.
+    """
+    database = isolated_db[0]
+    _seed(database)
+
+    report = run_db_preflight([_yaml_one("discord", "news-svc")], db_path=_db_path(database))
+
+    warnings = [warning for warning in report.warnings if "no live strategy runner" in warning]
+    assert len(warnings) == 1, report.warnings
+    assert "equity_momentum" in warnings[0]
+
+
+def test_a_discord_db_row_with_a_discord_yaml_twin_stays_quiet(isolated_db) -> None:
+    """The row above is a defect report, not a report on every row."""
+    database = isolated_db[0]
+    _seed(database, signal_source="discord", signal_source_id="news-svc")
+
+    report = run_db_preflight([_yaml_one("discord", "news-svc")], db_path=_db_path(database))
+
+    assert report.warnings == [], report.warnings

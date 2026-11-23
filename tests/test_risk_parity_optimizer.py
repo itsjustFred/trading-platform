@@ -5,6 +5,7 @@ import pytest
 from runner.risk_parity_optimizer import (
     candidate_universes,
     risk_contributions,
+    score_risk_parity_universe,
     select_best_risk_parity_universe,
     shrink_covariance,
     solve_risk_parity_weights,
@@ -37,6 +38,27 @@ def test_select_best_risk_parity_universe_returns_diagnostics() -> None:
     assert sum(result["best_weights"].values()) == pytest.approx(1.0)
     assert result["evaluated_universes"]
     assert "best_risk_contributions" in result
+
+
+def test_score_risk_parity_universe_rejects_a_symbol_without_a_weight() -> None:
+    """A universe whose symbols outnumber its covariance columns must raise.
+
+    The published weights pair each symbol with a risk contribution by
+    ``strict=True``: a mismatch (a universe/covariance disagreement) used to
+    truncate, silently dropping a symbol from the mapping instead of attributing
+    one symbol's risk to another.
+    """
+    returns = np.array(
+        [
+            [0.010, 0.020],
+            [-0.005, 0.015],
+            [0.012, -0.008],
+            [0.004, 0.009],
+        ]
+    )
+
+    with pytest.raises(ValueError, match=r"shorter"):
+        score_risk_parity_universe(["SPY", "TLT", "GLD"], returns)
 
 
 def test_candidate_universes_are_deterministic_and_deduped() -> None:

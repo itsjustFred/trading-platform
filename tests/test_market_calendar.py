@@ -150,7 +150,8 @@ def test_last_session_at_or_before(moment, expected):
 
 
 def test_last_session_at_or_before_refuses_a_naive_moment():
-    naive = dt.datetime(2026, 9, 8, 15)
+    # Deliberately naive: the refusal under test only triggers on naive.
+    naive = dt.datetime(2026, 9, 8, 15)  # noqa: DTZ001
     with pytest.raises(ValueError, match="timezone-aware"):
         market_calendar.last_session_at_or_before(naive)
 
@@ -216,7 +217,8 @@ def test_a_weekly_bar_stamped_on_monday_covers_the_week():
 
 
 def test_bar_staleness_refuses_a_naive_bar():
-    naive_bar = dt.datetime(2026, 9, 8, 15)
+    # Deliberately naive: the refusal under test only triggers on naive.
+    naive_bar = dt.datetime(2026, 9, 8, 15)  # noqa: DTZ001
     now = _at(2026, 9, 9, 15)
     with pytest.raises(ValueError, match="timezone-aware"):
         market_calendar.bar_staleness_sessions(naive_bar, now, nominal_days=1.0)

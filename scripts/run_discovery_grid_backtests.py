@@ -150,6 +150,7 @@ def run_trial(trial: dict[str, Any]) -> dict[str, Any]:
     with log_path.open("w", encoding="utf-8") as log:
         proc = subprocess.run(
             cmd,
+            check=False,
             cwd=PROJECT_ROOT,
             env=env,
             text=True,

@@ -28,11 +28,101 @@ the price data.
 `self.equity = initial + realized + unrealized` — open positions' paper profit
 compounded into the next entry's quantity, and paper drawdown shrank it.
 
+**Regression found in #190 and re-fixed there:** the 16-D2 structural split
+(`runner/engine.py` → `runner/engine_pkg/`) dropped `_sizing_equity` and
+reverted every sizing call to `self.equity`. The two F21 tests stayed green only
+because creation sizing runs *before* the bar's `_update_equity`, so the
+mark-to-market figure they compared against lagged one bar and happened to be
+realized in that fixture. The fill-time re-size added in #190 removed the lag
+and exposed it. `_sizing_equity` is restored (initialised in `__init__`,
+refreshed in `_close_partial` and `_finalize_position`, and used by
+`_calculate_position_size` / `_current_risk_exposure`).
+
 **Decision:** sizing draws on `_sizing_equity = initial_capital + realized_pnl`
-(realized cash only, updated in `_close_partial`). `self.equity` remains the
-mark-to-market *reporting* equity for the curve. Sizing is therefore
-indifferent to open-trade fluctuations: unrealized profit is not spendable,
-and unrealized loss does not shrink new positions.
+(realized cash only). `self.equity` remains the mark-to-market *reporting*
+equity for the curve. Sizing is therefore indifferent to open-trade
+fluctuations: unrealized profit is not spendable, and unrealized loss does not
+shrink new positions. Every sizing input reads that one basis — the risk
+engine's `account_balance`, the notional/exposure caps
+(`_sizing_equity × max_position_exposure_pct`), the aggregate-exposure
+denominator
+(`_current_risk_exposure`) and `equity_at_entry`, the recorded basis the
+multi-symbol shared-equity replay (`replay_shared_equity`) divides the
+quantity by — that replay accumulates realized PnL only, so a mark-to-market
+`equity_at_entry` would rescale a realized-cash quantity by a reporting
+denominator. The one exception is the #347 free-margin leverage check,
+which reads mark-to-market equity and used margin by design (MT5-style
+margin) — it is a clamp on the sized quantity, not a sizing basis. Each
+order carries the basis its own quantity was computed from,
+so the recorded figure is the fill-time basis for an order that is re-sized at
+fill and the creation-time basis for the fallback-sized MARKET order that
+keeps its creation quantity under the D4 exception.
+
+`_sizing_equity` is recomputed by `_refresh_sizing_equity()` when a position is
+opened, at every partial close and when a trade is finalized. What it holds
+back is exactly the cost the fee model has already **incurred** for every
+still-open position, and nothing it has not (`_close_partial` books exit legs
+gross; the whole round-trip fee only leaves the ledger at finalization):
+
+- the **entry leg on the position's original quantity**, plus the per-trade
+  surcharge — owed from the moment the position was opened, which is why a
+  position that has not exited yet holds it back too; and
+- the **exit leg of every leg that has already closed**, priced at that leg's
+  own fill price.
+
+The exit leg of the still-open remainder is a *future* cost and is deliberately
+not held back: sizing may not be reduced by a fee the position has not
+incurred. Because `fee_for_trade == entry_fee + exit_fee`, the held-back
+figure and the fee charged at finalization meet there exactly.
+
+**Basis parity (#262):** D2 decides the basis. Neither reference marks open
+positions to market for sizing, so they are *consistent* with it — but they
+cannot distinguish the two bases, because none of them ever sizes while a
+position is open:
+
+- **MT5 (basis-independent fixed cash):** the EA's `CalculateLotSize`
+  (`strategy-comparisons/intraday_volatility_breakout/IntradayVolatilityBreakout.mq5:381-395`)
+  sizes from the `Fixed_Risk_Amount` input
+  (`IntradayVolatilityBreakout.mq5:46`) — a fixed cash amount — and never reads
+  the account value at all (no `AccountInfoDouble`, `ACCOUNT_BALANCE` or
+  `ACCOUNT_EQUITY` anywhere in the EA), so its lots are the same on either
+  basis. The repo's MT5 sizing code matches that: lots come from
+  `fixed_risk_amount` (`scripts/regenerate_mt5_parity_artifacts.py`
+  `_mt5_raw_lots`, line 344), with a 2% default stop distance when the report
+  carries no stop (line 437) — the fixed-risk branch is taken whenever that
+  distance is positive (line 443). Its only equity-denominated branch is the
+  degenerate non-positive-distance fallback `equity / entry_price` (line 446),
+  and that `equity` starts at the starting capital (line 367) and is credited
+  with a *closed* trade's PnL at its exit (line 486) — realized cash. The
+  script pairs one entry with one exit (`entry_indices` / `exit_cursor`), so
+  it never sizes while a position is open either.
+- **vectorbt (credited only at the close):** `runner/engines/vectorbt_adapter.py`
+  seeds `equity = config.initial_capital` (line 403) and credits `pnl - fees`
+  at each close (line 651), so `_size_trade`'s sizing basis is realized cash;
+  its `trade.meta["risk_math"]["equity_at_entry"]` records that same figure
+  (line 570). The runner holds one position at a time (`in_trade`, line 401)
+  and has no partial exit, so it never sizes while a position is open.
+
+**Therefore the references are consistent with realized cash but cannot decide
+between realized cash and mark-to-market** — in both, the two figures are equal
+at every moment a sizing decision is taken (no open position, hence no open
+mark), and MT5 could not even express a mark-to-market basis because it reads
+no account value. What decided D2 is the requirement itself: an open position's
+paper profit is not spendable and an unrealized drawdown is not a realized
+loss, which only the realized basis states directly.
+
+**Partial-exit timing vs. the multi-symbol replay (documented divergence):**
+`_close_partial` credits a partial leg to `_realized_pnl` (and hence to
+`_sizing_equity`) the moment it closes, while `replay_shared_equity`
+(`runner/engines/_shared.py`) credits a trade's PnL to its shared ledger only
+at that trade's **last** exit (`_release_through`, before the next entry).
+So a symbol's own run already books the first leg's cash into a later entry's
+basis, while the replay does not credit it until the whole trade is out: the
+per-unit coefficient `quantity / equity_at_entry` therefore stays exact only
+for the run that produced it, and a cross-symbol replay reproduces *quantities*
+rather than matching cash step for step. Accepted, not papered over — the
+alternative (credit nothing until the last exit) would let partial proceeds
+compound into entries that the ledger had not received.
 
 **Scope note:** F21 also flags the hidden per-call sizing protocol
 (`fixed_risk_amount`, `tick_value`, `lot_step`, `min_lot`, `max_lot`,
@@ -41,7 +131,41 @@ protocol is **deliberately untouched** here — it is a deliberate MT5-alignment
 interface (see `docs/mt5-backtest-alignment-plan.md`), documented rather than
 removed; only the equity base it reads was wrong and is fixed.
 
+**Leverage/margin check moved to free margin (#347):** the maintainer
+decisions on #267/#240/#329 resolved the open question this branch left —
+the leverage cap is no longer denominated in realized cash. It is now
+MT5-style: an order's margin (notional / `max_leverage`, the broker maximum
+for the account/asset; unknown → 1x) must fit **free margin** =
+mark-to-market equity − margin already used by open positions, marked at
+the sizing price. An order that would need more leverage than the broker
+maximum is clamped down (floored to `lot_step` when the leverage cap binds)
+instead of refused. #329 (open) proposes live pre-submit caps judging
+against `broker_leverage × equity` without used margin; #359 tracks
+moving them to the same free-margin rule — backtest and live do NOT yet
+apply the identical rule. The
+mark-to-market equity here is the *margin-check* input only — the sizing
+target, the exposure cap and the aggregate-exposure denominator all stay on
+realized cash. Pinned by
+`tests/test_engine_behavior.py::TestFreeMarginLeverageCap`.
+
 **Pinned by:** `tests/test_engine_behavior.py::TestSizingEquityExcludesUnrealizedPnl`.
+The two original scenarios are basis-blind (the first entry fills at the next
+bar's open, so its paper PnL only reaches equity on the bar the second entry is
+sized — *after* that bar's sizing call). The class therefore also pins the
+scenarios where a position is open and already marked when the next entry is
+sized: `test_open_paper_profit_does_not_grow_next_entry`,
+`test_open_paper_loss_does_not_shrink_next_entry`,
+`test_recorded_equity_at_entry_is_the_sizing_basis`,
+`test_recorded_basis_follows_the_surviving_quantity`,
+`test_resized_order_records_its_fill_time_basis`,
+`test_resized_limit_order_records_its_fill_time_basis` and
+`test_aggregate_exposure_denominator_is_realized_cash`. The held-back fee rule
+is pinned by `test_entry_fee_is_owed_before_the_first_exit` (a position with no
+exit yet still owes its entry leg), `test_partial_exit_fees_are_not_spendable_while_owed`
+(only the incurred legs are held back, on hand-computed figures) and
+`test_finalized_fees_are_not_held_back_twice` (a closed trade's fee is already
+in the ledger), with the per-leg additivity contract pinned in
+`tests/test_fees.py`.
 
 ## D3 — Engine risk policy is not strategy-configurable (F22)
 
@@ -68,9 +192,22 @@ creation-price estimate forever.
 actually fill. MARKET re-sizes at the next-bar open (creation sizing is only
 the pending estimate); LIMIT/STOP/STOP_LIMIT re-size from their trigger price
 at fill. Quantities across order types are now computed from the same rule:
-quantity = sizing rule evaluated at the fill price. One documented exception:
-a MARKET order **without any stop** has no fill-time risk input, so its
-creation-time estimate (signal-bar close) stands.
+quantity = sizing rule evaluated at the fill price.
+
+**Superseded (#190):** the original record carried one exception — a MARKET
+order **without any stop** kept its creation-time (signal-bar close) estimate
+because it was said to have "no fill-time risk input". That premise is false:
+a stopless order has a documented fill-time risk input, the fallback stop
+(`allow_fallback_stop` / `RiskConfig.fallback_stop_pct`, see
+`docs/live-risk-consistency.md`), which the risk engine derives from the entry
+price it is handed — and `docs/cross-engine-backtest-contract.md` §4 documents
+that fallback as "2% of entry". Keeping the exception also breached the
+documented notional cap: the cap is `equity * leverage / fill`, but the quantity
+came from the signal close, so a gap between them sized a position beyond the
+cap (#189's `gap_up_at_fill` repro: 103.4k notional on a 100k equity / 1x cap;
+vectorbt and the differential reference both cap it). MARKET orders therefore
+re-size at the fill like every other order type, fallback stop included, and
+the fallback stop level recorded in `trade.meta` is anchored to the fill.
 
 **Scope note:** F23 also lists the O(n) intrabar replay
 (`engine.py` `iterrows()` window per bar instead of searchsorted). That is a
@@ -79,7 +216,8 @@ behavior only; the perf fix lands with the structural cleanup (16-D2) to keep
 the golden-master diffs reviewable.
 
 **Pinned by:** `tests/test_engine_behavior.py::TestOrderTypeSizingSemantics`
-(LIMIT, STOP and the stopless-MARKET exception).
+(LIMIT and STOP re-sized at the trigger price, and the stopless MARKET order
+sized at the fill price with the fallback stop anchored to it — no exception).
 
 ## D5 — Stats definitions are environment-independent (F17)
 
@@ -98,6 +236,12 @@ installed but the daily series unresolvable, metrics silently 0.0 — is closed
 by falling through to the manual 252-period path on raw period returns in that
 case instead of staying at 0.0. The dead `_infer_periods_per_year` /
 `_annualize_total_return` helpers of the old fallback path are removed.
+
+> Update (#229): Sharpe/Sortino annualisation later moved to the asset-class
+> convention — calendar-filled weekend/holiday rows dropped, then 252 for
+> equities/FX/CFDs or 365 for 24/7 crypto (maintainer decision 2026-11-22);
+> the sqrt(252) wording above records the D5 decision as made, not the
+> current contract.
 
 **Daily series includes the first trading day.** The daily equity build writes
 an inception point at the window start (00:00) and a close at
@@ -300,8 +444,17 @@ this code (older persisted artifacts keep their original numbers):
 - Portfolio-optimizer `sharpe`/`oos_sharpe` are annualized (F36); values
   produced before 16-D1 are per-observation and ~15.9x smaller on daily
   curves.
-- `sharpe_ratio`/`sortino_ratio` are annualized with `sqrt(252)` on daily
-  returns, on both code paths. When the equity curve's timestamps cannot be
+- `sharpe_ratio`/`sortino_ratio` are annualized with `sqrt(periods)` on
+  daily returns, on both code paths, where `periods` is the asset-class
+  convention (#229 maintainer decision 2026-11-22): calendar-filled
+  weekend/holiday rows — days the venue was closed, whose forward-filled
+  equity can only produce a zero return — are dropped before the ratio is
+  computed, then 252 applies for equities/FX/CFDs and 365 for an all-crypto
+  (24/7) book, published as `equity_return_periods_per_year`. Trading days
+  come from `shared.venue_calendar` resolved from the run's symbols,
+  source and asset-class metadata; an unresolvable venue falls back to the
+  Monday–Friday grid and is never treated as 24/7. When the equity curve's
+  timestamps cannot be
   parsed the observation spacing is unknown, so the annualisation factor is
   unknown: Sharpe, Sortino and PSR are listed in `undefined_metrics` (and
   published as `0.0`, the repo's convention for an undefined metric) and

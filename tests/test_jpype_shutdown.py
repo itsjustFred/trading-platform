@@ -201,7 +201,19 @@ def test_viewer_lifespan_started_jvm_exits_cleanly():
     """
     result, elapsed = _run(
         """
+        import os
         import sys
+        import tempfile
+
+        # The subprocess inherits the suite's exported DATA_DIR, so without
+        # this it would share the worker's task-record database: the viewer
+        # lifespan would resume downloader tasks earlier tests left behind
+        # and spawn real fetch threads. Give it a throwaway store instead.
+        _sandbox = tempfile.mkdtemp(prefix="tp-jpype-lifespan-")
+        os.environ["DATA_DIR"] = _sandbox
+        os.environ["TRADING_DATA_DIR"] = _sandbox
+        os.environ["LOG_DIR"] = tempfile.mkdtemp(prefix="tp-jpype-lifespan-logs-")
+
         sys.path.insert(0, {repo!r})
         from fastapi.testclient import TestClient
         from viewer import main as viewer_main
