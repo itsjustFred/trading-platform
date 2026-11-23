@@ -42,6 +42,11 @@ dependencies = [
     "lxml>=5.0,<7",
     "SQLAlchemy>=2.0,<3",
     "scipy>=1.12,<2",
+    # Direct dep since issue #378: shared.indicators kernels compile with
+    # numba.njit. It was previously only transitive via vectorbt; the kernels
+    # treat it as optional at runtime (pure-NumPy fallback), but it must not
+    # silently disappear if vectorbt is ever dropped.
+    "numba>=0.67,<0.68",
     "starlette>=0.40,<2",
     "filelock>=4.0,<5",
     "tzdata>=2024.1,<2027",
@@ -64,6 +69,7 @@ dev = [
     "pytest-xdist>=3.6.0,<4",
     "pytest-json-report>=1.5.0,<2",
     "pytest-timeout>=2.3.1,<3",
+    "pytest-randomly>=5.1,<6",
     "httpx>=0.27.0,<1",
     "ruff>=0.3,<1",
     # Pinned exactly so a local run type-checks with the same mypy as the CI

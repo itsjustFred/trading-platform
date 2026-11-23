@@ -129,9 +129,14 @@ def normalize_ohlcv_columns(path: Path) -> None:
             df[col] = pd.NA
     df[OHLCV_SOURCE_COLUMN] = sides
     canonical = ["timestamp", "open", "high", "low", "close", "volume"]
+    # ``bid_*`` columns are dropped: canonical OHLCV already carries the
+    # bid-priority values and ``ohlcv_source_side`` records which side fed
+    # each bar. ``ask_*`` columns MUST survive (maintainer decision
+    # 2026-11-22): the slippage bar-spread model prices FX/CFD fills off
+    # the quoted ask-minus-bid spread, so dropping them would silently
+    # degrade every spread-aware run to the fixed-bps fallback.
     raw_quote_columns = {
-        f"{side}_{field}"
-        for side in ("bid", "ask")
+        f"bid_{field}"
         for field in ("open", "high", "low", "close", "volume")
     }
     metadata_columns = [

@@ -61,14 +61,16 @@ parent Cleanup 16 record.
   as `stop_trigger_side = "bar_low_high"` and
   `take_profit_trigger_side = "bar_high_low"`.
 - Fill price (owner decision 2026-11-13, supersedes "always the level"): the
-  protective **level** on an **intrabar touch** (the bar opens on the safe side
-  and trades through the level later); the bar's **open** when the bar **opens
-  beyond** the level (gap through a stop — the worse price — or through a
-  take-profit in your favour — the price actually available). An open exactly at
-  the level fills at that price either way. The gap is the first event of the
-  bar, so it also beats a later same-bar touch of the other level and needs no
-  intrabar data. The entry bar is never a gap (the position was opened at that
-  very open). Shared primitives: `contract.level_gapped_at_open` /
+  protective **level ± the resolved slippage model** (#130 — with
+  `slippage="none"` the level is exact) on an **intrabar touch** (the bar
+  opens on the safe side and trades through the level later); the bar's
+  **open** ± slippage when the bar **opens beyond** the level (gap through a
+  stop — the worse price — or through a take-profit in your favour — the
+  price actually available). An open exactly at the level fills at that
+  price either way. The gap is the first event of the bar, so it also beats a
+  later same-bar touch of the other level and needs no intrabar data. The
+  entry bar is never a gap (the position was opened at that very open).
+  Shared primitives: `contract.level_gapped_at_open` /
   `contract.level_fill_price` / `contract.resolve_protective_exit`; the
   gap-first ordering (gap through the stop, then gap through the target, then
   the stop-first range test) is implemented in native `_check_stops` and in
@@ -84,6 +86,35 @@ parent Cleanup 16 record.
   `stop_loss`. Native names take-profit exits after the level name (`tp`,
   `tp1`, …); vectorbt and signal replay use `take_profit`. Consumers must
   treat both spellings as the same event class.
+- Level aliases: `take_profit` and `tp_price` are two spellings of the SAME
+  plain take-profit level (as `stop_loss`/`sl_price` are one stop). Both engines
+  resolve the pair once, and both use the canonical-first order
+  `risk.live.resolve_live_levels`, the validation comparison and the engine
+  resolvers use (#237): when a row carries both, `take_profit` wins and
+  `tp_price` is the fallback when it is absent, null or unusable. Native
+  resolves it inside `TradeEngine._extract_levels`; vectorbt resolves it in
+  `_find_indicator_series` (which alias series to read) and
+  `_resolve_take_profit_price` (the entry-bar value), canonical spelling first,
+  so the winner never depends on the order the strategy published them in.
+  One alias pair must never become two levels: both would
+  be named `tp`, so the row's single intended level filled as two take-profit
+  legs that shared the `tp_pct` fraction, and the phantom candidate also took
+  a share of the default `1/n` split (an explicit `tpN_pct` fraction is keyed
+  by level name, so only the default denominator of the numbered levels
+  changes).
+- Unusable take-profit price: a level whose price is non-numeric, non-finite
+  or `<= 0` arms no level in either engine. Live refuses the whole signal
+  instead (`resolve_live_levels` raises, see `docs/live-risk-consistency.md`),
+  so neither engine books a take-profit the market cannot price: a LONG level
+  of `0` is reached by every bar. The stop pair is validated only by live —
+  the stop feeds position sizing, so an engine-side refusal would change risk,
+  not just exits.
+- Last level rule: the LAST pending take-profit level takes the position's
+  remaining quantity, so a ladder closes the position instead of leaving a
+  dust remainder, and a single level closes the whole position (the same
+  outcome a single live bracket order produces). A `fraction` below 1 on the
+  last level therefore does not keep part of the position open; a strategy
+  that wants a remainder held past its last level needs a later signal exit.
 - Vectorbt has no bar-loop position model: protective levels are resolved on
   the entry bar and enforced through the intrabar walk (§3), where the gap rule
   applies per **sub-bar** (a sub-bar that opens beyond the level fills at its
@@ -97,6 +128,44 @@ parent Cleanup 16 record.
   emulator fills gaps at the open; the adapter's containment
   (`_normalize_trade_exits`, §5) restates a level-violating leg to the level, or
   to the exit bar's open when that bar gapped through the level.
+
+### Slippage (fill-price cost model, #130)
+
+Slippage is applied to the **fill price** in the adverse direction —
+never as a separate cost line, so `pnl`, `net_pnl`, the equity curve and
+sizing equity all carry the same cost. For the fixed-bps models that
+means buys fill higher and sells fill lower; the bar-spread model
+charges the quoted spread **once per round trip, on the buy side only**
+(canonical OHLC is the bid series: buys lift to the ask, sells stay on
+the bid) — an implementer porting this must not subtract the spread on
+sells as well or the spread is charged twice.
+Scope per the maintainer decision: the **native** engine and **signal
+replay** only (the engines #318 keeps; LEAN stays import-only; vectorbt
+and pynecore do not model slippage and record that fact in
+`meta.data["slippage"]` when run through the CLI).
+
+- `runner.slippage.resolve_slippage_model` resolves one model per run (per
+  symbol where asset classes differ) from engine params:
+  `slippage="none"|"zero"` is the explicit parity opt-out that reproduces
+  pre-#130 gross fills; `"spread"` uses the bar's bid/ask columns
+  (MT5-tester-like) with a fixed-bps fallback; `"bps"`/`slippage_bps` is a
+  fixed-bps model; absent config picks the per-asset-class default
+  (FX/CFD-like classes → bar spread, equities → 5 bps, crypto → 10 bps,
+  all overridable via `slippage_defaults`/`slippage_default_bps`).
+- Instruments are classified from the `ohlcv/{source}/{asset_class}/…`
+  parquet path; runs that cannot be classified — or whose class maps to
+  no slippage model — REFUSE under the default `auto` resolution
+  (fail closed like fees, #84): pass `slippage="none"` for a deliberate
+  gross run or an explicit cost (`"bps"`/`"spread"`/`slippage_bps`).
+- Every run records the resolved model per symbol in
+  `meta.data["slippage"]["models"]` (plus the data's `price_basis`), so a
+  reader never has to guess which cost model produced the numbers.
+- When a strategy already prices the spread through `spread_price_col`,
+  the auto model degrades to fixed bps so the quoted spread is not
+  charged twice. `ask_ohlc` does not degrade the model — it only moves
+  SHORT stop/TP *triggers* onto the ask side, and those ask-triggered
+  exits pass `fill_side="ask"` so the bar spread is not charged twice on
+  them either.
 
 ## 2. End-date boundary
 
@@ -562,6 +631,27 @@ specific stats (pynecore strategy stats) are merged **on top of** the
 canonical ones via `EngineStatsKeys.merge_over_canonical`; they may add keys
 but never remove or overwrite them — a same-named engine key loses the
 collision, so consumers always read the canonical value.
+
+**Sharpe/Sortino convention (#229).** The equity curve is resampled to one
+observation per calendar day (the production `attach_daily_equity` shape
+fills every day, flat days included), then the calendar-filled rows —
+weekend/holiday days the venue was closed, whose forward-filled equity can
+only produce a zero return — are dropped before the ratio is computed.
+Trading days come from the venue calendar resolved from the run's symbols,
+source and asset-class metadata (`shared.venue_calendar`); a symbol whose
+venue cannot be resolved falls back to the Monday–Friday grid. The ratio is
+annualised at 252 for equities/FX/CFDs and 365 for an all-crypto (24/7)
+book, published as `equity_return_periods_per_year`. Cross-platform parity
+(the MT5 audit matrix in `validation/statistics/cross_platform.py`) applies
+this identical formula to realized-exit equity curves rebuilt from BOTH
+trade lists — initial capital plus cumulative net PnL booked at each
+position's last exit, calendar-filled to the production daily shape —
+rather than comparing against MT5's printed
+Sharpe-Ratio, which uses MT5's own convention; the printed value is kept
+as `sharpe_ratio_reported`, and the platform artifact's mark-to-market
+Sharpe is kept as `sharpe_ratio_mtm`. Because both sides now run the same
+formula on the same curve shape, identical trade lists give identical
+parity Sharpes; the trade list remains the primary parity evidence.
 
 ## 7. `total_bars`
 

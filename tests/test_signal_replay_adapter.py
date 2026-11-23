@@ -39,7 +39,7 @@ def test_signal_replay_adapter_updates_trailing_stop_and_exits() -> None:
         default_timeframe="1m",
     )
 
-    adapter = SignalReplayAdapter(fee_params={"fees": "zero"},
+    adapter = SignalReplayAdapter(fee_params={"fees": "zero"}, slippage_params={"slippage": "none"},
         risk_config=RiskConfig(
             max_risk_per_trade=0.01,
             max_total_exposure=0.05,
@@ -99,7 +99,7 @@ def _one_bar_frame() -> pd.DataFrame:
 
 
 def _run_replay(signals: list[ReplaySignal]):
-    adapter = SignalReplayAdapter(fee_params={"fees": "zero"}, default_timeframe="1m")
+    adapter = SignalReplayAdapter(fee_params={"fees": "zero"}, slippage_params={"slippage": "none"}, default_timeframe="1m")
     return adapter.run(
         signals=signals,
         ohlcv_by_symbol={"AAPL": _one_bar_frame()},
@@ -135,7 +135,7 @@ def test_replay_executes_supertrend_flip() -> None:
         },
         default_timeframe="1m",
     )
-    adapter = SignalReplayAdapter(fee_params={"fees": "zero"}, default_timeframe="1m")
+    adapter = SignalReplayAdapter(fee_params={"fees": "zero"}, slippage_params={"slippage": "none"}, default_timeframe="1m")
     result = adapter.run(
         signals=[signal],
         ohlcv_by_symbol={"AAPL": _one_bar_frame()},
@@ -180,7 +180,7 @@ def test_replay_rejects_unknown_trailing_mode() -> None:
 
 def test_replay_mode_none_trades_with_initial_stop_only() -> None:
     """#150: mode 'none' is replay-supported: initial stop, no trailing."""
-    adapter = SignalReplayAdapter(fee_params={"fees": "zero"}, default_timeframe="1m")
+    adapter = SignalReplayAdapter(fee_params={"fees": "zero"}, slippage_params={"slippage": "none"}, default_timeframe="1m")
     result = adapter.run(
         signals=[_trailing_replay_signal({"mode": "none"})],
         ohlcv_by_symbol={"AAPL": _one_bar_frame()},
@@ -232,6 +232,7 @@ def _replay_engine(data_dir) -> SignalReplayEngine:
         data_dir=data_dir,
         default_timeframe="1m",
         fee_params={"fees": "zero"},
+        slippage_params={"slippage": "none"},
     )
 
 
@@ -316,7 +317,7 @@ def test_run_backtest_rejects_empty_signals_and_symbols(tmp_path) -> None:
 def test_build_risk_signal_maps_direction_levels_and_metadata() -> None:
     """The risk signal is what the sizing engine sees: direction, fill price,
     the signal's own levels and the live position count."""
-    adapter = SignalReplayAdapter(fee_params={"fees": "zero"}, default_timeframe="1m")
+    adapter = SignalReplayAdapter(fee_params={"fees": "zero"}, slippage_params={"slippage": "none"}, default_timeframe="1m")
     signal = ReplaySignal(
         timestamp=pd.Timestamp("2026-01-01T00:00:00Z"),
         symbol="aapl",
