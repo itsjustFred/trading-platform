@@ -103,6 +103,13 @@ _TOKEN_VALUE_RES = (
     re.compile(r"(?i)\b(?:sk|pk|ghp|github_pat|xox[baprs])[-_][A-Za-z0-9_-]{12,}\b"),
     re.compile(r"\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b"),
 )
+# Discord webhook URLs carry the channel secret in the path
+# (/api/webhooks/<id>/<token>); a requests exception repr can embed the full
+# URL, so the token segment is redacted like any other credential.
+_WEBHOOK_URL_RE = re.compile(
+    r"(?i)(https?://(?:canary\.|ptb\.)?discord(?:app)?\.com/api/webhooks/\d+/)"
+    r"[^\s/?#\"']+"
+)
 
 _loggers: dict[str, logging.Logger] = {}
 _console_stream_name = "stdout"
@@ -142,6 +149,7 @@ def redact_text(value: object) -> str:
     redacted = _SENSITIVE_QUERY_RE.sub(r"\1[Filtered]", redacted)
     redacted = _SENSITIVE_ASSIGNMENT_RE.sub(r"\1[Filtered]", redacted)
     redacted = _PRIVATE_KEY_RE.sub("[Filtered private key]", redacted)
+    redacted = _WEBHOOK_URL_RE.sub(r"\1[Filtered]", redacted)
     for pattern in _TOKEN_VALUE_RES:
         redacted = pattern.sub("[Filtered]", redacted)
     return redacted
@@ -253,9 +261,9 @@ def get_logger(service: str) -> logging.Logger:
         return _loggers[service]
 
     logger = logging.getLogger(f"trading.{service}")
-    logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
     logger.propagate = False
 
+    level = getattr(logging, LOG_LEVEL, logging.INFO)
     formatter = JsonFormatter()
 
     # File handler with rotation
@@ -267,16 +275,39 @@ def get_logger(service: str) -> logging.Logger:
         encoding="utf-8",
     )
     file_handler.setFormatter(formatter)
+    file_handler.setLevel(level)
     logger.addHandler(file_handler)
 
     # Console handler (stdout, or stderr after route_console_logs_to_stderr())
     stream_handler = logging.StreamHandler(stream=getattr(sys, _console_stream_name))
     stream_handler.setFormatter(formatter)
+    stream_handler.setLevel(level)
     stream_handler._trading_console = True  # type: ignore[attr-defined]
     logger.addHandler(stream_handler)
 
+    # Ops alert sink (shared/alerts.py): installed per-process by the entry
+    # point that wants alerting (today only the live daemon). Lazy import keeps
+    # this module free of an alerts -> logging -> alerts cycle.
+    from shared.alerts import get_alert_handler
+
+    alert_handler = get_alert_handler()
+    if alert_handler is not None:
+        if alert_handler not in logger.handlers:
+            logger.addHandler(alert_handler)
+        # LOG_LEVEL now lives on the output handlers above, so `data.alert`
+        # markers below it still reach the sink; file and console output is
+        # unchanged.
+        logger.setLevel(logging.DEBUG)
+    else:
+        logger.setLevel(level)
+
     _loggers[service] = logger
     return logger
+
+
+def managed_service_loggers() -> list[logging.Logger]:
+    """Loggers created through :func:`get_logger`, for shared.alerts install/close."""
+    return list(_loggers.values())
 
 
 def route_console_logs_to_stderr() -> None:

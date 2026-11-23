@@ -1378,6 +1378,29 @@ def test_prepare_order_uses_get_equity_not_the_sizing_balance():
         )
 
 
+def test_prepare_order_refuses_when_equity_read_is_unparseable():
+    """A broker equity read that hits an unreadable money field (cTrader's
+    ``get_equity`` raises ``MoneyParseError`` on garbage balance/equity/
+    netUnrealizedPnL) must refuse the entry with
+    ``LossBreakerBreachError(state_unreadable=True)`` - never submit."""
+    from shared.money import MoneyParseError
+
+    account_id = "acc-eqgarbage"
+    dep = _deployment(account_id=account_id)
+    _observe(account_id, 100_000.0, DAY1)
+
+    class _GarbageEquityAdapter(_Adapter):
+        async def get_equity(self):
+            raise MoneyParseError("unreadable money value: 'junk'")
+
+    adapter = _GarbageEquityAdapter(equity=100_000.0)
+    with pytest.raises(LossBreakerBreachError) as excinfo:
+        asyncio.run(
+            daemon.prepare_order_with_risk(adapter, dep, _entry_signal(dep))
+        )
+    assert excinfo.value.state_unreadable is True
+
+
 def test_prepare_order_refuses_on_malformed_loss_breaker_config():
     """A bad ``loss_breaker_*`` deployment setting is a distinct
     configuration refusal (``config_invalid``), not a generic error."""

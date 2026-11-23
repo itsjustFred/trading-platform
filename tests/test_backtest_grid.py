@@ -634,6 +634,61 @@ def test_in_process_cell_stamps_its_identity(monkeypatch, tmp_path):
     assert _cell_record(request)["status"] == "skipped_existing"
 
 
+def test_in_process_out_of_scope_engine_stamps_not_modeled_slippage(
+    monkeypatch, tmp_path
+):
+    """#130: an in-process vectorbt cell must record the explicit 'not
+    modeled' slippage note on its artifact — never silence. Guards the
+    ``meta.data['slippage']`` setdefault in ``_run_backtest_in_process_body``."""
+    from dataclasses import replace
+
+    from shared.models import BacktestMeta, BacktestResult
+
+    request, artifact, _parquet = _identity_fixture(tmp_path, stamp=False)
+    request = replace(request, engine="vectorbt")
+    artifact.unlink()
+    monkeypatch.setattr(bg, "require_generated_strategy_approval", lambda strategy: None)
+    monkeypatch.setattr(bg, "detect_strategy_type", lambda path: bg.StrategyType.MARKET_DATA)
+    monkeypatch.setattr(
+        bg, "resolve_strategy_parameters", lambda strategy, params: dict(params or {})
+    )
+    monkeypatch.setattr(bg, "ensure_backtest_data", lambda **kwargs: [])
+    monkeypatch.setattr(bg, "attach_daily_equity", lambda result, **kwargs: result)
+    monkeypatch.setattr(bg, "merge_canonical_stats", lambda result: None)
+
+    class FakeEngine:
+        def validate_config(self, config):
+            return []
+
+        def run(self, config, strategy):
+            return BacktestResult(
+                meta=BacktestMeta(
+                    id=bg.build_run_id(strategy, "AAPL", "1d"),
+                    created_at="2024-01-06T00:00:00+00:00",
+                    engine="vectorbt",
+                    strategies=["demo"],
+                    backtest_start="2024-01-01",
+                    backtest_end="2024-01-05",
+                    initial_capital=10_000.0,
+                    data={"symbols": ["AAPL"], "timeframes": ["1d"]},
+                ),
+                trades=[],
+                equity_curve=[],
+                stats={},
+            )
+
+    monkeypatch.setattr(bg, "get_engine", lambda engine: FakeEngine())
+
+    result = bg.run_one_backtest_in_process(request)
+
+    assert result["status"] == "ok"
+    slippage = json.loads(artifact.read_text(encoding="utf-8"))["meta"]["data"][
+        "slippage"
+    ]
+    assert slippage["models"] == {}
+    assert "does not apply a slippage model" in slippage["note"]
+
+
 def test_subprocess_cell_stamps_its_identity(monkeypatch, tmp_path):
     """`runner.cli` knows nothing about grid identity, so the parent writes it.
 
