@@ -479,7 +479,7 @@ async def _clear_exit_reprotection_marker(
             signal_id,
             EXIT_REPROTECTION_METADATA_KEY,
         )
-    except Exception as exc:
+    except Exception as exc:  # except-kind: money-decision
         logger.debug(
             "Alpaca exit re-protection marker for %s could not be cleared (%s): %r",
             symbol,
@@ -1398,7 +1398,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         # readable again. Best-effort per symbol inside; never blocks connect.
         try:
             await self._recover_exit_reprotections()
-        except Exception as exc:  # pragma: no cover - defensive
+        except Exception as exc:  # pragma: no cover - defensive  # except-kind: money-decision
             logger.warning(
                 "Alpaca exit re-protection recovery failed; markers stay pending",
                 extra={"data": {"account_id": self.account_id, "error": str(exc)}},
@@ -1503,7 +1503,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             return None
         try:
             metadata = await asyncio.to_thread(get_live_signal_metadata, candidate)
-        except Exception as exc:
+        except Exception as exc:  # except-kind: money-decision
             logger.debug(
                 "Alpaca re-protect entry lookup failed for %s: %r", candidate, exc
             )
@@ -1644,7 +1644,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 broker_order_id,
                 GetOrderByIdRequest(nested=True),
             )
-        except Exception:
+        except Exception:  # except-kind: money-decision
             return
         if fetched is None:
             return
@@ -1934,7 +1934,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             before = next_before
         try:
             await self._reconcile_reprotect_orders()
-        except Exception as exc:
+        except Exception as exc:  # except-kind: money-decision
             logger.warning(
                 "Alpaca re-protect order reconciliation failed; leg fills may be "
                 "missing until the next connect",
@@ -2046,7 +2046,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 self.account_id,
                 _REPROTECT_RECONCILE_STATE_KEY,
             )
-        except Exception as exc:
+        except Exception as exc:  # except-kind: money-decision
             logger.debug(
                 "Alpaca re-protect reconcile watermark unreadable; scanning "
                 "unbounded this pass: %r",
@@ -2086,7 +2086,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 _REPROTECT_RECONCILE_STATE_KEY,
                 {"after": bound.isoformat()},
             )
-        except Exception as exc:
+        except Exception as exc:  # except-kind: money-decision
             logger.debug(
                 "Alpaca re-protect reconcile watermark could not be persisted "
                 "(%r); the next pass rescans from the older bound",
@@ -3033,7 +3033,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             found = await asyncio.to_thread(
                 find_latest_filled_live_entry_signals, [deployment_id], [symbol]
             )
-        except Exception as exc:
+        except Exception as exc:  # except-kind: money-decision
             logger.debug(
                 "Alpaca exit re-protection: entry-signal lookup failed for %s: %r",
                 symbol,
@@ -3192,7 +3192,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             return False
         try:
             order = await asyncio.to_thread(client.submit_order, order_data=request)
-        except Exception as exc:
+        except Exception as exc:  # except-kind: money-decision
             if plan.get("stop_price") is not None:
                 logger.critical(
                     "Alpaca exit re-protection failed for %s; the remaining "
@@ -3268,7 +3268,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         """
         try:
             current_qty = await self._symbol_position_qty(str(plan["symbol"]))
-        except Exception as exc:  # pragma: no cover - defensive
+        except Exception as exc:  # pragma: no cover - defensive  # except-kind: money-decision
             logger.critical(
                 "Alpaca exit %s: could not re-read the position to restore its "
                 "protection; the position may be unprotected",
@@ -3396,7 +3396,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 return False
             try:
                 order = await asyncio.to_thread(client.submit_order, order_data=request)
-            except Exception as exc:
+            except Exception as exc:  # except-kind: money-decision
                 (logger.critical if has_stop else logger.error)(
                     "Alpaca exit %s: restoring recorded protection for %s "
                     "failed (%r); the position may be unprotected",
@@ -3562,7 +3562,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 for order_id in plan["order_ids"]:
                     try:
                         await self._cancel_one(client, order_id)
-                    except Exception as exc:
+                    except Exception as exc:  # except-kind: money-decision
                         # A parent cancel can cascade onto legs already gone;
                         # the re-read below - not this error - decides whether
                         # anything still reserves the quantity.
@@ -3605,7 +3605,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                         f"(was {plan['position_qty']:g}, now "
                         f"{current_qty!r}); refusing the exit order."
                     )
-            except Exception as exc:
+            except Exception as exc:  # except-kind: money-decision
                 await self._restore_exit_protection(
                     client, plan, reason=f"release failed: {exc}", signal_id=signal_id
                 )
@@ -3614,7 +3614,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 order = await asyncio.to_thread(
                     client.submit_order, order_data=request
                 )
-            except Exception as exc:
+            except Exception as exc:  # except-kind: money-decision
                 # An HTTP rejection proves the broker never took the order; a
                 # timeout or connection error does not - the exit may be
                 # working. The restore protects whatever position remains
@@ -3697,7 +3697,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             return
         try:
             fresh = await asyncio.to_thread(get_order, order_id)
-        except Exception as exc:
+        except Exception as exc:  # except-kind: money-decision
             logger.debug(
                 "Alpaca exit order %s could not be re-read after re-protect; "
                 "the marker stays pending: %r",
@@ -3958,7 +3958,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             return None
         try:
             order = await asyncio.to_thread(get_order, order_id)
-        except Exception as exc:
+        except Exception as exc:  # except-kind: money-decision
             logger.debug(
                 "Alpaca could not re-read exit order %s for re-protection "
                 "recovery: %r",
@@ -4091,7 +4091,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             rows = await asyncio.to_thread(
                 list_pending_exit_reprotections, self.account_id
             )
-        except Exception as exc:
+        except Exception as exc:  # except-kind: money-decision
             logger.warning(
                 "Alpaca exit re-protection recovery could not list markers; "
                 "they stay pending for the next connect",
@@ -4108,7 +4108,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 await self._recover_exit_reprotection(marker)
             except asyncio.CancelledError:
                 raise
-            except Exception as exc:
+            except Exception as exc:  # except-kind: money-decision
                 logger.critical(
                     "Alpaca exit re-protection recovery failed for %s; the "
                     "remainder may be unprotected",
@@ -4133,7 +4133,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 metadata = await asyncio.to_thread(
                     get_live_signal_metadata, signal_id
                 )
-            except Exception:
+            except Exception:  # except-kind: money-decision
                 metadata = None
             if (
                 signal_id
@@ -4147,7 +4147,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                         symbol,
                         keep_signal_id=signal_id,
                     )
-                except Exception as exc:
+                except Exception as exc:  # except-kind: money-decision
                     logger.debug(
                         "Alpaca superseded exit re-protection markers for %s "
                         "could not be cleared: %r",
@@ -6375,7 +6375,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             metadata = await asyncio.to_thread(
                 get_live_signal_metadata, str(signal_uuid)
             )
-        except Exception as exc:
+        except Exception as exc:  # except-kind: money-decision
             logger.debug(
                 "Alpaca exit re-protection watchdog could not read signal "
                 "%s metadata: %r",
@@ -6435,7 +6435,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 await self._recover_exit_reprotection(row)
             except asyncio.CancelledError:
                 raise
-            except Exception as exc:
+            except Exception as exc:  # except-kind: money-decision
                 logger.critical(
                     "Alpaca exit re-protection watchdog replay failed for %s; "
                     "the remainder may be unprotected until the next connect",
