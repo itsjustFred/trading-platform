@@ -8,6 +8,7 @@ a failed flatten must not leave a naked position.
 from __future__ import annotations
 
 import asyncio
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -5842,3 +5843,209 @@ def test_marker_clears_when_re_read_shows_terminal_full_fill(monkeypatch) -> Non
     )
 
     assert cleared == ["sig-1"]
+
+
+# ─── #350 bundle-82 finish: in-flight guards, crypto key, scan bound ────
+
+
+def _unknown_uuid_fill(
+    symbol: str, *, side: str, order_type: str
+) -> SimpleNamespace:
+    """A fill whose client order id is a UUID naming no persisted signal."""
+    return SimpleNamespace(
+        event="fill",
+        order=SimpleNamespace(
+            id=str(uuid4()),
+            client_order_id=str(uuid4()),
+            status="filled",
+            symbol=symbol,
+            side=side,
+            order_type=order_type,
+            filled_qty=1.0,
+        ),
+        timestamp=datetime.now(timezone.utc),
+        qty=1.0,
+    )
+
+
+def _assert_unattributed_fill(
+    monkeypatch, caplog, adapter: AlpacaLiveAdapter, update: SimpleNamespace
+) -> None:
+    """The fill must raise the unattributed ERROR, not a flatten WARNING."""
+    flagged: list[dict] = []
+    monkeypatch.setattr(
+        alpaca_module,
+        "flag_live_ledger_reconciliation",
+        lambda **kwargs: flagged.append(kwargs) or {},
+    )
+    with caplog.at_level("ERROR"):
+        asyncio.run(adapter._on_trade_update(update))
+    assert flagged
+    assert flagged[0]["cause"] == "alpaca_unattributed_order_fill"
+    assert any(
+        record.levelname == "ERROR" and "could not be attributed" in record.message
+        for record in caplog.records
+    )
+
+
+def test_in_flight_match_rejects_a_fill_on_the_wrong_side(
+    monkeypatch, caplog
+) -> None:
+    """A foreign BUY during a long flatten's window is not the flatten's fill.
+
+    The marker records the reducing side (``sell`` for a long position); a
+    ``buy`` market fill - an operator's manual order, a lost-registration
+    entry - must keep the unattributed ERROR severity (#350 S1).
+    """
+    adapter = _adapter(_FakeTradingClient(positions=[]))
+    adapter._flatten_in_flight["AAPL"] = (time.monotonic(), "sell")
+
+    _assert_unattributed_fill(
+        monkeypatch,
+        caplog,
+        adapter,
+        _unknown_uuid_fill("AAPL", side="buy", order_type="market"),
+    )
+
+
+def test_in_flight_match_rejects_a_non_market_fill(
+    monkeypatch, caplog
+) -> None:
+    """A resting ``stop`` fill during the window is not the flatten's fill.
+
+    ``close_position`` only ever submits market orders; a same-side stop
+    fill is somebody else's order and keeps the unattributed ERROR (#350 S1).
+    """
+    adapter = _adapter(_FakeTradingClient(positions=[]))
+    adapter._flatten_in_flight["AAPL"] = (time.monotonic(), "sell")
+
+    _assert_unattributed_fill(
+        monkeypatch,
+        caplog,
+        adapter,
+        _unknown_uuid_fill("AAPL", side="sell", order_type="stop"),
+    )
+
+
+def test_in_flight_match_rejects_a_fill_past_the_ttl(
+    monkeypatch, caplog
+) -> None:
+    """A marker older than the TTL no longer lends attribution (#350 S1).
+
+    The window exists only to cover the submit/remember race; a same-symbol
+    market fill long after it is unrelated and must stay an ERROR.
+    """
+    adapter = _adapter(_FakeTradingClient(positions=[]))
+    adapter._flatten_in_flight["AAPL"] = (
+        time.monotonic() - alpaca_module._FLATTEN_IN_FLIGHT_TTL_SECONDS - 1.0,
+        "sell",
+    )
+
+    _assert_unattributed_fill(
+        monkeypatch,
+        caplog,
+        adapter,
+        _unknown_uuid_fill("AAPL", side="sell", order_type="market"),
+    )
+    # The stale marker is spent by the lookup, not left to match again.
+    assert "AAPL" not in adapter._flatten_in_flight
+
+
+def test_flatten_in_flight_marker_matches_across_crypto_symbol_forms(
+    monkeypatch, caplog
+) -> None:
+    """``BTCUSD`` (position) and ``BTC/USD`` (order) name the same flatten.
+
+    The marker is written under the position symbol but looked up under the
+    order symbol; without canonicalisation a crypto flatten fill missed the
+    marker and raised the unattributed ERROR (#350 N1).
+    """
+    flagged: list[dict] = []
+    monkeypatch.setattr(
+        alpaca_module,
+        "flag_live_ledger_reconciliation",
+        lambda **kwargs: flagged.append(kwargs) or {},
+    )
+    adapter = _adapter(_FakeTradingClient(positions=[]))
+    # Written exactly the way ``close_all_positions`` writes it: keyed by
+    # the position symbol through the canonicalising helper.
+    adapter._flatten_in_flight[alpaca_module._flatten_marker_key("BTCUSD")] = (
+        time.monotonic(),
+        "sell",
+    )
+
+    with caplog.at_level("WARNING"):
+        asyncio.run(
+            adapter._on_trade_update(
+                _unknown_uuid_fill("BTC/USD", side="sell", order_type="market")
+            )
+        )
+
+    assert flagged
+    assert flagged[0]["cause"] == "alpaca_flatten_fill"
+    assert flagged[0]["symbol"] == "BTC/USD"
+    assert not any(
+        record.levelname == "ERROR" and "could not be attributed" in record.message
+        for record in caplog.records
+    )
+
+
+def test_disconnect_does_not_self_await_the_recovery_task() -> None:
+    """``connect`` failing inside the recovery task runs ``disconnect`` on it.
+
+    ``_exit_reprotection_recovery_task`` can point at the CURRENT task; the
+    self-await guard must return early instead of ``task.cancel()`` +
+    ``await task`` raising ``RuntimeError``/``CancelledError`` (#350 S3).
+    """
+    adapter = _adapter(_FakeTradingClient(positions=[]))
+    adapter.account_id = "acct-self-await"
+
+    async def _run() -> None:
+        me = asyncio.current_task()
+        adapter._exit_reprotection_recovery_task = me
+        await adapter._cancel_exit_reprotection_recovery()
+        assert adapter._exit_reprotection_recovery_task is None
+        assert me is not None
+        assert not me.cancelling()
+        assert not me.cancelled()
+
+    asyncio.run(_run())
+
+
+def test_held_leg_scan_after_is_unbounded_when_a_symbol_has_no_bound(
+    monkeypatch,
+) -> None:
+    """A symbol with neither bound leaves the whole scan unbounded (#350 N2).
+
+    AAA's open-lot bound must not narrow the window for BBB: with no open
+    lot and no signal, BBB's held legs could be arbitrarily old, so
+    ``after`` stays ``None`` - the page cap is the only backstop.
+    """
+    t_lot = datetime(2026, 2, 1, tzinfo=timezone.utc)
+    monkeypatch.setattr(
+        alpaca_module,
+        "earliest_live_open_lot_entry_timestamp",
+        lambda account_id, symbols: t_lot if "AAA" in symbols else None,
+    )
+    monkeypatch.setattr(
+        alpaca_module,
+        "earliest_live_signal_timestamp",
+        lambda account_id, symbols: None,
+    )
+    adapter = _adapter(_FakeTradingClient())
+    adapter.account_id = "acct-unbounded"
+
+    # Positive control: a fully bounded symbol still gets min - margin.
+    assert asyncio.run(adapter._held_leg_scan_after({"AAA"})) == (
+        t_lot - timedelta(minutes=5)
+    )
+    # BBB has no bound at all: the scan is unbounded, not AAA's window.
+    assert asyncio.run(adapter._held_leg_scan_after({"AAA", "BBB"})) is None
+    # ``None`` symbols is the account-wide orphan sweep: unbounded by design.
+    assert asyncio.run(adapter._held_leg_scan_after(None)) is None
+
+    client = _FakeTradingClient(orders=[])
+    asyncio.run(
+        adapter._list_filled_parents_with_held_legs(client, {"AAA", "BBB"})
+    )
+    assert client.last_order_filter.after is None

@@ -48,7 +48,11 @@ from live_runner.base_adapter import (
 )
 from live_runner.credential_env import parse_bool_env, resolve_env_value
 from live_runner.exit_signals import ExitBelowStepError
-from live_runner.symbol_class import canonical_crypto_symbol, classify_symbol
+from live_runner.symbol_class import (
+    UnclassifiableSymbolError,
+    canonical_crypto_symbol,
+    classify_symbol,
+)
 from shared import venue_calendar
 from shared.alpaca_symbols import classify_alpaca_symbol, crypto_pair_key
 from shared.constants import DATA_DIR
@@ -361,6 +365,23 @@ def _order_type(order: Any) -> str:
         raw = _order_attr(order, "type", "")
     text = str(getattr(raw, "value", raw) or "").strip().lower()
     return text.rsplit(".", 1)[-1]
+
+
+def _flatten_marker_key(symbol: str) -> str:
+    """Canonical ``_flatten_in_flight`` key for a symbol in any Alpaca form.
+
+    The marker is written under the position symbol (Alpaca reports crypto
+    positions as ``BTCUSD``) but looked up under the order symbol (orders say
+    ``BTC/USD``): both normalise to the same canonical crypto form so a crypto
+    flatten fill is still attributed (#350 review). Non-crypto symbols pass
+    through unchanged, and an unclassifiable one keeps its raw form - the
+    lookup then simply misses, which is the fail-closed direction.
+    """
+    normalized = str(symbol or "").strip().upper()
+    try:
+        return canonical_crypto_symbol(normalized)
+    except UnclassifiableSymbolError:
+        return normalized
 
 
 def _order_submitted_at_utc(order: Any) -> Any:
@@ -1580,7 +1601,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 raise
             except AccountOrderLockTimeoutError as exc:
                 if attempt == _RECOVERY_LOCK_ATTEMPTS:
-                    logger.error(
+                    logger.exception(
                         "ALERT: Alpaca exit re-protection recovery could not "
                         "take the account order-placement lock after %d "
                         "attempts; markers stay pending until the next "
@@ -5857,7 +5878,10 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         reducing_side = None
         if position_qty is not None and not _is_flat(position_qty):
             reducing_side = "sell" if position_qty > 0 else "buy"
-        self._flatten_in_flight[symbol] = (time.monotonic(), reducing_side)
+        self._flatten_in_flight[_flatten_marker_key(symbol)] = (
+            time.monotonic(),
+            reducing_side,
+        )
         try:
             close_order = await asyncio.to_thread(client.close_position, symbol)
         except Exception as exc:  # except-kind: money-decision
@@ -5869,6 +5893,9 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 removed_protection=cancelled_any,
             )
         self._remember_flatten_order(close_order, symbol=symbol)
+        # The marker is deliberately NOT popped here: the stream may have
+        # checked ``_flatten_order_ids`` (miss) and be about to consult the
+        # marker on its own thread; it expires by TTL instead.
         return None
 
     def _remember_flatten_order(self, order: Any, *, symbol: str) -> None:
@@ -6148,53 +6175,58 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             return []
         if symbols is not None and not symbols:
             return []
-        # Only orders submitted after the symbols' open lots' first entry can
-        # still be relevant: the held legs belong to entry brackets of
-        # positions that are open now. The open-lot bound ADVANCES as rounds
-        # close (an account-wide all-signals bound never did - #350 review),
-        # and the all-signals bound remains the fail-closed fallback when no
-        # open lot can be named. The bound is computed PER SYMBOL and the
-        # scan takes the minimum: a symbol whose ledger shows no open lot -
-        # an entry fill not yet booked, or ledger/broker drift - keeps its
-        # own all-signals fallback window instead of inheriting a sibling's
-        # newer open-lot bound and losing its older held legs (#350 review).
-        # A symbol with neither bound leaves the scan unbounded, and the page
-        # cap remains the backstop either way.
-        after = None
-        if symbols is not None:
-            scoped = {
-                str(symbol or "").strip().upper() for symbol in symbols
-            }
-            scoped.discard("")
-            bounds: list[datetime] = []
-            unbounded = not scoped
-            for symbol in sorted(scoped):
-                bound = await asyncio.to_thread(
-                    earliest_live_open_lot_entry_timestamp,
-                    self.account_id,
-                    {symbol},
-                )
-                if bound is None:
-                    bound = await asyncio.to_thread(
-                        earliest_live_signal_timestamp,
-                        self.account_id,
-                        {symbol},
-                    )
-                if bound is None:
-                    unbounded = True
-                    break
-                bounds.append(bound)
-            if not unbounded:
-                after = min(bounds)
-        if after is not None:
-            # Margin for clock skew and the signal-to-submit delay: the bound
-            # must stay at or before the entry order's own ``submitted_at``.
-            after = after - _ORDER_SCAN_AFTER_MARGIN
+        after = await self._held_leg_scan_after(symbols)
         result = await self._list_orders_status_all(
             client, symbols=symbols, after=after
         )
 
         return self._parents_with_resting_legs(result)
+
+    async def _held_leg_scan_after(self, symbols: set[str] | None) -> datetime | None:
+        """Lower ``submitted_at`` bound for the held-leg ``status=all`` scan.
+
+        Only orders submitted after the symbols' open lots' first entry can
+        still be relevant: the held legs belong to entry brackets of
+        positions that are open now. The open-lot bound ADVANCES as rounds
+        close (an account-wide all-signals bound never did - #350 review),
+        and the all-signals bound remains the fail-closed fallback when no
+        open lot can be named. The bound is computed PER SYMBOL and the
+        scan takes the minimum: a symbol whose ledger shows no open lot -
+        an entry fill not yet booked, or ledger/broker drift - keeps its
+        own all-signals fallback window instead of inheriting a sibling's
+        newer open-lot bound and losing its older held legs (#350 review).
+        A symbol with neither bound leaves the scan unbounded
+        (``after=None``), and the page cap remains the backstop either way.
+        ``symbols=None`` is the account-wide orphan sweep: unbounded by
+        design, since its job is symbols that no longer have a position.
+        """
+        if symbols is None:
+            return None
+        scoped = {
+            str(symbol or "").strip().upper() for symbol in symbols
+        }
+        scoped.discard("")
+        if not scoped:
+            return None
+        bounds: list[datetime] = []
+        for symbol in sorted(scoped):
+            bound = await asyncio.to_thread(
+                earliest_live_open_lot_entry_timestamp,
+                self.account_id,
+                {symbol},
+            )
+            if bound is None:
+                bound = await asyncio.to_thread(
+                    earliest_live_signal_timestamp,
+                    self.account_id,
+                    {symbol},
+                )
+            if bound is None:
+                return None
+            bounds.append(bound)
+        # Margin for clock skew and the signal-to-submit delay: the bound
+        # must stay at or before the entry order's own ``submitted_at``.
+        return min(bounds) - _ORDER_SCAN_AFTER_MARGIN
 
     @staticmethod
     def _parents_with_resting_legs(orders: Any) -> list[Any]:
@@ -6849,13 +6881,13 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         resting order type, the wrong side, a stale marker - falls through
         to the normal attribution paths.
         """
-        symbol = _order_symbol(order)
-        entry = self._flatten_in_flight.get(symbol)
+        key = _flatten_marker_key(_order_symbol(order))
+        entry = self._flatten_in_flight.get(key)
         if entry is None:
             return False
         marked_at, reducing_side = entry
         if time.monotonic() - marked_at > _FLATTEN_IN_FLIGHT_TTL_SECONDS:
-            self._flatten_in_flight.pop(symbol, None)
+            self._flatten_in_flight.pop(key, None)
             return False
         if _order_type(order) != "market":
             return False

@@ -1231,7 +1231,7 @@ def get_live_adapter_state(account_id: str, key: str) -> dict[str, Any] | None:
 
     ``account_id`` is the id the account order-placement lock uses
     (``order_placement_account_id``); ``key`` is a free-form namespaced key
-    (this repo uses the ``alpaca_`` prefix convention).
+    under the broker prefix convention (``alpaca_…``, ``ctrader_…``).
     """
     normalized_account_id = str(account_id or "").strip()
     normalized_key = str(key or "").strip()
