@@ -55,9 +55,11 @@ from shared.database import (
     get_live_signal_timestamp,
     list_live_account_open_position_lots,
     list_live_ledger_reconciliation_deal_ids,
-    list_live_ledger_reconciliation_flag_details,
+    list_live_ledger_reconciliation_flag_entries,
     list_live_signal_ids_for_reconciliation,
+    list_outstanding_ledger_flag_details,
     live_execution_dedupe_key_exists,
+    live_execution_dedupe_keys_present,
     record_live_broker_side_close_fill,
     resolve_ledger_reconciliation_flag,
     save_live_execution,
@@ -476,6 +478,17 @@ BROKER_CLOSE_FLAGGED_RETRYABLE_CAUSES = frozenset(
 #: flapping broker must not turn one reconcile into a timeout per pending
 #: range inside the connect lock.
 BROKER_CLOSE_SCAN_MAX_CONSECUTIVE_FAILURES = 3
+#: How far below the last covered top the fresh scan gap starts. A deal the
+#: deal list had not yet shown at the previous pass's ``now`` - broker-side
+#: visibility lag, or local clock ahead of broker time - lands below the old
+#: top and would be skipped forever; deal-id dedupe makes re-reading it free.
+BROKER_CLOSE_SCAN_CURSOR_OVERLAP_MS = 60 * 60 * 1000
+#: Flag causes a booking can never clear: they name no bookable deal or the
+#: attribution itself was refused, so they keep the ``account:symbol``
+#: target unresolved until an operator resolves it.
+_LEDGER_FLAG_UNRESOLVABLE_CAUSES = frozenset(
+    {"ambiguous_parent", "no_position_id"}
+)
 
 
 def _power_of_ten_exponent(value: int) -> int:
@@ -5915,9 +5928,11 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         ):
             # Already booked by the stream or an earlier pass: skip before the
             # position-order/order-detail broker reads, not after them. A
-            # still-flagged deal is handled now, so its flag is stale.
+            # still-flagged deal is handled now, so its flag is stale - the
+            # resolve itself only fires when every outstanding flag on the
+            # target names an already-booked deal.
             if deal_id in flagged_deal_ids:
-                self._resolve_booked_ledger_flag(
+                await self._resolve_booked_ledger_flag(
                     self._fill_symbol_name(order_id=None, order=None, deal=deal)
                     or "",
                     deal_id,
@@ -6005,8 +6020,9 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         if deal_id in flagged_deal_ids:
             # The booking attempt succeeded for a deal an earlier process
             # flagged: supersede the flag as resolved-by-booking so the
-            # account:symbol stops counting as unreconciled.
-            self._resolve_booked_ledger_flag(
+            # account:symbol stops counting as unreconciled - but only when
+            # every other outstanding flag on the target is booked too.
+            await self._resolve_booked_ledger_flag(
                 self._fill_symbol_name(order_id=order_id, order=order, deal=deal)
                 or "",
                 deal_id,
@@ -6031,7 +6047,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             return 1
         return 0
 
-    def _resolve_booked_ledger_flag(
+    async def _resolve_booked_ledger_flag(
         self,
         symbol: str,
         deal_id: int,
@@ -6039,15 +6055,49 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         parent_signal_id: str,
         persisted_qty: float,
     ) -> None:
-        """Supersede a ``ledger_reconciliation_required`` flag as resolved-by-booking.
+        """Supersede ``ledger_reconciliation_required`` flags as resolved-by-booking.
 
         The flag's audit row is never touched (the trail is append-only); a
         ``ledger_reconciliation_resolved`` row for the same ``account:symbol``
-        target is what stops the flag counting as unresolved. Flag resolution
-        is per account+symbol, not per deal - the note records which deal was
-        booked so the audit trail keeps the attribution.
+        target is what stops the flag counting as unresolved. Resolution is
+        per account+symbol, NOT per deal, so it is only written when it is
+        both needed and safe: every flag still outstanding on the target must
+        name a deal the ledger has already booked, with a cause a booking can
+        clear. One unattributable sibling, one deterministic flag
+        (``ambiguous_parent``, ``no_position_id``, ``unusable_*``) or one
+        flag without a deal id keeps the whole target unresolved - resolving
+        anyway would silently clear flags this booking says nothing about
+        and lift the loss-breaker halt with the ledger still wrong.
         """
         if not symbol or not self.account_config_id:
+            return
+        outstanding = await asyncio.to_thread(
+            list_outstanding_ledger_flag_details,
+            self.account_config_id,
+            symbol,
+        )
+        if not outstanding:
+            # Already resolved (or never flagged): writing another resolution
+            # row would only grow the audit trail and re-supersede nothing.
+            return
+        required_keys: set[str] = set()
+        for detail in outstanding:
+            cause = str(detail.get("cause") or "")
+            if cause in _LEDGER_FLAG_UNRESOLVABLE_CAUSES or cause.startswith(
+                "unusable_"
+            ):
+                return
+            try:
+                flagged_deal_id = int(detail.get("deal_id") or 0)
+            except (TypeError, ValueError):
+                return
+            if flagged_deal_id <= 0:
+                return
+            required_keys.add(f"ctrader:deal:{flagged_deal_id}")
+        present = await asyncio.to_thread(
+            live_execution_dedupe_keys_present, required_keys
+        )
+        if required_keys - present:
             return
         outcome = (
             f"booked {persisted_qty}"
@@ -6055,13 +6105,15 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             else "already recorded"
         )
         parent = f" under parent {parent_signal_id}" if parent_signal_id else ""
-        resolve_ledger_reconciliation_flag(
+        booked_ids = ", ".join(sorted(required_keys))
+        await asyncio.to_thread(
+            resolve_ledger_reconciliation_flag,
             account_id=self.account_config_id,
             symbol=symbol,
             actor="live-runner",
             note=(
                 f"cTrader broker-close deal {deal_id}{parent} {outcome} "
-                "by the broker-close reconcile"
+                f"by the broker-close reconcile; clears booked flags {booked_ids}"
             ),
         )
 
@@ -6191,28 +6243,34 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                     # A sub-range could not be fetched (timeout or the request
                     # budget ran out mid-subdivision). The parent's rows are
                     # still real coverage - keep them plus whichever half
-                    # succeeded, and record each missing half as uncovered
-                    # instead of discarding the whole window.
+                    # succeeded, and record each missing half as UNCOVERED so
+                    # the scan cursor re-queues it next pass: a failed fetch
+                    # is transient, and losing the range here would strand a
+                    # close the old flat-window rescan used to heal.
                     gathered = list(deals)
                     if first is not None:
                         gathered.extend(first)
                     if second is not None:
                         gathered.extend(second)
                     if first is None:
-                        budget["truncated_ranges"].append(
+                        budget["failed_ranges"].append(
                             (int(start_ms), int(mid_ms))
                         )
                     if second is None:
-                        budget["truncated_ranges"].append(
+                        budget["failed_ranges"].append(
                             (int(mid_ms), int(end_ms))
                         )
                     return gathered
                 return first + second
             # The window still reports more rows than one response can carry
-            # and subdivision is exhausted (depth cap, minimum width, or the
-            # request budget): record the gap once for the pass-level warning
-            # instead of logging once per minimum-width window.
-            budget["truncated_ranges"].append((int(start_ms), int(end_ms)))
+            # and subdivision is exhausted. A spent request budget is
+            # transient - the range goes back on the cursor. A depth or width
+            # cap cannot be fixed by rescanning, so it is recorded as
+            # unpageable for the pass-level warning/alert instead.
+            if budget["exhausted"]:
+                budget["failed_ranges"].append((int(start_ms), int(end_ms)))
+            else:
+                budget["truncated_ranges"].append((int(start_ms), int(end_ms)))
         return deals
 
     @staticmethod
@@ -6241,19 +6299,37 @@ class CTraderLiveAdapter(BaseLiveAdapter):
 
         The persisted cursor says which ``[from, to)`` ranges earlier passes
         left uncovered; this pass adds the fresh gap since the last covered
-        top, any band a moved floor reopened, and a small window around every
-        transiently-flagged deal so its booking attempt is retried even when
-        its original window is already covered. Ranges are clamped to
-        ``[floor_ms, now_ms]`` and merged before scanning.
+        top (overlapped by ``BROKER_CLOSE_SCAN_CURSOR_OVERLAP_MS`` so a deal
+        the deal list had not yet shown is not skipped forever), any band a
+        moved floor reopened, and a small window around every
+        transiently-flagged deal whose fill is not already booked, so its
+        booking attempt is retried even when its original window is already
+        covered. Ranges are clamped to ``[floor_ms, now_ms]`` and merged
+        before scanning.
         """
-        state = (
-            await asyncio.to_thread(
-                get_live_adapter_state,
-                self.account_config_id,
-                BROKER_CLOSE_SCAN_STATE_KEY,
+        try:
+            state = (
+                await asyncio.to_thread(
+                    get_live_adapter_state,
+                    self.account_config_id,
+                    BROKER_CLOSE_SCAN_STATE_KEY,
+                )
+                or {}
             )
-            or {}
-        )
+        except Exception as exc:  # except-kind: money-decision
+            # A state read failure must not abort the pass: degrade to the
+            # full floor..now scan, which is what a missing cursor means.
+            logger.warning(
+                "cTrader broker-close scan cursor unreadable; scanning the "
+                "full range this pass",
+                extra={
+                    "data": {
+                        "account_id": self.account_config_id,
+                        "error": str(exc),
+                    }
+                },
+            )
+            state = {}
         covered_top = state.get("top_ms")
         covered_floor = state.get("floor_ms")
         try:
@@ -6280,28 +6356,89 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 # top: rescan the band rather than trust it.
                 pending.append([floor_ms, covered_top_ms])
             if covered_top_ms < now_ms:
-                pending.append([covered_top_ms, now_ms])
-        flag_details = await asyncio.to_thread(
-            list_live_ledger_reconciliation_flag_details, self.account_config_id
-        )
-        for detail in flag_details:
+                # The overlap re-reads a sliver below the last covered top:
+                # a deal the deal list had not yet shown, or one stamped
+                # before it by broker/local clock skew, still gets fetched.
+                pending.append(
+                    [
+                        covered_top_ms - BROKER_CLOSE_SCAN_CURSOR_OVERLAP_MS,
+                        now_ms,
+                    ]
+                )
+        try:
+            flag_entries = await asyncio.to_thread(
+                list_live_ledger_reconciliation_flag_entries,
+                self.account_config_id,
+            )
+        except Exception as exc:  # except-kind: money-decision
+            logger.warning(
+                "cTrader broker-close flag retry lookup failed; flagged "
+                "deals are not re-queued this pass",
+                extra={
+                    "data": {
+                        "account_id": self.account_config_id,
+                        "error": str(exc),
+                    }
+                },
+            )
+            flag_entries = []
+        flagged_windows: list[tuple[int, list[int]]] = []
+        for entry in flag_entries:
+            detail = entry.get("detail")
+            if not isinstance(detail, dict):
+                continue
             if (
                 str(detail.get("cause") or "")
                 not in BROKER_CLOSE_FLAGGED_RETRYABLE_CAUSES
             ):
                 continue
             try:
+                flag_deal_id = int(detail.get("deal_id") or 0)
+            except (TypeError, ValueError):
+                flag_deal_id = 0
+            try:
                 deal_ts_ms = int(detail.get("deal_timestamp_ms") or 0)
             except (TypeError, ValueError):
-                continue
+                deal_ts_ms = 0
+            if deal_ts_ms <= 0:
+                # Legacy flags predate ``deal_timestamp_ms``: the flag's own
+                # audit timestamp is the only clock left, and for a stream
+                # flag it is the close's arrival time.
+                created_at = entry.get("created_at")
+                if isinstance(created_at, datetime):
+                    deal_ts_ms = int(
+                        created_at.replace(tzinfo=timezone.utc).timestamp() * 1000
+                    )
             if deal_ts_ms <= 0:
                 continue
-            pending.append(
-                [
-                    deal_ts_ms - BROKER_CLOSE_FLAGGED_RETRY_MARGIN_MS,
-                    deal_ts_ms + BROKER_CLOSE_FLAGGED_RETRY_MARGIN_MS,
-                ]
+            flagged_windows.append(
+                (
+                    flag_deal_id,
+                    [
+                        deal_ts_ms - BROKER_CLOSE_FLAGGED_RETRY_MARGIN_MS,
+                        deal_ts_ms + BROKER_CLOSE_FLAGGED_RETRY_MARGIN_MS,
+                    ],
+                )
             )
+        retry_deal_ids = {deal_id for deal_id, _ in flagged_windows if deal_id > 0}
+        booked_deal_ids: set[int] = set()
+        if retry_deal_ids:
+            # A deal the ledger already booked needs no retry window: its
+            # flag is stale bookkeeping, and re-fetching it on every pass
+            # (and every reconnect) is what used to rewrite resolution rows.
+            booked_keys = await asyncio.to_thread(
+                live_execution_dedupe_keys_present,
+                {f"ctrader:deal:{deal_id}" for deal_id in retry_deal_ids},
+            )
+            booked_deal_ids = {
+                int(key.rsplit(":", 1)[-1])
+                for key in booked_keys
+                if key.startswith("ctrader:deal:")
+            }
+        for deal_id, window in flagged_windows:
+            if deal_id > 0 and deal_id in booked_deal_ids:
+                continue
+            pending.append(window)
         stored_pending = state.get("pending")
         range_pairs: list[list[int]] = []
         if isinstance(stored_pending, list):
@@ -6418,11 +6555,16 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             "last_request_at": 0.0,
             "exhausted": False,
             "truncated_ranges": [],
+            "failed_ranges": [],
         }
         pending = await self._broker_close_scan_pending_ranges(
             floor_ms=floor_ms, now_ms=now_ms
         )
         deals: list[Any] = []
+        # id(deal) -> the top-level ``[from, to)`` window that returned it:
+        # the fallback retry window for a deal whose own timestamp is
+        # unreadable when its processing fails.
+        deal_scan_ranges: dict[int, list[int]] = {}
         remaining_pending: list[list[int]] = []
         consecutive_failures = 0
         stop_scan = False
@@ -6452,26 +6594,27 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                     break
                 consecutive_failures = 0
                 deals.extend(window_deals)
+                for fetched in window_deals:
+                    deal_scan_ranges[id(fetched)] = [
+                        int(window_start),
+                        int(window_end),
+                    ]
                 window_end = window_start
                 if budget["exhausted"]:
                     remaining_pending.append([range_start, window_end])
                     stop_scan = True
                     break
-        remaining_pending = self._merge_scan_ranges(
+        # ``failed_ranges`` are sub-windows a failed or budget-cut fetch left
+        # uncovered: they go back on the cursor with the scan leftovers.
+        # ``truncated_ranges`` are ``hasMore`` ranges no rescan can page
+        # (depth/width caps): alert-only, never persisted.
+        uncovered_pending = self._merge_scan_ranges(
             [
                 [max(int(start), floor_ms), min(int(end), now_ms)]
-                for start, end in remaining_pending
+                for start, end in (
+                    list(remaining_pending) + list(budget["failed_ranges"])
+                )
             ]
-        )
-        await asyncio.to_thread(
-            set_live_adapter_state,
-            self.account_config_id,
-            BROKER_CLOSE_SCAN_STATE_KEY,
-            {
-                "pending": remaining_pending,
-                "floor_ms": int(floor_ms),
-                "top_ms": int(now_ms),
-            },
         )
         truncated_ranges = [
             (int(start), int(end)) for start, end in budget["truncated_ranges"]
@@ -6479,7 +6622,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         requests_used = (
             BROKER_CLOSE_RECONCILE_MAX_DEAL_LIST_REQUESTS - int(budget["remaining"])
         )
-        if truncated_ranges:
+        if truncated_ranges or budget["failed_ranges"]:
             logger.warning(
                 "cTrader broker-close reconcile hasMore truncation left deal "
                 "ranges uncovered this pass",
@@ -6491,48 +6634,14 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                         "max_requests": BROKER_CLOSE_RECONCILE_MAX_DEAL_LIST_REQUESTS,
                         "truncated_count": len(truncated_ranges),
                         "truncated_ranges": truncated_ranges[:10],
+                        "failed_count": len(budget["failed_ranges"]),
+                        "failed_ranges": [
+                            (int(start), int(end))
+                            for start, end in budget["failed_ranges"]
+                        ][:10],
                     }
                 },
             )
-        exposure_pending = [
-            pair for pair in remaining_pending if pair[1] > exposure_from_ms
-        ]
-        if remaining_pending:
-            logger.warning(
-                "cTrader broker-close reconcile left deal-time ranges "
-                "uncovered; the scan cursor resumes there next pass",
-                extra={
-                    "data": {
-                        "account_id": self.account_config_id,
-                        "floor_ms": floor_ms,
-                        "pending_count": len(remaining_pending),
-                        "pending_ranges": remaining_pending[:10],
-                        "requests_used": requests_used,
-                        "max_requests": BROKER_CLOSE_RECONCILE_MAX_DEAL_LIST_REQUESTS,
-                    }
-                },
-            )
-        if exposure_pending and not self._broker_close_coverage_alert_sent:
-            logger.error(
-                "ALERT: cTrader broker-close reconcile has incomplete deal "
-                "coverage; an open lot's close may be hidden in the "
-                "uncovered ranges",
-                extra={
-                    "data": {
-                        "alert": "broker_close_coverage_incomplete",
-                        "account_id": self.account_config_id,
-                        "floor_ms": floor_ms,
-                        "exposure_from_ms": exposure_from_ms,
-                        "pending_count": len(remaining_pending),
-                        "pending_ranges": remaining_pending[:10],
-                        "requests_used": requests_used,
-                        "max_requests": BROKER_CLOSE_RECONCILE_MAX_DEAL_LIST_REQUESTS,
-                    }
-                },
-            )
-            self._broker_close_coverage_alert_sent = True
-        elif not exposure_pending:
-            self._broker_close_coverage_alert_sent = False
         # Process chronologically even though the scan covered windows
         # newest-first: booking order stays deterministic for partial closes.
         deals.sort(
@@ -6545,45 +6654,201 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         order_cache: dict[int, Any | None] = {}
         own_order_cache: dict[int, bool] = {}
         seen_deal_ids: set[int] = set()
-        flagged_deal_ids = (
-            await asyncio.to_thread(
-                list_live_ledger_reconciliation_deal_ids, self.account_config_id
+        try:
+            flagged_deal_ids = (
+                await asyncio.to_thread(
+                    list_live_ledger_reconciliation_deal_ids,
+                    self.account_config_id,
+                )
+                if deals
+                else set()
             )
-            if deals
-            else set()
-        )
-        for deal in deals:
-            # Windows abut and subdivided halves can both return a boundary
-            # deal; the per-deal work (broker reads + dedupe checks) runs once.
-            deal_id = _deal_id_or_none(deal)
-            if deal_id is not None:
-                if deal_id in seen_deal_ids:
-                    continue
-                seen_deal_ids.add(deal_id)
-            try:
-                recovered += await self._reconcile_position_close_deal(
-                    deal,
-                    parent_cache=parent_cache,
-                    order_cache=order_cache,
-                    own_order_cache=own_order_cache,
-                    flagged_deal_ids=flagged_deal_ids,
-                    order_window=order_window,
-                    pace=budget,
-                )
-            except CTraderApiError:
-                raise
-            except Exception as exc:  # except-kind: money-decision
-                logger.warning(
-                    "cTrader broker-close reconcile skipped an unreadable deal",
-                    extra={
-                        "data": {
-                            "account_id": self.account_config_id,
-                            "deal_id": deal_id,
-                            "error": str(exc),
-                        }
-                    },
-                )
+        except Exception as exc:  # except-kind: money-decision
+            logger.warning(
+                "cTrader broker-close flagged-deal lookup failed; flags are "
+                "not deduplicated this pass",
+                extra={
+                    "data": {
+                        "account_id": self.account_config_id,
+                        "error": str(exc),
+                    }
+                },
+            )
+            flagged_deal_ids = set()
+        deal_retry_pending: list[list[int]] = []
+        try:
+            for index, deal in enumerate(deals):
+                # Windows abut and subdivided halves can both return a boundary
+                # deal; the per-deal work (broker reads + dedupe checks) runs once.
+                deal_id = _deal_id_or_none(deal)
+                if deal_id is not None:
+                    if deal_id in seen_deal_ids:
+                        continue
+                    seen_deal_ids.add(deal_id)
+                try:
+                    recovered += await self._reconcile_position_close_deal(
+                        deal,
+                        parent_cache=parent_cache,
+                        order_cache=order_cache,
+                        own_order_cache=own_order_cache,
+                        flagged_deal_ids=flagged_deal_ids,
+                        order_window=order_window,
+                        pace=budget,
+                    )
+                except CTraderApiError:
+                    # This deal and every deal not yet reached stay
+                    # unprocessed: their windows go back on the cursor so a
+                    # later pass retries them instead of losing the booking.
+                    deal_retry_pending.extend(
+                        self._broker_close_deal_retry_ranges(
+                            deals[index:],
+                            deal_scan_ranges,
+                            floor_ms=floor_ms,
+                            now_ms=now_ms,
+                        )
+                    )
+                    raise
+                except Exception as exc:  # except-kind: money-decision
+                    deal_retry_pending.extend(
+                        self._broker_close_deal_retry_ranges(
+                            [deal],
+                            deal_scan_ranges,
+                            floor_ms=floor_ms,
+                            now_ms=now_ms,
+                        )
+                    )
+                    logger.warning(
+                        "cTrader broker-close reconcile skipped an unreadable deal",
+                        extra={
+                            "data": {
+                                "account_id": self.account_config_id,
+                                "deal_id": deal_id,
+                                "error": str(exc),
+                            }
+                        },
+                    )
+        finally:
+            # The cursor advances only now - after every gathered deal was
+            # processed or re-queued - so a transient read error can never
+            # mark a deal's range covered without booking it.
+            final_pending = self._merge_scan_ranges(
+                [
+                    [max(int(start), floor_ms), min(int(end), now_ms)]
+                    for start, end in uncovered_pending + deal_retry_pending
+                ]
+            )
+            self._persist_broker_close_scan_state(
+                final_pending, floor_ms=floor_ms, now_ms=now_ms
+            )
+        exposure_pending = [
+            pair for pair in final_pending if pair[1] > exposure_from_ms
+        ]
+        unpageable_pending = [
+            [int(start), int(end)]
+            for start, end in truncated_ranges
+            if int(end) > exposure_from_ms
+        ]
+        if final_pending:
+            logger.warning(
+                "cTrader broker-close reconcile left deal-time ranges "
+                "uncovered; the scan cursor resumes there next pass",
+                extra={
+                    "data": {
+                        "account_id": self.account_config_id,
+                        "floor_ms": floor_ms,
+                        "pending_count": len(final_pending),
+                        "pending_ranges": final_pending[:10],
+                        "requests_used": requests_used,
+                        "max_requests": BROKER_CLOSE_RECONCILE_MAX_DEAL_LIST_REQUESTS,
+                    }
+                },
+            )
+        if (exposure_pending or unpageable_pending) and (
+            not self._broker_close_coverage_alert_sent
+        ):
+            logger.error(
+                "ALERT: cTrader broker-close reconcile has incomplete deal "
+                "coverage; an open lot's close may be hidden in the "
+                "uncovered ranges",
+                extra={
+                    "data": {
+                        "alert": "broker_close_coverage_incomplete",
+                        "account_id": self.account_config_id,
+                        "floor_ms": floor_ms,
+                        "exposure_from_ms": exposure_from_ms,
+                        "pending_count": len(final_pending),
+                        "pending_ranges": final_pending[:10],
+                        "unpageable_count": len(unpageable_pending),
+                        "requests_used": requests_used,
+                        "max_requests": BROKER_CLOSE_RECONCILE_MAX_DEAL_LIST_REQUESTS,
+                    }
+                },
+            )
+            self._broker_close_coverage_alert_sent = True
+        elif not exposure_pending and not unpageable_pending:
+            self._broker_close_coverage_alert_sent = False
         return recovered
+
+    def _broker_close_deal_retry_ranges(
+        self,
+        deal_subset: list[Any],
+        deal_scan_ranges: dict[int, list[int]],
+        *,
+        floor_ms: int,
+        now_ms: int,
+    ) -> list[list[int]]:
+        """``[from, to)`` windows re-queued for deals whose processing failed.
+
+        A deal with a readable timestamp gets the same narrow window a
+        transient flag retry uses; one without falls back to the scan window
+        that returned it (a superset, at most one extra deal-list request),
+        and finally to the whole scanned band rather than being lost.
+        """
+        ranges: list[list[int]] = []
+        for deal in deal_subset:
+            timestamp_ms = self._resolve_execution_timestamp_ms(
+                order=None, deal=deal
+            )
+            if timestamp_ms > 0:
+                ranges.append(
+                    [
+                        timestamp_ms - BROKER_CLOSE_FLAGGED_RETRY_MARGIN_MS,
+                        timestamp_ms + BROKER_CLOSE_FLAGGED_RETRY_MARGIN_MS,
+                    ]
+                )
+                continue
+            scanned = deal_scan_ranges.get(id(deal))
+            if scanned is not None:
+                ranges.append(list(scanned))
+            else:
+                ranges.append([int(floor_ms), int(now_ms)])
+        return ranges
+
+    def _persist_broker_close_scan_state(
+        self, pending: list[list[int]], *, floor_ms: int, now_ms: int
+    ) -> None:
+        """Write the scan cursor; a DB failure is loud but never fatal."""
+        try:
+            set_live_adapter_state(
+                self.account_config_id,
+                BROKER_CLOSE_SCAN_STATE_KEY,
+                {
+                    "pending": pending,
+                    "floor_ms": int(floor_ms),
+                    "top_ms": int(now_ms),
+                },
+            )
+        except Exception as exc:  # except-kind: money-decision
+            logger.error(
+                "cTrader broker-close scan cursor could not be persisted; "
+                "the next pass rescans from the previous cursor",
+                extra={
+                    "data": {
+                        "account_id": self.account_config_id,
+                        "error": str(exc),
+                    }
+                },
+            )
 
     def _extract_order_and_client_ids(
         self, order: Any | None, deal: Any | None

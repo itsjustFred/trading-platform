@@ -831,6 +831,7 @@ def test_fetch_broker_close_window_halves_has_more_and_keeps_second_half(
         "last_request_at": 0.0,
         "exhausted": False,
         "truncated_ranges": [],
+        "failed_ranges": [],
     }
 
     deals = asyncio.run(
@@ -1564,3 +1565,475 @@ def test_reconcile_paces_order_reads_like_deal_list_reads(database) -> None:
     )
     assert broker_close_reads > 0
     assert paced_calls == broker_close_reads
+
+
+# ─── bundle-78 findings: per-deal flag resolution, cursor coverage, retry ─────────────────────
+
+
+def _resolved_flag_rows(database) -> list[dict[str, Any]]:
+    import shared.database as db
+
+    return [
+        row
+        for row in database.list_live_control_audit(limit=200)
+        if row["action"] == db.LEDGER_RECONCILIATION_RESOLVED_AUDIT_ACTION
+    ]
+
+
+def test_a_booked_close_does_not_resolve_a_sibling_unresolved_flag(database) -> None:
+    """B1: flag resolution is per ``account:symbol``, so booking deal A must
+    not clear deal B's still-outstanding flag - the loss-breaker halt has to
+    stay while the ledger is still wrong."""
+    import shared.database as db
+
+    signal_id = _persist_entry(database, qty=10.0)
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    deal_a = _close_deal(
+        deal_id=9301, order_id=CLOSE_ORDER_ID, timestamp_ms=now_ms - 26 * 3_600_000
+    )
+    deal_b = _close_deal(
+        deal_id=9302, order_id=779, volume=5.0, timestamp_ms=now_ms - 2 * 3_600_000
+    )
+    deal_b.positionId = POSITION_ID + 1  # a different position, no opener
+
+    first = _reconcilable_adapter(
+        database, position_orders={}, deal_list=[deal_a, deal_b]
+    )
+    asyncio.run(first.reconcile_executions())
+    assert len(_reconciliation_flags(database)) == 2
+
+    second = _reconcilable_adapter(
+        database,
+        position_orders={POSITION_ID: [_entry_order(signal_id)]},
+        deal_list=[deal_a, deal_b],
+        order_details={CLOSE_ORDER_ID: _closing_order()},
+    )
+    asyncio.run(second.reconcile_executions())
+
+    # Deal A booked; deal B is still unattributable, so the target stays
+    # unresolved and no resolution row may be written.
+    assert _ledger(database) == pytest.approx(0.0)
+    assert _resolved_flag_rows(database) == []
+    assert db.list_unresolved_ledger_reconciliation_flags(ACCOUNT) == [
+        f"{ACCOUNT}:AAPL"
+    ]
+
+
+def test_a_later_deterministic_flag_survives_a_reconnect_pass(database) -> None:
+    """B1: a booked-and-resolved deal must not be re-fetched (and re-resolved)
+    on reconnect, and a later deterministic flag on the same symbol must not
+    be cleared by it."""
+    import shared.database as db
+
+    signal_id = _persist_entry(database, qty=10.0)
+    # A PARTIAL close: 6 units stay open, so the scan floor keeps reaching
+    # back to the deal's era and its flag retry window is not clamped away.
+    deal = _close_deal(
+        deal_id=9401, volume=4.0, timestamp_ms=T0_MS + 3_600_000
+    )
+    first = _reconcilable_adapter(
+        database,
+        position_orders={POSITION_ID: [_entry_order(signal_id)]},
+        deal_list=[deal],
+    )
+    inner_send = first._send_request_with_refresh_retry
+
+    async def unreadable_order_list(request: Any, **kwargs: Any) -> Any:
+        if isinstance(request, _OrderListReq):
+            return object()
+        return await inner_send(request, **kwargs)
+
+    first._send_request_with_refresh_retry = unreadable_order_list  # type: ignore[assignment]
+    asyncio.run(first.reconcile_executions())
+    assert len(_reconciliation_flags(database)) == 1
+
+    # The broker recovers: the flagged deal books and - being the only
+    # outstanding flag on the target - the flag resolves once.
+    second = _reconcilable_adapter(
+        database,
+        position_orders={POSITION_ID: [_entry_order(signal_id)]},
+        deal_list=[deal],
+        order_details={
+            CLOSE_ORDER_ID: _closing_order(order_id=CLOSE_ORDER_ID, volume=4.0)
+        },
+    )
+    asyncio.run(second.reconcile_executions())
+    assert _ledger(database) == pytest.approx(6.0)
+    assert db.list_unresolved_ledger_reconciliation_flags(ACCOUNT) == []
+    assert len(_resolved_flag_rows(database)) == 1
+
+    # The stream then flags a genuine deterministic cause on the same symbol.
+    db.flag_live_ledger_reconciliation(
+        account_id=ACCOUNT,
+        symbol="AAPL",
+        cause="ambiguous_parent",
+        detail={"deal_id": 9555, "position_id": POSITION_ID + 9},
+    )
+    assert db.list_unresolved_ledger_reconciliation_flags(ACCOUNT) == [
+        f"{ACCOUNT}:AAPL"
+    ]
+
+    # A reconnect pass must not re-fetch the booked deal's retry window, and
+    # even a dedupe hit may not resolve over the deterministic flag.
+    third = _reconcilable_adapter(
+        database,
+        position_orders={POSITION_ID: [_entry_order(signal_id)]},
+        deal_list=[deal],
+        order_details={
+            CLOSE_ORDER_ID: _closing_order(order_id=CLOSE_ORDER_ID, volume=4.0)
+        },
+    )
+    asyncio.run(third.reconcile_executions())
+
+    assert db.list_unresolved_ledger_reconciliation_flags(ACCOUNT) == [
+        f"{ACCOUNT}:AAPL"
+    ]
+    assert len(_resolved_flag_rows(database)) == 1
+    # The booked deal's window was not re-queued: the only deal-list request
+    # is the fresh gap, which does not reach back to the old deal.
+    deal_ts = T0_MS + 3_600_000
+    assert all(
+        not (from_ms <= deal_ts < to_ms)
+        for from_ms, to_ms in _deal_windows(third)
+    )
+
+
+def _strip_hasmore_parent_rows(adapter: CTraderLiveAdapter) -> None:
+    """Make ``hasMore`` windows return no rows, like a >maxRows account."""
+    inner_send = adapter._send_request_with_refresh_retry
+
+    async def stripped(request: Any, **kwargs: Any) -> Any:
+        response = await inner_send(request, **kwargs)
+        if isinstance(request, _DealListReq) and getattr(
+            response, "hasMore", False
+        ):
+            response.deal = []
+        return response
+
+    adapter._send_request_with_refresh_retry = stripped  # type: ignore[assignment]
+
+
+def test_reconcile_requeues_a_failed_hasmore_subwindow(database, caplog) -> None:
+    """B2: a ``hasMore`` sub-window that fails is uncovered, not covered - it
+    must go back on the cursor and raise the coverage alert."""
+    import logging
+
+    signal_id = _persist_entry(database, qty=10.0)
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    window_ms = BROKER_CLOSE_RECONCILE_WINDOW_MS
+    close = _close_deal(deal_id=9601, timestamp_ms=now_ms - 3_600_000)
+    adapter = _reconcilable_adapter(
+        database,
+        position_orders={POSITION_ID: [_entry_order(signal_id)]},
+        deal_list=[close],
+        order_details={CLOSE_ORDER_ID: _closing_order()},
+        deal_list_has_more=lambda from_ms, to_ms: (
+            to_ms - from_ms == window_ms and to_ms > now_ms - 86_400_000
+        ),
+        deal_list_fail_predicate=lambda from_ms, _to_ms: (
+            TimeoutError("sub-window timed out")
+            if from_ms > now_ms - 4 * 86_400_000
+            else None
+        ),
+    )
+    _strip_hasmore_parent_rows(adapter)
+
+    with caplog.at_level(logging.ERROR):
+        asyncio.run(adapter.reconcile_executions())
+
+    # The close sat in the failed half: nothing was booked, the range is
+    # pending, and the coverage gap alerts.
+    assert _ledger(database) == pytest.approx(10.0)
+    assert any(
+        "incomplete deal coverage" in record.getMessage()
+        for record in caplog.records
+    )
+
+    second = _reconcilable_adapter(
+        database,
+        position_orders={POSITION_ID: [_entry_order(signal_id)]},
+        deal_list=[close],
+        order_details={CLOSE_ORDER_ID: _closing_order()},
+    )
+    asyncio.run(second.reconcile_executions())
+
+    assert _ledger(database) == pytest.approx(0.0)
+
+
+def test_reconcile_requeues_a_budget_cut_hasmore_subwindow(
+    database, monkeypatch, caplog
+) -> None:
+    """B2/P3: a request budget that runs out mid-subdivision leaves the
+    unfetched half pending, not silently covered."""
+    import logging
+
+    monkeypatch.setattr(
+        "live_runner.ctrader_adapter.BROKER_CLOSE_RECONCILE_MAX_DEAL_LIST_REQUESTS",
+        2,
+    )
+    signal_id = _persist_entry(database, qty=10.0)
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    window_ms = BROKER_CLOSE_RECONCILE_WINDOW_MS
+    close = _close_deal(deal_id=9602, timestamp_ms=now_ms - 3_600_000)
+    adapter = _reconcilable_adapter(
+        database,
+        position_orders={POSITION_ID: [_entry_order(signal_id)]},
+        deal_list=[close],
+        order_details={CLOSE_ORDER_ID: _closing_order()},
+        deal_list_has_more=lambda from_ms, to_ms: (
+            to_ms - from_ms == window_ms and to_ms > now_ms - 86_400_000
+        ),
+    )
+    _strip_hasmore_parent_rows(adapter)
+
+    with caplog.at_level(logging.ERROR):
+        asyncio.run(adapter.reconcile_executions())
+
+    assert _ledger(database) == pytest.approx(10.0)
+    assert any(
+        "incomplete deal coverage" in record.getMessage()
+        for record in caplog.records
+    )
+
+    second = _reconcilable_adapter(
+        database,
+        position_orders={POSITION_ID: [_entry_order(signal_id)]},
+        deal_list=[close],
+        order_details={CLOSE_ORDER_ID: _closing_order()},
+    )
+    asyncio.run(second.reconcile_executions())
+
+    assert _ledger(database) == pytest.approx(0.0)
+
+
+def test_reconcile_retries_a_deal_whose_processing_timed_out(database) -> None:
+    """B3: a deal skipped by a transient processing error keeps its window
+    pending - the cursor may not advance past an unbooked deal."""
+    signal_id = _persist_entry(database, qty=10.0)
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    close = _close_deal(deal_id=9701, timestamp_ms=now_ms - 2 * 86_400_000)
+    first = _reconcilable_adapter(
+        database,
+        position_orders={POSITION_ID: [_entry_order(signal_id)]},
+        deal_list=[close],
+        order_details={CLOSE_ORDER_ID: _closing_order()},
+    )
+    inner_send = first._send_request_with_refresh_retry
+
+    async def timeout_order_list(request: Any, **kwargs: Any) -> Any:
+        if isinstance(request, _OrderListReq):
+            raise TimeoutError("order list timed out")
+        return await inner_send(request, **kwargs)
+
+    first._send_request_with_refresh_retry = timeout_order_list  # type: ignore[assignment]
+    asyncio.run(first.reconcile_executions())
+
+    assert _ledger(database) == pytest.approx(10.0)
+    assert _reconciliation_flags(database) == []
+
+    second = _reconcilable_adapter(
+        database,
+        position_orders={POSITION_ID: [_entry_order(signal_id)]},
+        deal_list=[close],
+        order_details={CLOSE_ORDER_ID: _closing_order()},
+    )
+    asyncio.run(second.reconcile_executions())
+
+    assert _ledger(database) == pytest.approx(0.0)
+
+
+def test_reconcile_retries_unprocessed_deals_after_an_order_list_api_error(
+    database,
+) -> None:
+    """B3: a ``CTraderApiError`` aborts the pass, but the cursor persisted
+    afterwards still carries the failed deal AND every later deal."""
+    signal_id = _persist_entry(database, qty=10.0)
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    deal_old = _close_deal(
+        deal_id=9801, order_id=CLOSE_ORDER_ID, volume=4.0,
+        timestamp_ms=now_ms - 2 * 86_400_000,
+    )
+    deal_new = _close_deal(
+        deal_id=9802, order_id=779, volume=6.0,
+        timestamp_ms=now_ms - 86_400_000,
+    )
+    order_details = {
+        CLOSE_ORDER_ID: _closing_order(order_id=CLOSE_ORDER_ID, volume=4.0),
+        779: _closing_order(order_id=779, volume=6.0),
+    }
+    first = _reconcilable_adapter(
+        database,
+        position_orders={POSITION_ID: [_entry_order(signal_id)]},
+        deal_list=[deal_old, deal_new],
+        order_details=order_details,
+    )
+    inner_send = first._send_request_with_refresh_retry
+    failed_once = {"done": False}
+
+    async def fail_order_list_once(request: Any, **kwargs: Any) -> Any:
+        if isinstance(request, _OrderListReq) and not failed_once["done"]:
+            failed_once["done"] = True
+            raise CTraderApiError("TEST_FAILURE", "order list failed")
+        return await inner_send(request, **kwargs)
+
+    first._send_request_with_refresh_retry = fail_order_list_once  # type: ignore[assignment]
+    with pytest.raises(CTraderApiError):
+        asyncio.run(first.reconcile_executions())
+
+    assert _ledger(database) == pytest.approx(10.0)
+
+    second = _reconcilable_adapter(
+        database,
+        position_orders={POSITION_ID: [_entry_order(signal_id)]},
+        deal_list=[deal_old, deal_new],
+        order_details=order_details,
+    )
+    asyncio.run(second.reconcile_executions())
+
+    # Both the failed deal and the one never reached are booked on pass 2.
+    assert _ledger(database) == pytest.approx(0.0)
+
+
+def test_reconcile_scan_gap_overlaps_the_previous_covered_top(database) -> None:
+    """S1: the fresh gap starts a margin BELOW the last covered top, so a
+    deal the deal list had not yet shown - or one stamped before it by clock
+    skew - is re-read instead of skipped forever."""
+    from live_runner.ctrader_adapter import BROKER_CLOSE_SCAN_CURSOR_OVERLAP_MS
+
+    _persist_entry(database, qty=10.0)
+    first = _reconcilable_adapter(database, deal_list=[])
+    asyncio.run(first.reconcile_executions())
+    covered_top_ms = max(to_ms for _, to_ms in _deal_windows(first))
+
+    second = _reconcilable_adapter(database, deal_list=[])
+    asyncio.run(second.reconcile_executions())
+    windows = _deal_windows(second)
+
+    assert windows
+    min_from_ms = min(from_ms for from_ms, _ in windows)
+    expected_from_ms = covered_top_ms - BROKER_CLOSE_SCAN_CURSOR_OVERLAP_MS
+    assert abs(min_from_ms - expected_from_ms) < 60_000
+
+
+def test_reconcile_state_read_failure_still_books_the_close(
+    database, monkeypatch
+) -> None:
+    """S2: an unreadable scan cursor degrades to the full floor..now scan -
+    it must not abort the pass."""
+    signal_id = _persist_entry(database, qty=10.0)
+    close = _close_deal(deal_id=9901, timestamp_ms=T0_MS + 3_600_000)
+    adapter = _reconcilable_adapter(
+        database,
+        position_orders={POSITION_ID: [_entry_order(signal_id)]},
+        deal_list=[close],
+        order_details={CLOSE_ORDER_ID: _closing_order()},
+    )
+
+    def unreadable_state(*_args: Any, **_kwargs: Any) -> None:
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(
+        "live_runner.ctrader_adapter.get_live_adapter_state", unreadable_state
+    )
+    asyncio.run(adapter.reconcile_executions())
+
+    assert _ledger(database) == pytest.approx(0.0)
+
+
+def test_reconcile_state_write_failure_still_books_the_close(
+    database, monkeypatch, caplog
+) -> None:
+    """S2: a cursor that cannot be persisted is an ERROR, not an abort - the
+    gathered deals are still processed and the next pass rescans."""
+    import logging
+
+    signal_id = _persist_entry(database, qty=10.0)
+    close = _close_deal(deal_id=9902, timestamp_ms=T0_MS + 3_600_000)
+    adapter = _reconcilable_adapter(
+        database,
+        position_orders={POSITION_ID: [_entry_order(signal_id)]},
+        deal_list=[close],
+        order_details={CLOSE_ORDER_ID: _closing_order()},
+    )
+
+    def unwritable_state(*_args: Any, **_kwargs: Any) -> None:
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(
+        "live_runner.ctrader_adapter.set_live_adapter_state", unwritable_state
+    )
+    with caplog.at_level(logging.ERROR):
+        asyncio.run(adapter.reconcile_executions())
+
+    assert _ledger(database) == pytest.approx(0.0)
+    assert any(
+        "scan cursor could not be persisted" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+def test_a_flag_without_deal_timestamp_retries_from_its_audit_time(database) -> None:
+    """S3: flags written before ``deal_timestamp_ms`` existed still get a
+    retry window, derived from the flag row's own timestamp."""
+    import shared.database as db
+
+    flag_at = datetime.now(timezone.utc) - timedelta(hours=2)
+    with db.get_session() as session:
+        session.add(
+            db.LiveControlAuditModel(
+                id="legacy-flag-1",
+                created_at=flag_at.replace(tzinfo=None),
+                actor="live-runner",
+                action=db.LEDGER_RECONCILIATION_AUDIT_ACTION,
+                target_type="account_symbol",
+                target_id=f"{ACCOUNT}:AAPL",
+                succeeded=True,
+                detail_json={
+                    "account_id": ACCOUNT,
+                    "symbol": "AAPL",
+                    "cause": "position_orders_unreadable",
+                    "deal_id": 424242,
+                    "source": "reconcile",
+                },
+            )
+        )
+        session.commit()
+    # A completed cursor so the only pending ranges are the fresh gap and
+    # the flag retry window.
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    floor_ms = now_ms - BROKER_CLOSE_RECONCILE_WINDOW_MS
+    db.set_live_adapter_state(
+        ACCOUNT,
+        "ctrader_broker_close_scan",
+        {"pending": [], "floor_ms": floor_ms, "top_ms": now_ms},
+    )
+    adapter = _reconcilable_adapter(database, deal_list=[])
+
+    pending = asyncio.run(
+        adapter._broker_close_scan_pending_ranges(floor_ms=floor_ms, now_ms=now_ms)
+    )
+
+    flag_ms = int(flag_at.timestamp() * 1000)
+    assert any(
+        start <= flag_ms <= end and end - start <= 700_000
+        for start, end in pending
+    )
+
+
+def test_adapter_state_keys_from_two_brokers_coexist_on_one_account(database) -> None:
+    """The shared ``live_adapter_state`` table namespaces keys per adapter:
+    a cTrader scan cursor and an Alpaca watermark on one account id must not
+    collide (#350/#415 reconciliation)."""
+    import shared.database as db
+
+    db.set_live_adapter_state(ACCOUNT, "ctrader_broker_close_scan", {"top_ms": 1})
+    db.set_live_adapter_state(
+        ACCOUNT, "alpaca_reprotect_reconcile_after", {"mark": 2}
+    )
+
+    assert db.get_live_adapter_state(ACCOUNT, "ctrader_broker_close_scan") == {
+        "top_ms": 1
+    }
+    assert db.get_live_adapter_state(
+        ACCOUNT, "alpaca_reprotect_reconcile_after"
+    ) == {"mark": 2}

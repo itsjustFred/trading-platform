@@ -123,6 +123,9 @@ def _is_sqlite_url(url: str) -> bool:
 #: spelling that turns a ``file:`` database name into a SQLite URI filename.
 _SQLITE_URI_TRUE_VALUES = frozenset({"true", "yes", "on", "y", "t", "1"})
 
+#: The SQLite write-lock pragma every read-modify-write critical section opens with.
+_SQLITE_BEGIN_IMMEDIATE = "BEGIN IMMEDIATE"
+
 
 def _sqlite_uri_file_path(body: str) -> str:
     """The path inside a ``file:`` URI body, after ``uri=true`` was established.
@@ -1171,6 +1174,72 @@ class LiveAccountModel(SQLModel, table=True):
         )
 
 
+class LiveAdapterStateModel(SQLModel, table=True):
+    """Small persisted key/value store for adapter runtime state.
+
+    Adapters need a durable place for pass-to-pass bookkeeping that is not a
+    signal, an execution or an account attribute - e.g. the Alpaca
+    re-protect reconciliation watermark (#350 review). ``id`` is
+    ``"{account_id}|{key}"`` so one account can hold several keys.
+    """
+
+    __tablename__ = "live_adapter_state"
+
+    id: str = Field(primary_key=True)
+    account_id: str = Field(index=True)
+    key: str = Field(index=True)
+    value_json: dict[str, Any] = Field(
+        default_factory=dict,
+        sa_column=Column("value", JSON, nullable=False),
+    )
+    updated_at: datetime = Field(default_factory=_utcnow_naive)
+
+
+def _adapter_state_id(account_id: str, key: str) -> str:
+    return f"{account_id}|{key}"
+
+
+def get_live_adapter_state(account_id: str, key: str) -> dict[str, Any] | None:
+    """The persisted value for ``(account_id, key)``, or ``None`` when unset."""
+    normalized_account_id = str(account_id or "").strip()
+    normalized_key = str(key or "").strip()
+    if not normalized_account_id or not normalized_key:
+        return None
+    init_db()
+    state_id = _adapter_state_id(normalized_account_id, normalized_key)
+    with get_session() as session:
+        record = session.get(LiveAdapterStateModel, state_id)
+    if record is None or not isinstance(record.value_json, dict):
+        return None
+    return dict(record.value_json)
+
+
+def set_live_adapter_state(
+    account_id: str, key: str, value: Mapping[str, Any]
+) -> None:
+    """Persist ``value`` for ``(account_id, key)``, replacing any earlier one."""
+    normalized_account_id = str(account_id or "").strip()
+    normalized_key = str(key or "").strip()
+    if not normalized_account_id or not normalized_key:
+        raise ValueError("adapter state requires an account id and a key")
+    init_db()
+    state_id = _adapter_state_id(normalized_account_id, normalized_key)
+    with get_session() as session:
+        session.connection().exec_driver_sql(_SQLITE_BEGIN_IMMEDIATE)
+        record = session.get(LiveAdapterStateModel, state_id)
+        if record is None:
+            record = LiveAdapterStateModel(
+                id=state_id,
+                account_id=normalized_account_id,
+                key=normalized_key,
+            )
+            session.add(record)
+        record.value_json = dict(value)
+        record.updated_at = _utcnow_naive()
+        session.add(record)
+        session.commit()
+
+
 class LiveControlAuditModel(SQLModel, table=True):
     """Durable record of every state-changing live control.
 
@@ -1198,27 +1267,6 @@ class LiveControlAuditModel(SQLModel, table=True):
         default_factory=dict,
         sa_column=Column("detail", JSON, nullable=False),
     )
-
-
-class LiveAdapterStateModel(SQLModel, table=True):
-    """Small durable key/value state owned by a live adapter.
-
-    Not an audit trail: rows here are overwritten in place and exist so a
-    restarted process can resume where the previous one stopped - e.g. the
-    cTrader broker-close reconcile's per-account scan cursor, which must
-    survive reconnects or a request cap would starve the oldest windows
-    forever.
-    """
-
-    __tablename__ = "live_adapter_state"
-
-    state_key: str = Field(primary_key=True)
-    account_id: str = Field(index=True)
-    value_json: dict[str, Any] = Field(
-        default_factory=dict,
-        sa_column=Column("value", JSON, nullable=False),
-    )
-    updated_at: datetime = Field(default_factory=_utcnow_naive)
 
 
 #: Reserved ``scope`` of the halt that covers every account. Refused as an account
@@ -4033,6 +4081,28 @@ def live_execution_dedupe_key_exists(dedupe_key: str) -> bool:
     return row is not None
 
 
+def live_execution_dedupe_keys_present(dedupe_keys: Iterable[str]) -> set[str]:
+    """The subset of ``dedupe_keys`` an execution row already carries.
+
+    Bulk form of :func:`live_execution_dedupe_key_exists` for callers that
+    must classify many flagged deals in one pass (the broker-close reconcile
+    skips re-queueing windows for deals the ledger already booked).
+    """
+    normalized_keys = {
+        str(key).strip() for key in dedupe_keys if str(key or "").strip()
+    }
+    if not normalized_keys:
+        return set()
+    init_db()
+    with get_session() as session:
+        rows = session.exec(
+            select(LiveExecutionModel.dedupe_key).where(
+                LiveExecutionModel.dedupe_key.in_(normalized_keys)
+            )
+        ).all()
+    return {str(row) for row in rows}
+
+
 def get_live_signal_filled_qty_for_broker_order(signal_id: str, broker_order_id: str) -> float:
     """The quantity already recorded for one signal and one broker order (a leg's own id).
 
@@ -4440,6 +4510,42 @@ def list_live_ledger_reconciliation_deal_ids(account_id: str) -> set[int]:
     return deal_ids
 
 
+def list_live_ledger_reconciliation_flag_entries(
+    account_id: str,
+) -> list[dict[str, Any]]:
+    """``{"target_id", "detail", "created_at"}`` per flag row on an account.
+
+    Same rows :func:`list_live_ledger_reconciliation_flag_details` returns,
+    plus the audit timestamp: flags written before ``deal_timestamp_ms``
+    existed have no deal time of their own, so the reconcile pass derives
+    their retry window from when the flag itself was raised.
+    """
+    normalized_account = str(account_id or "").strip()
+    if not normalized_account:
+        return []
+    like_pattern = _ledger_flag_account_like(normalized_account)
+    init_db()
+    with get_session() as session:
+        rows = session.exec(
+            select(
+                LiveControlAuditModel.target_id,
+                LiveControlAuditModel.detail_json,
+                LiveControlAuditModel.created_at,
+            )
+            .where(LiveControlAuditModel.action == LEDGER_RECONCILIATION_AUDIT_ACTION)
+            .where(LiveControlAuditModel.target_id.like(like_pattern, escape="\\"))
+        ).all()
+    return [
+        {
+            "target_id": str(target_id),
+            "detail": dict(detail),
+            "created_at": created_at,
+        }
+        for target_id, detail, created_at in rows
+        if isinstance(detail, dict)
+    ]
+
+
 def list_live_ledger_reconciliation_flag_details(account_id: str) -> list[dict[str, Any]]:
     """The ``detail`` payloads of every ledger-reconciliation flag on an account.
 
@@ -4449,60 +4555,10 @@ def list_live_ledger_reconciliation_flag_details(account_id: str) -> list[dict[s
     must be retried. Resolved flags are included - flag resolution never
     books the fill, so a still-transient deal stays worth retrying.
     """
-    normalized_account = str(account_id or "").strip()
-    if not normalized_account:
-        return []
-    like_pattern = _ledger_flag_account_like(normalized_account)
-    init_db()
-    with get_session() as session:
-        rows = session.exec(
-            select(LiveControlAuditModel.detail_json)
-            .where(LiveControlAuditModel.action == LEDGER_RECONCILIATION_AUDIT_ACTION)
-            .where(LiveControlAuditModel.target_id.like(like_pattern, escape="\\"))
-        ).all()
-    return [dict(detail) for detail in rows if isinstance(detail, dict)]
-
-
-def get_live_adapter_state(account_id: str, state_key: str) -> dict[str, Any] | None:
-    """One durable adapter-state value, or ``None`` when never written."""
-    normalized_account = str(account_id or "").strip()
-    normalized_key = str(state_key or "").strip()
-    if not normalized_account or not normalized_key:
-        return None
-    init_db()
-    with get_session() as session:
-        row = session.get(
-            LiveAdapterStateModel, f"{normalized_account}:{normalized_key}"
-        )
-    if row is None or not isinstance(row.value_json, dict):
-        return None
-    return dict(row.value_json)
-
-
-def set_live_adapter_state(
-    account_id: str, state_key: str, value: dict[str, Any]
-) -> None:
-    """Overwrite one durable adapter-state value for ``account_id``/``state_key``."""
-    normalized_account = str(account_id or "").strip()
-    normalized_key = str(state_key or "").strip()
-    if not normalized_account or not normalized_key:
-        raise ValueError("set_live_adapter_state requires account_id and state_key")
-    init_db()
-    with get_session() as session:
-        row = session.get(
-            LiveAdapterStateModel, f"{normalized_account}:{normalized_key}"
-        )
-        if row is None:
-            row = LiveAdapterStateModel(
-                state_key=f"{normalized_account}:{normalized_key}",
-                account_id=normalized_account,
-                value_json=dict(value),
-            )
-            session.add(row)
-        else:
-            row.value_json = dict(value)
-            row.updated_at = _utcnow_naive()
-        session.commit()
+    return [
+        entry["detail"]
+        for entry in list_live_ledger_reconciliation_flag_entries(account_id)
+    ]
 
 
 def get_live_deployment_net_filled_qty(deployment_id: str, symbol: str) -> float:
@@ -7663,6 +7719,42 @@ def account_has_ledger_reconciliation_flags(account_id: str) -> bool:
     it is not trustworthy.
     """
     return bool(list_unresolved_ledger_reconciliation_flags(account_id))
+
+
+def list_outstanding_ledger_flag_details(
+    account_id: str, symbol: str
+) -> list[dict[str, Any]]:
+    """``detail`` payloads of the flag rows still outstanding on one target.
+
+    "Outstanding" means newer than the latest
+    ``ledger_reconciliation_resolved`` row for the SAME ``account:symbol`` -
+    exactly the set :func:`list_unresolved_ledger_reconciliation_flags`
+    counts as live, but with the per-flag payloads the bot needs to decide
+    whether a booking may supersede them. Empty means the target is already
+    resolved (or was never flagged).
+    """
+    normalized_account = str(account_id or "").strip()
+    normalized_symbol = str(symbol or "").strip().upper()
+    if not normalized_account or not normalized_symbol:
+        return []
+    target_id = f"{normalized_account}:{normalized_symbol}"
+    init_db()
+    with get_session() as session:
+        resolved_at = session.exec(
+            select(func.max(LiveControlAuditModel.created_at)).where(
+                LiveControlAuditModel.action
+                == LEDGER_RECONCILIATION_RESOLVED_AUDIT_ACTION,
+                LiveControlAuditModel.target_id == target_id,
+            )
+        ).first()
+        query = select(LiveControlAuditModel.detail_json).where(
+            LiveControlAuditModel.action == LEDGER_RECONCILIATION_AUDIT_ACTION,
+            LiveControlAuditModel.target_id == target_id,
+        )
+        if resolved_at is not None:
+            query = query.where(LiveControlAuditModel.created_at > resolved_at)
+        rows = session.exec(query).all()
+    return [dict(detail) for detail in rows if isinstance(detail, dict)]
 
 
 def resolve_ledger_reconciliation_flag(
