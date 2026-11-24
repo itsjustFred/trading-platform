@@ -1894,6 +1894,7 @@ def test_ctrader_get_positions_qty_matches_volume_contract():
         positionStatus=1,
         tradeData=SimpleNamespace(symbolId=1, volume=2_500_000, tradeSide=1),
         price=1.1,
+        takeProfit=1.2,
     )
     sell_position = SimpleNamespace(
         positionStatus=1,
@@ -1924,9 +1925,9 @@ def test_ctrader_get_positions_qty_matches_volume_contract():
 
     assert positions == [
         {"symbol": "EURUSD", "qty": pytest.approx(2500.0), "entry_price": pytest.approx(1.1),
-         "current_price": 0.0, "unrealized_pnl": 0.0},
+         "current_price": 0.0, "unrealized_pnl": 0.0, "take_profit": 1.2},
         {"symbol": "EURUSD", "qty": pytest.approx(-1000.0), "entry_price": pytest.approx(1.1),
-         "current_price": 0.0, "unrealized_pnl": 0.0},
+         "current_price": 0.0, "unrealized_pnl": 0.0, "take_profit": None},
     ]
 
 

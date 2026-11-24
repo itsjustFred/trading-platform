@@ -61,7 +61,7 @@ import asyncio
 import contextlib
 import math
 import uuid
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -159,6 +159,10 @@ FLIP_PENDING_TIMEOUT_SECONDS = 15 * 60
 #: new deterministic signal id, so a terminal (rejected/cancelled) order can
 #: never be double-submitted under the same id.
 FLIP_MAX_CLOSE_ATTEMPTS = 8
+#: Bounded retries of the fallback take-profit amend while the workflow is
+#: halted/given up. Each attempt is paced by the position's own backoff or
+#: give-up probe interval - never a tight loop.
+FLIP_FALLBACK_TP_MAX_ATTEMPTS = 4
 #: Account-level backoff bounds, same policy as the trailing loop.
 FLIP_RETRY_INITIAL_SECONDS = TRAILING_RETRY_INITIAL_SECONDS
 FLIP_RETRY_MAX_SECONDS = TRAILING_RETRY_MAX_SECONDS
@@ -175,6 +179,18 @@ _FLIP_SIGNAL_NAMESPACE = uuid.uuid5(
 )
 
 EntrySignalLoader = Callable[[list[str], list[str]], dict[str, dict[str, Any]]]
+
+#: What ``_prepare_position`` returns for one manageable position.
+_PreparedPosition = tuple[
+    LiveDeploymentConfig, SupertrendFlipPlan, dict[str, Any], Mapping[str, Any]
+]
+
+#: Deferred fallback-TP removal for one managed pass (#168 B5): invoked
+#: before the pass's first broker mutation and once more if the pass
+#: completes its reads without one, so the TP stays in force while the
+#: pass's broker reads prove the outage recovered. ``None`` means the
+#: shutdown gate refused the removal - the pass must not mutate.
+_FallbackTpGate = Callable[[], Awaitable[bool | None]]
 
 #: Deployment ``settings`` key opting a deployment into the live
 #: ``supertrend_flip`` workflow (#168). Canonical definition lives in
@@ -213,6 +229,65 @@ def _flip_signal_id(
 
 def _iso(moment: datetime) -> str:
     return moment.astimezone(timezone.utc).isoformat()
+
+
+#: How the halt/give-up alert phrases the fallback-TP outcome (#168). The
+#: note comes from ``_ensure_fallback_tp``; anything not listed stays silent
+#: (not-applicable cases never mention it).
+_FALLBACK_ALERT_SUFFIXES = {
+    "placed": "; a fallback take-profit was placed at the plan's TP1 level",
+    "placed_unmarked": (
+        "; a fallback take-profit was placed at the broker but its state "
+        "marker could not be persisted - verify it manually"
+    ),
+    "already_placed": "; the fallback take-profit is already in place",
+    "tp1_done": (
+        "; no fallback take-profit: TP1 already completed and the "
+        "remainder exits on the flip - the position stays stop-only"
+    ),
+    "failed": (
+        "; the fallback take-profit could not be placed - verify the "
+        "broker-side protection manually"
+    ),
+    "exhausted": (
+        "; fallback take-profit attempts are exhausted - verify the "
+        "broker-side protection manually"
+    ),
+    "unsupported": (
+        "; this adapter cannot amend a position take-profit: the position "
+        "stays stop-only"
+    ),
+    "shutdown": "; the fallback take-profit was not placed (shutdown gate)",
+    "unverified": (
+        "; the position's provenance or quantity is not proven - no "
+        "fallback take-profit was attempted"
+    ),
+    "not_bound": (
+        "; the position binding is unproven - no fallback take-profit was "
+        "attempted"
+    ),
+    "intent_unpersisted": (
+        "; the fallback take-profit intent could not be persisted, so no "
+        "amend was attempted"
+    ),
+    "tp1_pending": (
+        "; a TP1 close is still in flight - no fallback take-profit until "
+        "it resolves"
+    ),
+    "tp1_pending_halted": (
+        "; a TP1 close is still in flight and this plan is halted - the "
+        "position stays stop-only and needs manual handling"
+    ),
+    "foreign_tp": (
+        "; the broker shows a different take-profit - it was left "
+        "untouched and needs manual verification"
+    ),
+    "error": "; the fallback take-profit evaluation failed",
+}
+
+
+def _fallback_alert_suffix(note: str | None) -> str:
+    return _FALLBACK_ALERT_SUFFIXES.get(note or "", "")
 
 
 def _parse_iso(value: Any) -> datetime | None:
@@ -378,6 +453,26 @@ def _fresh_state(position_qty: float, entry_price: float) -> dict[str, Any]:
         "tp1_filled_qty": None,
         "breakeven_done": False,
         "halt_reason": None,
+        # Fallback take-profit (#168 maintainer decision): placed at the
+        # plan's TP1 price when the workflow halts permanently or gives up,
+        # so a bound position is never left without an upside exit. Removed
+        # again before the workflow resumes - a broker TP at tp1_price would
+        # close the WHOLE position instead of the TP1 tranche.
+        "fallback_tp_price": None,
+        "fallback_tp_attempts": 0,
+        "fallback_tp_cleared": False,
+        # The amend target persisted BEFORE the broker write so a restart can
+        # resolve an unconfirmed intent by reading the broker position.
+        "fallback_tp_pending_price": None,
+        # ISO timestamps pacing halted-plan fallback-TP retries (S1): the
+        # last consumed attempt and the next allowed one.
+        "fallback_tp_last_attempt_at": None,
+        "fallback_tp_next_attempt_at": None,
+        # Persisted marker: the position's provenance/quantity was never
+        # proven (e.g. the qty-mismatch halt). While True the plan gets zero
+        # broker writes - the ``_``-prefixed in-memory markers cannot survive
+        # a restart, so the durable flag carries the same guarantee.
+        "unverified_position": False,
     }
 
 
@@ -407,7 +502,14 @@ def _normalize_state(raw: Any, *, context: str) -> dict[str, Any] | None:
     state["phase"] = phase
     # Coerce the numeric fields the machine reads; a value that cannot be read
     # is corrupt state, not a default.
-    for key in ("entry_qty", "tp1_qty", "exit_qty", "tp1_filled_qty"):
+    for key in (
+        "entry_qty",
+        "tp1_qty",
+        "exit_qty",
+        "tp1_filled_qty",
+        "fallback_tp_price",
+        "fallback_tp_pending_price",
+    ):
         if state.get(key) is not None:
             number = _float_or_none(state.get(key))
             if number is None or number < 0:
@@ -426,7 +528,7 @@ def _normalize_state(raw: Any, *, context: str) -> dict[str, Any] | None:
                 f"position_id ({state.get('position_id')!r})",
                 permanent=True,
             ) from exc
-    for key in ("tp1_attempts", "exit_attempts"):
+    for key in ("tp1_attempts", "exit_attempts", "fallback_tp_attempts"):
         try:
             state[key] = max(0, int(state.get(key) or 0))
         except (TypeError, ValueError) as exc:
@@ -435,6 +537,8 @@ def _normalize_state(raw: Any, *, context: str) -> dict[str, Any] | None:
                 permanent=True,
             ) from exc
     state["breakeven_done"] = state.get("breakeven_done") is True
+    state["fallback_tp_cleared"] = state.get("fallback_tp_cleared") is True
+    state["unverified_position"] = state.get("unverified_position") is True
     return state
 
 
@@ -607,9 +711,10 @@ class LiveSupertrendFlipManager:
             "deployment_id": (entry or {}).get("deployment_id"),
         }
         key = (account_id, symbol)
+        prepared: _PreparedPosition | None = None
         try:
             prepared = self._prepare_position(
-                adapter, deployments_by_id, entry, rows, context
+                adapter, deployments_by_id, entry, rows, context, moment=moment
             )
             if prepared is None:
                 self._workflows.pop(key, None)
@@ -624,9 +729,22 @@ class LiveSupertrendFlipManager:
                     "signal; refusing to manage it",
                     permanent=True,
                 )
+            prior = self._workflows.get(key)
             workflow = self._workflow_for(key, str(entry["signal_id"]))
-            if workflow.outage.probe_blocked(moment) or (
-                workflow.retry_at is not None and moment < workflow.retry_at
+            fresh_workflow = prior is None or prior.signal_id != workflow.signal_id
+            if fresh_workflow and self._fallback_tp_unresolved(state):
+                # B5: a restart finds the persisted fallback TP still
+                # unresolved. Seed the outage as given-up so this pass is a
+                # probe: the TP stays in force while the pass's broker
+                # reads run and comes off only once they prove the outage
+                # recovered - a still-failing probe makes zero SLTP writes,
+                # so a long outage can never churn the TP off.
+                workflow.outage.given_up = True
+                workflow.outage.next_probe_at = moment
+            halted_fallback_retry = state.get("phase") == PHASE_HALTED
+            if not halted_fallback_retry and (
+                workflow.outage.probe_blocked(moment)
+                or (workflow.retry_at is not None and moment < workflow.retry_at)
             ):
                 return
             if state.get("_verify_entry_qty") and not (
@@ -691,6 +809,16 @@ class LiveSupertrendFlipManager:
                 moment=moment,
                 context=context,
             )
+            if (
+                state.get("fallback_tp_cleared") is True
+                and state.get("fallback_tp_attempts")
+            ):
+                # B4/decision: this pass PROVED the outage recovered (it
+                # completed without raising). Commit the attempt-budget
+                # reset even when the pass persisted nothing else - a clean
+                # resume must still start the next episode fresh.
+                state["fallback_tp_attempts"] = 0
+                await self._persist_state(str(entry["signal_id"]), state)
             self._record_success(workflow)
         except _FlipPositionMismatch as exc:
             # The broker position is not the one the plan is bound to: alert,
@@ -713,7 +841,10 @@ class LiveSupertrendFlipManager:
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # except-kind: money-decision
-            await self._record_failure(key, entry, exc, context, moment)
+            await self._record_failure(
+                key, entry, exc, context, moment,
+                adapter=adapter, prepared=prepared,
+            )
 
     async def _load_stops_once(
         self,
@@ -776,10 +907,9 @@ class LiveSupertrendFlipManager:
         entry: Mapping[str, Any] | None,
         rows: list[Mapping[str, Any]],
         context: Mapping[str, Any],
-    ) -> (
-        tuple[LiveDeploymentConfig, SupertrendFlipPlan, dict[str, Any], Mapping[str, Any]]
-        | None
-    ):
+        *,
+        moment: datetime,
+    ) -> _PreparedPosition | None:
         """Everything needed to manage one position, or ``None`` to skip it.
 
         ``None`` means "not ours": no filled entry signal, a non-flip trailing
@@ -847,8 +977,17 @@ class LiveSupertrendFlipManager:
             # symbol - the normal case once the flip trade ended and
             # someone else opened a long - must not raise the identity
             # mismatch below every pass. Returning ``None`` ("not ours")
-            # alerts only on the transition that set ``done``.
-            return None
+            # alerts only on the transition that set ``done``. A ``halted``
+            # plan is different only while its fallback TP is still owed:
+            # the bounded retry budget (S1) needs the plan, so it falls
+            # through to the binding check and comes back prepared.
+            if not (
+                state.get("phase") == PHASE_HALTED
+                and self._halted_fallback_owed(
+                    adapter, symbol, state, moment, position_qty=qty
+                )
+            ):
+                return None
         position_id = self._position_id(position)
         if state is None:
             state = _fresh_state(qty, entry_price)
@@ -979,8 +1118,16 @@ class LiveSupertrendFlipManager:
         exc: BaseException,
         context: dict[str, Any],
         moment: datetime,
+        *,
+        adapter: BaseLiveAdapter | None = None,
+        prepared: _PreparedPosition | None = None,
     ) -> None:
-        """Surface one failed pass and back the position off."""
+        """Surface one failed pass and back the position off.
+
+        ``adapter``/``prepared`` carry the position context the fallback
+        take-profit needs (#168): on a permanent halt or the give-up they
+        are present exactly when the position was provably bound this pass.
+        """
         workflow = self._workflows.get(key)
         if entry is not None and (
             workflow is None or workflow.signal_id != str(entry["signal_id"])
@@ -993,16 +1140,14 @@ class LiveSupertrendFlipManager:
                 workflow.outage.given_up = True
                 workflow.outage.permanent = True
                 workflow.outage.next_probe_at = None
-            self._surface(
-                "Live supertrend-flip halted for this position; the "
-                "broker-side stop stays in force and the workflow will not "
-                "act on guesses",
-                exc,
-                context,
-                critical=True,
+            await self._surface_permanent_halt(
+                entry=entry,
+                exc=exc,
+                context=context,
+                moment=moment,
+                adapter=adapter,
+                prepared=prepared,
             )
-            if entry is not None:
-                await self._persist_halt(entry, exc)
             return
         if workflow is None:
             self._surface(
@@ -1012,6 +1157,15 @@ class LiveSupertrendFlipManager:
         outage = workflow.outage
         if outage.given_up:
             outage.next_probe_at = moment + timedelta(seconds=FLIP_GIVEN_UP_PROBE_SECONDS)
+            # A still-failing probe is also the paced retry for a fallback
+            # TP amend that has not landed yet.
+            await self._fallback_tp_note(
+                adapter=adapter,
+                entry=entry,
+                prepared=prepared,
+                context=context,
+                moment=moment,
+            )
             logger.warning(
                 "Live supertrend-flip probe still failing; staying given up",
                 extra={"data": {**context, "error": repr(exc)}},
@@ -1025,11 +1179,18 @@ class LiveSupertrendFlipManager:
         if elapsed >= FLIP_GIVE_UP_AFTER_SECONDS:
             outage.given_up = True
             outage.next_probe_at = moment + timedelta(seconds=FLIP_GIVEN_UP_PROBE_SECONDS)
+            note = await self._fallback_tp_note(
+                adapter=adapter,
+                entry=entry,
+                prepared=prepared,
+                context=context,
+                moment=moment,
+            )
             self._surface(
                 "Live supertrend-flip given up on for this position; the "
                 "broker-side stop stays at its last level and the workflow is "
                 "no longer retried until a probe succeeds or the position or "
-                "its entry signal changes",
+                "its entry signal changes" + _fallback_alert_suffix(note),
                 exc,
                 context,
                 critical=True,
@@ -1044,15 +1205,69 @@ class LiveSupertrendFlipManager:
         workflow.retry_at = moment + timedelta(seconds=workflow.retry_delay)
         workflow.retry_delay = min(workflow.retry_delay * 2.0, FLIP_RETRY_MAX_SECONDS)
 
-    async def _persist_halt(self, entry: Mapping[str, Any], exc: BaseException) -> None:
+    async def _surface_permanent_halt(
+        self,
+        *,
+        entry: Mapping[str, Any] | None,
+        exc: BaseException,
+        context: dict[str, Any],
+        moment: datetime,
+        adapter: BaseLiveAdapter | None,
+        prepared: _PreparedPosition | None,
+    ) -> None:
+        """Persist the halt, run the fallback-TP step, alert critical."""
+        if entry is not None:
+            await self._persist_halt(
+                entry, exc, prepared[2] if prepared is not None else None
+            )
+        note = await self._fallback_tp_note(
+            adapter=adapter,
+            entry=entry,
+            prepared=prepared,
+            context=context,
+            moment=moment,
+            plan_halted=True,
+            # B2: the halt fields ride the fallback persists too, so a
+            # stale in-memory phase can never overwrite the halt when
+            # nothing usable was ever persisted.
+            extra_fields={
+                "phase": PHASE_HALTED,
+                "halt_reason": repr(exc)[:500],
+            },
+        )
+        self._surface(
+            "Live supertrend-flip halted for this position; the "
+            "broker-side stop stays in force and the workflow will not "
+            "act on guesses" + _fallback_alert_suffix(note),
+            exc,
+            context,
+            critical=True,
+        )
+
+    async def _persist_halt(
+        self,
+        entry: Mapping[str, Any],
+        exc: BaseException,
+        state: Mapping[str, Any] | None = None,
+    ) -> None:
         """Best-effort: mark the workflow halted so a restart does not retry."""
         signal_id = str(entry.get("signal_id") or "")
         if not signal_id:
             return
-        raw_state = (entry.get("metadata") or {}).get(self._state_key)
+        # The merge base must be the freshest state this pass knows - see
+        # ``_halt_merge_base``: a stale base is a lost update.
+        raw_state = await self._halt_merge_base(entry, state, signal_id)
         halted = dict(raw_state) if isinstance(raw_state, dict) else _fresh_state(0.0, 0.0)
         halted["phase"] = PHASE_HALTED
         halted["halt_reason"] = repr(exc)[:500]
+        # B1: a halt raised while the first-sight markers were still set
+        # means provenance/quantity was never proven - persist that so the
+        # S1 fallback-TP retry (and any later pass) keeps zero broker writes
+        # even after a restart, when the ``_`` markers are long gone.
+        halted["unverified_position"] = bool(
+            state is not None
+            and (state.get("_verify_entry_qty") or state.get("_needs_persist"))
+        )
         try:
             await asyncio.to_thread(
                 merge_live_signal_metadata,
@@ -1065,6 +1280,38 @@ class LiveSupertrendFlipManager:
                 "halt still applies this run",
                 extra={"data": {"signal_id": signal_id}},
             )
+
+    async def _halt_merge_base(
+        self,
+        entry: Mapping[str, Any],
+        state: Mapping[str, Any] | None,
+        signal_id: str,
+    ) -> Any:
+        """The freshest workflow state available as the halt merge base.
+
+        The in-memory ``prepared`` state carries every write the pass made
+        (TP1 intent, fallback-TP markers), while the entry row was loaded at
+        pass start and predates them - merging the halt onto that snapshot
+        would clobber them (``merge_live_signal_metadata`` replaces the
+        whole state key, so a stale base is a lost update). Only when no
+        prepared state exists (the failure happened before
+        ``_prepare_position`` returned, so no same-pass writes can exist)
+        is the persisted row or the entry snapshot an acceptable base.
+        """
+        if state is not None:
+            return {
+                key: value
+                for key, value in state.items()
+                if not str(key).startswith("_")
+            }
+        try:
+            metadata = await asyncio.to_thread(get_live_signal_metadata, signal_id)
+            candidate = (metadata or {}).get(self._state_key)
+            if isinstance(candidate, dict):
+                return candidate
+        except Exception:  # except-kind: money-decision
+            pass
+        return (entry.get("metadata") or {}).get(self._state_key)
 
     async def _mark_done_by_signal_id(self, signal_id: str) -> None:
         """Best-effort ``done`` mark for a workflow whose position vanished."""
@@ -1118,6 +1365,18 @@ class LiveSupertrendFlipManager:
         self, signal_id: str, state: Mapping[str, Any]
     ) -> None:
         clean = {key: value for key, value in state.items() if not key.startswith("_")}
+        if clean.get("fallback_tp_cleared") is True:
+            # B4/decision: the fallback-TP attempt budget belongs to one
+            # unresolved episode. A managed pass that persists progress
+            # while the broker TP is cleared IS the proven resume - reset
+            # the count here so the next halt/give-up starts a fresh
+            # episode. Failed passes never reach this write, so a resume
+            # that does not complete keeps the durable budget. The caller's
+            # in-memory copy is synced too so a same-pass ``_ensure`` cannot
+            # read a stale high count against the fresh durable one.
+            clean["fallback_tp_attempts"] = 0
+            if isinstance(state, dict):
+                state["fallback_tp_attempts"] = 0
         persisted = await asyncio.to_thread(
             merge_live_signal_metadata, signal_id, {self._state_key: clean}
         )
@@ -1172,6 +1431,844 @@ class LiveSupertrendFlipManager:
             ) from exc
         return str(opened_by or "").strip() == signal_id
 
+    # ── fallback take-profit (#168 maintainer decision) ──────────────────
+    #
+    # When the workflow stops managing a position that is provably ours - a
+    # permanent halt or the give-up after ``FLIP_GIVE_UP_AFTER_SECONDS`` -
+    # the broker stop stays in force AND the position gets a broker
+    # take-profit at the plan's ``tp1_price`` so it is not left without an
+    # upside exit. TP1 already done means there is no price level for the
+    # remainder (it exits on the flip): stop-only, said in the alert.
+    # Provenance-unproven and position-identity-mismatch positions stay
+    # hands-off - those paths never reach ``_record_failure``. When the
+    # outage recovers and the plan resumes, the fallback TP is amended away
+    # BEFORE any TP1 close logic runs.
+
+    @staticmethod
+    def _fallback_tp_unresolved(state: Mapping[str, Any]) -> bool:
+        """Whether a fallback TP may still be on the broker for this plan.
+
+        True while a confirmed TP is recorded, and also while an amend was
+        attempted but never confirmed - the broker may have applied it, so
+        resume must clear before closing anything.
+        """
+        if _float_or_none(state.get("fallback_tp_price")) is not None:
+            return True
+        try:
+            attempts = int(state.get("fallback_tp_attempts") or 0)
+        except (TypeError, ValueError):
+            attempts = 0
+        return attempts > 0 and state.get("fallback_tp_cleared") is not True
+
+    async def _fallback_tp_note(
+        self,
+        *,
+        adapter: BaseLiveAdapter | None,
+        entry: Mapping[str, Any] | None,
+        prepared: _PreparedPosition | None,
+        context: dict[str, Any],
+        moment: datetime,
+        extra_fields: Mapping[str, Any] | None = None,
+        plan_halted: bool = False,
+    ) -> str | None:
+        """Run the fallback-TP step for a halted/given-up position.
+
+        Returns the outcome note for the alert suffix, ``None`` when there
+        is nothing to do (no entry, no prepared position, or the position
+        is not provably ours). Never raises: a failure inside is surfaced
+        on its own so halt/give-up accounting is never disturbed.
+        ``extra_fields`` are merged into every state persist the step makes
+        (the halt path passes ``phase``/``halt_reason`` so a stale in-memory
+        phase can never win). ``plan_halted`` marks the permanent-halt
+        context: a TP1 close in flight there NEVER resolves on its own (a
+        halted plan is hands-off), so the alert must say the position
+        stays stop-only instead of "until it resolves".
+        """
+        if adapter is None or prepared is None or entry is None:
+            return None
+        _deployment, plan, state, position = prepared
+        signal_id = str(entry.get("signal_id") or "")
+        if not signal_id:
+            return None
+        try:
+            note = await self._ensure_fallback_tp(
+                adapter=adapter,
+                plan=plan,
+                state=state,
+                position=position,
+                signal_id=signal_id,
+                context=context,
+                moment=moment,
+                extra_fields=extra_fields,
+            )
+            if plan_halted and note == "tp1_pending":
+                return "tp1_pending_halted"
+            return note
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # except-kind: money-decision
+            self._surface(
+                "Live supertrend-flip fallback take-profit evaluation failed",
+                exc,
+                context,
+                critical=True,
+            )
+            return "error"
+
+    @staticmethod
+    def _tp_amend_supported(adapter: BaseLiveAdapter) -> bool:
+        """Whether the adapter really implements ``amend_position_take_profit``.
+
+        The base stub exists on every adapter, so ``callable`` alone cannot
+        tell support from the ``NotImplementedError`` default.
+        """
+        amend = getattr(adapter, "amend_position_take_profit", None)
+        if not callable(amend):
+            return False
+        func = getattr(amend, "__func__", amend)
+        return func is not BaseLiveAdapter.amend_position_take_profit
+
+    @staticmethod
+    def _fallback_retry_due(state: Mapping[str, Any], moment: datetime) -> bool:
+        """Whether a halted plan's next fallback-TP retry is due (S1)."""
+        nxt = _parse_iso(state.get("fallback_tp_next_attempt_at"))
+        if nxt is not None:
+            return moment >= nxt
+        last = _parse_iso(state.get("fallback_tp_last_attempt_at"))
+        if last is None:
+            return True
+        return moment >= last + timedelta(seconds=FLIP_GIVEN_UP_PROBE_SECONDS)
+
+    @staticmethod
+    def _tp1_close_in_flight(state: Mapping[str, Any]) -> bool:
+        """Whether a TP1 close is still unresolved for this plan.
+
+        One helper for both fallback gates so they cannot drift: a
+        whole-position TP at tp1_price must never race the tranche close.
+        """
+        return (
+            state.get("phase") == PHASE_TP1_PENDING
+            or state.get("tp1_pending_since") is not None
+            or state.get("tp1_order_id") is not None
+        )
+
+    def _halted_fallback_owed(
+        self,
+        adapter: BaseLiveAdapter,
+        symbol: str,
+        state: Mapping[str, Any],
+        moment: datetime,
+        *,
+        position_qty: float,
+    ) -> bool:
+        """Whether a ``halted`` plan still owes a fallback-TP attempt (S1).
+
+        Permanent halts get the same bounded budget as give-ups: retry only
+        while no TP is recorded, attempts remain, the position is proven
+        (bound, verified, TP1 not done, no TP1 close in flight, quantity
+        still the plan's entry qty) and the probe cadence says due. A TP1
+        close in flight on a halted plan NEVER resolves by itself - the
+        plan is hands-off - so it is simply never owed a TP; the halt alert
+        says the position stays stop-only and needs manual handling.
+        """
+        if _float_or_none(state.get("fallback_tp_price")) is not None:
+            return False
+        if state.get("fallback_tp_cleared") is True:
+            return False
+        if state.get("unverified_position") is True:
+            return False
+        if state.get("tp1_time") is not None:
+            return False
+        if self._tp1_close_in_flight(state):
+            return False
+        if state.get("position_id") is None:
+            return False
+        # The bound position's quantity must still be the plan's proven
+        # entry qty (TP1 is not done on this path): a netting add or manual
+        # trade under the same position_id would otherwise get a
+        # whole-position TP that closes the foreign volume at our TP1.
+        expected_qty = _float_or_none(state.get("entry_qty"))
+        if (
+            expected_qty is None
+            or expected_qty <= 0
+            or abs(float(position_qty) - expected_qty)
+            > self._qty_tolerance(adapter, symbol)
+        ):
+            return False
+        try:
+            attempts = max(0, int(state.get("fallback_tp_attempts") or 0))
+        except (TypeError, ValueError):
+            attempts = 0
+        if attempts >= FLIP_FALLBACK_TP_MAX_ATTEMPTS:
+            return False
+        if not self._tp_amend_supported(adapter):
+            return False
+        return self._fallback_retry_due(state, moment)
+
+    async def _retry_halted_fallback_tp(
+        self,
+        *,
+        adapter: BaseLiveAdapter,
+        plan: SupertrendFlipPlan,
+        state: dict[str, Any],
+        position: Mapping[str, Any],
+        signal_id: str,
+        context: dict[str, Any],
+        moment: datetime,
+    ) -> None:
+        """Run one paced fallback-TP attempt for a halted plan (S1)."""
+        try:
+            note = await self._ensure_fallback_tp(
+                adapter=adapter,
+                plan=plan,
+                state=state,
+                position=position,
+                signal_id=signal_id,
+                context=context,
+                moment=moment,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # except-kind: money-decision
+            self._surface(
+                "Live supertrend-flip fallback take-profit evaluation failed",
+                exc,
+                context,
+                critical=True,
+            )
+            note = "error"
+        if note in {"failed", "intent_unpersisted", "error", "shutdown"}:
+            # Pace the next attempt on the probe interval; terminal notes
+            # (placed, exhausted, unsupported, unverified, ...) need none.
+            await self._persist_fallback_fields(
+                signal_id,
+                state,
+                {
+                    "fallback_tp_next_attempt_at": _iso(
+                        moment + timedelta(seconds=FLIP_GIVEN_UP_PROBE_SECONDS)
+                    )
+                },
+            )
+
+    @staticmethod
+    def _fallback_position_bound(
+        state: Mapping[str, Any], position: Mapping[str, Any]
+    ) -> bool:
+        """The plan's ``position_id`` binding matches THIS broker position."""
+        position_id = LiveSupertrendFlipManager._position_id(position)
+        bound = state.get("position_id")
+        return (
+            position_id is not None
+            and bound is not None
+            and int(bound) == int(position_id)
+        )
+
+    @staticmethod
+    def _fallback_provenance_pending(state: Mapping[str, Any]) -> bool:
+        """First-sight markers or the persisted flag: not provably ours yet."""
+        return bool(
+            state.get("_verify_entry_qty")
+            or state.get("_needs_persist")
+            or state.get("unverified_position") is True
+        )
+
+    @staticmethod
+    def _fallback_qty_proven(
+        adapter: BaseLiveAdapter,
+        symbol: str,
+        state: Mapping[str, Any],
+        position: Mapping[str, Any],
+    ) -> bool:
+        """The bound position's quantity still equals the plan's entry qty.
+
+        TP1 is not done on this path, so the full entry qty is expected: a
+        netting add or manual trade under the same position_id would
+        otherwise get a whole-position TP that closes the foreign volume at
+        our TP1.
+        """
+        expected_qty = _float_or_none(state.get("entry_qty"))
+        try:
+            position_qty = abs(LiveSupertrendFlipManager._position_qty(position))
+        except _FlipFailure:
+            return False
+        return (
+            expected_qty is not None
+            and expected_qty > 0
+            and abs(position_qty - expected_qty)
+            <= LiveSupertrendFlipManager._qty_tolerance(adapter, symbol)
+        )
+
+    @staticmethod
+    def _fallback_level_note(
+        adapter: BaseLiveAdapter,
+        symbol: str,
+        state: Mapping[str, Any],
+        position: Mapping[str, Any],
+    ) -> str | None:
+        """``"already_placed"``/``"foreign_tp"`` when a broker TP settles it.
+
+        A broker TP that is provably this workflow's (the confirmed price,
+        or the still-unconfirmed amend's pending target) needs no new
+        amend; a DIFFERENT broker TP is foreign - never overwritten,
+        reported accurately instead of claiming ours is in place. A pending
+        intent with NO broker TP means the amend never landed: ``None``
+        (fall through and retry it).
+        """
+        recorded = _float_or_none(state.get("fallback_tp_price"))
+        pending = _float_or_none(state.get("fallback_tp_pending_price"))
+        broker_tp = _float_or_none(position.get("take_profit"))
+        if broker_tp is not None and broker_tp > 0:
+            expected_tp = recorded if recorded is not None else pending
+            if expected_tp is None:
+                return None
+            if math.isclose(
+                broker_tp,
+                expected_tp,
+                rel_tol=0.0,
+                abs_tol=LiveSupertrendFlipManager._price_tolerance(adapter, symbol),
+            ):
+                return "already_placed"
+            return "foreign_tp"
+        if recorded is not None:
+            return "already_placed"
+        return None
+
+    @staticmethod
+    def _fallback_attempts_exhausted(state: Mapping[str, Any]) -> bool:
+        """The durable attempt budget for this outage episode is spent."""
+        try:
+            attempts = max(0, int(state.get("fallback_tp_attempts") or 0))
+        except (TypeError, ValueError):
+            attempts = 0
+        return attempts >= FLIP_FALLBACK_TP_MAX_ATTEMPTS
+
+    def _fallback_tp_block_reason(
+        self,
+        *,
+        adapter: BaseLiveAdapter,
+        plan: SupertrendFlipPlan,
+        state: Mapping[str, Any],
+        position: Mapping[str, Any],
+        context: dict[str, Any],
+    ) -> str | None:
+        """Why no fallback TP may be placed now, ``None`` when it may.
+
+        Every check is fail-closed: only a position whose plan is bound to
+        THIS broker ``position_id``, whose provenance AND quantity are
+        proven, whose quantity still equals the plan's entry qty, and which
+        has no TP1 close in flight or TP1 done qualifies. The in-memory
+        ``fallback_tp_attempts`` IS the durable count: every write that
+        moves it (``_persist_intent``, the confirmed-placement restore,
+        ``_persist_state``'s resume reset) updates memory and disk together,
+        so no second read is needed to floor it.
+        """
+        symbol = str(context.get("symbol") or "")
+        if not self._fallback_position_bound(state, position):
+            return "not_bound"
+        if self._fallback_provenance_pending(state):
+            # First sight whose provenance/quantity proof has not completed:
+            # the position is NOT provably ours yet - zero broker writes.
+            return "unverified"
+        if self._tp1_close_in_flight(state):
+            # A TP1 close is still in flight: a whole-position TP at
+            # tp1_price must not be placed until that close resolves
+            # (maintainer decision); the next pass re-evaluates.
+            return "tp1_pending"
+        if (
+            state.get("phase") in _POST_TP1_PHASES
+            or state.get("tp1_time") is not None
+        ):
+            # Checked BEFORE the quantity rule: after TP1 the position
+            # legitimately holds less than entry_qty.
+            return "tp1_done"
+        if not self._fallback_qty_proven(adapter, symbol, state, position):
+            return "unverified"
+        level = self._fallback_level_note(adapter, symbol, state, position)
+        if level is not None:
+            return level
+        if self._fallback_attempts_exhausted(state):
+            return "exhausted"
+        if not self._tp_amend_supported(adapter):
+            return "unsupported"
+        target = _float_or_none(getattr(plan, "tp1_price", None))
+        if target is None or target <= 0:
+            self._surface(
+                "Live supertrend-flip fallback take-profit has no usable "
+                "tp1_price; the broker-side protection is unchanged",
+                _FlipFailure("fallback TP target price is unusable"),
+                context,
+                critical=True,
+            )
+            return "failed"
+        return None
+
+    async def _ensure_fallback_tp(
+        self,
+        *,
+        adapter: BaseLiveAdapter,
+        plan: SupertrendFlipPlan,
+        state: dict[str, Any],
+        position: Mapping[str, Any],
+        signal_id: str,
+        context: dict[str, Any],
+        moment: datetime,
+        extra_fields: Mapping[str, Any] | None = None,
+    ) -> str:
+        """Place (or confirm already placed) the fallback TP. Returns a note."""
+        blocked = self._fallback_tp_block_reason(
+            adapter=adapter,
+            plan=plan,
+            state=state,
+            position=position,
+            context=context,
+        )
+        if blocked is not None:
+            return blocked
+        return await self._place_fallback_tp(
+            adapter=adapter,
+            plan=plan,
+            state=state,
+            position=position,
+            signal_id=signal_id,
+            context=context,
+            moment=moment,
+            extra_fields=extra_fields,
+        )
+
+    async def _place_fallback_tp(
+        self,
+        *,
+        adapter: BaseLiveAdapter,
+        plan: SupertrendFlipPlan,
+        state: dict[str, Any],
+        position: Mapping[str, Any],
+        signal_id: str,
+        context: dict[str, Any],
+        moment: datetime,
+        extra_fields: Mapping[str, Any] | None = None,
+    ) -> str:
+        """Persist the intent, run the gated amend, confirm and mark."""
+        try:
+            attempts = max(0, int(state.get("fallback_tp_attempts") or 0))
+        except (TypeError, ValueError):
+            attempts = 0
+        target = _float_or_none(getattr(plan, "tp1_price", None))
+        position_id = self._position_id(position)
+        if position_id is None or target is None or target <= 0:
+            # ``_fallback_tp_block_reason`` already cleared both; defensive.
+            return "failed"
+        account_id = str(context.get("account_id") or "")
+
+        async def _persist_intent() -> bool:
+            # B3: the intent - attempt count AND target price - is durable
+            # BEFORE the broker write, and a failed persist refuses the
+            # amend: a crash cannot hide that an amend may have landed.
+            return await self._persist_fallback_fields(
+                signal_id,
+                state,
+                {
+                    "fallback_tp_attempts": attempts + 1,
+                    "fallback_tp_cleared": False,
+                    "fallback_tp_pending_price": target,
+                    "fallback_tp_last_attempt_at": _iso(moment),
+                },
+                extra_fields=extra_fields,
+            )
+
+        def _consume_attempt() -> None:
+            state["fallback_tp_attempts"] = attempts + 1
+            state["fallback_tp_cleared"] = False
+            state["fallback_tp_pending_price"] = target
+            state["fallback_tp_last_attempt_at"] = _iso(moment)
+
+        result = await self._gated_fallback_tp_amend(
+            adapter=adapter,
+            position_id=int(position_id),
+            target=float(target),
+            account_id=account_id,
+            persist_intent=_persist_intent,
+            consume_attempt=_consume_attempt,
+            context=context,
+        )
+        if isinstance(result, str):
+            if result == "intent_unpersisted":
+                self._surface(
+                    "Live supertrend-flip fallback take-profit intent could "
+                    "not be persisted; the amend was refused so no broker "
+                    "write happened",
+                    _FlipFailure("fallback TP intent persist failed"),
+                    context,
+                    critical=True,
+                )
+            return result
+        price = _float_or_none(result)
+        if price is None or price <= 0:
+            self._surface(
+                "Live supertrend-flip fallback take-profit amend returned no "
+                "confirmed price; the previous broker-side protection is "
+                "unchanged",
+                _FlipFailure("fallback TP amend unconfirmed"),
+                context,
+                critical=True,
+            )
+            return "failed"
+        state["fallback_tp_price"] = price
+        state["fallback_tp_pending_price"] = None
+        # A CONFIRMED placement does not consume an attempt: the budget
+        # counts only failed or unconfirmed amends, so a long outage can
+        # never exhaust a TP that keeps landing. Restore the pre-attempt
+        # count (earlier failures still count) in memory and on disk.
+        state["fallback_tp_attempts"] = attempts
+        marked = await self._persist_fallback_fields(
+            signal_id,
+            state,
+            {
+                "fallback_tp_price": price,
+                "fallback_tp_pending_price": None,
+                "fallback_tp_attempts": attempts,
+            },
+            extra_fields=extra_fields,
+        )
+        if not marked:
+            self._surface(
+                "Live supertrend-flip fallback take-profit is at the broker "
+                "but its state marker could not be persisted; a restart "
+                "would not remove it before TP1 - verify manually",
+                _FlipFailure("fallback TP marker persist failed"),
+                context,
+                critical=True,
+            )
+            return "placed_unmarked"
+        logger.info(
+            "Placed live flip fallback take-profit",
+            extra={
+                "data": {
+                    **context,
+                    "fallback_tp_price": price,
+                    "position_id": int(position_id),
+                }
+            },
+        )
+        return "placed"
+
+    async def _gated_fallback_tp_amend(
+        self,
+        *,
+        adapter: BaseLiveAdapter,
+        position_id: int,
+        target: float,
+        account_id: str,
+        persist_intent: Callable[[], Awaitable[bool]],
+        consume_attempt: Callable[[], None],
+        context: dict[str, Any],
+    ) -> object:
+        """The shutdown-gated, account-locked fallback-TP amend.
+
+        S2: the shutdown gate is checked BEFORE the intent persist, so a
+        refused mutation never consumes an attempt. S3: the amend (which
+        reads the stop it echoes and then writes) runs inside the account
+        order-placement lock, same section rule as order submission -
+        ``_exit_lock`` is not held here, the account lock is the outer
+        section. Returns ``"shutdown"``/``"intent_unpersisted"`` or the
+        adapter's amend result; amend errors propagate to the caller.
+        """
+
+        async def _gated() -> object:
+            if self._mutation_gate is not None:
+                async with self._mutation_gate() as may_mutate:
+                    if not may_mutate:
+                        return "shutdown"
+                    if not await persist_intent():
+                        return "intent_unpersisted"
+                    consume_attempt()
+                    return await adapter.amend_position_take_profit(
+                        position_id, target
+                    )
+            if not await persist_intent():
+                return "intent_unpersisted"
+            consume_attempt()
+            return await adapter.amend_position_take_profit(position_id, target)
+
+        try:
+            if account_id:
+                async with account_order_placement(account_id):
+                    return await _gated()
+            return await _gated()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # except-kind: money-decision
+            self._surface(
+                "Live supertrend-flip fallback take-profit amend failed; "
+                "the previous broker-side protection is unchanged",
+                exc,
+                context,
+                critical=True,
+            )
+            return "failed"
+
+    @staticmethod
+    def _expected_fallback_tp(
+        state: Mapping[str, Any], plan: SupertrendFlipPlan
+    ) -> float | None:
+        """The broker TP level this workflow may have written, if known."""
+        expected = _float_or_none(state.get("fallback_tp_price"))
+        if expected is None:
+            expected = _float_or_none(state.get("fallback_tp_pending_price"))
+        if expected is None:
+            expected = _float_or_none(getattr(plan, "tp1_price", None))
+        return expected
+
+    async def _mark_fallback_tp_cleared(
+        self, *, signal_id: str, state: dict[str, Any]
+    ) -> bool:
+        """Persist "broker TP is clear"; the attempt count stays put.
+
+        The budget resets only when a managed pass PROVES the resume by
+        persisting progress (``_persist_state`` / the post-pass commit in
+        ``_manage_symbol``). A pass that fails after the removal keeps the
+        durable budget, so retries stay bounded.
+        """
+        state["fallback_tp_price"] = None
+        state["fallback_tp_cleared"] = True
+        state["fallback_tp_pending_price"] = None
+        state["fallback_tp_next_attempt_at"] = None
+        return await self._persist_fallback_fields(
+            signal_id,
+            state,
+            {
+                "fallback_tp_price": None,
+                "fallback_tp_cleared": True,
+                "fallback_tp_pending_price": None,
+                "fallback_tp_next_attempt_at": None,
+            },
+        )
+
+    async def _clear_fallback_tp_at_broker(
+        self,
+        *,
+        adapter: BaseLiveAdapter,
+        deployment: LiveDeploymentConfig,
+        position_id: int,
+        context: dict[str, Any],
+    ) -> bool:
+        """Send the TP-clear amend. ``False`` on shutdown refusal.
+
+        Any failure raises ``_FlipFailure`` - the caller must not continue
+        the TP1 partial-close logic while a broker TP at tp1_price may be
+        in force, because it would close the whole position instead of the
+        tranche.
+        """
+        amend = adapter.amend_position_take_profit
+        account_id = str(getattr(deployment, "account_id", "") or "")
+
+        async def _clear() -> bool:
+            """True when the clear amend ran; False on shutdown refusal."""
+            if self._mutation_gate is not None:
+                async with self._mutation_gate() as may_mutate:
+                    if not may_mutate:
+                        return False
+                    await amend(position_id, None)
+                    return True
+            await amend(position_id, None)
+            return True
+
+        try:
+            if account_id:
+                async with account_order_placement(account_id):
+                    return await _clear()
+            return await _clear()
+        except asyncio.CancelledError:
+            raise
+        except NotImplementedError as exc:
+            raise _FlipFailure(
+                "cannot remove the fallback take-profit: the adapter cannot "
+                "amend a position take-profit; refusing to run TP1 closes "
+                "while an unaccounted broker TP may be in force",
+                permanent=True,
+            ) from exc
+        except Exception as exc:  # except-kind: money-decision
+            self._surface(
+                "Live supertrend-flip could not remove the fallback "
+                "take-profit; the workflow stays fail-closed and the "
+                "broker TP remains in force",
+                exc,
+                context,
+            )
+            raise _FlipFailure(
+                f"could not remove the fallback take-profit for "
+                f"{context.get('symbol')}: {exc!r}; TP1 closes stay "
+                "blocked while the broker TP may still be in force"
+            ) from exc
+
+    async def _remove_fallback_tp(
+        self,
+        *,
+        adapter: BaseLiveAdapter,
+        deployment: LiveDeploymentConfig,
+        signal_id: str,
+        state: dict[str, Any],
+        position: Mapping[str, Any],
+        plan: SupertrendFlipPlan,
+        context: dict[str, Any],
+    ) -> bool | None:
+        """Clear the fallback TP before the workflow resumes.
+
+        ``True`` once the broker shows no TP (or the amend is confirmed);
+        ``None`` when the shutdown gate refused the mutation.
+
+        Only a TP that provably belongs to this workflow is cleared: the
+        broker-reported TP must match the persisted ``fallback_tp_price``
+        (or the persisted intent's pending target, or the plan's tp1_price
+        for legacy states - the only level this workflow ever writes)
+        within tick tolerance. A different broker TP is NOT ours: it is
+        left untouched, alerted critical, and the pass fails closed.
+        """
+        position_id = self._position_id(position)
+        if position_id is None or not self._tp_amend_supported(adapter):
+            raise _FlipFailure(
+                "cannot remove the fallback take-profit: the adapter cannot "
+                "amend a position take-profit; refusing to run TP1 closes "
+                "while an unaccounted broker TP may be in force",
+                permanent=True,
+            )
+        if "take_profit" not in position:
+            raise _FlipFailure(
+                "cannot verify the broker take-profit before removing the "
+                "fallback TP: the position read carries no take_profit; "
+                "refusing to clear a TP that may not be ours",
+                permanent=True,
+            )
+        broker_tp = _float_or_none(position.get("take_profit"))
+        symbol = str(context.get("symbol") or "")
+        tolerance = self._price_tolerance(adapter, symbol)
+
+        if broker_tp is None or broker_tp <= 0:
+            # Already clear at the broker: an unconfirmed intent is resolved
+            # by READING the position, no write needed.
+            if not await self._mark_fallback_tp_cleared(
+                signal_id=signal_id, state=state
+            ):
+                raise _FlipFailure(
+                    "fallback take-profit is already clear at the broker but "
+                    "the cleared marker could not be persisted; retrying "
+                    "rather than risking a stale marker"
+                )
+            logger.info(
+                "Fallback take-profit already clear at the broker",
+                extra={"data": {**context, "position_id": int(position_id)}},
+            )
+            return True
+
+        expected = self._expected_fallback_tp(state, plan)
+        if expected is None or not math.isclose(
+            broker_tp, expected, rel_tol=0.0, abs_tol=tolerance
+        ):
+            self._surface(
+                "Live supertrend-flip broker take-profit "
+                f"{broker_tp!r} does not match the workflow's fallback TP "
+                f"{expected!r}; leaving it untouched and refusing to run "
+                "TP1 closes while an unaccounted broker TP is in force",
+                _FlipFailure("broker TP is not the workflow's fallback TP"),
+                context,
+                critical=True,
+            )
+            raise _FlipFailure(
+                f"broker take-profit {broker_tp!r} on {symbol} does not "
+                f"match the persisted fallback TP {expected!r}; refusing "
+                "to clear a TP that may not be ours and blocking TP1 "
+                "closes until it is resolved",
+                permanent=True,
+            )
+
+        ran = await self._clear_fallback_tp_at_broker(
+            adapter=adapter,
+            deployment=deployment,
+            position_id=int(position_id),
+            context=context,
+        )
+        if not ran:
+            return None
+        if not await self._mark_fallback_tp_cleared(
+            signal_id=signal_id, state=state
+        ):
+            # The broker TP IS cleared; only the marker write failed. Retry
+            # next pass - the broker read makes it cheap.
+            raise _FlipFailure(
+                "fallback take-profit cleared at the broker but the cleared "
+                "marker could not be persisted; retrying rather than "
+                "risking a stale marker"
+            )
+        logger.info(
+            "Removed live flip fallback take-profit before resuming",
+            extra={"data": {**context, "position_id": int(position_id)}},
+        )
+        return True
+
+    async def _persist_fallback_fields(
+        self,
+        signal_id: str,
+        state: Mapping[str, Any],
+        fields: Mapping[str, Any],
+        *,
+        extra_fields: Mapping[str, Any] | None = None,
+    ) -> bool:
+        """Merge fallback-TP fields into the persisted workflow state.
+
+        The persisted state is read first and used as the merge base, so a
+        ``halted`` phase written moments ago is never clobbered by this
+        pass's in-memory copy - and a read that FAILS refuses the write
+        outright (B2): merging on a guessed base could overwrite a just-
+        persisted ``halted``/``done`` phase with stale in-memory progress.
+        The in-memory state is only a base when the read succeeded and the
+        key is genuinely absent (nothing was ever persisted).
+        ``extra_fields`` are merged last (the halt path forces
+        ``phase``/``halt_reason`` through them).
+        """
+        try:
+            metadata = await asyncio.to_thread(get_live_signal_metadata, signal_id)
+        except Exception:  # except-kind: money-decision
+            logger.warning(
+                "Could not read live signal metadata for the fallback-TP "
+                "persist; refusing to merge on a guessed base",
+                extra={"data": {"signal_id": signal_id}},
+            )
+            return False
+        persisted = (metadata or {}).get(self._state_key)
+        if isinstance(persisted, dict):
+            base = dict(persisted)
+        else:
+            base = dict(_fresh_state(0.0, 0.0))
+            base.update(
+                {
+                    key: value
+                    for key, value in state.items()
+                    if not str(key).startswith("_")
+                }
+            )
+        merged = {
+            key: value
+            for key, value in {
+                **base,
+                **dict(fields),
+                **dict(extra_fields or {}),
+            }.items()
+            if not str(key).startswith("_")
+        }
+        try:
+            return bool(
+                await asyncio.to_thread(
+                    merge_live_signal_metadata,
+                    signal_id,
+                    {self._state_key: merged},
+                )
+            )
+        except Exception:  # except-kind: money-decision
+            logger.warning(
+                "Could not persist supertrend_flip fallback-TP state",
+                extra={"data": {"signal_id": signal_id}},
+            )
+            return False
+
     # ── one position ─────────────────────────────────────────────────────
 
     async def _manage_position(
@@ -1194,7 +2291,21 @@ class LiveSupertrendFlipManager:
         signal_id = str(entry["signal_id"])
         qty = abs(self._position_qty(position))
 
-        if state["phase"] in {PHASE_HALTED, PHASE_DONE}:
+        if state["phase"] == PHASE_HALTED:
+            # S1: a halted plan retries its still-owed fallback TP on the
+            # probe cadence (``_halted_fallback_owed`` already gated this
+            # pass); everything else about a halt stays hands-off.
+            await self._retry_halted_fallback_tp(
+                adapter=adapter,
+                plan=plan,
+                state=state,
+                position=position,
+                signal_id=signal_id,
+                context=context,
+                moment=moment,
+            )
+            return
+        if state["phase"] == PHASE_DONE:
             return
         dirty = False
 
@@ -1202,11 +2313,12 @@ class LiveSupertrendFlipManager:
         # quantity against the entry signal's ledgered fills BEFORE trusting
         # the plan, then persist the binding. A mismatch means the position
         # is not what the entry opened (manual add, stale read, netting) -
-        # halt rather than manage a guess.
-        needs_persist = state.pop("_needs_persist", False)
-        verify_entry = state.pop("_verify_entry_qty", False)
-        if needs_persist or verify_entry:
-            if verify_entry:
+        # halt rather than manage a guess. The ``_`` markers stay on the
+        # state until verification AND the first persist succeed: a halt
+        # raised while they are still set is "not provably ours" and must
+        # get zero broker writes, including the fallback TP (B1).
+        if state.get("_needs_persist") or state.get("_verify_entry_qty"):
+            if state.get("_verify_entry_qty"):
                 filled = float(
                     await asyncio.to_thread(
                         get_live_signal_filled_qty, signal_id
@@ -1226,6 +2338,29 @@ class LiveSupertrendFlipManager:
                         permanent=True,
                     )
             await self._persist_state(signal_id, state)
+            state.pop("_needs_persist", None)
+            state.pop("_verify_entry_qty", None)
+
+        # A fallback TP placed while the workflow was halted or given up
+        # must come off before any close logic resumes: a broker TP at the
+        # TP1 price would close the WHOLE position instead of the tranche.
+        # Removal is DEFERRED (B5): the TP stays in force while this pass's
+        # broker reads run, and comes off inside the first broker mutation
+        # or once the pass completes without one - a probe that still fails
+        # makes zero SLTP writes, so a long outage can never churn the TP
+        # off. Removal failure is fail-closed - the workflow does not
+        # continue to TP1 while an unaccounted broker TP may be in force.
+        fallback_gate: _FallbackTpGate | None = None
+        if self._fallback_tp_unresolved(state):
+            fallback_gate = self._fallback_removal_gate(
+                adapter=adapter,
+                deployment=deployment,
+                signal_id=signal_id,
+                state=state,
+                position=position,
+                plan=plan,
+                context=context,
+            )
 
         # ── TP1 ──────────────────────────────────────────────────────────
         if state["phase"] in _TP1_PHASES:
@@ -1241,7 +2376,12 @@ class LiveSupertrendFlipManager:
                 bar_seconds=bar_seconds,
                 moment=moment,
                 context=context,
+                fallback_gate=fallback_gate,
             ):
+                if fallback_gate is not None and await fallback_gate() is None:
+                    # Shutdown refused the removal: retry next pass, same
+                    # rule as the breakeven amend.
+                    return
                 return
             dirty = True
 
@@ -1260,13 +2400,56 @@ class LiveSupertrendFlipManager:
                 moment=moment,
                 context=context,
                 dirty=dirty,
-                qty=qty,
+                fallback_gate=fallback_gate,
             )
             if finished:
                 return
 
+        if fallback_gate is not None and await fallback_gate() is None:
+            # The pass proved recovery (it completed its reads) but the
+            # shutdown gate refused the removal: persist progress and
+            # retry next pass.
+            if dirty:
+                await self._persist_state(signal_id, state)
+            return
+
         if dirty:
             await self._persist_state(signal_id, state)
+
+    def _fallback_removal_gate(
+        self,
+        *,
+        adapter: BaseLiveAdapter,
+        deployment: LiveDeploymentConfig,
+        signal_id: str,
+        state: dict[str, Any],
+        position: Mapping[str, Any],
+        plan: SupertrendFlipPlan,
+        context: dict[str, Any],
+    ) -> _FallbackTpGate:
+        """The pass's deferred fallback-TP removal, memoized.
+
+        ``_remove_fallback_tp`` runs at most once per pass: inside the
+        first broker mutation, or at pass end when the pass completed its
+        reads without mutating. Exceptions are not memoized - a failed
+        removal fails the pass and the next pass retries.
+        """
+        done: dict[str, bool | None] = {}
+
+        async def _gate() -> bool | None:
+            if "result" not in done:
+                done["result"] = await self._remove_fallback_tp(
+                    adapter=adapter,
+                    deployment=deployment,
+                    signal_id=signal_id,
+                    state=state,
+                    position=position,
+                    plan=plan,
+                    context=context,
+                )
+            return done["result"]
+
+        return _gate
 
     async def _tp1_phase(
         self,
@@ -1282,6 +2465,7 @@ class LiveSupertrendFlipManager:
         bar_seconds: int,
         moment: datetime,
         context: dict[str, Any],
+        fallback_gate: _FallbackTpGate | None = None,
     ) -> bool:
         """Run the TP1 step; ``True`` when the pass ends here.
 
@@ -1300,6 +2484,7 @@ class LiveSupertrendFlipManager:
             bar_seconds=bar_seconds,
             moment=moment,
             context=context,
+            fallback_gate=fallback_gate,
         )
         if state["phase"] in {PHASE_TP1_PENDING, PHASE_BEFORE_TP1}:
             if dirty:
@@ -1322,7 +2507,7 @@ class LiveSupertrendFlipManager:
         moment: datetime,
         context: dict[str, Any],
         dirty: bool,
-        qty: float,
+        fallback_gate: _FallbackTpGate | None = None,
     ) -> tuple[bool, bool]:
         """Breakeven, bar evaluation and the remainder close.
 
@@ -1341,6 +2526,7 @@ class LiveSupertrendFlipManager:
                 state=state,
                 stops=stops,
                 context=context,
+                fallback_gate=fallback_gate,
             )
             if amended is None:
                 # Shutdown refused the mutation: persist progress and
@@ -1385,11 +2571,11 @@ class LiveSupertrendFlipManager:
                 deployment=deployment,
                 symbol=symbol,
                 signal_id=signal_id,
-                position_id=self._position_id(position),
-                qty=qty,
+                position=position,
                 state=state,
                 moment=moment,
                 context=context,
+                fallback_gate=fallback_gate,
             )
             dirty = True
         return dirty, False
@@ -1410,6 +2596,7 @@ class LiveSupertrendFlipManager:
         bar_seconds: int,
         moment: datetime,
         context: dict[str, Any],
+        fallback_gate: _FallbackTpGate | None = None,
     ) -> bool:
         """TP1 trigger, pending resolution and confirmation. Returns dirty."""
         dirty = False
@@ -1429,6 +2616,7 @@ class LiveSupertrendFlipManager:
                 bar_seconds=bar_seconds,
                 moment=moment,
                 context=context,
+                fallback_gate=fallback_gate,
             )
         else:
             resolved = await self._trigger_tp1(
@@ -1442,6 +2630,7 @@ class LiveSupertrendFlipManager:
                 state=state,
                 moment=moment,
                 context=context,
+                fallback_gate=fallback_gate,
             )
         return dirty or resolved
 
@@ -1458,6 +2647,7 @@ class LiveSupertrendFlipManager:
         bar_seconds: int,
         moment: datetime,
         context: dict[str, Any],
+        fallback_gate: _FallbackTpGate | None = None,
     ) -> bool:
         """Resolve a submitted TP1 close; ``True`` when state changed."""
         outcome = await self._confirm_pending_close(
@@ -1508,6 +2698,7 @@ class LiveSupertrendFlipManager:
                 pending_key="tp1",
                 moment=moment,
                 context=context,
+                fallback_gate=fallback_gate,
             )
             return True
         if outcome == "resubmit_same":
@@ -1527,6 +2718,7 @@ class LiveSupertrendFlipManager:
                 attempt=int(state.get("tp1_attempts") or 0),
                 reference_price=None,
                 context=context,
+                fallback_gate=fallback_gate,
             )
             state["tp1_order_id"] = order_id
             state["tp1_signal_id"] = str(
@@ -1552,6 +2744,7 @@ class LiveSupertrendFlipManager:
         state: dict[str, Any],
         moment: datetime,
         context: dict[str, Any],
+        fallback_gate: _FallbackTpGate | None = None,
     ) -> bool:
         """PHASE_BEFORE_TP1: quote check, then maybe submit the tranche."""
         if state.get("tp1_skipped_time") is not None:
@@ -1635,6 +2828,7 @@ class LiveSupertrendFlipManager:
                 attempt=attempt,
                 reference_price=bid,
                 context=context,
+                fallback_gate=fallback_gate,
             )
         except ExitBelowStepError as exc:
             # The broker still refused the volume (a step the adapter did
@@ -1854,6 +3048,7 @@ class LiveSupertrendFlipManager:
         pending_key: str,
         moment: datetime,
         context: dict[str, Any],
+        fallback_gate: _FallbackTpGate | None = None,
     ) -> None:
         """Retry a close whose order died, under the next deterministic id."""
         attempts = int(state.get(f"{pending_key}_attempts") or 0) + 1
@@ -1887,6 +3082,7 @@ class LiveSupertrendFlipManager:
             attempt=attempts,
             reference_price=None,
             context=context,
+            fallback_gate=fallback_gate,
         )
         state[f"{pending_key}_order_id"] = order_id
         logger.warning(
@@ -1910,14 +3106,20 @@ class LiveSupertrendFlipManager:
         attempt: int,
         reference_price: float | None,
         context: dict[str, Any],
+        fallback_gate: _FallbackTpGate | None = None,
     ) -> str:
         """Submit one workflow close through the daemon's exit chokepoints.
 
         Order of gates, mirroring a Discord/internal exit: the per-symbol
         exit lock serialises against other exits, the in-flight check
         defers while ANY exit for this deployment+symbol is working, and
-        the shutdown mutation gate bounds the broker call itself.
+        the shutdown mutation gate bounds the broker call itself. The
+        deferred fallback-TP removal runs FIRST (before any lock is held):
+        a broker TP at the TP1 price would close the whole position instead
+        of the tranche.
         """
+        if fallback_gate is not None:
+            await fallback_gate()
         flip_signal_id = _flip_signal_id(kind, signal_id, event=event, attempt=attempt)
         metadata: dict[str, Any] = {
             "exit_only": True,
@@ -2006,6 +3208,7 @@ class LiveSupertrendFlipManager:
         state: dict[str, Any],
         stops: list[ProtectiveStop],
         context: dict[str, Any],
+        fallback_gate: _FallbackTpGate | None = None,
     ) -> bool | None:
         """Amend the stop to the entry price once the TP1 bar has closed.
 
@@ -2038,21 +3241,43 @@ class LiveSupertrendFlipManager:
         if abs(current.stop_price - entry_price) <= tolerance:
             return True
         target = adapter.round_stop_price(current, entry_price)
-        amended = await self._amend_stop(adapter, current, target)
+        if fallback_gate is not None and await fallback_gate() is None:
+            # The shutdown gate refused the fallback-TP removal, so the
+            # stop amend below would be refused too: same "retry next
+            # pass" answer as a refused amend.
+            return None
+        amended = await self._amend_stop(
+            adapter, current, target, account_id=str(context.get("account_id") or "")
+        )
         if amended is None:
             return None
         context["target_stop"] = amended.stop_price
         return True
 
     async def _amend_stop(
-        self, adapter: BaseLiveAdapter, current: ProtectiveStop, target: float
+        self,
+        adapter: BaseLiveAdapter,
+        current: ProtectiveStop,
+        target: float,
+        *,
+        account_id: str = "",
     ) -> ProtectiveStop | None:
-        if self._mutation_gate is None:
-            return await adapter.amend_protective_stop(current, target)
-        async with self._mutation_gate() as may_mutate:
-            if not may_mutate:
-                return None
-            return await adapter.amend_protective_stop(current, target)
+        # S3: the amend reads the position's current levels and writes them
+        # back atomically, so the read->send window runs inside the account
+        # order-placement lock - a concurrent entry for the same symbol
+        # cannot move the stop between the read and the write.
+        async def _amend() -> ProtectiveStop | None:
+            if self._mutation_gate is None:
+                return await adapter.amend_protective_stop(current, target)
+            async with self._mutation_gate() as may_mutate:
+                if not may_mutate:
+                    return None
+                return await adapter.amend_protective_stop(current, target)
+
+        if account_id:
+            async with account_order_placement(account_id):
+                return await _amend()
+        return await _amend()
 
     # ── Supertrend bars ──────────────────────────────────────────────────
 
@@ -2208,13 +3433,15 @@ class LiveSupertrendFlipManager:
         deployment: LiveDeploymentConfig,
         symbol: str,
         signal_id: str,
-        position_id: int | None,
-        qty: float,
+        position: Mapping[str, Any],
         state: dict[str, Any],
         moment: datetime,
         context: dict[str, Any],
+        fallback_gate: _FallbackTpGate | None = None,
     ) -> None:
         """Close the remainder once the flip exit has been decided."""
+        position_id = self._position_id(position)
+        qty = abs(self._position_qty(position))
         tolerance = self._qty_tolerance(adapter, symbol)
         if qty <= tolerance:
             # Dust or already closed: nothing left to send.
@@ -2249,6 +3476,7 @@ class LiveSupertrendFlipManager:
                 pending_key="exit",
                 moment=moment,
                 context=context,
+                fallback_gate=fallback_gate,
             )
             return
         # "resubmit_same" or no order yet: persist the exit INTENT -
@@ -2275,6 +3503,7 @@ class LiveSupertrendFlipManager:
             attempt=attempt,
             reference_price=None,
             context=context,
+            fallback_gate=fallback_gate,
         )
         state["exit_order_id"] = order_id
         logger.info(
