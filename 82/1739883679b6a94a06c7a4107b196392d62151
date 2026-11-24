@@ -1,0 +1,35 @@
+live_runner/ctrader_adapter.py
+  s_cf18a1388ebe38::t_f5e1268e35f502 4648-4649,4651-4654,4656,4663-4715,5041-5074,5109-5115,5118-5120,5125-5126
+live_runner/supertrend_flip.py
+  s_c3cbbfca9afb52::t_3a656edd2c4390 64,188-194,277-284,738-741,984-988,1143,1145,1148-1149,1208-1246,1257-1285,1466,1476-1479,1488,1498-1500,1536-1548,1555-1556,1562-1566,1576,1580-1591,1647,1652,1655-1665,1667,1684-1687,1694-1695,1697-1734,1754-1810,1835-1843,1868-1872,1876-1880,1905-2053,2068,2099-2101,2112-2113,2134-2139,2142-2144,2296,2298-2304,2306,2330,2332-2335,2355,2360-2367,2371-2405,2420,2439,2463,2482,2532,2553,2573,2587,2604,2655,2675,2701,2785,3005,3039,3063,3070-3073,3075-3076,3165,3198-3202,3395,3432,3459
+tests/test_ctrader_stop_amendment.py
+  s_c3cbbfca9afb52::t_594a76cc61c78c 488,490,507,509,521,523,544,546,555,557,580,582
+tests/test_live_execution_safety.py
+  s_c3cbbfca9afb52::t_dc95f9a98b7301 1883,1914,1916
+tests/test_live_supertrend_flip.py
+  s_c3cbbfca9afb52::t_24b8e887f0ca76 1649-1653,1661-1663,1665,1676,1693-1818,2134-2137,2142
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "821739883679b6a94a06c7a4107b196392d62151",
+  "prompts": {},
+  "sessions": {
+    "s_c3cbbfca9afb52": {
+      "agent_id": {
+        "tool": "devin",
+        "id": "s_c3cbbfca9afb52",
+        "model": "unknown"
+      },
+      "human_author": "itsjustFred <justfred.business@gmail.com>"
+    },
+    "s_cf18a1388ebe38": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "89a0ca19-4b09-4edb-8bd9-cc391f1b137d",
+        "model": "unknown"
+      },
+      "human_author": "itsjustFred <justfred.business@gmail.com>"
+    }
+  }
+}
