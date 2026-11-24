@@ -507,3 +507,70 @@ def test_amend_position_tp_unconfirmed_fails_closed(monkeypatch) -> None:
         asyncio.run(adapter.amend_position_take_profit(7, 1.10000))
     # Broker state never showed the TP: previous state still in force.
     assert not position.HasField("takeProfit") or position.takeProfit == 0
+
+
+def test_amend_position_tp_refuses_a_zero_stop() -> None:
+    """S7/#1: a zero (not just missing) stopLoss is just as unsafe to echo -
+    refuse before any request goes out."""
+    adapter = _adapter()
+    position = _position(stop_loss=0.0, take_profit=None)
+    state = _amend_state(adapter, [position])
+
+    with pytest.raises(ValueError, match="stopLoss"):
+        asyncio.run(adapter.amend_position_take_profit(7, 1.10000))
+    assert state["sent"] == []
+
+
+def test_amend_position_tp_clear_with_zero_tp_is_a_noop() -> None:
+    """S7/#2: the broker reporting ``takeProfit=0.0`` already means clear -
+    no request is sent."""
+    adapter = _adapter()
+    position = _position(stop_loss=1.08000, take_profit=0.0)
+    state = _amend_state(adapter, [position])
+
+    assert asyncio.run(adapter.amend_position_take_profit(7, None)) is None
+    assert state["sent"] == []
+
+
+def test_amend_position_tp_rejects_a_non_positive_price() -> None:
+    """S7/#8: a zero/negative TP target is refused before rounding or send."""
+    adapter = _adapter()
+    position = _position(stop_loss=1.08000, take_profit=None)
+    state = _amend_state(adapter, [position])
+
+    with pytest.raises(ValueError, match="take-profit"):
+        asyncio.run(adapter.amend_position_take_profit(7, 0.0))
+    assert state["sent"] == []
+
+
+def test_base_adapter_tp_amend_stub_raises_not_implemented() -> None:
+    """S7/#18: the base stub must raise - an adapter that never implemented
+    the TP amend cannot be mistaken for support."""
+    from live_runner.base_adapter import BaseLiveAdapter
+
+    with pytest.raises(NotImplementedError):
+        asyncio.run(BaseLiveAdapter.amend_position_take_profit(object(), 1, 1.0))
+
+
+def test_amend_position_tp_unconfirmed_when_the_stop_moved(
+    monkeypatch,
+) -> None:
+    """S4: confirmation requires BOTH the TP at the target AND the echoed
+    stopLoss still in force. A broker that applied the TP but dropped or
+    moved the stop is NOT a confirmed amendment."""
+    import live_runner.ctrader_adapter as ctrader_adapter
+
+    monkeypatch.setattr(ctrader_adapter, "_AMEND_CONFIRM_INTERVAL_SECONDS", 0.001)
+    adapter = _adapter()
+    position = _position(stop_loss=1.08000, take_profit=None)
+    state = _amend_state(adapter, [position])
+
+    def _tp_lands_stop_drops(_request):
+        position.takeProfit = 1.10000
+        position.stopLoss = 0.0  # the stop did NOT survive
+        return _request
+
+    state["on_send"] = _tp_lands_stop_drops
+
+    with pytest.raises(RuntimeError, match="did not confirm"):
+        asyncio.run(adapter.amend_position_take_profit(7, 1.10000))

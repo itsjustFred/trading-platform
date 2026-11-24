@@ -4658,6 +4658,18 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 "current_price": 0.0,
                 "unrealized_pnl": 0.0,
             }
+            # The flip workflow's fallback-TP removal verifies the broker TP
+            # is the one it placed before clearing anything (#168 review):
+            # the position read must carry the TP so a foreign TP fails
+            # closed instead of being silently removed.
+            broker_tp = (
+                parse_optional(getattr(position, "takeProfit", None))
+                if self._has_proto_field(position, "takeProfit")
+                else None
+            )
+            row["take_profit"] = (
+                float(broker_tp) if broker_tp is not None and broker_tp > 0 else None
+            )
             position_id = int(getattr(position, "positionId", 0) or 0)
             if position_id > 0:
                 row["position_id"] = position_id
@@ -5055,6 +5067,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             symbol=symbol,
             expected=target,
             digits=digits,
+            expected_stop=stop_price,
             send_error=send_error,
         )
         return None if target is None else float(confirmed)
@@ -5103,13 +5116,22 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         return request
 
     async def _confirm_position_tp(
-        self, position_id: int, expected: float | None, *, digits: int
+        self,
+        position_id: int,
+        expected: float | None,
+        *,
+        digits: int,
+        expected_stop: float,
     ) -> float | None:
-        """The broker-reported TP once it matches ``expected``.
+        """The broker-reported TP once it matches ``expected`` AND the stop survived.
 
         ``expected=None`` confirms an absent/zero ``takeProfit`` and reports
         ``0.0``; ``None`` means "not yet" (or the position is gone - the
         caller's final read distinguishes the two, same as the stop path).
+        The amend echoes ``stopLoss`` verbatim, so confirmation also requires
+        the broker stop to still sit at ``expected_stop`` within tick
+        tolerance: a TP that landed while the stop was dropped or moved is
+        NOT a confirmed amendment.
         """
         position = await self._fetch_open_position(position_id)
         if position is None:
@@ -5119,14 +5141,38 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             if self._has_proto_field(position, "takeProfit")
             else None
         )
-        if expected is None:
-            return 0.0 if (broker_tp is None or broker_tp <= 0) else None
-        if broker_tp is None or broker_tp <= 0:
+        tp_ok = (
+            (broker_tp is None or broker_tp <= 0)
+            if expected is None
+            else (
+                broker_tp is not None
+                and broker_tp > 0
+                and math.isclose(
+                    broker_tp,
+                    expected,
+                    rel_tol=0.0,
+                    abs_tol=float(Decimal(1).scaleb(-max(0, int(digits)))) * 0.5
+                    + 1e-12,
+                )
+            )
+        )
+        if not tp_ok:
             return None
-        tolerance = float(Decimal(1).scaleb(-max(0, int(digits)))) * 0.5 + 1e-12
-        if math.isclose(broker_tp, expected, rel_tol=0.0, abs_tol=tolerance):
-            return broker_tp
-        return None
+        broker_stop = (
+            parse_optional(getattr(position, "stopLoss", None))
+            if self._has_proto_field(position, "stopLoss")
+            else None
+        )
+        if broker_stop is None or not math.isclose(
+            broker_stop,
+            expected_stop,
+            rel_tol=0.0,
+            abs_tol=float(Decimal(1).scaleb(-max(0, int(digits)))) * 0.5 + 1e-12,
+        ):
+            return None
+        if expected is None:
+            return 0.0
+        return float(broker_tp) if broker_tp is not None else None
 
     async def _confirmed_tp_amendment(
         self,
@@ -5135,6 +5181,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         symbol: str,
         expected: float | None,
         digits: int,
+        expected_stop: float,
         send_error: BaseException | None,
     ) -> float:
         """Poll broker state until the TP shows (or clears), or fail closed."""
@@ -5142,7 +5189,10 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         for attempt in range(_AMEND_CONFIRM_ATTEMPTS):
             try:
                 confirmed = await self._confirm_position_tp(
-                    position_id, expected, digits=digits
+                    position_id,
+                    expected,
+                    digits=digits,
+                    expected_stop=expected_stop,
                 )
             except asyncio.CancelledError:
                 raise
@@ -5164,8 +5214,9 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             raise RuntimeError(
                 f"cTrader did not confirm the take-profit amendment for position "
                 f"{position_id} ({symbol}): broker still reports takeProfit "
-                f"{getattr(position_now, 'takeProfit', None)!r}, requested "
-                f"{expected!r}.{detail}"
+                f"{getattr(position_now, 'takeProfit', None)!r} and stopLoss "
+                f"{getattr(position_now, 'stopLoss', None)!r}, requested TP "
+                f"{expected!r} with stop {expected_stop!r}.{detail}"
             )
         return confirmed
 
