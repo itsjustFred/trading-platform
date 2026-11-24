@@ -38,6 +38,9 @@ Keine Partial Exits implementiert.
 | ATR Stop | Multiplier | 1.5 |
 | Take Profit | R-Multiple | 2.0 |
 
+### Indikator-Semantik (P3, #317)
+Der SuperTrend-Oszillator nutzt `ta.atr`-Baender ab `hl2` mit NaN-Warm-up und sicherer Division (Bandbreite 0 -> `NaN`); WaveTrend folgt dem Cipher-B-Pine (`ta.ema`/`ta.sma`-Seeds) und der Stop-ATR ist `ta.atr` statt SMA(TR). Warm-up-Bars sind `NaN`, nie `0`.
+
 ## Risk-Management
 - Stop-Distanz: ATR-basiert
 - Position Sizing: Runner berechnet die Positionsgroesse ueber `--risk-pct` und `sl_price`

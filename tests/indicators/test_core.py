@@ -134,6 +134,36 @@ class TestEma:
         )
         assert ema(s, 5, seed="first").iloc[:4].isna().all()
 
+    def test_seed_first_skipna_keeps_historical_step_law(self):
+        """``seed="first"`` + ``skipna=True`` must stay bit-identical to the
+        pre-P3 ``alpha * x + (1 - alpha) * prev`` recursion: the Pine
+        ``prev + alpha * (x - prev)`` step is scoped to ``seed="sma"``.
+        The literals below were computed with the historical form on an
+        input (with NaN gaps) where the two forms differ in the last bits;
+        an exact comparison is required — ``rtol`` would hide the drift."""
+        values = pd.Series(
+            [
+                515908.805880605, -158856.83833831002, -482166.4994140733,
+                22549.44273721706, np.nan, 567597.1780695452,
+                -393374.5478421451, np.nan, 166764.07891006232,
+                816225.7703906703, 9373.711634780513, -436324.3112005923,
+                511608.40831444785,
+            ],
+            dtype=float,
+        )
+        out = ema(values, 5, seed="first", skipna=True)
+        expected = pd.Series(
+            [
+                np.nan, np.nan, np.nan, np.nan, np.nan,
+                208996.32063656728, 8206.03114366319, np.nan,
+                61058.7137324629, 312781.06595186534, 211645.28117950374,
+                -4344.5829471949255, 167639.74747335265,
+            ],
+            index=out.index,
+            dtype=float,
+        )
+        pd.testing.assert_series_equal(out, expected, check_exact=True)
+
 
 class TestRma:
     def test_seed_sma_hand_computed(self):
@@ -239,6 +269,36 @@ class TestAtr:
     def test_min_periods_rejected_where_ignored(self, kwargs, match):
         with pytest.raises(ValueError, match=match):
             atr_from_tr(pd.Series([1.0, 2.0, 3.0]), 2, **kwargs)
+
+    def test_atr_ema_seed_first_skipna_keeps_historical_step_law(self):
+        """Same pin as ``TestEma.test_seed_first_skipna_keeps_historical_step_law``
+        for the ``atr_from_tr(smoothing="ema", seed="first", skipna=True)``
+        route into ``_ema_valid``."""
+        tr = pd.Series(
+            [
+                515908.805880605, -158856.83833831002, np.nan,
+                22549.44273721706, -190131.7250991714, 567597.1780695452,
+                -393374.5478421451, -46806.09169528843, 166764.07891006232,
+                816225.7703906703, 9373.711634780513, -436324.3112005923,
+                511608.40831444785,
+            ],
+            dtype=float,
+        )
+        out = atr_from_tr(
+            tr, 3, smoothing="ema", seed="first", skipna=True
+        )
+        expected = pd.Series(
+            [
+                np.nan, np.nan, np.nan, 100537.71325418228,
+                -44797.00592249456, 261400.0860735253, -65987.23088430989,
+                -56396.66128979916, 55183.70881013158, 435704.7396004009,
+                222539.2256175907, -106892.5427915008, 202357.93276147352,
+            ],
+            index=out.index,
+            name=out.name,
+            dtype=float,
+        )
+        pd.testing.assert_series_equal(out, expected, check_exact=True)
 
     def test_rma_rejects_min_periods_for_sma_seed_and_skipna(self):
         s = pd.Series([1.0, 2.0, 3.0, 4.0])
@@ -404,11 +464,15 @@ class TestSupertrend:
     def test_hand_computed_pine_rule(self):
         # 3 bars, period=1, multiplier=1, SMA ATR -> atr == tr == [2,2,2]
         # src = hl2 = [9,10,11]
-        # i=1: raw_low=8, raw_high=12; prev bands NaN -> lower=8, upper=12;
-        #       trend stays +1 (close[1]=10 not < NaN)
-        # i=2: raw_low=9, raw_high=13; close[1]=10 > lower[1]=8 ->
-        #       lower=max(9,8)=9; close[1]=10 < upper[1]=12 ->
-        #       upper=min(13,12)=12; close[2]=11 not < lower[1]=8 -> +1
+        # i=0: raw_low=7, raw_high=11; no previous bands -> nz fallback makes
+        #       up1=7/dn1=11; close[-1] is NaN so bands stay raw (7/11);
+        #       close=9 is not < up1=7 -> trend stays +1.
+        # i=1: raw_low=8, raw_high=12; close[0]=9 > up1=7 ->
+        #       lower=max(8,7)=8; close[0]=9 < dn1=11 -> upper=min(12,11)=11;
+        #       close[1]=10 not < up1=7 -> +1.
+        # i=2: raw_low=9, raw_high=13; close[1]=10 > up1=8 ->
+        #       lower=max(9,8)=9; close[1]=10 < dn1=11 -> upper=min(13,11)=11;
+        #       close[2]=11 not < up1=8 -> +1.
         idx = pd.RangeIndex(3)
         high = pd.Series([10.0, 11.0, 12.0], index=idx)
         low = pd.Series([8.0, 9.0, 10.0], index=idx)
@@ -419,10 +483,10 @@ class TestSupertrend:
             atr_first_bar="hl",
         )
         _assert_close(result.trend, [1.0, 1.0, 1.0])
-        _assert_close(result.lower_band, [np.nan, 8.0, 9.0])
-        _assert_close(result.upper_band, [np.nan, 12.0, 12.0])
+        _assert_close(result.lower_band, [7.0, 8.0, 9.0])
+        _assert_close(result.upper_band, [11.0, 11.0, 11.0])
         _assert_close(result.atr, [2.0, 2.0, 2.0])
-        assert result.ready.tolist() == [False, True, True]
+        assert result.ready.tolist() == [True, True, True]
 
     def test_bands_ordered_and_trend_binary(self):
         high, low, close = _ohlc(80, seed=3)
@@ -624,7 +688,7 @@ class TestNoLookahead:
 
     @pytest.mark.parametrize("frame_kind", ["clean", "nan"])
     @pytest.mark.parametrize(
-        "rule", ["pine", "pine_dema", "pine_superosc", "ta"]
+        "rule", ["pine", "ta"]
     )
     @pytest.mark.parametrize(
         "atr_smoothing,atr_seed,atr_min_periods,atr_skipna",
@@ -698,7 +762,7 @@ class TestWarmupNaN:
 
     def test_ready_is_false_wherever_bands_are_nan(self):
         high, low, close = _ohlc(80, seed=6)
-        for rule in ("pine", "pine_dema", "pine_superosc", "ta"):
+        for rule in ("pine", "ta"):
             result = supertrend(
                 high, low, close, 10, 3.0,
                 atr_smoothing="wilder", atr_seed="first", rule=rule,
@@ -709,7 +773,7 @@ class TestWarmupNaN:
 
     def test_supertrend_direction_never_zero_filled(self):
         high, low, close = _ohlc(60)
-        for rule in ("pine", "pine_dema", "pine_superosc", "ta"):
+        for rule in ("pine", "ta"):
             result = supertrend(
                 high, low, close, 10, 3.0,
                 atr_smoothing="wilder", atr_seed="sma", rule=rule,

@@ -20,58 +20,8 @@ STRATEGY_META = {
 import numpy as np
 import pandas as pd
 
+from shared.indicators import presets
 from shared.strategy_markers import entry_exit_markers
-
-
-def _calc_supertrend_osc(df: pd.DataFrame, length: int, mult: float):
-    close = df["close"].values
-    high = df["high"].values
-    low = df["low"].values
-    hl2 = (high + low) / 2
-
-    tr = np.zeros(len(close))
-    for i in range(1, len(close)):
-        tr[i] = max(high[i] - low[i], abs(high[i] - close[i - 1]), abs(low[i] - close[i - 1]))
-    atr = pd.Series(tr, index=df.index).rolling(length).mean()
-
-    upper = np.full(len(close), np.nan)
-    lower = np.full(len(close), np.nan)
-    trend = np.ones(len(close))
-
-    atr_values = atr.values
-    for i in range(length, len(close)):
-        up = hl2[i] + mult * atr_values[i]
-        dn = hl2[i] - mult * atr_values[i]
-
-        if i > 0 and not np.isnan(upper[i - 1]):
-            upper[i] = min(up, upper[i - 1]) if close[i - 1] < upper[i - 1] else up
-            lower[i] = max(dn, lower[i - 1]) if close[i - 1] > lower[i - 1] else dn
-        else:
-            upper[i] = up
-            lower[i] = dn
-
-        if i > 0 and not np.isnan(upper[i - 1]) and close[i] > upper[i - 1]:
-            trend[i] = 1
-        elif i > 0 and not np.isnan(lower[i - 1]) and close[i] < lower[i - 1]:
-            trend[i] = 0
-        else:
-            trend[i] = trend[i - 1] if i > 0 else 1
-
-    spt = np.where(trend == 1, lower, upper)
-    den = upper - lower
-    den = np.where(np.abs(den) < 1e-10, 1e-10, den)
-    osc = np.clip((close - spt) / den, -1, 1)
-    return pd.Series(osc, index=df.index)
-
-
-def _calc_wavetrend(df: pd.DataFrame, channel_len: int, avg_len: int, ma_len: int):
-    hlc3 = (df["high"] + df["low"] + df["close"]) / 3
-    esa = hlc3.ewm(span=channel_len, adjust=False).mean()
-    de = (hlc3 - esa).abs().ewm(span=channel_len, adjust=False).mean()
-    ci = (hlc3 - esa) / (0.015 * de).clip(lower=1e-10)
-    wt1 = ci.ewm(span=avg_len, adjust=False).mean()
-    wt2 = wt1.rolling(ma_len).mean()
-    return wt1, wt2
 
 
 def generate_signals(df: pd.DataFrame, params: dict):
@@ -85,21 +35,15 @@ def generate_signals(df: pd.DataFrame, params: dict):
     tp_r_mult = params.get("tp_r_mult", 2.0)
 
     close = df["close"]
-    osc = _calc_supertrend_osc(df, sto_length, sto_mult)
-    wt1, wt2 = _calc_wavetrend(df, vmc_channel, vmc_avg, vmc_ma)
+    osc = presets.superosc_luxalgo(df["high"], df["low"], df["close"], sto_length, sto_mult)
+    wt1, wt2 = presets.wavetrend_vumanchu(
+        df["high"], df["low"], df["close"], vmc_channel, vmc_avg, vmc_ma
+    )
 
     wt_cross_up = (wt1 > wt2) & (wt1.shift(1) <= wt2.shift(1))
     buy_signal = (osc > 0) & wt_cross_up & (wt2 <= -60)
 
-    tr = pd.concat(
-        [
-            df["high"] - df["low"],
-            (df["high"] - close.shift(1)).abs(),
-            (df["low"] - close.shift(1)).abs(),
-        ],
-        axis=1,
-    ).max(axis=1)
-    atr = tr.rolling(atr_sl_len).mean()
+    atr = presets.atr_pine_ta(df["high"], df["low"], df["close"], atr_sl_len)
 
     entries = pd.Series(False, index=df.index)
     exits = pd.Series(False, index=df.index)

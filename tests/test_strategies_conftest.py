@@ -268,3 +268,13 @@ def test_missing_dataset_message_names_the_opt_in(gate):
         gate._require_ohlcv_coverage("US500", "1h", "2025-01-01", "2025-03-31")
 
     assert "TP_TEST_OHLCV_DIR" in str(excinfo.value)
+
+
+def test_missing_dataset_message_names_the_requested_window(gate):
+    """A skip must say which data window is missing, not just the symbol."""
+    with pytest.raises(pytest.skip.Exception) as excinfo:
+        gate._require_ohlcv_coverage("US500", "1h", "2025-04-01", "2025-06-30")
+
+    message = str(excinfo.value)
+    assert "US500/1h" in message
+    assert "2025-04-01..2025-06-30" in message

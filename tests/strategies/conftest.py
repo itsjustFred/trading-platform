@@ -236,8 +236,10 @@ def _require_ohlcv_coverage(symbol: str, timeframe: str, start: str, end: str) -
     """
     paths = _candidate_ohlcv_paths(symbol, timeframe)
     if not paths:
+        window = f"{start}..{end}" if start or end else "the requested window"
         _data_gate_result(
-            f"missing OHLCV dataset for {symbol}/{timeframe} under {_ohlcv_root()} "
+            f"missing OHLCV dataset for {symbol}/{timeframe} covering {window} "
+            f"under {_ohlcv_root()} "
             f"(point {TEST_OHLCV_DIR_ENV} at a local dataset root to use one)"
         )
         return
