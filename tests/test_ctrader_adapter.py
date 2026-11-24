@@ -477,6 +477,69 @@ def test_send_request_rejects_foreign_account_response(caplog) -> None:
     )
 
 
+@pytest.mark.parametrize(
+    "response_kind",
+    ["application_auth", "account_auth", "error_without_account"],
+)
+def test_send_request_accepts_app_level_and_own_account_responses(
+    response_kind: str,
+) -> None:
+    """App-level and own-account responses must survive the foreign-account
+    guard; an ``ErrorRes`` without an account id is an API error, not a
+    foreign-account ``RuntimeError``."""
+    from ctrader_open_api import Protobuf
+    from ctrader_open_api.messages.OpenApiCommonMessages_pb2 import ProtoMessage
+    from ctrader_open_api.messages.OpenApiMessages_pb2 import (
+        ProtoOAAccountAuthRes,
+        ProtoOAApplicationAuthRes,
+        ProtoOAErrorRes,
+        ProtoOANewOrderReq,
+    )
+
+    account_id = 46736452
+    if response_kind == "application_auth":
+        payload = ProtoOAApplicationAuthRes()
+    elif response_kind == "account_auth":
+        payload = ProtoOAAccountAuthRes(ctidTraderAccountId=account_id)
+    else:
+        payload = ProtoOAErrorRes(errorCode="X")
+
+    async def _run():
+        adapter = CTraderLiveAdapter(
+            app_id="app",
+            app_secret="secret",
+            access_token="token",
+            account_id=str(account_id),
+        )
+        adapter._loop = asyncio.get_running_loop()
+        adapter._Protobuf = Protobuf
+        adapter._ProtoOAErrorRes = ProtoOAErrorRes
+
+        class _Deferred:
+            def asFuture(self, _loop):
+                future = _loop.create_future()
+                future.set_result(_wire_payload(ProtoMessage, payload))
+                return future
+
+        class _Client:
+            def send(self, _request, **kwargs):
+                return _Deferred()
+
+        adapter._client = _Client()
+        try:
+            return await adapter._send_request(ProtoOANewOrderReq(), timeout_seconds=15)
+        except Exception as exc:
+            return exc
+
+    result = asyncio.run(_run())
+
+    if response_kind == "error_without_account":
+        assert type(result) is CTraderApiError
+        assert result.error_code == "X"
+    else:
+        assert result == payload
+
+
 def test_send_request_logs_timeout_with_request_identity(caplog) -> None:
     """A timed-out request logs its payload type and clientMsgId at the point
     of failure, for orders included - not only via the final connect-failure

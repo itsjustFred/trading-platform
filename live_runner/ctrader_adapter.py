@@ -1791,7 +1791,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 if name in data:
                     continue
                 value = getattr(source, name, None)
-                if value is not None and value != "":
+                if value not in (None, "", 0):
                     data[name] = value
         logger.warning(
             "Dropping cTrader payload for a different account",
