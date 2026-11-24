@@ -1,0 +1,43 @@
+live_runner/supertrend_flip.py
+  s_07f6905d92fc96::t_15beca2d7b8883 242-243,246-247,254-270,449-460,496,526,702,717,719-732,797-806,895-897,965-974,1128-1130,1132-1143,1165-1169,1185-1189,1210-1215,1220-1234,1238-1245,1311-1322,1413-1414,1422-1424,1440-1441,1454-1561,1571-1572,1578-1580,1590-1596,1598-1606,1619-1624,1627,1629-1669,1674-1678,1680-1690,1692,1698,1704-1715,1719-1720,1727,1729-1732,1760,1764,1775-1781,1784,1791-1865,1869,1871-1878,1880,1883-1889,1903-1905,1907,1919-1938,1944-1945,1951-1957,1962-1967,1982-1986,2026-2040,2048-2053,2073-2074,2084,2088,2908-2910,2917-2922,2924-2939
+tests/test_ctrader_stop_amendment.py
+  s_07f6905d92fc96::t_b2c9c115809edf 510-576
+tests/test_live_supertrend_flip.py
+  s_72b81e13fd197a::t_05775850741a84 143-150,1648-1651,1660-1676,1679,1682-1685,1687,1780-2154
+docs/live-deploy-runbook.md
+  s_b704f3ebe53b7c::t_ee4088ac98e849 125-142
+live_runner/ctrader_adapter.py
+  s_b704f3ebe53b7c::t_0c511c3af971fa 4661-4672,5070,5119-5124,5126,5131-5134,5144-5159,5161-5175,5184,5192-5195,5217-5219
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "debe71efb250339a160e90ff975803f2f6e2af15",
+  "prompts": {},
+  "sessions": {
+    "s_07f6905d92fc96": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "506789eb-415f-4b01-b888-95b051664cc7",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "itsjustFred <justfred.business@gmail.com>"
+    },
+    "s_72b81e13fd197a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b26fdc3a-6176-466d-9ab1-1ac4055c946c",
+        "model": "unknown"
+      },
+      "human_author": "itsjustFred <justfred.business@gmail.com>"
+    },
+    "s_b704f3ebe53b7c": {
+      "agent_id": {
+        "tool": "devin",
+        "id": "s_b704f3ebe53b7c",
+        "model": "unknown"
+      },
+      "human_author": "itsjustFred <justfred.business@gmail.com>"
+    }
+  }
+}
