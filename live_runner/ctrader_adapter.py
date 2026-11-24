@@ -408,12 +408,25 @@ def decode_trendbars_response(
     return rows
 
 
-#: How far back the deal-list pass looks for broker-side position closes the
-#: stream never saw (#144). Bounded on purpose: an older unattributed close is
-#: surfaced by the ledger-mismatch alert and periodic broker reconciliation,
-#: not silently booked from a stale snapshot.
-BROKER_CLOSE_RECONCILE_LOOKBACK_MS = 7 * 24 * 60 * 60 * 1000
+#: Per-request span of the broker-close deal-list pass (#144): the pass pages
+#: backwards in windows of this size from ``now`` down to its floor (see
+#: ``_reconcile_broker_side_closes``). A window that still reports ``hasMore``
+#: is re-fetched halved, down to ``BROKER_CLOSE_RECONCILE_MIN_WINDOW_MS``
+#: before the truncation is only logged.
+BROKER_CLOSE_RECONCILE_WINDOW_MS = 7 * 24 * 60 * 60 * 1000
 BROKER_CLOSE_RECONCILE_MAX_ROWS = 1000
+#: Smallest deal-list window the pass will subdivide to before accepting the
+#: broker's ``hasMore`` truncation as a loud warning instead of paging further.
+BROKER_CLOSE_RECONCILE_MIN_WINDOW_MS = 60 * 60 * 1000
+#: How far back the paged pass may reach at all. A close older than this - or
+#: one the deal list cannot attribute - stays with the ledger-mismatch halt
+#: and operator reconciliation; the pass bounds its connect-time cost rather
+#: than brute-forcing years of account deal history.
+BROKER_CLOSE_RECONCILE_MAX_LOOKBACK_MS = 400 * 24 * 60 * 60 * 1000
+#: Slack subtracted from the oldest persisted signal's timestamp: an opening
+#: deal cannot precede its signal by more than broker/local clock skew and
+#: order lead time, but the margin keeps a skewed clock from hiding a close.
+BROKER_CLOSE_RECONCILE_OPEN_MARGIN_MS = 24 * 60 * 60 * 1000
 
 
 def _power_of_ten_exponent(value: int) -> int:
@@ -2543,8 +2556,34 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             )
         # #144: broker-side position closes have no signal of ours, so the
         # per-signal pass above can never see them; the account deal list can.
-        recovered += await self._reconcile_broker_side_closes()
+        # The scan floor is the oldest persisted signal's timestamp: a close
+        # can only belong to a position one of our signals opened. The flat
+        # 7-day window this replaced let a close older than a week - a daemon
+        # down that long, or a position held for months - keep the ledger
+        # permanently mismatched (the 2026-11-24 soak's stale EURUSD lot).
+        recovered += await self._reconcile_broker_side_closes(
+            not_before_ms=await self._oldest_reconciled_signal_ms(signal_ids)
+        )
         return recovered
+
+    async def _oldest_reconciled_signal_ms(self, signal_ids: list[str]) -> int | None:
+        """The oldest persisted signal's timestamp in ms, or ``None``.
+
+        ``signal_ids`` is ordered newest-first, so its last id is the oldest
+        signal this account ever persisted - the earliest moment a
+        broker-side close could belong to a position we opened.
+        """
+        if not signal_ids:
+            return None
+        cursor = await asyncio.to_thread(
+            get_live_signal_reconciliation_cursor, signal_ids[-1]
+        )
+        if cursor is None:
+            return None
+        timestamp = cursor[0]
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.replace(tzinfo=timezone.utc)
+        return int(timestamp.timestamp() * 1000)
 
     def _parse_signal_uuid(self, signal_id: str) -> UUID | None:
         try:
@@ -5735,26 +5774,20 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             return 1
         return 0
 
-    async def _reconcile_broker_side_closes(self) -> int:
-        """Backfill position closes the stream never delivered (#144).
+    async def _fetch_broker_close_deal_window(
+        self, start_ms: int, end_ms: int
+    ) -> list[Any] | None:
+        """One deal-list window, halved while the broker reports ``hasMore``.
 
-        The per-signal pass above only re-reads orders this platform submitted;
-        a broker-side close has no signal, so it is invisible there. The account
-        deal list is the only place it shows up. Bounded to a recent window and
-        a row cap: anything older or unattributable is flagged for the periodic
-        broker reconciliation rather than booked from stale state.
+        ``None`` means the fetch failed and the caller stops paging; deals
+        gathered from earlier windows are still reconciled (booking is
+        idempotent through the shared deal-id dedupe key, and the next connect
+        re-runs the whole scan).
         """
-        if (
-            self._ProtoOADealListReq is None
-            or self._ProtoOADealListRes is None
-            or self._ProtoOADealStatus is None
-        ):
-            return 0
-        now_ms = int(time.time() * 1000)
         request = self._ProtoOADealListReq()
         request.ctidTraderAccountId = self.ctid_trader_account_id
-        request.fromTimestamp = now_ms - BROKER_CLOSE_RECONCILE_LOOKBACK_MS
-        request.toTimestamp = now_ms
+        request.fromTimestamp = int(start_ms)
+        request.toTimestamp = int(end_ms)
         request.maxRows = BROKER_CLOSE_RECONCILE_MAX_ROWS
         try:
             response = await self._send_request_with_refresh_retry(
@@ -5767,41 +5800,126 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 extra={
                     "data": {
                         "account_id": self.account_config_id,
+                        "from_ms": start_ms,
+                        "to_ms": end_ms,
                         "error": str(exc),
                     }
                 },
             )
-            return 0
+            return None
         if not isinstance(response, self._ProtoOADealListRes):
             logger.warning(
                 "Unexpected deal-list response during broker-close reconcile",
                 extra={
                     "data": {
                         "account_id": self.account_config_id,
+                        "from_ms": start_ms,
+                        "to_ms": end_ms,
                         "response_type": type(response).__name__,
                     }
                 },
             )
-            return 0
+            return None
+        deals = list(getattr(response, "deal", []) or [])
         if getattr(response, "hasMore", False):
-            # maxRows truncated the window: older closes in it are silently
-            # missed, so the truncation has to be loud rather than discovered
-            # as a ledger gap weeks later.
+            if end_ms - start_ms > BROKER_CLOSE_RECONCILE_MIN_WINDOW_MS:
+                # maxRows truncated the window: page deeper instead of
+                # accepting the miss. Halving keeps every sub-window under
+                # the row cap where the account's deal rate allows it.
+                mid_ms = start_ms + (end_ms - start_ms) // 2
+                first = await self._fetch_broker_close_deal_window(start_ms, mid_ms)
+                second = await self._fetch_broker_close_deal_window(mid_ms, end_ms)
+                if first is None or second is None:
+                    return None
+                return first + second
+            # Even a minimum-width window holds more deals than one response
+            # can carry: the oldest of them are missed, so the truncation has
+            # to be loud rather than discovered as a ledger gap weeks later.
             logger.warning(
-                "cTrader deal list reports hasMore during broker-close reconcile; "
-                "closes older than the returned rows are not reconciled this pass",
+                "cTrader deal list reports hasMore at the minimum "
+                "broker-close reconcile window; closes inside it may be "
+                "missed this pass",
                 extra={
                     "data": {
                         "account_id": self.account_config_id,
+                        "from_ms": start_ms,
+                        "to_ms": end_ms,
                         "max_rows": BROKER_CLOSE_RECONCILE_MAX_ROWS,
                     }
                 },
             )
+        return deals
+
+    async def _reconcile_broker_side_closes(
+        self, *, not_before_ms: int | None = None
+    ) -> int:
+        """Backfill position closes the stream never delivered (#144).
+
+        The per-signal pass above only re-reads orders this platform submitted;
+        a broker-side close has no signal, so it is invisible there. The account
+        deal list is the only place it shows up.
+
+        The scan pages backwards in ``BROKER_CLOSE_RECONCILE_WINDOW_MS``
+        windows from ``now`` down to a floor: the oldest persisted signal's
+        timestamp minus ``BROKER_CLOSE_RECONCILE_OPEN_MARGIN_MS`` - a close can
+        only belong to a position one of our signals opened - and never below
+        ``now - BROKER_CLOSE_RECONCILE_MAX_LOOKBACK_MS``. A flat 7-day window
+        used to be the whole scan, so a close older than a week (a daemon down
+        that long, or a position held for months) was never fetched: the
+        ledger kept the quantity forever and periodic broker reconciliation
+        halted the account on every pass. Anything older than the floor, or
+        unattributable, is still left to the ledger-mismatch alert and
+        operator reconciliation rather than booked from a stale snapshot.
+        """
+        if (
+            self._ProtoOADealListReq is None
+            or self._ProtoOADealListRes is None
+            or self._ProtoOADealStatus is None
+        ):
+            return 0
+        now_ms = int(time.time() * 1000)
+        floor_ms = now_ms - BROKER_CLOSE_RECONCILE_WINDOW_MS
+        if not_before_ms is not None:
+            signal_floor_ms = int(not_before_ms) - BROKER_CLOSE_RECONCILE_OPEN_MARGIN_MS
+            lookback_floor_ms = now_ms - BROKER_CLOSE_RECONCILE_MAX_LOOKBACK_MS
+            floor_ms = max(lookback_floor_ms, min(floor_ms, signal_floor_ms))
+            if signal_floor_ms < lookback_floor_ms:
+                logger.warning(
+                    "cTrader broker-close reconcile floor truncated by the "
+                    "maximum lookback; older closes are not reconciled this pass",
+                    extra={
+                        "data": {
+                            "account_id": self.account_config_id,
+                            "max_lookback_ms": BROKER_CLOSE_RECONCILE_MAX_LOOKBACK_MS,
+                        }
+                    },
+                )
+        deals: list[Any] = []
+        window_start = floor_ms
+        while window_start < now_ms:
+            window_end = min(
+                window_start + BROKER_CLOSE_RECONCILE_WINDOW_MS, now_ms
+            )
+            window_deals = await self._fetch_broker_close_deal_window(
+                window_start, window_end
+            )
+            if window_deals is None:
+                break
+            deals.extend(window_deals)
+            window_start = window_end
         recovered = 0
         parent_cache: dict[int, tuple[str | None, str]] = {}
         order_cache: dict[int, Any | None] = {}
         own_order_cache: dict[int, bool] = {}
-        for deal in getattr(response, "deal", []) or []:
+        seen_deal_ids: set[int] = set()
+        for deal in deals:
+            # Windows abut and subdivided halves can both return a boundary
+            # deal; the per-deal work (broker reads + dedupe checks) runs once.
+            deal_id = _deal_id_or_none(deal)
+            if deal_id is not None:
+                if deal_id in seen_deal_ids:
+                    continue
+                seen_deal_ids.add(deal_id)
             try:
                 recovered += await self._reconcile_position_close_deal(
                     deal,
@@ -5817,7 +5935,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                     extra={
                         "data": {
                             "account_id": self.account_config_id,
-                            "deal_id": _deal_id_or_none(deal),
+                            "deal_id": deal_id,
                             "error": str(exc),
                         }
                     },

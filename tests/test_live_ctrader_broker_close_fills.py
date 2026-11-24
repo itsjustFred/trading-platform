@@ -236,7 +236,27 @@ def _adapter(
         if isinstance(request, _OrderListReq):
             return _OrderListRes(orders_by_position.get(int(request.positionId), []))
         if isinstance(request, _DealListReq):
-            response = _DealListRes(list(deal_list or []))
+            # Honour the request's from/to window like the broker does: a deal
+            # outside it is not returned, which is what made the flat 7-day
+            # scan miss closes older than a week.
+            from_ms = int(getattr(request, "fromTimestamp", 0) or 0)
+            to_ms = int(getattr(request, "toTimestamp", 0) or 0)
+
+            def _deal_ts(deal: Any) -> int:
+                for attr in ("executionTimestamp", "utcLastUpdateTimestamp", "createTimestamp"):
+                    value = int(getattr(deal, attr, 0) or 0)
+                    if value:
+                        return value
+                return 0
+
+            response = _DealListRes(
+                [
+                    deal
+                    for deal in (deal_list or [])
+                    if not _deal_ts(deal)
+                    or from_ms <= _deal_ts(deal) < to_ms
+                ]
+            )
             response.hasMore = deal_list_has_more
             return response
         if isinstance(request, _OrderDetailsReq):
@@ -485,6 +505,73 @@ def test_reconcile_backfills_a_position_close_missed_while_down(database) -> Non
 
     assert recovered >= 1
     assert _ledger(database) == pytest.approx(0.0)
+
+
+def test_reconcile_books_a_close_older_than_the_flat_week_window(database) -> None:
+    """The 2026-11-24 soak regression: a position closed at the broker while
+    the daemon was down for weeks kept its ledger quantity forever, because
+    the deal-list pass only scanned the last 7 days. The scan now pages back
+    to the oldest persisted signal's timestamp."""
+    signal_id = _persist_entry(database, qty=10.0)
+    # The entry signal is timestamped T0 (months before "now"); the close deal
+    # sits one hour later - far outside any 7-day window ending today.
+    old_close = _close_deal(deal_id=9001, timestamp_ms=T0_MS + 3_600_000)
+    adapter = _reconcilable_adapter(
+        database,
+        position_orders={POSITION_ID: [_entry_order(signal_id)]},
+        deal_list=[old_close],
+        order_details={CLOSE_ORDER_ID: _closing_order()},
+    )
+
+    recovered = asyncio.run(adapter.reconcile_executions())
+
+    assert recovered >= 1
+    assert _ledger(database) == pytest.approx(0.0)
+
+
+def test_reconcile_close_beyond_max_lookback_is_not_booked(database, caplog) -> None:
+    """The paged scan is still bounded: a signal (and so any position it
+    opened) older than ``BROKER_CLOSE_RECONCILE_MAX_LOOKBACK_MS`` is outside
+    the pass, and the truncation is logged rather than silent."""
+    import logging
+
+    ancient = T0.timestamp() - (401 * 24 * 60 * 60)
+    signal = LiveSignal(
+        deployment_id=DEP_ENTRY,
+        symbol="AAPL",
+        action="buy",
+        theoretical_price=100.0,
+        timestamp=datetime.fromtimestamp(ancient, tz=timezone.utc),
+        metadata={"broker_order_id": str(ENTRY_ORDER_ID)},
+    )
+    signal_id, created = database.save_live_signal(signal)
+    assert created
+    assert database.save_live_execution(
+        LiveExecution(
+            signal_id=UUID(signal_id),
+            actual_price=100.0,
+            actual_price_observed="observed",
+            filled_qty=10.0,
+            commission=0.0,
+            timestamp=signal.timestamp,
+            broker_order_id=str(ENTRY_ORDER_ID),
+            dedupe_key=f"ctrader:test:entry:{signal_id}",
+        )
+    )
+    ancient_close = _close_deal(
+        deal_id=9001, timestamp_ms=int(ancient * 1000) + 3_600_000
+    )
+    adapter = _reconcilable_adapter(
+        database,
+        position_orders={POSITION_ID: [_entry_order(signal_id)]},
+        deal_list=[ancient_close],
+    )
+
+    with caplog.at_level(logging.WARNING):
+        asyncio.run(adapter.reconcile_executions())
+
+    assert _ledger(database) == pytest.approx(10.0)
+    assert any("maximum lookback" in record.getMessage() for record in caplog.records)
 
 
 def test_reconcile_skips_a_close_our_own_exit_order_made(database) -> None:
