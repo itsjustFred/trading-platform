@@ -1646,9 +1646,11 @@ def test_fallback_tp_is_idempotent_across_restart(
     live: _Live, surfaced
 ) -> None:
     """Restart safety for the fallback TP (B5): a restarted manager seeds
-    the outage as given-up, so each still-failing probe clears AND re-places
-    the TP - the broker TP is never left off for the ~40-minute retry
-    horizon. Only a pass that proves the outage recovered keeps it cleared."""
+    the outage as given-up so the pass is a probe - but the TP stays in
+    force while the probe's broker reads run. A still-failing probe makes
+    ZERO SLTP writes: the TP is never churned off and re-placed, so a long
+    outage cannot exhaust the attempt budget. Only a pass that proves the
+    outage recovered removes it, once."""
     manager = LiveSupertrendFlipManager()
     _drive_quote_outage(live, manager, 46)
     assert live.adapter.tp_amend_calls == [TP1_PRICE]
@@ -1656,13 +1658,11 @@ def test_fallback_tp_is_idempotent_across_restart(
     restarted = LiveSupertrendFlipManager()
     for minute in range(46, 62):
         live.tick(restarted, _at(minute * 1.0 + 0.1))
+        # The TP is in force at the end of EVERY pass, failing probes
+        # included: no clear, no re-place, no writes at all.
+        assert live.adapter.position_tp == TP1_PRICE
 
-    # Two probes ran (46.1 seeded, 61.1 paced): each removed the TP and the
-    # failed pass re-placed it. The TP is in force at the end of every pass.
-    assert live.adapter.tp_amend_calls == [
-        TP1_PRICE, None, TP1_PRICE, None, TP1_PRICE
-    ]
-    assert live.adapter.position_tp == TP1_PRICE
+    assert live.adapter.tp_amend_calls == [TP1_PRICE]
     assert live.state()["fallback_tp_price"] == TP1_PRICE
     assert live.state()["fallback_tp_cleared"] is False
     assert live.adapter.orders == []
@@ -1673,7 +1673,7 @@ def test_fallback_tp_is_idempotent_across_restart(
     live.adapter.quote_error = None
     live.tick(restarted, _at(77.0))
 
-    assert live.adapter.tp_amend_calls[-1] is None
+    assert live.adapter.tp_amend_calls == [TP1_PRICE, None]
     assert live.adapter.position_tp is None
     assert live.state()["fallback_tp_cleared"] is True
     assert live.state()["fallback_tp_attempts"] == 0
@@ -1688,6 +1688,132 @@ def test_fallback_tp_is_idempotent_across_restart(
     assert live.adapter.position_tp == TP1_PRICE
     assert live.state()["fallback_tp_price"] == TP1_PRICE
     assert live.adapter.orders == []
+
+
+def test_long_quote_outage_keeps_the_fallback_tp(
+    live: _Live, surfaced
+) -> None:
+    """R2: a 3-hour outage must never strip the fallback TP. Probes that
+    still fail make zero SLTP writes, so the single confirmed placement
+    stays in force for the whole outage and the attempt budget is never
+    touched - no restart involved."""
+    manager = LiveSupertrendFlipManager()
+    _drive_quote_outage(live, manager, 181)
+
+    # Exactly ONE broker write the whole outage: the confirmed placement.
+    # No remove/re-place churn, so the TP can never be silently lost.
+    assert live.adapter.tp_amend_calls == [TP1_PRICE]
+    assert live.adapter.position_tp == TP1_PRICE
+    assert live.state()["fallback_tp_price"] == TP1_PRICE
+    assert live.state()["fallback_tp_attempts"] == 0
+    assert live.adapter.orders == []
+
+
+def test_long_quote_outage_keeps_the_fallback_tp_across_restart(
+    live: _Live, surfaced
+) -> None:
+    """R2 with a restart mid-outage: the persisted unresolved TP seeds the
+    new manager's first pass as a probe, and every still-failing probe
+    leaves the broker TP alone - the position is never stop-only."""
+    manager = LiveSupertrendFlipManager()
+    _drive_quote_outage(live, manager, 46)
+    assert live.adapter.tp_amend_calls == [TP1_PRICE]
+
+    restarted = LiveSupertrendFlipManager()
+    for minute in range(46, 181):
+        live.tick(restarted, _at(minute * 1.0 + 0.1))
+        assert live.adapter.position_tp == TP1_PRICE
+
+    assert live.adapter.tp_amend_calls == [TP1_PRICE]
+    assert live.state()["fallback_tp_price"] == TP1_PRICE
+    assert live.adapter.orders == []
+
+
+def test_recovery_pass_that_fails_later_keeps_tp_state_consistent(
+    live: _Live, surfaced
+) -> None:
+    """R2: a probe whose reads recover but whose close submit then fails
+    still ends consistent - the TP was removed only because the pass
+    proved recovery before the first broker mutation, and the cleared
+    marker is durable so the next pass does not re-remove or re-place."""
+    manager = LiveSupertrendFlipManager()
+    _drive_quote_outage(live, manager, 46)
+    assert live.adapter.position_tp == TP1_PRICE
+
+    live.adapter.quote_error = None
+    live.adapter.bid = 106.0
+    live.adapter.submit_error = RuntimeError("order gateway down")
+    live.tick(manager, _at(62.0))
+
+    # The TP came off ahead of the (failed) TP1 submit; the cleared marker
+    # persisted, so the workflow is simply retrying the close - no TP is
+    # re-placed and no second clear is sent.
+    assert live.adapter.tp_amend_calls == [TP1_PRICE, None]
+    assert live.adapter.position_tp is None
+    assert live.state()["fallback_tp_cleared"] is True
+    assert live.adapter.orders == []
+
+    live.adapter.submit_error = None
+    # The failed pass kept the give-up probe cadence: the next probe is due
+    # 15 minutes later, still inside the TP1 pending timeout.
+    live.tick(manager, _at(77.0))
+    assert live.adapter.tp_amend_calls == [TP1_PRICE, None]
+    order_entries = [e for e in live.adapter.journal if e.startswith("order:")]
+    assert order_entries, "TP1 close was never submitted after recovery"
+
+
+def test_grown_position_qty_gets_no_fallback_tp(
+    live: _Live, surfaced
+) -> None:
+    """R3: the bound position's quantity growing under the same
+    position_id (a netting add or manual trade) means it is no longer the
+    plan's proven volume - the whole-position fallback TP must NOT be
+    placed, and the give-up alert says the quantity is not proven."""
+    manager = LiveSupertrendFlipManager()
+    live.tick(manager, _at(0.2))
+    assert live.state()["position_id"] == 4242
+    assert live.state()["entry_qty"] == POSITION_QTY
+
+    # Foreign volume joins the same broker position after binding.
+    live.adapter.positions[0]["qty"] = POSITION_QTY * 2.0
+    _drive_quote_outage(live, manager, 46)
+
+    assert live.adapter.tp_amend_calls == []
+    assert live.adapter.position_tp is None
+    assert live.adapter.orders == []
+    critical = [msg for msg, _ in surfaced if "given up" in msg]
+    assert critical
+    assert "not proven" in critical[0]
+
+
+def test_changed_broker_tp_alerts_instead_of_claiming_ours(
+    live: _Live, surfaced
+) -> None:
+    """N-new-1: when the broker TP differs from the one this workflow
+    recorded, the halt alert must say a DIFFERENT take-profit was found -
+    never 'the fallback take-profit is already in place'."""
+    manager = LiveSupertrendFlipManager()
+    _drive_quote_outage(live, manager, 46)
+    assert live.adapter.position_tp == TP1_PRICE
+    assert live.state()["fallback_tp_price"] == TP1_PRICE
+
+    # Someone replaced the broker TP, then the plan hits a permanent halt.
+    live.adapter.position_tp = 103.0
+
+    async def _no_quote(symbol: str):
+        raise NotImplementedError("no quote surface")
+
+    live.adapter.get_quote = _no_quote  # type: ignore[method-assign]
+    live.tick(manager, _at(62.0))
+
+    assert live.state()["phase"] == PHASE_HALTED
+    # The foreign TP was left untouched: no clear, no re-place.
+    assert live.adapter.tp_amend_calls == [TP1_PRICE]
+    assert live.adapter.position_tp == 103.0
+    halt_msgs = [msg for msg, _ in surfaced if "halted" in msg]
+    assert halt_msgs
+    assert "different take-profit" in halt_msgs[-1]
+    assert "already in place" not in halt_msgs[-1]
 
 
 def test_resume_removes_fallback_tp_before_any_tp1_close(
@@ -2005,12 +2131,15 @@ def test_shutdown_gate_refusal_does_not_consume_an_attempt(
     assert live.state().get("fallback_tp_attempts", 0) == 0
     assert any("shutdown gate" in msg for msg, _ in surfaced)
 
-    # Gate opens: the next probe places the TP with a fresh budget.
+    # Gate opens: the next probe places the TP. A CONFIRMED placement does
+    # not consume an attempt - the budget counts only failed or
+    # unconfirmed amends, so a long outage can never exhaust a TP that
+    # keeps landing.
     allowed = True
     for minute in range(46, 64):
         live.tick(manager, _at(minute * 1.0 + 0.1))
     assert live.adapter.tp_amend_calls == [TP1_PRICE]
-    assert live.state()["fallback_tp_attempts"] == 1
+    assert live.state()["fallback_tp_attempts"] == 0
 
 
 def test_tp1_close_in_flight_gets_no_fallback_tp(

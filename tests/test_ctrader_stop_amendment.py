@@ -485,8 +485,9 @@ def test_amend_position_tp_refuses_without_a_readable_stop() -> None:
     position = _position(stop_loss=None, take_profit=None)
     state = _amend_state(adapter, [position])
 
+    amendment = adapter.amend_position_take_profit(7, 1.10000)
     with pytest.raises(ValueError, match="stopLoss"):
-        asyncio.run(adapter.amend_position_take_profit(7, 1.10000))
+        asyncio.run(amendment)
     assert state["sent"] == []
 
 
@@ -503,8 +504,9 @@ def test_amend_position_tp_unconfirmed_fails_closed(monkeypatch) -> None:
 
     state["on_send"] = _timeout
 
+    amendment = adapter.amend_position_take_profit(7, 1.10000)
     with pytest.raises(RuntimeError, match="did not confirm"):
-        asyncio.run(adapter.amend_position_take_profit(7, 1.10000))
+        asyncio.run(amendment)
     # Broker state never showed the TP: previous state still in force.
     assert not position.HasField("takeProfit") or position.takeProfit == 0
 
@@ -516,8 +518,9 @@ def test_amend_position_tp_refuses_a_zero_stop() -> None:
     position = _position(stop_loss=0.0, take_profit=None)
     state = _amend_state(adapter, [position])
 
+    amendment = adapter.amend_position_take_profit(7, 1.10000)
     with pytest.raises(ValueError, match="stopLoss"):
-        asyncio.run(adapter.amend_position_take_profit(7, 1.10000))
+        asyncio.run(amendment)
     assert state["sent"] == []
 
 
@@ -538,8 +541,9 @@ def test_amend_position_tp_rejects_a_non_positive_price() -> None:
     position = _position(stop_loss=1.08000, take_profit=None)
     state = _amend_state(adapter, [position])
 
+    amendment = adapter.amend_position_take_profit(7, 0.0)
     with pytest.raises(ValueError, match="take-profit"):
-        asyncio.run(adapter.amend_position_take_profit(7, 0.0))
+        asyncio.run(amendment)
     assert state["sent"] == []
 
 
@@ -548,8 +552,9 @@ def test_base_adapter_tp_amend_stub_raises_not_implemented() -> None:
     the TP amend cannot be mistaken for support."""
     from live_runner.base_adapter import BaseLiveAdapter
 
+    amendment = BaseLiveAdapter.amend_position_take_profit(object(), 1, 1.0)
     with pytest.raises(NotImplementedError):
-        asyncio.run(BaseLiveAdapter.amend_position_take_profit(object(), 1, 1.0))
+        asyncio.run(amendment)
 
 
 def test_amend_position_tp_unconfirmed_when_the_stop_moved(
@@ -572,5 +577,6 @@ def test_amend_position_tp_unconfirmed_when_the_stop_moved(
 
     state["on_send"] = _tp_lands_stop_drops
 
+    amendment = adapter.amend_position_take_profit(7, 1.10000)
     with pytest.raises(RuntimeError, match="did not confirm"):
-        asyncio.run(adapter.amend_position_take_profit(7, 1.10000))
+        asyncio.run(amendment)

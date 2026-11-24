@@ -4645,54 +4645,73 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._position_ids_by_symbol = {}
         self._position_volumes = observed_volumes
         for position in open_positions:
-            trade_data = getattr(position, "tradeData", None)
-            if trade_data is None:
+            row = self._position_row(position, symbol_id_to_name)
+            if row is None:
                 continue
-            symbol_id = int(getattr(trade_data, "symbolId", 0) or 0)
-            # #80: unmapped ids fail closed (no guessed FX scale).
-            symbol = symbol_id_to_name.get(symbol_id)
-            if symbol is None:
-                raise ValueError(
-                    f"cTrader symbol id {symbol_id!r} is not in the symbols "
-                    "cache; refusing to scale its position with a guess."
+            payload.append(row["row"])
+            if row["position_id"] > 0:
+                observed_position_ids.setdefault(row["symbol"], []).append(
+                    row["position_id"]
                 )
-            volume = parse_money(getattr(trade_data, "volume", 0))
-            qty = _broker_volume_to_qty(
-                volume, self._scale_for(symbol).volume_per_qty
-            )
-            if int(getattr(trade_data, "tradeSide", 0) or 0) == self._ProtoOATradeSide.SELL:
-                qty = -qty
-            normalized_symbol = str(symbol).strip().upper()
-            row: dict[str, Any] = {
-                "symbol": normalized_symbol,
-                "qty": qty,
-                "entry_price": parse_money(getattr(position, "price", 0)),
-                "current_price": 0.0,
-                "unrealized_pnl": 0.0,
-            }
-            # The flip workflow's fallback-TP removal verifies the broker TP
-            # is the one it placed before clearing anything (#168 review):
-            # the position read must carry the TP so a foreign TP fails
-            # closed instead of being silently removed.
-            broker_tp = (
-                parse_optional(getattr(position, "takeProfit", None))
-                if self._has_proto_field(position, "takeProfit")
-                else None
-            )
-            row["take_profit"] = (
-                float(broker_tp) if broker_tp is not None and broker_tp > 0 else None
-            )
-            position_id = int(getattr(position, "positionId", 0) or 0)
-            if position_id > 0:
-                row["position_id"] = position_id
-                observed_position_ids.setdefault(normalized_symbol, []).append(position_id)
-                observed_volumes[position_id] = int(volume)
-            payload.append(row)
+                observed_volumes[row["position_id"]] = row["volume"]
         self._position_ids_by_symbol = {
             symbol: tuple(position_ids)
             for symbol, position_ids in observed_position_ids.items()
         }
         return payload
+
+    def _position_row(
+        self, position: Any, symbol_id_to_name: Mapping[int, str]
+    ) -> dict[str, Any] | None:
+        """One ``get_positions`` row, or ``None`` when there is no trade data."""
+        trade_data = getattr(position, "tradeData", None)
+        if trade_data is None:
+            return None
+        symbol_id = int(getattr(trade_data, "symbolId", 0) or 0)
+        # #80: unmapped ids fail closed (no guessed FX scale).
+        symbol = symbol_id_to_name.get(symbol_id)
+        if symbol is None:
+            raise ValueError(
+                f"cTrader symbol id {symbol_id!r} is not in the symbols "
+                "cache; refusing to scale its position with a guess."
+            )
+        volume = parse_money(getattr(trade_data, "volume", 0))
+        qty = _broker_volume_to_qty(
+            volume, self._scale_for(symbol).volume_per_qty
+        )
+        if int(getattr(trade_data, "tradeSide", 0) or 0) == self._ProtoOATradeSide.SELL:
+            qty = -qty
+        normalized_symbol = str(symbol).strip().upper()
+        # The flip workflow's fallback-TP removal verifies the broker TP
+        # is the one it placed before clearing anything (#168 review):
+        # the position read must carry the TP so a foreign TP fails
+        # closed instead of being silently removed.
+        broker_tp = (
+            parse_optional(getattr(position, "takeProfit", None))
+            if self._has_proto_field(position, "takeProfit")
+            else None
+        )
+        position_id = int(getattr(position, "positionId", 0) or 0)
+        row: dict[str, Any] = {
+            "symbol": normalized_symbol,
+            "qty": qty,
+            "entry_price": parse_money(getattr(position, "price", 0)),
+            "current_price": 0.0,
+            "unrealized_pnl": 0.0,
+            "take_profit": (
+                float(broker_tp)
+                if broker_tp is not None and broker_tp > 0
+                else None
+            ),
+        }
+        if position_id > 0:
+            row["position_id"] = position_id
+        return {
+            "row": row,
+            "symbol": normalized_symbol,
+            "position_id": position_id if position_id > 0 else 0,
+            "volume": int(volume),
+        }
 
     # ── Protective stops / in-place SL-TP amendment (#168) ──────────────────────
     #
@@ -5019,6 +5038,40 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             )
         if self._ProtoOAAmendPositionSLTPReq is None:
             raise RuntimeError("cTrader amend-position-SLTP request type is not loaded")
+        position, symbol, digits, stop_price, current_tp = (
+            await self._position_tp_amend_context(pid)
+        )
+        target = (
+            self._round_take_profit(symbol, take_profit)
+            if take_profit is not None
+            else None
+        )
+        tolerance = float(Decimal(1).scaleb(-max(0, int(digits)))) * 0.5 + 1e-12
+        noop, noop_result = self._tp_amend_noop(target, current_tp, tolerance)
+        if noop:
+            return noop_result
+
+        request = self._build_position_tp_request(pid, position, stop_price, target)
+        send_error = await self._send_amend_position_request(request)
+        confirmed = await self._confirmed_tp_amendment(
+            position_id=pid,
+            symbol=symbol,
+            expected=target,
+            digits=digits,
+            expected_stop=stop_price,
+            send_error=send_error,
+        )
+        return None if target is None else float(confirmed)
+
+    async def _position_tp_amend_context(
+        self, pid: int
+    ) -> tuple[Any, str, int, float, float | None]:
+        """``(position, symbol, price_digits, stop, current TP)`` for an amend.
+
+        Every refusal lives here: a gone position, an unreadable symbolId,
+        or a missing/non-positive ``stopLoss`` (the amend echoes the stop
+        verbatim, so without a readable one it could clear protection).
+        """
         position = await self._fetch_open_position(pid)
         if position is None:
             raise RuntimeError(
@@ -5038,9 +5091,6 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             )
         symbol = self._symbol_name_for_id(symbol_id).strip().upper()
         digits = self._scale_for(symbol).price_digits
-
-        # The stop must be echoed exactly; without a readable one the amend
-        # could clear protection, so it is refused before any request.
         stop_price = (
             parse_optional(getattr(position, "stopLoss", None))
             if self._has_proto_field(position, "stopLoss")
@@ -5056,33 +5106,24 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             if self._has_proto_field(position, "takeProfit")
             else None
         )
-        target = (
-            self._round_take_profit(symbol, take_profit)
-            if take_profit is not None
-            else None
-        )
-        tolerance = float(Decimal(1).scaleb(-max(0, int(digits)))) * 0.5 + 1e-12
+        return position, symbol, digits, stop_price, current_tp
+
+    @staticmethod
+    def _tp_amend_noop(
+        target: float | None, current_tp: float | None, tolerance: float
+    ) -> tuple[bool, float | None]:
+        """``(handled, result)``: True when the broker already matches - no write."""
         if target is None:
             if current_tp is None or current_tp <= 0:
-                return None  # already clear: idempotent, no write
-        elif (
+                return True, None  # already clear: idempotent, no write
+            return False, None
+        if (
             current_tp is not None
             and current_tp > 0
             and math.isclose(current_tp, target, rel_tol=0.0, abs_tol=tolerance)
         ):
-            return float(current_tp)  # already at the target: no write
-
-        request = self._build_position_tp_request(pid, position, stop_price, target)
-        send_error = await self._send_amend_position_request(request)
-        confirmed = await self._confirmed_tp_amendment(
-            position_id=pid,
-            symbol=symbol,
-            expected=target,
-            digits=digits,
-            expected_stop=stop_price,
-            send_error=send_error,
-        )
-        return None if target is None else float(confirmed)
+            return True, float(current_tp)  # already at the target: no write
+        return False, None
 
     def _round_take_profit(self, symbol: str, price: float) -> float:
         """Quantize a take-profit onto the symbol's price grid (nearest tick)."""
