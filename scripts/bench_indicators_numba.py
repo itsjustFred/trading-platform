@@ -1,8 +1,11 @@
 """Benchmark the Supertrend ``"ta"`` recursion and the optional numba kernel.
 
-This is the reproducible harness for the #317 Numba evaluation. It does not
-add a dependency: ``numba`` is already locked transitively via ``vectorbt``.
-When numba is unavailable the script still times the current Python kernel.
+This is the reproducible harness for the #317/#378 Numba evaluation. It does
+not add a dependency: ``numba`` is already locked transitively via
+``vectorbt``. The kernels themselves live in
+``shared.indicators.core`` (``_supertrend_ta_kernel_py`` reference +
+``_supertrend_ta_kernel_nb`` lazy numba dispatch); when numba is
+unavailable the script still times the Python kernel.
 """
 
 from __future__ import annotations
@@ -28,64 +31,7 @@ import _import_origin as _guard
 _guard.ensure_own_checkout("bench_indicators_numba")
 # --- end import-origin guard ---
 import shared  # noqa: F401
-from shared.indicators import core
-
-try:
-    from numba import njit
-except Exception:  # pragma: no cover - optional dependency path
-    njit = None
-
-
-if njit is not None:
-
-    @njit
-    def _supertrend_ta_nb(
-        src: np.ndarray,
-        close: np.ndarray,
-        atr_values: np.ndarray,
-        multiplier: float,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
-        n = close.shape[0]
-        basic_upper = src + multiplier * atr_values
-        basic_lower = src - multiplier * atr_values
-        upper = np.full(n, np.nan)
-        lower = np.full(n, np.nan)
-        trend = np.full(n, -1.0)
-
-        first_valid = -1
-        for i in range(n):
-            if not np.isnan(basic_upper[i]):
-                first_valid = i
-                break
-        if first_valid < 0:
-            return trend, upper, lower, -1
-
-        upper[first_valid] = basic_upper[first_valid]
-        lower[first_valid] = basic_lower[first_valid]
-        trend[first_valid] = (
-            1.0 if close[first_valid] >= lower[first_valid] else -1.0
-        )
-        for i in range(first_valid + 1, n):
-            basic_u = basic_upper[i]
-            basic_l = basic_lower[i]
-            upper_prev = upper[i - 1]
-            lower_prev = lower[i - 1]
-            close_prev = close[i - 1]
-            upper[i] = (
-                basic_u
-                if basic_u < upper_prev or close_prev > upper_prev
-                else upper_prev
-            )
-            lower[i] = (
-                basic_l
-                if basic_l > lower_prev or close_prev < lower_prev
-                else lower_prev
-            )
-            if trend[i - 1] > 0:
-                trend[i] = 1.0 if close[i] > lower[i] else -1.0
-            else:
-                trend[i] = 1.0 if close[i] >= upper[i] else -1.0
-        return trend, upper, lower, first_valid
+from shared.indicators import _numba, core
 
 
 def _arrays(bars: int, period: int, seed: int) -> tuple[np.ndarray, ...]:
@@ -135,32 +81,33 @@ def main() -> None:
     src, close, atr = _arrays(args.bars, args.period, args.seed)
 
     def run_python() -> None:
-        core._supertrend_ta(src, close, atr, args.multiplier)
+        core._supertrend_ta_kernel_py(src, close, atr, args.multiplier)
 
     python_ms = _best_ms(run_python, args.repeats)
     print(f"python _supertrend_ta: {python_ms:.1f} ms")
 
-    if njit is None:
+    if _numba._load_njit() is None:
         print("numba unavailable; skipping @njit comparison")
         return
 
     # Compile/warm the kernel once, then verify it matches the Python loop.
-    py_trend, py_upper, py_lower, py_first = core._supertrend_ta(
+    py_result = core._supertrend_ta_kernel_py(
         src, close, atr, args.multiplier
     )
-    nb_trend, nb_upper, nb_lower, nb_first = _supertrend_ta_nb(
-        src, close, atr, args.multiplier
-    )
-    ok = (
-        py_first == nb_first
-        and _same(py_trend, nb_trend)
-        and _same(py_upper, nb_upper)
-        and _same(py_lower, nb_lower)
+    try:
+        nb_result = core._supertrend_ta_kernel_nb(
+            src, close, atr, args.multiplier
+        )
+    except _numba._NumbaUnavailable:
+        print("numba kernel failed to build; skipping @njit comparison")
+        return
+    ok = py_result[3] == nb_result[3] and all(
+        _same(a, b) for a, b in zip(py_result[:3], nb_result[:3], strict=True)
     )
     print(f"numba parity: {'ok' if ok else 'MISMATCH'}")
 
     def run_numba() -> None:
-        _supertrend_ta_nb(src, close, atr, args.multiplier)
+        core._supertrend_ta_kernel_nb(src, close, atr, args.multiplier)
 
     numba_ms = _best_ms(run_numba, args.repeats)
     print(f"numba _supertrend_ta: {numba_ms:.1f} ms")
