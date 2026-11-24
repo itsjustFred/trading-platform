@@ -1,0 +1,20 @@
+live_runner/ctrader_adapter.py
+  h_f251b30ae7fbf6 387-389,392-403
+live_runner/internal_strategy_runner.py
+  h_f251b30ae7fbf6 558,565-567,1163
+tests/live_runner/test_internal_strategy_runner.py
+  h_f251b30ae7fbf6 326-358
+tests/test_ctrader_trendbars.py
+  h_f251b30ae7fbf6 129-159
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "f89ad7f0155342c26b194f958179b9740863999b",
+  "prompts": {},
+  "humans": {
+    "h_f251b30ae7fbf6": {
+      "author": "itsjustFred <justfred.business@gmail.com>"
+    }
+  }
+}
