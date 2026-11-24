@@ -15,7 +15,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from pathlib import Path
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pandas as pd
 
@@ -1273,11 +1273,15 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._terminal_auth_failure_code = ""
         self._already_logged_in_notified = False
         # Payload types already reported by the foreign-account drop guard in
-        # ``_on_message``; each is logged once so a steady drip cannot flood.
+        # ``_on_message``; only SpotEvent is rate-limited this way (a steady
+        # drip cannot flood), every other dropped payload is logged each time.
         self._dropped_foreign_account_payload_types: set[int] = set()
-        # Monotonic per-adapter suffix for the ``clientMsgId`` ``_send_request``
-        # puts on the wire, so a NO RESPONSE log line identifies the request.
+        # Monotonic per-adapter suffix plus a per-adapter random token for the
+        # ``clientMsgId`` ``_send_request`` puts on the wire, so a NO RESPONSE
+        # log line identifies the request and two adapters can never mint the
+        # same id for the same request sequence.
         self._client_msg_seq = 0
+        self._client_msg_token = uuid4().hex[:12]
         self._refresh_flow = False
 
         self._client_class: Any = None
@@ -1744,22 +1748,54 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         from being queued, persisted or latched under THIS account's
         ``account_config_id``. The payload is dropped, not re-routed: the
         owning adapter's connection never sees it either way, and booking it
-        here would misattribute the fill. Logged once per payload type so a
-        steady drip cannot flood the log on every tick.
+        here would misattribute the fill.
+
+        ``SpotEvent`` is the only type logged once per adapter: quotes arrive
+        on every tick, so a steady drip of foreign quotes would flood the
+        log. A dropped ``ExecutionEvent``/``OrderErrorEvent``/``ErrorRes`` is
+        a real fill, rejection or error on another account that nobody here
+        will book, so every one is logged at WARNING with its order/deal ids
+        for manual reconciliation.
         """
-        if payload_type in self._dropped_foreign_account_payload_types:
+        is_spot = (
+            self._spot_payload_type is not None
+            and payload_type == self._spot_payload_type
+        )
+        if is_spot and payload_type in self._dropped_foreign_account_payload_types:
             return
-        self._dropped_foreign_account_payload_types.add(payload_type)
+        if is_spot:
+            self._dropped_foreign_account_payload_types.add(payload_type)
+        data: dict[str, Any] = {
+            "account_id": self.ctid_trader_account_id,
+            "payload_account_id": payload_account_id,
+            "payload_type": payload_type,
+            "payload_class": type(payload).__name__,
+        }
+        # ``ExecutionEvent`` nests its ids under ``order``/``deal``/``position``
+        # submessages; collect whichever ids the payload actually carries so
+        # the drop can be reconciled against the owning account's records.
+        sources = [payload] + [
+            getattr(payload, name, None) for name in ("order", "deal", "position")
+        ]
+        for source in sources:
+            if source is None:
+                continue
+            for name in (
+                "orderId",
+                "dealId",
+                "positionId",
+                "symbolId",
+                "executionType",
+                "errorCode",
+            ):
+                if name in data:
+                    continue
+                value = getattr(source, name, None)
+                if value is not None and value != "":
+                    data[name] = value
         logger.warning(
             "Dropping cTrader payload for a different account",
-            extra={
-                "data": {
-                    "account_id": self.ctid_trader_account_id,
-                    "payload_account_id": payload_account_id,
-                    "payload_type": payload_type,
-                    "payload_class": type(payload).__name__,
-                }
-            },
+            extra={"data": data},
         )
 
     async def _send_request(self, request: Any, *, timeout_seconds: int = 10) -> Any:
@@ -1767,9 +1803,16 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             raise RuntimeError("cTrader client is not initialized.")
         # An explicit clientMsgId (upstream would use ``str(id(deferred))``)
         # makes the id self-describing and lets a NO RESPONSE log line name
-        # the request that was lost instead of only its account.
+        # the request that was lost instead of only its account. The id is
+        # account-scoped AND process-unique: upstream resolves pending
+        # Deferreds by clientMsgId alone, so ``<PayloadType>-<seq>`` would let
+        # one adapter's response satisfy another adapter's identical pending
+        # request if a payload is ever misrouted again.
         self._client_msg_seq += 1
-        client_msg_id = f"{type(request).__name__}-{self._client_msg_seq}"
+        client_msg_id = (
+            f"{self.ctid_trader_account_id}-{self._client_msg_token}-"
+            f"{type(request).__name__}-{self._client_msg_seq}"
+        )
         deferred = self._client.send(
             request,
             clientMsgId=client_msg_id,
@@ -1779,10 +1822,50 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             response_message = await deferred.asFuture(self._loop)
         except Exception as exc:
             request_exc: Any = exc
-            request_exc.ctrader_request_payload_type = type(request).__name__
-            request_exc.ctrader_client_msg_id = client_msg_id
+            with contextlib.suppress(AttributeError):
+                request_exc.ctrader_request_payload_type = type(request).__name__
+                request_exc.ctrader_client_msg_id = client_msg_id
+            # A request timeout is logged HERE, at the point it happens, for
+            # every request type - orders included - not only when a connect
+            # retry finally gives up and ``_log_connect_failure`` runs.
+            is_response_timeout, timeout_s = _classify_deferred_response_timeout(
+                exc, str(exc)
+            )
+            if is_response_timeout:
+                logger.warning(
+                    "cTrader request timed out with no response",
+                    extra={
+                        "data": {
+                            "account_id": self.ctid_trader_account_id,
+                            "request_payload_type": type(request).__name__,
+                            "client_msg_id": client_msg_id,
+                            "response_timeout_s": timeout_s,
+                        }
+                    },
+                )
             raise
         payload = self._Protobuf.extract(response_message)
+        # Upstream resolves the pending Deferred by clientMsgId alone; the
+        # ``_on_message`` foreign-account guard never sees this path. A
+        # response naming a different account must never be booked here.
+        payload_account_id = _payload_ctid_trader_account_id(payload)
+        if payload_account_id and payload_account_id != self.ctid_trader_account_id:
+            logger.error(
+                "Dropping cTrader response for a different account",
+                extra={
+                    "data": {
+                        "account_id": self.ctid_trader_account_id,
+                        "payload_account_id": payload_account_id,
+                        "payload_class": type(payload).__name__,
+                        "client_msg_id": client_msg_id,
+                    }
+                },
+            )
+            raise RuntimeError(
+                f"cTrader response for foreign account {payload_account_id} "
+                f"on adapter for account {self.ctid_trader_account_id}; "
+                "refusing to use it."
+            )
         if isinstance(payload, self._ProtoOAErrorRes):
             raise CTraderApiError(
                 error_code=str(getattr(payload, "errorCode", "")),

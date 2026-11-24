@@ -126,6 +126,8 @@ def test_load_openapi_types_installs_connection_scoped_protocol(monkeypatch) -> 
         app_id="app", app_secret="secret", access_token="token", account_id="1"
     )
     adapter._client_class = None
+    # Not a real loop: only reached if the stubbed reactor install is bypassed,
+    # and ``_load_openapi_types`` never awaits on it in this test.
     adapter._loop = object()
     monkeypatch.setattr(module, "_ensure_asyncio_twisted_reactor", lambda _loop: None)
 
@@ -210,17 +212,36 @@ def test_on_message_drops_events_for_a_different_account(caplog) -> None:
         ProtoOAOrderErrorEvent,
         ProtoOASpotEvent,
     )
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import (
+        ProtoOAOrder,
+        ProtoOAOrderStatus,
+        ProtoOAOrderType,
+        ProtoOATradeData,
+        ProtoOATradeSide,
+    )
 
     adapter, client, ProtoMessage = _real_proto_message_adapter()
     foreign_account = 11111111
 
     foreign_payloads = [
-        ProtoOAExecutionEvent(ctidTraderAccountId=foreign_account, executionType=2),
+        ProtoOAExecutionEvent(
+            ctidTraderAccountId=foreign_account,
+            executionType=2,
+            order=ProtoOAOrder(
+                orderId=45678,
+                tradeData=ProtoOATradeData(
+                    symbolId=1, volume=1000, tradeSide=ProtoOATradeSide.BUY
+                ),
+                orderType=ProtoOAOrderType.MARKET,
+                orderStatus=ProtoOAOrderStatus.ORDER_STATUS_ACCEPTED,
+            ),
+        ),
         ProtoOASpotEvent(ctidTraderAccountId=foreign_account, symbolId=1),
         ProtoOAOrderErrorEvent(
             ctidTraderAccountId=foreign_account,
             errorCode="TRADING_BAD_VOLUME",
             description="bad volume",
+            orderId=45678,
         ),
         ProtoOAErrorRes(
             ctidTraderAccountId=foreign_account,
@@ -231,8 +252,6 @@ def test_on_message_drops_events_for_a_different_account(caplog) -> None:
 
     with caplog.at_level(logging.WARNING, logger="live-runner"):
         for payload in foreign_payloads:
-            # Delivered twice: the drop is logged once per payload type, not
-            # once per message, so a steady drip cannot flood the log.
             adapter._on_message(client, _wire_payload(ProtoMessage, payload))
             adapter._on_message(client, _wire_payload(ProtoMessage, payload))
 
@@ -244,8 +263,27 @@ def test_on_message_drops_events_for_a_different_account(caplog) -> None:
         for record in caplog.records
         if "different account" in record.getMessage()
     ]
-    assert len(drops) == len(foreign_payloads), [r.getMessage() for r in caplog.records]
+    # SpotEvent is the only rate-limited type (a quote drip cannot flood the
+    # log); every other dropped payload is logged each time so a lost
+    # fill/rejection on the foreign account leaves a trace with its ids.
+    spot_type = ProtoOASpotEvent().payloadType
+    counts: dict[int, int] = {}
+    for record in drops:
+        counts[record.data["payload_type"]] = counts.get(record.data["payload_type"], 0) + 1
+    assert counts[spot_type] == 1
+    for payload in foreign_payloads:
+        expected = 1 if payload.payloadType == spot_type else 2
+        assert counts[payload.payloadType] == expected
+    assert len(drops) == 1 + 2 * (len(foreign_payloads) - 1)
     assert all(record.data["payload_account_id"] == foreign_account for record in drops)
+
+    by_type = {record.data["payload_type"]: record.data for record in drops}
+    assert by_type[ProtoOAExecutionEvent().payloadType]["orderId"] == 45678
+    assert by_type[ProtoOAOrderErrorEvent().payloadType]["orderId"] == 45678
+    assert (
+        by_type[ProtoOAErrorRes().payloadType]["errorCode"]
+        == "TRADING_ACCOUNT_IS_NOT_AUTHORIZED"
+    )
 
 
 def test_on_message_accepts_payloads_for_its_own_account() -> None:
@@ -287,8 +325,9 @@ def test_on_message_accepts_error_res_without_account_id(caplog) -> None:
 
 
 def test_send_request_stamps_client_msg_id_and_failed_await() -> None:
-    """The clientMsgId on the wire names the request type, and a failed await
-    is stamped so the NO RESPONSE log can identify what was lost."""
+    """The clientMsgId on the wire is account-scoped, process-unique and
+    names the request type, and a failed await is stamped so the NO RESPONSE
+    log can identify what was lost."""
     from ctrader_open_api.messages.OpenApiMessages_pb2 import ProtoOANewOrderReq
 
     async def _run():
@@ -321,16 +360,178 @@ def test_send_request_stamps_client_msg_id_and_failed_await() -> None:
 
     _adapter, sent, exc = asyncio.run(_run())
 
-    assert sent["clientMsgId"].startswith("ProtoOANewOrderReq-")
+    # ``<ctidTraderAccountId>-<per-adapter token>-<PayloadType>-<seq>``
+    client_msg_id_parts = sent["clientMsgId"].split("-")
+    assert client_msg_id_parts[0] == "1"
+    assert client_msg_id_parts[1]
+    assert client_msg_id_parts[2] == "ProtoOANewOrderReq"
+    assert client_msg_id_parts[3] == "1"
     assert sent["responseTimeoutInSeconds"] == 15
     assert exc.ctrader_request_payload_type == "ProtoOANewOrderReq"
     assert exc.ctrader_client_msg_id == sent["clientMsgId"]
 
 
+def test_client_msg_ids_are_unique_across_adapters() -> None:
+    """Two adapters must never mint the same ``clientMsgId`` for the same
+    request sequence - upstream ``Client._received`` resolves pending
+    Deferreds by clientMsgId alone, so a collision would let one account's
+    response satisfy the other's identical pending request."""
+    from ctrader_open_api.messages.OpenApiMessages_pb2 import ProtoOANewOrderReq
+
+    class _SendFailed(Exception):
+        pass
+
+    async def _run():
+        ids: list[str] = []
+
+        class _Deferred:
+            def asFuture(self, _loop):
+                future = _loop.create_future()
+                future.set_exception(_SendFailed("send failed"))
+                return future
+
+        class _Client:
+            def send(self, _request, **kwargs):
+                ids.append(kwargs["clientMsgId"])
+                return _Deferred()
+
+        for _ in range(2):
+            adapter = CTraderLiveAdapter(
+                app_id="app",
+                app_secret="secret",
+                access_token="token",
+                account_id="1",
+            )
+            adapter._loop = asyncio.get_running_loop()
+            adapter._client = _Client()
+            with pytest.raises(_SendFailed):
+                await adapter._send_request(ProtoOANewOrderReq(), timeout_seconds=15)
+        return ids
+
+    first_id, second_id = asyncio.run(_run())
+
+    assert first_id != second_id
+    # Both are account-scoped even though the adapters share account "1".
+    assert first_id.startswith("1-")
+    assert second_id.startswith("1-")
+
+
+def test_send_request_rejects_foreign_account_response(caplog) -> None:
+    """A response whose ``ctidTraderAccountId`` names another account must
+    raise and log ERROR - upstream resolves it by clientMsgId without ever
+    passing through the ``_on_message`` foreign-account guard."""
+    import logging
+
+    from ctrader_open_api import Protobuf
+    from ctrader_open_api.messages.OpenApiCommonMessages_pb2 import ProtoMessage
+    from ctrader_open_api.messages.OpenApiMessages_pb2 import (
+        ProtoOAErrorRes,
+        ProtoOANewOrderReq,
+    )
+
+    async def _run():
+        adapter = CTraderLiveAdapter(
+            app_id="app",
+            app_secret="secret",
+            access_token="token",
+            account_id="46736452",
+        )
+        adapter._loop = asyncio.get_running_loop()
+        adapter._Protobuf = Protobuf
+        adapter._ProtoOAErrorRes = ProtoOAErrorRes
+
+        class _Deferred:
+            def asFuture(self, _loop):
+                future = _loop.create_future()
+                future.set_result(
+                    _wire_payload(
+                        ProtoMessage,
+                        ProtoOAErrorRes(
+                            ctidTraderAccountId=11111111,
+                            errorCode="SOME_ERROR",
+                            description="foreign",
+                        ),
+                    )
+                )
+                return future
+
+        class _Client:
+            def send(self, _request, **kwargs):
+                return _Deferred()
+
+        adapter._client = _Client()
+        try:
+            await adapter._send_request(ProtoOANewOrderReq(), timeout_seconds=15)
+        except Exception as exc:
+            return exc
+        raise AssertionError("expected the foreign-account response to be rejected")
+
+    with caplog.at_level(logging.ERROR, logger="live-runner"):
+        exc = asyncio.run(_run())
+
+    assert isinstance(exc, RuntimeError)
+    assert "foreign account 11111111" in str(exc)
+    assert any(
+        record.levelno >= logging.ERROR and "different account" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+def test_send_request_logs_timeout_with_request_identity(caplog) -> None:
+    """A timed-out request logs its payload type and clientMsgId at the point
+    of failure, for orders included - not only via the final connect-failure
+    NO RESPONSE line."""
+    import logging
+
+    from ctrader_open_api.messages.OpenApiMessages_pb2 import ProtoOANewOrderReq
+
+    class _DeferredTimeout(Exception):
+        """Same ``(seconds, "Deferred")`` shape Twisted's response timeout has."""
+
+        def __init__(self) -> None:
+            super().__init__(15, "Deferred")
+
+    async def _run():
+        adapter = CTraderLiveAdapter(
+            app_id="app",
+            app_secret="secret",
+            access_token="token",
+            account_id="1",
+        )
+        adapter._loop = asyncio.get_running_loop()
+        sent = {}
+
+        class _Deferred:
+            def asFuture(self, _loop):
+                future = _loop.create_future()
+                future.set_exception(_DeferredTimeout())
+                return future
+
+        class _Client:
+            def send(self, _request, **kwargs):
+                sent.update(kwargs)
+                return _Deferred()
+
+        adapter._client = _Client()
+        with pytest.raises(_DeferredTimeout):
+            await adapter._send_request(ProtoOANewOrderReq(), timeout_seconds=15)
+        return sent
+
+    with caplog.at_level(logging.WARNING, logger="live-runner"):
+        sent = asyncio.run(_run())
+
+    record = next(
+        r for r in caplog.records if "timed out with no response" in r.getMessage()
+    )
+    assert record.data["request_payload_type"] == "ProtoOANewOrderReq"
+    assert record.data["client_msg_id"] == sent["clientMsgId"]
+    assert record.data["response_timeout_s"] == 15
+
+
 def test_no_response_log_names_the_lost_request(caplog) -> None:
-    """A timed-out order request must be distinguishable from a timed-out
-    auth request in the logs - the duplicate-submission risk the review
-    flagged when 16.9k NO RESPONSE lines named only the account."""
+    """The final connect-failure NO RESPONSE line must name the request that
+    was lost - the duplicate-submission risk the review flagged when 16.9k
+    NO RESPONSE lines named only the account."""
     import logging
 
     adapter = CTraderLiveAdapter(
@@ -338,14 +539,14 @@ def test_no_response_log_names_the_lost_request(caplog) -> None:
     )
     exc = Exception(15, "Deferred")
     exc.ctrader_request_payload_type = "ProtoOANewOrderReq"
-    exc.ctrader_client_msg_id = "ProtoOANewOrderReq-7"
+    exc.ctrader_client_msg_id = "1-abc123def456-ProtoOANewOrderReq-7"
 
     with caplog.at_level(logging.INFO, logger="live-runner"):
         adapter._log_connect_failure(exc, str(exc), str(exc).lower())
 
     record = next(r for r in caplog.records if "NO RESPONSE" in r.getMessage())
     assert record.data["request_payload_type"] == "ProtoOANewOrderReq"
-    assert record.data["client_msg_id"] == "ProtoOANewOrderReq-7"
+    assert record.data["client_msg_id"] == "1-abc123def456-ProtoOANewOrderReq-7"
 
 
 def test_adapter_uses_strict_canonical_demo_switch(monkeypatch) -> None:
@@ -504,7 +705,7 @@ def test_execution_queue_overflow_requests_broker_reconciliation() -> None:
         app_id="app", app_secret="secret", access_token="token", account_id="1"
     )
     current_client = object()
-    payload = SimpleNamespace(executionType=2)
+    payload = SimpleNamespace(executionType=1)
     adapter._client = current_client
     adapter._execution_payload_type = 200
     adapter._heartbeat_payload_type = -1
@@ -721,7 +922,7 @@ def test_unmapped_execution_fill_is_not_acknowledged_as_persisted(monkeypatch) -
     )
     adapter._ProtoOAExecutionType = SimpleNamespace(ORDER_FILLED=1, ORDER_PARTIAL_FILL=2)
     event = SimpleNamespace(
-        executionType=2,
+        executionType=1,
         order=SimpleNamespace(orderId=45678, clientOrderId=""),
         deal=None,
         HasField=lambda field: field == "order",
@@ -1266,7 +1467,7 @@ def _fill_event(
 ):
     """A fill whose deal carries the broker's per-fill id."""
     return SimpleNamespace(
-        executionType=2,
+        executionType=1,
         order=None,
         deal=SimpleNamespace(
             dealId=deal_id,
@@ -1449,7 +1650,7 @@ def test_a_deal_that_grows_is_amended_not_dropped(isolated_db) -> None:
     adapter = _execution_adapter()
 
     event = SimpleNamespace(
-        executionType=2,
+        executionType=1,
         order=SimpleNamespace(
             orderId=45678,
             clientOrderId=signal_id,
@@ -1573,7 +1774,7 @@ def test_the_verdict_is_persisted_beside_the_price(isolated_db) -> None:
         if price is not None:
             deal.executionPrice = price
         return SimpleNamespace(
-            executionType=2,
+            executionType=1,
             order=None,
             deal=deal,
             HasField=lambda field: field == "deal",
