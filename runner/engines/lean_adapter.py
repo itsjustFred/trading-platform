@@ -17,13 +17,19 @@ import logging
 import os
 import shutil
 import subprocess
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from runner.agent_process import build_backtest_child_env
 from runner.approval_gate import require_generated_strategy_approval
 from runner.converters.lean_converter import convert_lean_result
-from runner.engines.base import BacktestConfig, EngineAdapter, ProgressCallback
+from runner.engines.base import (
+    BacktestConfig,
+    EngineAdapter,
+    ProgressCallback,
+    warn_if_engine_frozen,
+)
+from runner.engines import contract
 from shared.atomic_io import write_text_atomically
 from shared.models import BacktestResult
 
@@ -35,6 +41,30 @@ LEAN_PROJECT_DIR = Path(
         Path.home() / "Desktop" / "custom_lean_integration",
     )
 )
+
+
+def _frozen_signal_exit_fill(config: BacktestConfig) -> BacktestConfig:
+    """Refuse the native-only ``next_open`` exit model on the LEAN run path.
+
+    LEAN decides its own fills; the platform's ``next_open`` convention is a
+    native-engine model the LEAN run cannot honour, so a ``next_open`` config
+    fails loud instead of persisting a fill model LEAN never simulated (the
+    imported result records ``signal_exit_fill`` as unset — "not modelled by
+    this platform"). Mirrors the vectorbt/pynecore frozen-engine guards.
+    """
+    # normalize first: a config that bypassed BacktestConfig validation still
+    # fails loudly on the removed "open" mode (issue #153) instead of silently
+    # keeping an unsupported fill.
+    mode = contract.normalize_signal_exit_fill(
+        getattr(config, "signal_exit_fill", "close") or "close"
+    )
+    if mode == contract.SIGNAL_EXIT_FILL_NEXT_OPEN:
+        raise ValueError(
+            "engine 'lean' does not implement signal_exit_fill='next_open'; "
+            "LEAN fills come from LEAN itself — pass signal_exit_fill='close' "
+            "explicitly, or run the native engine"
+        )
+    return config
 
 
 class LeanAdapter(EngineAdapter):
@@ -59,6 +89,7 @@ class LeanAdapter(EngineAdapter):
         strategy_path must point to a LEAN algorithm source file. Existing
         result JSON is imported through :meth:`import_result`.
         """
+        warn_if_engine_frozen("lean", stacklevel=2)
         sp = Path(strategy_path)
         if sp.suffix.lower() == ".json":
             raise ValueError(
@@ -66,6 +97,7 @@ class LeanAdapter(EngineAdapter):
                 "import_result() with the result path instead."
             )
         require_generated_strategy_approval(strategy_path)
+        config = _frozen_signal_exit_fill(config)
 
         lean_config = self._write_config(config, strategy_path)
         output_dir = self._run_lean(lean_config)
@@ -109,7 +141,13 @@ class LeanAdapter(EngineAdapter):
 
     def _run_lean(self, config_path: Path) -> Path:
         """Execute LEAN backtest via the ``lean`` CLI console script."""
-        output_dir = self.project_dir / "output" / datetime.now().strftime("%Y%m%d_%H%M%S")
+        # UTC: the folder name is the label a human matches back against the
+        # LEAN result inside it, and every other timestamp this repo writes (and
+        # every LEAN log line) is UTC. A local-clock name would be an hour or
+        # more off from the data it contains when read on a different machine.
+        output_dir = self.project_dir / "output" / datetime.now(timezone.utc).strftime(
+            "%Y%m%d_%H%M%S"
+        )
         output_dir.mkdir(parents=True, exist_ok=True)
 
         lean_bin = shutil.which("lean")
@@ -131,6 +169,7 @@ class LeanAdapter(EngineAdapter):
         try:
             result = subprocess.run(
                 cmd,
+                check=False,
                 capture_output=True,
                 text=True,
                 timeout=600,

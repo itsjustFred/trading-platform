@@ -73,6 +73,9 @@ class TradeSignal:
     timeframe: str
     metadata: dict[str, Any] = field(default_factory=dict)
     identity: str = field(default_factory=lambda: uuid4().hex, repr=False, compare=False)
+    # Local receipt stamp carried outside ``metadata`` so a payload value can
+    # never impersonate it; the Discord source stamps it at parse time.
+    received_at_local: str | None = None
 
     def __post_init__(self) -> None:
         normalized = str(self.action).strip().lower()
@@ -98,6 +101,8 @@ class TradeSignal:
         if not self.identity:
             raise ValueError("identity must be non-empty")
         self.metadata = dict(self.metadata or {})
+        if self.received_at_local is not None:
+            self.received_at_local = str(self.received_at_local).strip() or None
 
 
 @dataclass(slots=True)

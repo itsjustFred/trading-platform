@@ -15,16 +15,20 @@ import numpy as np
 import pandas as pd
 
 from shared.indicators import presets
+from shared.strategy_markers import entry_exit_markers
 
 STRATEGY_META = {
     "name": "Single-Leg Z-Score Mean Reversion",
-    "version": "1.2.0",
+    "version": "1.3.0",
     "source_url": "https://github.com/desenyon/quantconnect-strategies/blob/main/statistical_arbitrage_pairs.py",
     "notes": (
         "- KEIN Pairs-Trading: der Z-Score wird auf den kumulierten Log-"
         "Returns des EINZELNEN Instruments berechnet (Single-Leg Mean "
         "Reversion), nicht auf einem Spread zwischen zwei Instrumenten.\n"
         "- Long-only; keine Market-Neutral-Absicherung.\n"
+        "- 1.3.0: Z-Score-Ausstiege sind Market-Exits ohne exit_price=close "
+        "(Fill am naechsten Open); das Stop-Level reist in sl_price "
+        "(exit-bar exit_price ist nur mit exit_order_type='level' ein Level).\n"
         "- Quellen-Schwellen exakt: Lookback 60, Entry |z| >= 2.0, "
         "Mean-Reversion-Exit bei z >= -0.5, statistischer Fail-Stop bei "
         "z <= -4.0 (stop_zscore der Quelle).\n"
@@ -49,7 +53,7 @@ STRATEGY_META = {
 }
 
 
-def generate_signals(df: pd.DataFrame, params: dict = None):
+def generate_signals(df: pd.DataFrame, params: dict | None = None):
     params = params or {}
     lookback = int(params.get("lookback", 60))
     entry_zscore = float(params.get("entry_zscore", 2.0))
@@ -95,14 +99,17 @@ def generate_signals(df: pd.DataFrame, params: dict = None):
             zscore_stop_hit = z_value <= -stop_zscore
             if stop_hit or mean_reversion_hit or zscore_stop_hit:
                 exits.iloc[i] = True
+                # The ATR stop's level travels in sl_price (the protective
+                # stop fills it); the exit-bar exit_price is only honored as
+                # a level with exit_order_type="level", which is not emitted
+                # here. The z-score exits are close-triggered MARKET exits:
+                # no explicit exit_price, so they fill at the next bar's open.
                 if stop_hit:
                     exit_price.iloc[i] = active_stop
                     exit_reason.iloc[i] = "stop_loss"
                 elif mean_reversion_hit:
-                    exit_price.iloc[i] = float(close.iloc[i])
                     exit_reason.iloc[i] = "mean_reversion"
                 else:
-                    exit_price.iloc[i] = float(close.iloc[i])
                     exit_reason.iloc[i] = "zscore_stop"
                 in_long = False
                 active_stop = np.nan
@@ -126,35 +133,6 @@ def generate_signals(df: pd.DataFrame, params: dict = None):
     }
     if atr is not None:
         indicators_dict["ATR"] = atr
-    drawings: list[dict] = []
-    if "timestamp" in df.columns:
-        entry_times = pd.to_datetime(
-            df.loc[entries[entries].index, "timestamp"], utc=True, errors="coerce"
-        ).dropna()
-        exit_times = pd.to_datetime(
-            df.loc[exits[exits].index, "timestamp"], utc=True, errors="coerce"
-        ).dropna()
-        for ts in entry_times.iloc[:30]:
-            drawings.append(
-                {
-                    "type": "marker",
-                    "time": ts.isoformat(),
-                    "position": "belowBar",
-                    "shape": "arrowUp",
-                    "color": "#22c55e",
-                    "text": "Entry",
-                }
-            )
-        for ts in exit_times.iloc[:30]:
-            drawings.append(
-                {
-                    "type": "marker",
-                    "time": ts.isoformat(),
-                    "position": "aboveBar",
-                    "shape": "arrowDown",
-                    "color": "#ef4444",
-                    "text": "Exit",
-                }
-            )
+    drawings = entry_exit_markers(df, entries, exits)
 
     return entries, exits, indicators_dict, drawings

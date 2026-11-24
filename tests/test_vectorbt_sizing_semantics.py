@@ -46,6 +46,8 @@ def _config(tmp_path: Path, **overrides: Any) -> BacktestConfig:
         "risk_per_trade_pct": 0.01,
         "modeling_resolution": "main_timeframe",
         "data_dir": str(tmp_path),
+        # Frozen engine: next_open is refused; declare the legacy close fill.
+        "signal_exit_fill": "close",
         "parameters": {"fast_length": 3, "slow_length": 10},
     }
     payload.update(overrides)
@@ -101,6 +103,17 @@ class TestLeverageSemantics:
         risk_math = result.trades[0].meta["risk_math"]
         assert risk_math["max_leverage"] == 1.0
         assert risk_math["max_leverage_notional"] == pytest.approx(100_000.0)
+
+    def test_position_cap_above_one_is_refused(self, sizing_env):
+        """#240: the frozen vectorbt engine has no broker-leverage concept —
+        its unset max_leverage resolves to the 2.0x migration-gate default,
+        so a per-position cap above 1x would size past 1x equity with no
+        declared broker maximum. It refuses outright, the same fail-closed
+        rule PyneCore applies; use the native engine for leverage."""
+        tmp_path, strategy_path = sizing_env
+        config = _config(tmp_path, max_position_pct=5.0)  # max_leverage unset
+        with pytest.raises(ValueError, match="max_position_exposure_pct"):
+            VectorbtAdapter().run(config, str(strategy_path))
 
 
 # ─── F6: total_bars is the bar count ────────────────────────────────────────
@@ -270,7 +283,7 @@ class TestRiskTargetMath:
         # pin the vectorbt side through risk_math's stop_distance fallback.
         frame = _deterministic_frame()
         env = _sizing_env_from(frame, stop=False)
-        tmp_path, strategy_path, config = env
+        _tmp_path, strategy_path, config = env
         result = VectorbtAdapter().run(config, str(strategy_path))
         assert result.trades
         risk_math = result.trades[0].meta["risk_math"]
@@ -540,3 +553,77 @@ class TestEntryStopFills:
         )
         result = VectorbtAdapter().run(config, str(strategy_path))
         assert result.trades == []
+
+
+# ─── inverted SIZING-only stop guard ────────────────────────────────────────
+
+
+def _sizing_stop_env(tmp_path: Path, sizing_stop: float):
+    """Market LONG signalled on bar 5, filled at bar 6's open (100.0), with a
+    sizing-only stop (``sizing_sl_price``) published on the signal bar."""
+    text = '''
+import pandas as pd
+
+
+def generate_signals(df, params):
+    n = len(df)
+    entries = pd.Series(False, index=df.index)
+    exits = pd.Series(False, index=df.index)
+    entries.iloc[5] = True
+    exits.iloc[8] = True
+    sizing = pd.Series([float("nan")] * n, index=df.index)
+    sizing.iloc[5] = %r
+    return entries, exits, {
+        "direction": pd.Series(["LONG"] * n, index=df.index),
+        "sizing_sl_price": sizing,
+    }, []
+''' % float(sizing_stop)
+    frame = pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2024-01-01", periods=24, freq="h", tz="UTC"),
+            "open": [100.0] * 24,
+            "high": [101.0] * 24,
+            "low": [99.0] * 24,
+            "close": [100.0] * 24,
+            "volume": [1000.0] * 24,
+        }
+    )
+    strategy_dir = tmp_path / "strategies"
+    strategy_dir.mkdir(exist_ok=True)
+    strategy_path = strategy_dir / "vbt_sizing_stop.py"
+    strategy_path.write_text(text)
+    _write_ohlcv(tmp_path, "VSS", frame)
+    config = _config(
+        tmp_path,
+        strategy_name="vbt_sizing_stop",
+        symbols=["VSS"],
+        risk_per_trade_pct=0.01,
+        max_position_exposure_pct=1.0,
+        max_leverage=1.0,
+        parameters={},
+    )
+    return config, strategy_path
+
+
+class TestInvertedSizingStop:
+    def test_valid_sizing_stop_sizes_from_distance(self, tmp_path: Path):
+        config, strategy_path = _sizing_stop_env(tmp_path, 98.0)
+        result = VectorbtAdapter().run(config, str(strategy_path))
+        assert len(result.trades) == 1
+        # 1% of 100k over a 2.0 distance from the 100.0 fill.
+        assert result.trades[0].quantity == pytest.approx(500.0)
+        assert result.meta.data["inverted_stop_drops"] == 0
+
+    @pytest.mark.parametrize("sizing_stop", [100.0, 101.5])
+    def test_sizing_stop_at_or_above_long_fill_skips_trade(
+        self, tmp_path: Path, sizing_stop: float
+    ):
+        """A LONG sizing stop at/above the fill has no risk distance (e.g.
+        after a gap down): skip and count it, like native does, instead of
+        sizing on abs(entry - stop) or the 2% fallback."""
+        config, strategy_path = _sizing_stop_env(tmp_path, sizing_stop)
+        result = VectorbtAdapter().run(config, str(strategy_path))
+        assert result.trades == []
+        assert result.meta.data["inverted_stop_drops"] == 1
+
+

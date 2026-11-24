@@ -22,21 +22,46 @@ import numpy as np
 import optuna
 import pandas as pd
 
+from runner.stats import return_periods_per_year
 from shared.atomic_io import write_text_atomically
+from shared.constants import OPTIMIZATIONS_DIR
 
 logger = logging.getLogger(__name__)
+
+
+#: Minimum number of distinct DAILY out-of-sample observations before OOS
+#: Sharpe/drawdown statistics are meaningful (#133). Counted as distinct UTC
+#: dates of the aligned OOS timestamps — intraday bars on the same day are one
+#: observation because risk-adjusted ratios need one sample per trading day,
+#: not one per bar.
+MIN_OOS_DAILY_OBSERVATIONS = 20
+
+
+def daily_observation_count(times: Any) -> int:
+    """Distinct UTC calendar dates covered by equity-curve timestamps."""
+    days: set[Any] = set()
+    for value in times or []:
+        ts = _parse_time_to_ts(value)
+        if ts:
+            days.add(datetime.fromtimestamp(ts, tz=timezone.utc).date())
+    return len(days)
 
 
 @dataclass
 class StrategyEquityPoint:
     """Equity point from a single strategy backtest."""
+
     time: int  # Unix timestamp in seconds
     equity: float
 
 
-#: Annualization convention for the portfolio Sharpe (Cleanup 16-D1, F36):
-#: daily equity curves are the documented default cadence, annualized with
-#: 252 trading periods — the same convention as ``runner/stats.py``.
+#: Fallback annualization convention for the portfolio Sharpe (Cleanup
+#: 16-D1, F36) when the aligned equity curve's timestamps cannot be
+#: measured: 252 trading periods, the convention ``runner/stats.py`` uses
+#: for equities/FX/CFDs. Measurable curves annualise at their measured
+#: observation density instead (``_infer_portfolio_periods_per_year``,
+#: #353): crypto books ~365/366 calendar days, equity books their
+#: observed trading-day density.
 PORTFOLIO_PERIODS_PER_YEAR_DEFAULT = 252.0
 
 #: Timestamps (as datetime-like objects) of the equity matrix most recently
@@ -71,6 +96,7 @@ def _parse_time_to_ts(time_str: str | int) -> float:
     # Try ISO format first
     try:
         from datetime import datetime
+
         if isinstance(time_str, str):
             dt = datetime.fromisoformat(time_str.replace("Z", "+00:00"))
             if dt.tzinfo is None:
@@ -194,9 +220,7 @@ def _load_strategy_equity(
         if end_ts is not None and time_ts > end_ts:
             continue
         if math.isfinite(time_ts) and math.isfinite(float(point.equity)):
-            points.append(
-                StrategyEquityPoint(time=int(time_ts), equity=float(point.equity))
-            )
+            points.append(StrategyEquityPoint(time=int(time_ts), equity=float(point.equity)))
     return points
 
 
@@ -287,8 +311,7 @@ def _align_equity_curves(
         return np.empty((0, len(curves)))
 
     aligned_columns = [
-        _aligned_curve_values(curve, sorted_times, require_overlap)
-        for curve in curves
+        _aligned_curve_values(curve, sorted_times, require_overlap) for curve in curves
     ]
     return np.array(aligned_columns, dtype=float).T
 
@@ -342,44 +365,38 @@ def _average_off_diagonal(correlation_matrix: np.ndarray) -> float:
 
 
 def _infer_portfolio_periods_per_year(equity_matrix: np.ndarray) -> float:
-    """Infer annualization periods from the median point spacing.
+    """Measured observation density of the combined equity curve (#353).
 
-    Daily-spaced equity points → 252 trading periods per year (calendar 365
-    spacing → 365); sub-daily spacing scales proportionally. Falls back to
-    252 when the timestamps carry no usable cadence.
+    Annualisation follows ``runner.stats.return_periods_per_year`` — the
+    measured observation density of the combined curve's actual
+    timestamps: each consecutive equity pair is one return observation
+    stamped at the later point, so a crypto book measures ~365/366
+    calendar days per year, an equity book its observed trading-day
+    density, and a mixed book whatever the combined timestamps carry.
+    This measured density is deliberately NOT the convention
+    ``runner.stats`` uses for its own reported Sharpe, which keeps the
+    fixed #229 asset-class factors. Falls back to
+    ``PORTFOLIO_PERIODS_PER_YEAR_DEFAULT`` when the timestamps carry no
+    usable cadence.
     """
     if equity_matrix.shape[0] < 3 or len(_LAST_PORTFOLIO_TIMESTAMPS) < 3:
         return PORTFOLIO_PERIODS_PER_YEAR_DEFAULT
 
-    timestamps = pd.to_datetime(pd.Series(_LAST_PORTFOLIO_TIMESTAMPS), utc=True)
-    if len(timestamps) != equity_matrix.shape[0]:
+    try:
+        timestamps = pd.to_datetime(
+            pd.Series(_LAST_PORTFOLIO_TIMESTAMPS), utc=True, errors="coerce"
+        )
+    except (TypeError, ValueError):
+        return PORTFOLIO_PERIODS_PER_YEAR_DEFAULT
+    if len(timestamps) != equity_matrix.shape[0] or timestamps.isna().any():
         return PORTFOLIO_PERIODS_PER_YEAR_DEFAULT
 
-    spacings = timestamps.diff().dt.total_seconds().dropna()
-    spacing = float(spacings.median()) if not spacings.empty else 0.0
-    if not math.isfinite(spacing) or spacing <= 0:
+    # Return observations are stamped at the later point of each pair.
+    observation_index = pd.DatetimeIndex(timestamps.iloc[1:])
+    measured = return_periods_per_year(observation_index)
+    if measured is None or not math.isfinite(measured) or measured <= 0:
         return PORTFOLIO_PERIODS_PER_YEAR_DEFAULT
-
-    seconds_per_year = 365.25 * 24 * 60 * 60
-    periods_per_year = seconds_per_year / spacing
-    if not math.isfinite(periods_per_year) or periods_per_year <= 0:
-        return PORTFOLIO_PERIODS_PER_YEAR_DEFAULT
-
-    # Equity curves are trading-day series in practice; a calendar-daily
-    # cadence is mapped onto the 252 trading-day convention so the number is
-    # comparable with stats.py's daily Sharpe.
-    if 350.0 <= periods_per_year <= 380.0:
-        return PORTFOLIO_PERIODS_PER_YEAR_DEFAULT
-    # Coarser-than-daily cadences (weekly ≈ 52, biweekly ≈ 26, monthly ≈ 12)
-    # are legitimate period counts and scale proportionally — sqrt(52) for a
-    # weekly curve is the correct annualization, NOT 252 (CodeRabbit round:
-    # the earlier framing suggested anything above ~8.7h should collapse to
-    # 252, which would misstate weekly Sharpe by sqrt(252/52) ≈ 2.2x).
-    # Sub-daily cadences scale too. No artificial ceiling: clamping an
-    # intraday curve's period count (e.g. 2192 for 4-hourly points) would
-    # understate the annualization relative to the daily-resampled
-    # convention that stats.py reports, so the inferred count is used as is.
-    return float(periods_per_year)
+    return float(measured)
 
 
 def _portfolio_sharpe_from_weights(
@@ -390,10 +407,12 @@ def _portfolio_sharpe_from_weights(
 
     Sharpe definition (Cleanup 16-D1, F36): per-observation mean excess
     return / standard deviation, ANNUALIZED by the square root of the
-    number of observation periods per year (inferred from the equity-curve
-    cadence, 252 for daily curves). The previous raw mean/std was not
-    annualized and therefore not comparable with ``runner.stats``' Sharpe
-    even though both surface under the same name.
+    measured observation density of the combined equity curve's actual
+    timestamps (``runner.stats.return_periods_per_year``, #353 — crypto
+    ~365/366 calendar days, equities their observed trading-day density).
+    The previous raw mean/std was not annualized and therefore not
+    comparable with ``runner.stats``' Sharpe even though both surface
+    under the same name.
     """
     if equity_matrix.size == 0 or equity_matrix.shape[0] < 2 or len(weights) == 0:
         return 0.0, 1.0
@@ -408,11 +427,7 @@ def _portfolio_sharpe_from_weights(
     std_ret = np.std(returns)
 
     periods_per_year = _infer_portfolio_periods_per_year(equity_matrix)
-    sharpe = (
-        float(mean_ret / std_ret) * math.sqrt(periods_per_year)
-        if std_ret > 0
-        else 0.0
-    )
+    sharpe = float(mean_ret / std_ret) * math.sqrt(periods_per_year) if std_ret > 0 else 0.0
 
     # Max drawdown
     peak = np.maximum.accumulate(portfolio_eq)
@@ -448,17 +463,14 @@ def _build_objective(
 
     def objective(trial: optuna.Trial) -> float:
         weights_raw = [
-            trial.suggest_float(f"weight_{index}", 0.0, 1.0)
-            for index in range(len(backtest_ids))
+            trial.suggest_float(f"weight_{index}", 0.0, 1.0) for index in range(len(backtest_ids))
         ]
         weights = _normalize_weights(np.array(weights_raw))
         sharpe, max_drawdown = _portfolio_sharpe_from_weights(weights, equity_matrix)
         # #87: per-trial weighted penalty — weight-dependent, so the
         # optimizer can actually see diversification.
         penalty = _weighted_correlation_penalty(weights, correlation_matrix)
-        score = sharpe - (5.0 * penalty) - (
-            3.0 * max(0, max_drawdown - 0.3)
-        )
+        score = sharpe - (5.0 * penalty) - (3.0 * max(0, max_drawdown - 0.3))
         score -= max(0.0, float(target_sharpe) - sharpe)
 
         trial.report(sharpe, trial.number)
@@ -516,9 +528,20 @@ def _build_oos_equity_curve(
 def _compute_oos_metrics(
     test_curves: list[list[StrategyEquityPoint]],
     best_weights: np.ndarray,
+    *,
+    min_daily_observations: int = MIN_OOS_DAILY_OBSERVATIONS,
 ) -> tuple[float | None, float | None]:
-    """Compute OOS metrics when at least two aligned curves are available."""
+    """Compute OOS metrics when enough daily observations are aligned.
+
+    Below ``min_daily_observations`` distinct daily observations the OOS
+    window is rejected: Sharpe/drawdown over a handful of bars is noise, not
+    evidence (#133).
+    """
     if not test_curves:
+        return None, None
+
+    timestamps = _common_timestamps(test_curves, require_overlap=True)
+    if daily_observation_count(timestamps) < min_daily_observations:
         return None, None
 
     oos_equity_matrix = _align_equity_curves(test_curves, require_overlap=True)
@@ -530,9 +553,7 @@ def _compute_oos_metrics(
         return None, None
     # Annualization cadence must come from the OOS timestamps themselves,
     # not the IS matrix recorded earlier.
-    _record_portfolio_timestamps(
-        test_curves, _common_timestamps(test_curves, require_overlap=True)
-    )
+    _record_portfolio_timestamps(test_curves, timestamps)
     try:
         return _portfolio_sharpe_from_weights(best_weights, oos_equity_matrix)
     finally:
@@ -555,6 +576,8 @@ def _build_optimization_result(
     train_end: str | None = None,
     test_start: str | None = None,
     test_end: str | None = None,
+    oos_daily_observations: int = 0,
+    min_oos_daily_observations: int = MIN_OOS_DAILY_OBSERVATIONS,
 ) -> tuple[dict[str, Any], Path]:
     """Build the persisted result and its output path."""
     now = datetime.now(timezone.utc)
@@ -567,9 +590,12 @@ def _build_optimization_result(
         "file": output_path.name,
         "created_at": now.isoformat(),
         "backtest_ids": backtest_ids,
+        # One weight per backtest id, by construction: `strict=True` makes a
+        # backtest that has no weight fail here instead of silently inheriting
+        # the weight of the next one.
         "weights": {
             backtest_id: float(weight)
-            for backtest_id, weight in zip(backtest_ids, best_weights)
+            for backtest_id, weight in zip(backtest_ids, best_weights, strict=True)
         },
         "sharpe": sharpe,
         "max_drawdown": max_drawdown,
@@ -595,10 +621,21 @@ def _build_optimization_result(
     if oos_sharpe is not None:
         oos_status = "available"
     elif oos_requested:
-        oos_status = "insufficient_overlap"
+        if oos_daily_observations == 0:
+            # No common timestamp at all: the curves never overlapped in the
+            # test window, which is a different failure than too-few-days.
+            oos_status = "insufficient_overlap"
+        elif oos_daily_observations < min_oos_daily_observations:
+            # Enough aligned rows may exist, but too few distinct DAYS: the
+            # OOS statistics would be computed on noise (#133).
+            oos_status = "insufficient_oos_bars"
+        else:
+            oos_status = "insufficient_overlap"
     else:
         oos_status = "no_oos_requested"
     result["oos_status"] = oos_status
+    result["oos_daily_observations"] = int(oos_daily_observations)
+    result["min_oos_daily_observations"] = int(min_oos_daily_observations)
     if oos_sharpe is not None:
         result["oos_sharpe"] = oos_sharpe
         result["oos_max_drawdown"] = oos_max_drawdown
@@ -613,9 +650,6 @@ def _build_optimization_result(
         if oos_equity_curve:
             result["oos_equity_curve"] = oos_equity_curve
     return result, output_path
-
-
-OPTIMIZATIONS_DIR = Path(__file__).resolve().parent.parent / "data" / "optimizations"
 
 
 def _explicit_boundary(value: str, *, is_end: bool = False) -> float:
@@ -689,6 +723,7 @@ def optimize_portfolio_allocation(
     train_end: str | None = None,
     test_start: str | None = None,
     test_end: str | None = None,
+    min_oos_daily_observations: int = MIN_OOS_DAILY_OBSERVATIONS,
 ) -> dict[str, Any]:
     """Optimize portfolio weights for maximum Sharpe with negative correlation.
 
@@ -714,6 +749,12 @@ def optimize_portfolio_allocation(
         raise ValueError("target_sharpe must be numeric") from exc
     if not math.isfinite(target) or target < 0:
         raise ValueError("target_sharpe must be finite and >= 0")
+    if (
+        isinstance(min_oos_daily_observations, bool)
+        or not isinstance(min_oos_daily_observations, int)
+        or min_oos_daily_observations < 1
+    ):
+        raise ValueError("min_oos_daily_observations must be an int >= 1")
 
     # Load equity curves
     if start_date or end_date:
@@ -737,9 +778,7 @@ def optimize_portfolio_allocation(
             test_end=test_end,
         )
     else:
-        train_curves, test_curves = _split_equity_curves_by_time(
-            curves, train_months, test_months
-        )
+        train_curves, test_curves = _split_equity_curves_by_time(curves, train_months, test_months)
 
     curves_to_optimize = train_curves if has_explicit_boundaries or train_curves else curves
     equity_matrix = _align_equity_curves(curves_to_optimize, require_overlap=True)
@@ -791,17 +830,22 @@ def optimize_portfolio_allocation(
             "backtest_ids": backtest_ids,
         }
 
-    best_raw = [
-        study.best_trial.params[f"weight_{index}"]
-        for index in range(len(backtest_ids))
-    ]
+    best_raw = [study.best_trial.params[f"weight_{index}"] for index in range(len(backtest_ids))]
     best_weights = _normalize_weights(np.array(best_raw))
     sharpe, max_drawdown = _portfolio_sharpe_from_weights(
         best_weights,
         equity_matrix,
     )
     correlation_matrix = _compute_correlation_matrix(returns)
-    oos_metrics = _compute_oos_metrics(test_curves, best_weights)
+    oos_timestamps = (
+        _common_timestamps(test_curves, require_overlap=True) if test_curves else []
+    )
+    oos_daily_observations = daily_observation_count(oos_timestamps)
+    oos_metrics = _compute_oos_metrics(
+        test_curves,
+        best_weights,
+        min_daily_observations=min_oos_daily_observations,
+    )
     oos_equity_curve = _build_oos_equity_curve(test_curves, best_weights)
     result, output_path = _build_optimization_result(
         backtest_ids,
@@ -819,6 +863,8 @@ def optimize_portfolio_allocation(
         train_end=train_end,
         test_start=test_start,
         test_end=test_end,
+        oos_daily_observations=oos_daily_observations,
+        min_oos_daily_observations=min_oos_daily_observations,
     )
 
     _persist_optimization_result(result, output_path)

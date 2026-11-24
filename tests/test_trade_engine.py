@@ -14,6 +14,7 @@ from runner.engines.contract import parse_date_bound
 from runner.engines.native_adapter import NativeAdapter
 from runner.engines.vectorbt_adapter import VectorbtAdapter
 from shared.constants import DATA_DIR
+from tests.helpers import TEST_OHLCV_DIR_ENV, resolve_ohlcv_root
 
 
 def _to_utc_datetime(value: object) -> datetime | None:
@@ -29,7 +30,7 @@ def _to_utc_datetime(value: object) -> datetime | None:
     return None
 
 
-@pytest.mark.parametrize("exposure", [0.0, -0.01, 1.01])
+@pytest.mark.parametrize("exposure", [0.0, -0.01])
 def test_backtest_config_rejects_position_exposure_outside_fraction_range(exposure: float):
     with pytest.raises(ValueError):
         BacktestConfig(
@@ -40,6 +41,21 @@ def test_backtest_config_rejects_position_exposure_outside_fraction_range(exposu
             end_date="2024-01-02",
             max_position_exposure_pct=exposure,
         )
+
+
+@pytest.mark.parametrize("exposure", [1.01, 2.5, 50.0])
+def test_backtest_config_accepts_position_exposure_above_one(exposure: float):
+    """#240: a per-position notional cap above 1x is leverage; the broker
+    maximum (``max_leverage``) bounds it at sizing time, not at config time."""
+    cfg = BacktestConfig(
+        strategy_name="bounds",
+        symbols=["TEST"],
+        timeframe="1h",
+        start_date="2024-01-01",
+        end_date="2024-01-02",
+        max_position_exposure_pct=exposure,
+    )
+    assert cfg.max_position_exposure_pct == exposure
 
 
 def _time_bounds(path: Path) -> tuple[datetime | None, datetime | None]:
@@ -67,9 +83,9 @@ def _has_coverage(path: Path, *, start: str, end: str) -> bool:
     # Conformance (Cleanup 16-A, F9): the coverage check uses the SHARED
     # contract parser instead of a private re-implementation, so the test's
     # window arithmetic can never drift from the engines'.
-    return lower <= parse_date_bound(start, is_end=False).to_pydatetime() and upper >= parse_date_bound(
-        end, is_end=True
-    ).to_pydatetime()
+    window_start = parse_date_bound(start, is_end=False).to_pydatetime()
+    window_end = parse_date_bound(end, is_end=True).to_pydatetime()
+    return lower <= window_start and upper >= window_end
 
 
 def _synthetic_ohlcv(rows: int = 100) -> pd.DataFrame:
@@ -111,7 +127,7 @@ def test_trade_engine_market_entry_and_signal_exit_price_model():
         end_date="2024-01-31",
         initial_capital=100_000,
         modeling_resolution="main_timeframe",
-        parameters={"fees": "zero"},
+        parameters={"fees": "zero", "slippage": "none"},
     )
 
     engine = TradeEngine(cfg, symbol="TEST")
@@ -128,6 +144,9 @@ def test_trade_engine_market_entry_and_signal_exit_price_model():
         "stop_trigger_side": "bar_low_high",
         "take_profit_trigger_side": "bar_high_low",
         "same_bar_order": "stop_first",
+        # Owner decision 2026-11-13: the model now also records the exit rules.
+        "protective_gap_fill": "open",
+        "signal_exit_fill": "next_open",
         "intrabar_resolution": None,
         "lower_timeframe_replay": False,
     }
@@ -162,7 +181,7 @@ def test_sizing_only_stop_survives_fill_and_is_used_for_risk_metadata():
         end_date="2024-01-01",
         initial_capital=100_000,
         risk_per_trade_pct=0.01,
-        parameters={"fees": "zero"},
+        parameters={"fees": "zero", "slippage": "none"},
     )
 
     result = TradeEngine(cfg, symbol="TEST").run(data, strategy_fn)
@@ -195,7 +214,7 @@ def test_sizing_only_stop_equal_to_fill_is_skipped():
         end_date="2024-01-01",
         initial_capital=100_000,
         risk_per_trade_pct=0.01,
-        parameters={"fees": "zero"},
+        parameters={"fees": "zero", "slippage": "none"},
     )
 
     result = TradeEngine(cfg, symbol="TEST").run(data, strategy_fn)
@@ -229,7 +248,7 @@ def test_trade_engine_stop_uses_bar_low_and_risk_sizing_1pct():
         risk_per_trade_pct=0.01,
         max_leverage=3.0,
         modeling_resolution="main_timeframe",
-        parameters={"fees": "zero"},
+        parameters={"fees": "zero", "slippage": "none"},
     )
 
     engine = TradeEngine(cfg, symbol="TEST")
@@ -274,7 +293,7 @@ def test_trade_engine_accepts_sl_price_alias_for_native_stops_and_risk_sizing():
         risk_per_trade_pct=0.01,
         max_leverage=3.0,
         modeling_resolution="main_timeframe",
-        parameters={"fees": "zero"},
+        parameters={"fees": "zero", "slippage": "none"},
     )
 
     engine = TradeEngine(cfg, symbol="TEST")
@@ -294,6 +313,10 @@ def test_trade_engine_can_anchor_market_stop_to_fill_price_with_stop_distance():
     data.loc[11, "high"] = 121.0
     data.loc[11, "low"] = 119.0
     data.loc[11, "close"] = 120.2
+    # Bar 12 opens ABOVE the anchored stop (118) and trades down through it, so
+    # the stop fills at its level. (The synthetic series' own open of 112 would
+    # gap through the stop and, since 2026-11-13, fill at that open.)
+    data.loc[12, "open"] = 119.5
     data.loc[12, "low"] = 118.0
 
     def strategy_fn(df: pd.DataFrame, params: dict):
@@ -319,7 +342,7 @@ def test_trade_engine_can_anchor_market_stop_to_fill_price_with_stop_distance():
         risk_per_trade_pct=0.01,
         max_leverage=10.0,
         modeling_resolution="main_timeframe",
-        parameters={"fees": "zero"},
+        parameters={"fees": "zero", "slippage": "none"},
     )
 
     engine = TradeEngine(cfg, symbol="TEST")
@@ -331,6 +354,57 @@ def test_trade_engine_can_anchor_market_stop_to_fill_price_with_stop_distance():
     assert trade.exits[-1].price == pytest.approx(118.0)
     assert trade.exits[-1].reason == "stop_loss"
     assert trade.pnl == pytest.approx(-1000.0, abs=0.5)
+
+
+def _tight_stop_strategy(df: pd.DataFrame, params: dict):
+    """One LONG entry at bar 10 with a 0.1 stop distance: risk sizing wants
+    10_000 units (1% of 100k / 0.1), so only the notional/leverage caps bind."""
+    entries = pd.Series(False, index=df.index)
+    exits = pd.Series(False, index=df.index)
+    entries.iloc[10] = True
+    indicators = {
+        "direction": pd.Series("LONG", index=df.index),
+        "sl_price": pd.Series(pd.NA, index=df.index),
+    }
+    indicators["sl_price"].iloc[10] = 110.9
+    return entries, exits, indicators, []
+
+
+def _run_tight_stop(**overrides) -> float:
+    cfg = BacktestConfig(
+        strategy_name="leverage-test",
+        symbols=["TEST"],
+        timeframe="1h",
+        start_date="2024-01-01",
+        end_date="2024-01-31",
+        initial_capital=100_000,
+        risk_per_trade_pct=0.01,
+        modeling_resolution="main_timeframe",
+        parameters={"fees": "zero", "slippage": "none"},
+        **overrides,
+    )
+    result = TradeEngine(cfg, symbol="TEST").run(_synthetic_ohlcv(100), _tight_stop_strategy)
+    assert len(result.trades) == 1
+    trade = result.trades[0]
+    # Entry fills at the bar-11 open (111.0); notional = qty * entry.
+    return trade.quantity * trade.entry_price
+
+
+def test_native_engine_bounds_notional_above_one_by_max_leverage():
+    """#240: max_position_exposure_pct > 1 is leverage; the broker maximum
+    (max_leverage) bounds the notional — an unset maximum fails closed to 1x."""
+    # Risk sizing wants ~11.1x equity of notional; the 3x broker maximum binds.
+    assert _run_tight_stop(max_position_exposure_pct=5.0, max_leverage=3.0) == pytest.approx(
+        300_000.0, rel=0.01
+    )
+    # Unknown broker maximum -> 1x, even with a 5x configured cap.
+    assert _run_tight_stop(max_position_exposure_pct=5.0, max_leverage=None) == pytest.approx(
+        100_000.0, rel=0.01
+    )
+    # A configured cap below the broker maximum still binds.
+    assert _run_tight_stop(max_position_exposure_pct=0.5, max_leverage=10.0) == pytest.approx(
+        50_000.0, rel=0.01
+    )
 
 
 def test_stop_distance_only_order_gets_fill_anchored_live_stop():
@@ -356,7 +430,7 @@ def test_stop_distance_only_order_gets_fill_anchored_live_stop():
         end_date="2024-01-31",
         initial_capital=100_000,
         risk_per_trade_pct=0.01,
-        parameters={"fees": "zero"},
+        parameters={"fees": "zero", "slippage": "none"},
     )
 
     result = TradeEngine(cfg, symbol="TEST").run(data, strategy_fn)
@@ -408,7 +482,7 @@ def test_trade_engine_configured_same_bar_take_profit_priority_falls_back_to_sto
         risk_per_trade_pct=0.01,
         max_leverage=3.0,
         modeling_resolution="main_timeframe",
-        parameters={"fees": "zero", "same_bar_order": "take_profit_first"},
+        parameters={"fees": "zero", "slippage": "none", "same_bar_order": "take_profit_first"},
     )
 
     engine = TradeEngine(cfg, symbol="TEST")
@@ -434,15 +508,25 @@ def test_example_sma_native_vs_vectorbt_smoke_on_local_data():
     - an empty store no longer passes the test (both engines returning zero
       trades is a failure, not "assert True");
     - divergence is capped at one trade, not 30%.
+
+    The dataset comes from the documented local opt-in (``TP_TEST_OHLCV_DIR``),
+    resolved by the same shared helper the strategy data gate uses. It always
+    did read ``DATA_DIR/ohlcv``, which the suite pins to a per-process temp
+    directory, so it could never run even where a developer has the dataset:
+    it skipped with a message that never named the way in.
     """
     strategy_path = Path("strategies/example_sma/example_sma.py").resolve()
     if not strategy_path.exists():
         pytest.skip("example_sma strategy not found")
 
-    ohlcv_root = DATA_DIR / "ohlcv"
+    ohlcv_root = resolve_ohlcv_root(DATA_DIR)
     parquet_files = list(ohlcv_root.rglob("**/1h.parquet"))
     if not parquet_files:
-        pytest.skip("No local 1h OHLCV parquet data available")
+        pytest.skip(
+            f"No local 1h OHLCV parquet data under {ohlcv_root}: set "
+            f"{TEST_OHLCV_DIR_ENV}=/path/to/ohlcv to run this real-data smoke "
+            f"test (the suite's DATA_DIR is a throwaway temp directory)"
+        )
 
     selected = next(
         (
@@ -453,7 +537,10 @@ def test_example_sma_native_vs_vectorbt_smoke_on_local_data():
         None,
     )
     if selected is None:
-        pytest.skip("No local 1h OHLCV parquet data covering 2024-01-01..2025-12-31")
+        pytest.skip(
+            f"No local 1h OHLCV parquet data under {ohlcv_root} covering "
+            f"2024-01-01..2025-12-31 (set {TEST_OHLCV_DIR_ENV}=/path/to/ohlcv)"
+        )
 
     symbol = selected.parent.name
     cfg = BacktestConfig(risk_per_trade_pct=0.01,
@@ -464,7 +551,11 @@ def test_example_sma_native_vs_vectorbt_smoke_on_local_data():
         end_date="2025-12-31",
         initial_capital=100_000,
         modeling_resolution="main_timeframe",
-        parameters={"fees": "zero"},
+        # The engines append "ohlcv" to data_dir, so this is the PARENT of the
+        # OHLCV root above: the suite's DATA_DIR by default, or the directory
+        # an exported TP_TEST_OHLCV_DIR names its shards from.
+        data_dir=str(ohlcv_root.parent),
+        parameters={"fees": "zero", "slippage": "none"},
     )
 
     native_result = NativeAdapter().run(cfg, str(strategy_path))
@@ -498,7 +589,7 @@ class TestIssueC2ExposureMath:
                 end_date="2024-01-02",
                 initial_capital=100_000.0,
                 risk_per_trade_pct=0.01,
-                parameters={"fees": "zero"},
+                parameters={"fees": "zero", "slippage": "none"},
             ),
             symbol="X",
         )
@@ -507,7 +598,11 @@ class TestIssueC2ExposureMath:
         from runner.engine_pkg.orders import Position
 
         engine = self._engine()
-        engine.equity = 100_000.0
+        # F21 (D2): the aggregate-exposure denominator is the realized
+        # sizing cash, never the mark-to-market reporting equity — both are
+        # set on purpose so the pair only reads as intended.
+        engine._sizing_equity = 100_000.0
+        engine.equity = 1_000_000.0
         engine.positions.append(
             Position(
                 symbol="X",
@@ -528,7 +623,11 @@ class TestIssueC2ExposureMath:
         from runner.engine_pkg.orders import Order, OrderType
 
         engine = self._engine()
-        engine.equity = 100_000.0
+        # F21 (D2): the aggregate-exposure denominator is the realized
+        # sizing cash, never the mark-to-market reporting equity — both are
+        # set on purpose so the pair only reads as intended.
+        engine._sizing_equity = 100_000.0
+        engine.equity = 1_000_000.0
         engine.pending_orders.append(
             Order(
                 symbol="X",
@@ -547,7 +646,11 @@ class TestIssueC2ExposureMath:
         from runner.engine_pkg.orders import Order, OrderType
 
         engine = self._engine()
-        engine.equity = 100_000.0
+        # F21 (D2): the aggregate-exposure denominator is the realized
+        # sizing cash, never the mark-to-market reporting equity — both are
+        # set on purpose so the pair only reads as intended.
+        engine._sizing_equity = 100_000.0
+        engine.equity = 1_000_000.0
         first = Order(
             symbol="X",
             direction="LONG",
@@ -575,7 +678,11 @@ class TestIssueC2ExposureMath:
         from runner.engine_pkg.orders import Position
 
         engine = self._engine()
-        engine.equity = 100_000.0
+        # F21 (D2): the aggregate-exposure denominator is the realized
+        # sizing cash, never the mark-to-market reporting equity — both are
+        # set on purpose so the pair only reads as intended.
+        engine._sizing_equity = 100_000.0
+        engine.equity = 1_000_000.0
         engine.positions.append(
             Position(
                 symbol="X",
@@ -607,17 +714,17 @@ def _wide_bar_run(strategy_name: str, *, stop=None, take_profit=None, exit_index
     full-bar MAE as if it were a bug in the clamp.
     """
     records = []
-    for index in range(25):
-        records.append(
-            {
-                "timestamp": pd.Timestamp("2024-01-01", tz="UTC") + pd.Timedelta(hours=index),
-                "open": 100.0,
-                "high": 130.0 if index == 10 else 101.0,
-                "low": 70.0 if index == 10 else 99.0,
-                "close": 100.0,
-                "volume": 1000,
-            }
-        )
+    records.extend(
+        {
+            "timestamp": pd.Timestamp("2024-01-01", tz="UTC") + pd.Timedelta(hours=index),
+            "open": 100.0,
+            "high": 130.0 if index == 10 else 101.0,
+            "low": 70.0 if index == 10 else 99.0,
+            "close": 100.0,
+            "volume": 1000,
+        }
+        for index in range(25)
+    )
     data = pd.DataFrame.from_records(records)
 
     def strategy_fn(df: pd.DataFrame, params: dict):
@@ -646,7 +753,7 @@ def _wide_bar_run(strategy_name: str, *, stop=None, take_profit=None, exit_index
         risk_per_trade_pct=0.01,
         max_leverage=3.0,
         modeling_resolution="main_timeframe",
-        parameters={"fees": "zero"},
+        parameters={"fees": "zero", "slippage": "none"},
     )
     return TradeEngine(cfg, symbol="TEST").run(data, strategy_fn)
 
@@ -752,7 +859,7 @@ def _excursion_run(take_profit=None, stop=None, direction="LONG", tps=None, hi=1
         risk_per_trade_pct=0.01,
         max_leverage=3.0,
         modeling_resolution="main_timeframe",
-        parameters={"fees": "zero"},
+        parameters={"fees": "zero", "slippage": "none"},
     )
     return TradeEngine(cfg, symbol="TEST").run(data, strategy_fn).trades[0]
 
@@ -857,3 +964,229 @@ def test_a_multi_level_ladder_is_credited_with_the_furthest_level_reached():
         f"MFE is {trade.mfe / trade.quantity:+.1f} per unit; both levels filled, so "
         f"the furthest one reached (115) is the cap, not the first pending (105)"
     )
+
+
+# ─── Multi-level take-profit: a level not reached this bar ────────────────────
+#
+# The close loop in ``trading_engine._check_stops`` walks every *pending* level
+# and skips the ones the bar did not reach (``if not reached: continue``), so a
+# ladder normally fills across several bars. Two paths that combination needs
+# were never executed by any test:
+#
+#   * a level that is not reached this bar stays pending and fills on a later
+#     bar (the ``continue`` arm);
+#   * a ladder that only part-fills on a bar that ALSO hits the stop closes the
+#     remainder at the stop level on that same bar.
+#
+# Both are partial-exit P&L paths, so the fills, the per-leg quantities and the
+# realized P&L are all asserted from hand-computed values.
+
+#: Entry at bar 1, so the market order fills at bar 2's open for 100.0.
+_LADDER_ENTRY_INDEX = 1
+#: 1% risk on 100_000 = 1_000 risk over a 2.0-point stop (98.0) => 500 units.
+_LADDER_RISK_UNITS = 500.0
+_LADDER_ENTRY_PRICE = 100.0
+
+
+def _ladder_data(num_bars: int = 8) -> pd.DataFrame:
+    """A flat series: the price only moves where a test says it does.
+
+    ``_synthetic_ohlcv`` rises one point per bar, so a level would be "missed"
+    by accident of the fixture. Here every bar is 99/101/100.2 around 100.0 and
+    a level is missed because the test moved that bar's high on purpose.
+    """
+    records = [
+        {
+            "timestamp": pd.Timestamp("2026-01-01", tz="UTC") + pd.Timedelta(hours=i),
+            "open": 100.0,
+            "high": 101.0,
+            "low": 99.0,
+            "close": 100.2,
+            "volume": 1000,
+        }
+        for i in range(num_bars)
+    ]
+    return pd.DataFrame.from_records(records)
+
+
+def _ladder_strategy(
+    stop: float | None,
+    levels: dict[str, float],
+    fractions: dict[str, float] | None = None,
+):
+    """Signal frame for one LONG entry carrying numbered ``tpN`` levels.
+
+    A ladder arrives as numbered ``tpN`` columns with an optional ``tpN_pct``
+    exit fraction, which is the shape ``_extract_levels`` understands; a list
+    inside ``take_profit`` is not.
+    """
+
+    def strategy_fn(df: pd.DataFrame, params: dict):
+        signals = pd.DataFrame(index=df.index)
+        signals["entries"] = False
+        signals["exits"] = False
+        signals["direction"] = "LONG"
+        signals["stop_loss"] = pd.NA
+        for column in ("take_profit", "tp1", "tp2", "tp1_pct", "tp2_pct"):
+            signals[column] = pd.NA
+        signals.loc[_LADDER_ENTRY_INDEX, "entries"] = True
+        if stop is not None:
+            signals.loc[_LADDER_ENTRY_INDEX, "stop_loss"] = stop
+        for name, price in levels.items():
+            signals.loc[_LADDER_ENTRY_INDEX, name] = price
+        for name, fraction in (fractions or {}).items():
+            signals.loc[_LADDER_ENTRY_INDEX, name] = fraction
+        return signals
+
+    return strategy_fn
+
+
+def _ladder_config() -> BacktestConfig:
+    return BacktestConfig(
+        strategy_name="tp-ladder",
+        symbols=["TEST"],
+        timeframe="1h",
+        start_date="2026-01-01",
+        end_date="2026-01-01",
+        initial_capital=100_000,
+        risk_per_trade_pct=0.01,
+        max_leverage=3.0,
+        modeling_resolution="main_timeframe",
+        parameters={"fees": "zero", "slippage": "none"},
+    )
+
+
+def test_a_take_profit_level_not_reached_this_bar_fills_on_a_later_bar():
+    """A ladder is walked level by level, across bars.
+
+    tp1 (103, half the position) is reached on bar 3; tp2 (106) is not, so the
+    position stays open with the other half and bar 4 fills tp2. Both legs, the
+    per-leg quantities and the excursion of the surviving half are hand-checked
+    below, because this is the path where a half-filled ladder's P&L is
+    computed.
+    """
+    data = _ladder_data()
+    data.loc[3, "high"] = 104.0  # reaches tp1 only
+    data.loc[4, "high"] = 107.0  # reaches tp2 only
+
+    result = TradeEngine(_ladder_config(), symbol="TEST").run(
+        data,
+        _ladder_strategy(
+            stop=98.0,
+            levels={"tp1": 103.0, "tp2": 106.0},
+            fractions={"tp1_pct": 0.5, "tp2_pct": 0.5},
+        ),
+    )
+
+    assert len(result.trades) == 1
+    trade = result.trades[0]
+    assert trade.entry_price == pytest.approx(_LADDER_ENTRY_PRICE)
+    assert trade.quantity == pytest.approx(_LADDER_RISK_UNITS), (
+        "1% of 100_000 over the 2.0-point stop is 500 units"
+    )
+
+    assert [exit.reason for exit in trade.exits] == ["tp1", "tp2"]
+    assert [exit.price for exit in trade.exits] == pytest.approx([103.0, 106.0]), (
+        "each level fills at its own level price, not at the bar high"
+    )
+    assert [exit.quantity for exit in trade.exits] == pytest.approx([250.0, 250.0]), (
+        "half the position per level"
+    )
+    # (103 - 100) * 250 = +750, then (106 - 100) * 250 = +1500.
+    assert [exit.pnl for exit in trade.exits] == pytest.approx([750.0, 1500.0])
+    assert trade.pnl == pytest.approx(2250.0)
+    assert trade.net_pnl == pytest.approx(2250.0)  # zero-fee run
+    assert trade.meta["exit_reason"] == "tp2"
+    assert trade.take_profit == pytest.approx(103.0), (
+        "the trade records the FIRST ladder level as its take-profit"
+    )
+
+    # Excursions: bar 3 caps the favourable side at tp1 for the full 500 units
+    # and records the untouched low; bar 4 caps at tp2 (106 = +6 per unit) for
+    # the 250 units that were still open, so the second leg does not re-credit
+    # the first half - 6 * 250 equals 3 * 500.
+    assert trade.mfe == pytest.approx(3.0 * _LADDER_RISK_UNITS)
+    assert trade.r_multiple == pytest.approx(2.25), "net +2250 on 1000 at risk"
+    assert trade.mae == pytest.approx(-1.0 * _LADDER_RISK_UNITS), (
+        "no stop fired, so the adverse side keeps the bar's low"
+    )
+
+
+def test_a_partial_take_profit_fill_is_followed_by_a_stop_on_the_remainder():
+    """Half out at tp1, the other half stopped out on the SAME bar.
+
+    The bar trades through both the stop (98) and tp1 (103), and the 15m
+    sub-bars order the rally ahead of the dip, so the chronological intrabar
+    event is the take-profit and the remainder is closed at the stop level
+    afterwards. tp2 (999) is deliberately out of reach: it is what makes tp1 a
+    *partial* fill, because the last pending level is sized on the remaining
+    quantity.
+    """
+    data = _ladder_data()
+    data.loc[3, "high"] = 106.0  # tp1 (103) reached, tp2 (999) not
+    data.loc[3, "low"] = 97.0  # stop (98) reached too
+    intrabar = pd.DataFrame(
+        {
+            # 15m sub-bars of the 03:00 bar: flat, then through tp1, then the
+            # dip through the stop.
+            "timestamp": pd.date_range("2026-01-01 03:00", periods=4, freq="15min", tz="UTC"),
+            "open": [100.0, 100.5, 103.5, 98.5],
+            "high": [101.0, 104.0, 104.0, 99.0],
+            "low": [99.5, 100.0, 97.5, 97.0],
+            "close": [100.5, 103.5, 98.5, 98.0],
+            "volume": [100.0] * 4,
+        }
+    )
+
+    cfg = BacktestConfig(
+        strategy_name="tp-ladder-then-stop",
+        symbols=["TEST"],
+        timeframe="1h",
+        start_date="2026-01-01",
+        end_date="2026-01-01",
+        initial_capital=100_000,
+        risk_per_trade_pct=0.01,
+        max_leverage=3.0,
+        # A lower timeframe is requested, so the same-bar ambiguity is resolved
+        # by the intrabar chronology instead of the stop-first tie-break.
+        modeling_resolution="15m",
+        parameters={"fees": "zero", "slippage": "none"},
+    )
+
+    result = TradeEngine(cfg, symbol="TEST", intrabar_data=intrabar).run(
+        data,
+        _ladder_strategy(
+            stop=98.0,
+            levels={"tp1": 103.0, "tp2": 999.0},
+            fractions={"tp1_pct": 0.5, "tp2_pct": 0.5},
+        ),
+    )
+
+    assert len(result.trades) == 1
+    trade = result.trades[0]
+    assert trade.meta["execution_model"]["intrabar_resolution"] == "15m"
+    assert trade.meta.get("same_bar_priority") is None, (
+        "the intrabar walk ordered the two events, so the stop-first fallback "
+        "flag must NOT be recorded"
+    )
+
+    assert [exit.reason for exit in trade.exits] == ["tp1", "stop_loss"]
+    assert [exit.price for exit in trade.exits] == pytest.approx([103.0, 98.0]), (
+        "the remainder exits AT the stop level, not at the 97.0 bar low"
+    )
+    assert [exit.quantity for exit in trade.exits] == pytest.approx([250.0, 250.0])
+    # (103 - 100) * 250 = +750, then (98 - 100) * 250 = -500.
+    assert [exit.pnl for exit in trade.exits] == pytest.approx([750.0, -500.0])
+    assert trade.pnl == pytest.approx(250.0)
+    assert trade.net_pnl == pytest.approx(250.0)  # zero-fee run
+    assert trade.meta["exit_reason"] == "stop_loss"
+
+    # Both caps are in force on this one bar (the documented two-cap case): the
+    # favourable side stops at the furthest level actually reached, the adverse
+    # side at the stop.
+    assert trade.mfe == pytest.approx(3.0 * _LADDER_RISK_UNITS)
+    assert trade.mae == pytest.approx(-2.0 * _LADDER_RISK_UNITS), (
+        "the stop caps the adverse side even though the bar ran to 97.0"
+    )
+    # 1% risk = 1000 over the 2.0-point stop; net +250 => +0.25R.
+    assert trade.r_multiple == pytest.approx(0.25)

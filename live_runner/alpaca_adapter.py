@@ -5,10 +5,10 @@ import inspect
 import math
 import os
 import re
-from collections.abc import Iterator, Mapping
+from collections.abc import Collection, Iterable, Iterator, Mapping
 from datetime import datetime, timedelta, timezone
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal, InvalidOperation
-from typing import Any
+from typing import Any, NamedTuple
 from uuid import UUID
 
 import pandas as pd
@@ -16,16 +16,25 @@ from alpaca.trading.enums import OrderClass
 from alpaca.trading.requests import ReplaceOrderRequest, StopLossRequest, TakeProfitRequest
 
 from live_runner.alpaca_fees import (
+    ACTIVITY_WINDOW_OVERLAP,
+    CFEE_LOOKBACK_MARGIN,
     COMMISSION_BACKFILL_LOOKBACK,
-    candidate_fee_days,
-    day_start_utc,
-    fee_day_is_posted,
+    CRYPTO_FILL_SCAN_UNKNOWN,
+    cfee_created_at,
+    earliest_crypto_fill_at,
+    fee_fill_window_start,
     fetch_account_activities,
+    has_earlier_account_activity,
     plan_commission_backfill,
+    select_activity_window,
 )
 from live_runner.base_adapter import (
     EXIT_ONLY_RISK_SIZING_MODE,
+    ORDER_STATE_FILLED,
+    ORDER_STATE_TERMINAL,
+    ORDER_STATE_WORKING,
     BaseLiveAdapter,
+    BrokerOrderView,
     ControlOutcome,
     LivePipValue,
     LiveQuote,
@@ -35,17 +44,25 @@ from live_runner.base_adapter import (
     order_not_submitted,
 )
 from live_runner.credential_env import parse_bool_env, resolve_env_value
-from live_runner.exit_signals import ExitBelowStepError, round_exit_qty_down
+from live_runner.exit_signals import ExitBelowStepError
 from live_runner.symbol_class import canonical_crypto_symbol, classify_symbol
+from shared import venue_calendar
 from shared.alpaca_symbols import classify_alpaca_symbol, crypto_pair_key
+from shared.constants import DATA_DIR
 from shared.database import (
+    BROKER_CLOSE_REASON_ALPACA_LEG,
+    BROKER_CLOSE_REASON_ALPACA_STOP_LEG,
+    BROKER_CLOSE_REASON_ALPACA_TARGET_LEG,
     apply_live_execution_commissions,
+    broker_close_signal_id,
     get_live_signal_broker_order_id,
     get_live_signal_filled_qty,
+    get_live_signal_filled_qty_for_broker_order,
     get_live_signal_reconciliation_cursor,
     list_live_executions_for_broker_orders,
     list_live_executions_missing_commission,
     list_live_signal_ids_for_reconciliation,
+    record_live_broker_side_close_fill,
     save_live_execution,
     save_live_execution_up_to_cumulative,
     save_live_signal,
@@ -53,6 +70,7 @@ from shared.database import (
 )
 from shared.fill_keys import canonical_utc_timestamp
 from shared.logging import get_logger
+from shared.lot_grid import floor_qty_to_step
 from shared.models import (
     PRICE_ABSENT,
     PRICE_DERIVED,
@@ -61,6 +79,7 @@ from shared.models import (
     LiveExecution,
     LiveSignal,
 )
+from shared.money import MoneyParseError, parse_money, parse_optional
 
 logger = get_logger("live-runner")
 
@@ -68,19 +87,107 @@ _ALPACA_ACC_RE = re.compile(r"^ALPACA_API_KEY_ACC(?P<index>\d+)$")
 
 _SL_METADATA_KEYS = ("stop_loss", "sl_price", "stop_price", "resolved_stop_loss")
 _TP_METADATA_KEYS = ("take_profit", "tp_price")
+#: Overnight Reg T ceiling for marginable stocks: Alpaca's ``multiplier`` = 4
+#: is intraday buying power only, so positions that may be held overnight are
+#: capped at 2x equity. No platform order is marked intraday-only.
+_ALPACA_OVERNIGHT_MAX_LEVERAGE = 2.0
+
 #: Newest orders requested per lookup of held bracket stop legs (Alpaca's maximum is 500).
 _ALPACA_HELD_LEG_LOOKUP_LIMIT = 500
+
+#: Pages of ``_ALPACA_HELD_LEG_LOOKUP_LIMIT`` newest orders scanned back when a held-leg page
+#: comes back full. A full page means the account's history reaches further back than one
+#: page, not that the page was cut off (an account trading one bracket a day fills a page in
+#: under two years); the budget is what stops a sweep from paging forever.
+_ALPACA_HELD_LEG_PAGE_LIMIT = 20
+
+#: States in which a bracket leg still rests at the broker: ``held`` is the OCO-inactive
+#: leg of a filled parent, ``pending_cancel`` one whose cancel has not settled yet and may
+#: still fill (#198). A leg whose cancel has settled says so in the listing.
+_RESTING_LEG_STATUSES = frozenset({"held", "pending_cancel"})
+
+#: Terminal states in which an order left the book without executing. Only these let a
+#: refuse-cancel be excused: a ``filled``/``partially_filled`` order executed (a stop that
+#: fills on a position that is already flat opens a short), a ``done_for_day`` order is only
+#: out for the session and resumes with the next one, and a row nobody could read proves
+#: nothing. alpaca-py 0.44.0's ``OrderStatus`` defines no "done" - its end-of-day state is
+#: ``done_for_day`` - so there is nothing here for a shorter spelling to match. Verified on
+#: paper 2026-11-20: the leg Alpaca removes as the OCO sibling of a cancelled take profit
+#: is still readable by id, as ``canceled``.
+_GONE_WITHOUT_EXECUTING = frozenset({"canceled", "expired", "rejected"})
 
 #: Alpaca rejects sub-penny prices: two decimals at or above $1, four below
 #: ("sub-penny increment does not fulfill minimum pricing criteria", HTTP 422).
 _ALPACA_TICK_AT_OR_ABOVE_ONE = Decimal("0.01")
 _ALPACA_TICK_BELOW_ONE = Decimal("0.0001")
 
+#: ``AlpacaLiveAdapter._earliest_crypto_fill_at`` before its one-time FILL-history scan ran.
+_CRYPTO_FILL_SCAN_PENDING = object()
+
 _EXTENDED_HOURS_BRACKET_MESSAGE = (
     "Extended-hours entry with mandatory SL/TP is not supported: "
     "the broker rejects bracket orders with extended_hours enabled "
     "(signal_id={signal_id}, symbol={symbol})."
 )
+
+#: Order statuses that account for an expected order without proving it is
+#: still working (#303 reconciliation lookups). "Terminal" here means "not a
+#: missing-order mismatch", not necessarily final at the broker: done_for_day,
+#: stopped and suspended orders are accounted for but can reappear, while an
+#: unrecognised status stays "unknown" and fails closed.
+_ALPACA_ACCOUNTED_ORDER_STATUSES = frozenset(
+    {
+        "filled",
+        "canceled",
+        "expired",
+        "rejected",
+        "done_for_day",
+        "stopped",
+        "suspended",
+        "replaced",
+    }
+)
+_ALPACA_WORKING_ORDER_STATUSES = frozenset(
+    {
+        "new",
+        "partially_filled",
+        "pending_cancel",
+        "pending_replace",
+        "pending_new",
+        "pending_review",
+        "accepted",
+        "accepted_for_bidding",
+        "held",
+    }
+)
+
+#: Default per-request HTTP timeout for the alpaca-py REST session. alpaca-py
+#: exposes no timeout knob; without one a hung socket keeps its executor
+#: thread forever, which is how a reconciliation read used to leak workers.
+ALPACA_HTTP_TIMEOUT_SECONDS = 30.0
+
+
+def _install_http_timeout(client: Any, timeout_seconds: float) -> None:
+    """Give the alpaca-py REST session a default per-request timeout.
+
+    ``RESTClient`` has no timeout parameter and ``requests.Session`` has no
+    session-level default, so the session's ``request`` entry point is wrapped
+    once. A hung socket then fails the call instead of pinning an executor
+    thread forever.
+    """
+    session = getattr(client, "_session", None)
+    if session is None or getattr(session, "_tp_timeout_installed", False):
+        return
+    original_request = getattr(session, "request", None)
+    if not callable(original_request):
+        return
+
+    def _request_with_timeout(method: str, url: str, **kwargs: Any) -> Any:
+        kwargs.setdefault("timeout", timeout_seconds)
+        return original_request(method, url, **kwargs)
+
+    session.request = _request_with_timeout
+    session._tp_timeout_installed = True
 
 
 def _round_bracket_price_toward_entry(price: float, *, entry_price: float) -> float:
@@ -149,9 +256,12 @@ def _floor_to_whole_shares(qty: float) -> float:
 
     A bracket/OTO entry with a fractional qty is rejected ("fractional orders
     must have order_class=simple", HTTP 422). Floor, never round up: rounding
-    up would exceed the risk-sized quantity.
+    up would exceed the risk-sized quantity. The shared lot-grid floor's
+    decimal noise band (1e-6 of a step) can return a value a hair ABOVE a
+    real fraction that close to the next whole share -- at most 1e-6 of a
+    share, below Alpaca's quantity resolution (#278).
     """
-    return float(math.floor(float(qty) + 1e-9))
+    return floor_qty_to_step(qty, 1.0)
 
 
 def _normalize_broker_order_id(value: Any) -> str | None:
@@ -224,6 +334,96 @@ def _order_type(order: Any) -> str:
     return text.rsplit(".", 1)[-1]
 
 
+def _requested_order_qty(order: Any) -> float | None:
+    """The order's requested quantity as the broker stated it (#134).
+
+    ``qty`` on an Alpaca order is the total ordered quantity in the same
+    share/coin units the fill's ``filled_qty`` uses. ``None`` when the payload
+    does not state a usable one - never an invented quantity.
+    """
+    return _positive_finite(_order_attr(order, "qty", None))
+
+def _order_remaining_qty(order: Any) -> float | None:
+    """Remaining working quantity for a broker order, when both fields are readable.
+
+    ``None`` means "unknown" — an absent field or one that does not parse —
+    and is never read as zero. ``parse_optional`` raises ``MoneyParseError``
+    on a present-but-garbage field; it is caught here so one malformed order
+    reports an unknown qty instead of failing the whole working-orders read.
+    """
+    try:
+        qty = parse_optional(_order_attr(order, "qty", None))
+        filled = parse_optional(_order_attr(order, "filled_qty", None))
+    except MoneyParseError:
+        return None
+    if qty is None or filled is None:
+        return None
+    remaining = qty - filled
+    # The order is still on the broker's working list, so a non-positive
+    # remainder means "filled but not yet off the book": report 0 remaining,
+    # not the full qty — the field only feeds finding detail.
+    return remaining if remaining > 0 else 0.0
+
+
+def _usable_stop_price(order: Any) -> float | None:
+    """An order's ``stop_price`` when it parses, else ``None`` — never raises.
+
+    The flatten reads this only to *restore* a protection if the close fails;
+    one malformed leg must not abort the flatten for every remaining symbol,
+    so an unreadable price is logged and treated as "no usable stop here".
+    """
+    try:
+        return parse_optional(_order_attr(order, "stop_price", None))
+    except ValueError:
+        logger.warning(
+            "Skipping an order with an unreadable stop_price",
+            extra={
+                "data": {
+                    "order_id": _control_order_id(_order_attr(order, "id")),
+                    "symbol": _order_symbol(order),
+                    "stop_price_raw": _order_attr(order, "stop_price", None),
+                }
+            },
+        )
+        return None
+
+
+def _bracket_leg_key(value: Any) -> str | None:
+    """A bracket leg's order id as a map key, with or without a UUID shape.
+
+    Alpaca order ids are UUIDs and `_normalize_broker_order_id` proves that. The looser text
+    form keeps the registration side (submit response, nested reconcile legs, a trailed
+    stop's replacement id) from silently dropping the mapping for a broker - or a fake
+    client - that answers with another id shape. The stream path still requires the strict
+    UUID form before it consults the map, so a non-UUID leg id is learned but its fill is
+    refused as unattributable rather than recorded - the one direction that cannot lose
+    money.
+    """
+    normalized = _normalize_broker_order_id(value)
+    if normalized is not None:
+        return normalized
+    text_value = str(value or "").strip()
+    if not text_value or text_value.lower() in {"none", "null", "false"}:
+        return None
+    return text_value
+
+
+#: Event label a bracket leg's fill is keyed by. One label for BOTH paths that record a leg fill
+#: (the trade-update stream and the reconciliation backfill): the dedupe key must be derivable
+#: identically from either, or the same leg fill could be stored twice.
+_LEG_FILL_EVENT_LABEL = "leg"
+
+
+def _bracket_leg_close_reason(leg: Any) -> str:
+    """Which kind of bracket leg this is, for the close signal's audit metadata."""
+    order_type = _order_type(leg)
+    if order_type == "stop":
+        return BROKER_CLOSE_REASON_ALPACA_STOP_LEG
+    if order_type == "limit":
+        return BROKER_CLOSE_REASON_ALPACA_TARGET_LEG
+    return BROKER_CLOSE_REASON_ALPACA_LEG
+
+
 def _stop_candidates(order: Any) -> Iterator[Any]:
     """Orders that may be a position's working stop: the order, and a filled parent's held legs.
 
@@ -239,8 +439,33 @@ def _stop_candidates(order: Any) -> Iterator[Any]:
             yield leg
 
 
+def _page_back_cursor(orders: list[Any]) -> datetime | None:
+    """The ``until`` that asks for the page before a newest-first listing's oldest row.
+
+    The cursor goes *past* that timestamp by a microsecond, never before it: ``until``
+    bounds the window at the old end, so a cursor short of the oldest row would omit the
+    orders submitted in the gap, and the filled parent that owns the resting leg can be
+    one of them. A microsecond past it instead asks for the same rows again under every
+    inclusive/exclusive reading, and a row that comes back twice is deduplicated by id -
+    unlike a row that was skipped, which cannot be recovered. None when a row carries no
+    readable timestamp, which leaves the caller unable to page back.
+    """
+    oldest: datetime | None = None
+    for order in orders:
+        stamp = _order_attr(order, "submitted_at", None)
+        if isinstance(stamp, datetime):
+            if stamp.tzinfo is None:
+                stamp = stamp.replace(tzinfo=timezone.utc)
+            if oldest is None or stamp < oldest:
+                oldest = stamp
+    return oldest + timedelta(microseconds=1) if oldest is not None else None
+
+
 def _protective_stop_of(
-    candidate: Any, parent: Any, reducing_sides: Mapping[str, str]
+    candidate: Any,
+    parent: Any,
+    reducing_sides: Mapping[str, str],
+    unreadable_symbols: set[str] | None = None,
 ) -> ProtectiveStop | None:
     symbol = _order_symbol(candidate) or _order_symbol(parent)
     if not symbol or reducing_sides.get(symbol) != _order_side(candidate):
@@ -248,16 +473,49 @@ def _protective_stop_of(
     if _order_type(candidate) != "stop":
         return None
     order_id = _control_order_id(_order_attr(candidate, "id"))
-    stop_price = _to_float(_order_attr(candidate, "stop_price", None), default=0.0)
-    if order_id is None or not math.isfinite(stop_price) or stop_price <= 0:
+    try:
+        stop_price = parse_optional(_order_attr(candidate, "stop_price", None))
+    except ValueError:
+        # One malformed candidate must not take down the whole account's
+        # protective-stop listing, but it must not be silently ignored either:
+        # the caller drops every stop on the symbol so the trailing path sees
+        # zero listed stops and refuses to amend — fail closed per symbol.
+        if unreadable_symbols is not None:
+            unreadable_symbols.add(symbol)
+        logger.warning(
+            "Skipping a protective-stop candidate with an unreadable stop_price",
+            extra={
+                "data": {
+                    "order_id": order_id,
+                    "symbol": symbol,
+                    "stop_price_raw": _order_attr(candidate, "stop_price", None),
+                }
+            },
+        )
         return None
-    qty = _to_float(_order_attr(candidate, "qty", None), default=0.0)
+    if order_id is None or stop_price is None or stop_price <= 0:
+        return None
+    try:
+        qty = parse_optional(_order_attr(candidate, "qty", None))
+    except ValueError:
+        # Informational only: an unreadable quantity must not hide the stop.
+        logger.warning(
+            "Protective stop has an unreadable qty; reporting it as unknown",
+            extra={
+                "data": {
+                    "order_id": order_id,
+                    "symbol": symbol,
+                    "qty_raw": _order_attr(candidate, "qty", None),
+                }
+            },
+        )
+        qty = None
     return ProtectiveStop(
         order_id=order_id,
         symbol=symbol,
         side=_order_side(candidate),
         stop_price=stop_price,
-        qty=qty if math.isfinite(qty) and qty > 0 else None,
+        qty=qty if qty is not None and qty > 0 else None,
     )
 
 
@@ -277,6 +535,18 @@ def _alpaca_timeframe(value: str):
         raise ValueError(f"Unsupported Alpaca market-data timeframe: {value!r}")
     amount, unit = units[normalized]
     return TimeFrame(amount=amount, unit=unit), normalized
+
+
+#: Nominal bar spacing per supported market-data timeframe, for the
+#: session-aware staleness limit in ``_raise_if_market_data_stale``.
+_ALPACA_TIMEFRAME_STEP_MINUTES = {
+    "1m": 1.0,
+    "5m": 5.0,
+    "15m": 15.0,
+    "30m": 30.0,
+    "1h": 60.0,
+    "1d": 1440.0,
+}
 
 
 # Markets are closed for most of the calendar. A US equity session is 6.5 hours
@@ -332,15 +602,37 @@ def _parse_bool_env(name: str, value: str | None, *, default: bool = True) -> bo
     return parse_bool_env(name, value, default=default)
 
 
-def _to_float(value: Any, *, default: float = 0.0) -> float:
-    if value is None:
-        return default
-    if isinstance(value, Decimal):
-        return float(value)
+def _display_float(value: Any) -> float:
+    """Best-effort float for display-only payload fields.
+
+    Money fields that feed risk decisions must use ``shared.money.parse_money``
+    so an unreadable value raises. This coercion exists only so one unreadable
+    display field cannot take down a whole position listing; callers that need
+    to know the value was unreadable check the ``*_unparseable`` marker the
+    row carries alongside it (#271).
+    """
     try:
-        return float(value)
-    except (TypeError, ValueError):
-        return default
+        return parse_money(value)
+    except ValueError:
+        return 0.0
+
+
+def _optional_display_money(value: Any, entry: dict[str, Any], field: str) -> float | None:
+    """Display-only optional money: absent stays ``None``; garbage is marked, not raised.
+
+    ``current_price``/``unrealized_pl`` are ``Optional[str]`` on the Alpaca
+    position model — null is a legitimate broker answer — and no risk path
+    reads them, so one malformed row must not take down ``get_positions``
+    (and with it the flatten and exit-sizing paths).
+    """
+    if value is None:
+        return None
+    try:
+        return parse_money(value)
+    except ValueError:
+        entry[f"{field}_unparseable"] = True
+        entry[f"{field}_raw"] = value
+        return None
 
 
 def _positive_finite(value: Any) -> float | None:
@@ -427,10 +719,11 @@ def _is_parseable_qty(value: Any) -> bool:
 def _position_qty(position: Mapping[str, Any]) -> float:
     """The broker position's signed quantity, refusing to guess on a bad value.
 
-    ``_to_float(..., default=0.0)`` maps an *unparseable* ``qty`` onto "flat",
-    which would let a position with a malformed quantity be silently skipped as
-    "no position" — the flatten would then report success and a STOPPED
-    deployment would be stamped enforced while real exposure stayed open.
+    The display coercion in :func:`get_positions` maps an *unparseable* ``qty``
+    onto "flat" for ordinary consumers, which would let a position with a
+    malformed quantity be silently skipped as "no position" — the flatten would
+    then report success and a STOPPED deployment would be stamped enforced
+    while real exposure stayed open.
 
     :func:`get_positions` marks such a row with ``qty_unparseable`` (the
     displayed ``qty`` is still the coerced ``0.0`` so ordinary consumers keep
@@ -460,6 +753,50 @@ def _position_qty(position: Mapping[str, Any]) -> float:
             f"qty ({value!r}); refusing to treat it as flat"
         )
     return qty
+
+
+def _order_filled_qty(order: Any) -> float | None:
+    """What the broker reports an order as filled, or ``None`` when it cannot be read.
+
+    A terminal state is not proof of "left without executing" on its own: a sell stop
+    that partly fills and is then cancelled is ``canceled`` *with* a quantity. So an
+    excusal needs this number, and a number nobody could read answers "unknown" -
+    the same fail-closed answer the rest of this file gives a row it cannot read.
+    """
+    try:
+        return parse_optional(_order_attr(order, "filled_qty", None))
+    except MoneyParseError:
+        return None
+
+
+class _RestingLeg(NamedTuple):
+    """A bracket leg that still rests, and the filled parent it rests under.
+
+    The parent travels with the leg because a leg can arrive without its own
+    ``symbol``: this file's other order readers fall back to the parent's
+    (``_protective_stop_of``, ``_best_stop_price`` and ``_has_working_stop`` all
+    accept an empty leg symbol), and a symbol nobody could read is not "no
+    position" - it is a position the sweep cannot place.
+    """
+
+    leg: Any
+    parent: Any
+
+
+class _LivePosition(NamedTuple):
+    """The broker's current position on a symbol.
+
+    ``flat`` is True only for a readable zero (or no row at all): a listing that
+    failed, or a quantity that cannot be read, leaves the position unknown - with
+    ``stop_qty``/``stop_side`` unset - so a caller can neither skip a position it
+    cannot see nor size an order from a quantity it could not read. The two stop
+    fields are the quantity and side of the stop that protects the position: the
+    *reducing* side's, so a long position's stop is a sell.
+    """
+
+    flat: bool
+    stop_qty: float | None = None
+    stop_side: str | None = None
 
 
 def _is_flat(qty: float) -> bool:
@@ -789,6 +1126,24 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         # #167: serialises stop amendments with the sweeps that cancel orders
         # (see `_order_book_lock`). Bound to the loop that first uses it.
         self._order_book_lock_state: tuple[asyncio.AbstractEventLoop, asyncio.Lock] | None = None
+        # #144: bracket leg order id -> the id of the signal whose position the leg closes.
+        # A leg is a broker-side child order: Alpaca gives it its own order id, so a fill of it
+        # names no signal of ours and would otherwise be dropped (`client_order_id` is not a
+        # signal), leaving the broker position smaller than every ledger on the account and
+        # #142's guard alerting on every later exit for that symbol.
+        # Learned from the parent order's nested legs whenever one is seen: at submit, on
+        # every reconciliation pass - which is the adapter's only one and runs on connect,
+        # before the trading stream consumes events, so a restart re-learns the mapping -
+        # and at once in `amend_protective_stop`, because a trailed stop's replacement is
+        # a NEW leg order id that would otherwise stay unattributable until the next pass.
+        self._bracket_leg_order_id_to_signal_id: dict[str, str] = {}
+        # The earliest crypto fill is fixed history once found: the FILL-history scan behind
+        # ``backfill_commissions`` runs once and later passes answer from this cache
+        # instead of re-paging up to ``MAX_ACTIVITY_PAGES`` requests every pass. Only a found
+        # datetime (or CRYPTO_FILL_SCAN_UNKNOWN, which fails closed either way) is cached -
+        # ``None`` ("no crypto fill up to the scan's ``until``") is not, because fills posted
+        # after the scan can still predate ``fill_start`` on a later pass.
+        self._earliest_crypto_fill_at: Any = _CRYPTO_FILL_SCAN_PENDING
 
         if not self.api_key or not self.secret_key:
             raise ValueError(
@@ -806,13 +1161,14 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 "alpaca-py is required for AlpacaLiveAdapter. Install package 'alpaca-py'."
             ) from exc
         self._trading_client = TradingClient(self.api_key, self.secret_key, paper=self.paper)
+        _install_http_timeout(self._trading_client, ALPACA_HTTP_TIMEOUT_SECONDS)
         self._trading_stream = TradingStream(self.api_key, self.secret_key, paper=self.paper)
         self._historical_data_client = StockHistoricalDataClient(
             self.api_key, self.secret_key
         )
         try:
             self._trading_client.get_account()
-        except Exception:
+        except Exception:  # except-kind: money-decision
             await self.disconnect()
             raise
         self._connected = True
@@ -827,7 +1183,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         # must say so rather than promise a pass.
         try:
             await self.reconcile_executions()
-        except Exception as exc:
+        except Exception as exc:  # except-kind: money-decision
             logger.warning(
                 "Alpaca execution reconciliation failed; fills may be missing until retry",
                 extra={"data": {"account_id": self.account_id, "error": str(exc)}},
@@ -851,113 +1207,297 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             before=before,
         )
 
-    async def _reconcile_signal_fill(self, signal_id: str) -> bool:
-        try:
-            order = await asyncio.to_thread(
-                self._trading_client.get_order_by_client_id, signal_id
+    def _register_bracket_legs(self, parent_signal_id: str, order: Any) -> int:
+        """Learn which bracket leg order ids belong to this parent signal (#144).
+
+        The broker reports a parent order's legs nested in it, and a leg carries only its own
+        order id: nothing else connects a leg's fill to the signal whose position it closes.
+        Returns how many leg ids were learned.
+        """
+        registered = 0
+        for leg in _order_legs(order):
+            leg_key = _bracket_leg_key(_order_attr(leg, "id"))
+            if leg_key is None:
+                continue
+            self._bracket_leg_order_id_to_signal_id[leg_key] = str(parent_signal_id)
+            registered += 1
+        return registered
+
+    async def _fetch_parent_order_with_legs(self, signal_id: str) -> Any:
+        """Fetch the parent order for a signal, with its bracket legs nested in it.
+
+        ``get_order_by_client_id`` takes no ``nested`` argument in alpaca-py 0.44.0, and the
+        runbook records that a bracket's legs are only reported back nested in the parent
+        (``docs/live-deploy-runbook.md``): fetching by client id alone therefore returns no
+        legs, and the leg-order-id -> signal map this adapter depends on would never be
+        re-learned after a restart - the #144 defect itself, since the stream drops a leg
+        fill whose client order id names no signal. The persisted broker order id is used
+        with ``GetOrderByIdRequest(nested=True)`` first; only a signal submitted before that
+        id was persisted falls back to the client-id fetch, and an alpaca-py without the
+        nested filter degrades to the flat ``get_order_by_id``.
+        """
+        trading_client = self._trading_client
+        if trading_client is None:
+            raise RuntimeError("Alpaca adapter is not connected; cannot fetch the parent order")
+        stored_order_id = await asyncio.to_thread(get_live_signal_broker_order_id, signal_id)
+        if stored_order_id:
+            try:
+                from alpaca.trading.requests import GetOrderByIdRequest
+            except ImportError:
+                # An alpaca-py without the nested filter request: the flat fetch below
+                # still carries the parent's own fill. `ImportError`, not
+                # `ModuleNotFoundError`: a missing NAME inside an importable
+                # module raises the former, and the fallback must still fire.
+                GetOrderByIdRequest = None  # type: ignore[assignment,misc]
+            if GetOrderByIdRequest is not None:
+                try:
+                    return await asyncio.to_thread(
+                        trading_client.get_order_by_id,
+                        stored_order_id,
+                        GetOrderByIdRequest(nested=True),
+                    )
+                except TypeError:
+                    # An alpaca-py whose get_order_by_id takes no filter: ask for the
+                    # flat order instead.
+                    pass
+            return await asyncio.to_thread(
+                trading_client.get_order_by_id, stored_order_id
             )
-        except Exception:
-            # Unknown to this account or not found.
+        return await asyncio.to_thread(trading_client.get_order_by_client_id, signal_id)
+
+    def _parent_signal_id_for_broker_order(self, broker_order_id: str | None) -> str | None:
+        """The signal whose bracket leg this broker order id names, or ``None``."""
+        if not broker_order_id:
+            return None
+        return self._bracket_leg_order_id_to_signal_id.get(str(broker_order_id))
+
+    async def _reconcile_bracket_leg_fill(self, parent_signal_id: str, leg: Any) -> bool:
+        """Backfill one bracket leg's missed fill against the parent signal's ledger (#144).
+
+        The leg's own broker cumulative is the authority. Only the slice still missing for that
+        leg order is persisted, so a leg the stream already saw in full - or in part - is not
+        counted twice, and a second pass adds nothing.
+        """
+        leg_order_id = _bracket_leg_key(_order_attr(leg, "id"))
+        if leg_order_id is None:
             return False
-        broker_filled_qty = _to_float(
-            getattr(order, "filled_qty", None), default=0.0
+        if _order_status(leg) not in {"filled", "partially_filled"}:
+            return False
+        # Absent reads as nothing filled; a present but unreadable quantity raises
+        # MoneyParseError (#280), which the reconciliation pass skips per signal;
+        # the parent fill booked earlier in the same call is kept.
+        parsed_leg_qty = parse_optional(_order_attr(leg, "filled_qty", None))
+        leg_cumulative_qty = 0.0 if parsed_leg_qty is None else parsed_leg_qty
+        if leg_cumulative_qty <= 0.0:
+            return False
+        close_signal_id = broker_close_signal_id(parent_signal_id)
+        recorded_qty = await asyncio.to_thread(
+            get_live_signal_filled_qty_for_broker_order, close_signal_id, leg_order_id
         )
-        if not math.isfinite(broker_filled_qty):
-            logger.warning(
-                "Alpaca order reports a non-finite filled_qty; not reconciling it",
-                extra={
-                    "data": {
-                        "signal_id": signal_id,
-                        "filled_qty": str(getattr(order, "filled_qty", None)),
-                    }
-                },
-            )
-            return False
-        local_filled_qty = await asyncio.to_thread(
-            get_live_signal_filled_qty, signal_id
-        )
-        missing_filled_qty = broker_filled_qty - local_filled_qty
-        if missing_filled_qty <= 0:
-            return False
-        broker_order_id = _normalize_broker_order_id(getattr(order, "id", None))
-        if broker_order_id is None:
-            return False
-        # `filled_avg_price` is the broker's average over the order's WHOLE cumulative quantity.
-        # Without it there is no price to record, and a fill at 0.0 is not a fill (#124): persist
-        # nothing, and the next reconciliation pass retries.
-        cumulative_avg_price = _positive_finite(getattr(order, "filled_avg_price", None))
-        if cumulative_avg_price is None:
-            logger.warning(
-                "Alpaca order has filled quantity but no usable filled_avg_price; not persisting "
-                "the missed fill, the next reconciliation pass retries",
-                extra={
-                    "data": {
-                        "account_id": self.account_id,
-                        "signal_id": signal_id,
-                        "broker_order_id": broker_order_id,
-                        "filled_avg_price": str(getattr(order, "filled_avg_price", None)),
-                        "missing_filled_qty": missing_filled_qty,
-                    }
-                },
-            )
+        missing_qty = leg_cumulative_qty - recorded_qty
+        if missing_qty <= 0.0:
             return False
         fill_ts = _broker_fill_timestamp(
-            getattr(order, "filled_at", None), getattr(order, "updated_at", None)
+            _order_attr(leg, "filled_at", None), _order_attr(leg, "updated_at", None)
         )
         if fill_ts is None:
             logger.warning(
-                "Alpaca order has filled quantity but neither a usable filled_at nor updated_at; "
-                "not persisting the missed fill with an invented time. reconciliation runs only "
-                "when the adapter connects, so the next adapter connect retries it",
+                "Alpaca bracket leg has filled quantity but neither a usable filled_at nor "
+                "updated_at; not persisting the missed close with an invented time. reconciliation "
+                "runs only when the adapter connects, so the next adapter connect retries it",
                 extra={
                     "data": {
                         "account_id": self.account_id,
-                        "signal_id": signal_id,
-                        "broker_order_id": broker_order_id,
-                        "filled_at": str(getattr(order, "filled_at", None)),
-                        "updated_at": str(getattr(order, "updated_at", None)),
-                        "missing_filled_qty": missing_filled_qty,
+                        "parent_signal_id": parent_signal_id,
+                        "leg_order_id": leg_order_id,
+                        "leg_filled_qty": leg_cumulative_qty,
+                        "leg_recorded_qty": recorded_qty,
                     }
                 },
             )
             return False
-        execution = LiveExecution(
-            signal_id=UUID(signal_id),
-            # Placeholder: the save derives the remainder's own price from the cumulative average
-            # inside its transaction, because part of the order may already be recorded at a
-            # different price, and sets the verdict (`derived`, or `derived_unavailable` with the
-            # quantity still recorded at 0.0).
-            actual_price=cumulative_avg_price,
-            actual_price_observed=PRICE_DERIVED,
-            filled_qty=missing_filled_qty,
-            commission=_known_commission(order),
-            timestamp=fill_ts,
-            broker_order_id=broker_order_id,
-            dedupe_key=(
-                f"alpaca:order:{broker_order_id}:reconciled:{broker_filled_qty}"
-            ),
+        actual_price, price_observed = _resolve_fill_price(
+            (None, None),
+            order_avg_price=_order_attr(leg, "filled_avg_price", None),
+            event_qty=missing_qty,
+            cumulative_qty=leg_cumulative_qty,
         )
         persisted_qty = await asyncio.to_thread(
-            save_live_execution_up_to_cumulative,
-            execution,
-            broker_filled_qty,
-            cumulative_avg_price=cumulative_avg_price,
+            record_live_broker_side_close_fill,
+            parent_signal_id=parent_signal_id,
+            close_reason=_bracket_leg_close_reason(leg),
+            filled_qty=missing_qty,
+            actual_price=actual_price,
+            actual_price_observed=price_observed,
+            commission=_known_commission(leg),
+            timestamp=fill_ts,
+            broker_order_id=leg_order_id,
+            # The leg's own cumulative and average let the insert cap the booking at
+            # what the leg has actually filled and derive the missing slice's price
+            # when this backfill covers only part of it.
+            cumulative_filled_qty=leg_cumulative_qty,
+            cumulative_avg_price=_positive_finite(
+                _order_attr(leg, "filled_avg_price", None)
+            ),
+            dedupe_key=_alpaca_fill_dedupe_key(
+                execution_id="",
+                broker_order_id=leg_order_id,
+                event=_LEG_FILL_EVENT_LABEL,
+                cumulative_filled_qty=leg_cumulative_qty,
+                raw_timestamp=None,
+                filled_qty=missing_qty,
+            )
+            or "",
+            close_side=_order_side(leg),
+            order_type=_order_type(leg) or None,
+            requested_qty=_requested_order_qty(leg),
         )
         if persisted_qty <= 0.0:
             return False
         logger.info(
-            "Reconciled missed Alpaca fill",
+            "Reconciled missed Alpaca bracket leg close fill",
             extra={
                 "data": {
-                    "signal_id": signal_id,
-                    "broker_order_id": broker_order_id,
+                    "parent_signal_id": parent_signal_id,
+                    "close_signal_id": broker_close_signal_id(parent_signal_id),
+                    "leg_order_id": leg_order_id,
+                    "close_reason": _bracket_leg_close_reason(leg),
                     "filled_qty": persisted_qty,
-                    "broker_cumulative_filled_qty": broker_filled_qty,
-                    "local_cumulative_filled_qty": local_filled_qty,
+                    "leg_cumulative_qty": leg_cumulative_qty,
+                    "leg_recorded_qty": recorded_qty,
                 }
             },
         )
         return True
+
+    async def _reconcile_signal_fill(self, signal_id: str) -> int:
+        """Backfill this signal's missed fills; returns how many fills were recovered.
+
+        The order's own fill first, then - since #144 - the fills of the bracket legs that hang
+        off it: both are recovered from one fetch of the parent order.
+        """
+        try:
+            order = await self._fetch_parent_order_with_legs(signal_id)
+        except Exception:  # except-kind: money-decision
+            # Unknown to this account or not found.
+            return 0
+        recovered = 0
+        # #144: the parent order carries its nested legs, so a restart (or a rebuild after a
+        # reconnect) re-learns which leg orders close this signal's position - even for a parent
+        # whose own fill is already recorded, which returns below without fetching anything else.
+        self._register_bracket_legs(signal_id, order)
+        # A present but unreadable (or non-finite) quantity raises inside parse_optional
+        # (#280); an order that reports none has no parent fill to reconcile, but its
+        # legs still do, so absence reads as 0 here rather than ending the reconcile.
+        parsed_filled_qty = parse_optional(getattr(order, "filled_qty", None))
+        broker_filled_qty = 0.0 if parsed_filled_qty is None else parsed_filled_qty
+        local_filled_qty = await asyncio.to_thread(
+            get_live_signal_filled_qty, signal_id
+        )
+        missing_filled_qty = broker_filled_qty - local_filled_qty
+        broker_order_id = _normalize_broker_order_id(getattr(order, "id", None))
+        # `filled_avg_price` is the broker's average over the order's WHOLE cumulative quantity.
+        # Without it there is no price to record, and a fill at 0.0 is not a fill (#124): persist
+        # nothing, and the next reconciliation pass retries.
+        cumulative_avg_price = (
+            _positive_finite(getattr(order, "filled_avg_price", None))
+            if missing_filled_qty > 0
+            else None
+        )
+        fill_ts = (
+            _broker_fill_timestamp(
+                getattr(order, "filled_at", None), getattr(order, "updated_at", None)
+            )
+            if missing_filled_qty > 0
+            else None
+        )
+        # #144: the order's own fill is booked FIRST and a leg's close only after it,
+        # because a leg closes the position that fill opened: booking a leg against a
+        # parent whose own fill could not be recovered drives the deployment's ledger
+        # below zero (the close insert refuses it outright, but the leg would then stay
+        # unbooked until the next connect - this function used to return early on exactly
+        # that, leaving an already-booked leg behind).
+        parent_fill_pending = missing_filled_qty > 0
+        parent_fill_unrecoverable = parent_fill_pending and (
+            cumulative_avg_price is None or fill_ts is None or broker_order_id is None
+        )
+        if parent_fill_pending and broker_order_id is not None:
+            if cumulative_avg_price is None:
+                logger.warning(
+                    "Alpaca order has filled quantity but no usable filled_avg_price; not "
+                    "persisting the missed fill, the next reconciliation pass retries",
+                    extra={
+                        "data": {
+                            "account_id": self.account_id,
+                            "signal_id": signal_id,
+                            "broker_order_id": broker_order_id,
+                            "filled_avg_price": str(getattr(order, "filled_avg_price", None)),
+                            "missing_filled_qty": missing_filled_qty,
+                        }
+                    },
+                )
+            elif fill_ts is None:
+                logger.warning(
+                    "Alpaca order has filled quantity but neither a usable filled_at nor "
+                    "updated_at; not persisting the missed fill with an invented time. "
+                    "reconciliation runs only when the adapter connects, so the next "
+                    "adapter connect retries it",
+                    extra={
+                        "data": {
+                            "account_id": self.account_id,
+                            "signal_id": signal_id,
+                            "broker_order_id": broker_order_id,
+                            "filled_at": str(getattr(order, "filled_at", None)),
+                            "updated_at": str(getattr(order, "updated_at", None)),
+                            "missing_filled_qty": missing_filled_qty,
+                        }
+                    },
+                )
+            else:
+                execution = LiveExecution(
+                    signal_id=UUID(signal_id),
+                    # Placeholder: the save derives the remainder's own price from the
+                    # cumulative average inside its transaction, because part of the order
+                    # may already be recorded at a different price, and sets the verdict
+                    # (`derived`, or `derived_unavailable` with the quantity still
+                    # recorded at 0.0).
+                    actual_price=cumulative_avg_price,
+                    actual_price_observed=PRICE_DERIVED,
+                    filled_qty=missing_filled_qty,
+                    commission=_known_commission(order),
+                    timestamp=fill_ts,
+                    broker_order_id=broker_order_id,
+                    dedupe_key=(
+                        f"alpaca:order:{broker_order_id}:reconciled:{broker_filled_qty}"
+                    ),
+                    order_type=_order_type(order) or None,
+                    requested_qty=_requested_order_qty(order),
+                )
+                persisted_qty = await asyncio.to_thread(
+                    save_live_execution_up_to_cumulative,
+                    execution,
+                    broker_filled_qty,
+                    cumulative_avg_price=cumulative_avg_price,
+                )
+                if persisted_qty > 0.0:
+                    logger.info(
+                        "Reconciled missed Alpaca fill",
+                        extra={
+                            "data": {
+                                "signal_id": signal_id,
+                                "broker_order_id": broker_order_id,
+                                "filled_qty": persisted_qty,
+                                "broker_cumulative_filled_qty": broker_filled_qty,
+                                "local_cumulative_filled_qty": local_filled_qty,
+                            }
+                        },
+                    )
+                    recovered += 1
+        if not parent_fill_unrecoverable:
+            for leg in _order_legs(order):
+                if await self._reconcile_bracket_leg_fill(signal_id, leg):
+                    recovered += 1
+        return recovered
 
     async def reconcile_executions(self, *, max_signals: int = 200) -> int:
         """Backfill missing fill quantity for recent signals in this Alpaca account.
@@ -966,6 +1506,11 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         broker submit and stream-event persistence. Uses the client_order_id == signal.id
         convention. Broker order quantities are cumulative, while local executions are
         stored as event deltas, so only the positive cumulative difference is persisted.
+
+        Since #144 one pass also recovers the fills of a bracket's stop/target legs, which
+        close the signal's position without any order of ours. Returns the number of signals
+        with at least one recovered fill - a signal counted once however many fills it needed,
+        because a leg's fill and the order's own are backfilled from the same fetch.
         """
         if self._trading_client is None:
             return 0
@@ -976,8 +1521,27 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             if not signal_ids:
                 break
             for signal_id in signal_ids:
-                if await self._reconcile_signal_fill(signal_id):
-                    recovered += 1
+                try:
+                    if await self._reconcile_signal_fill(signal_id):
+                        recovered += 1
+                except MoneyParseError as exc:
+                    # An unreadable money field raises inside the parse; one
+                    # malformed order must not stop the rest of the pass, and
+                    # nothing is persisted for it. The next pass retries. Only
+                    # parse failures are skipped — a programming error or a
+                    # database ValueError must surface, not read as "unreadable
+                    # order data".
+                    logger.warning(
+                        "Alpaca reconciliation skipped a signal with unreadable "
+                        "order data",
+                        extra={
+                            "data": {
+                                "account_id": self.account_id,
+                                "signal_id": signal_id,
+                                "error": str(exc),
+                            }
+                        },
+                    )
             if len(signal_ids) < max_signals:
                 break
             next_before = await asyncio.to_thread(
@@ -991,13 +1555,14 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
     async def backfill_commissions(self, *, now: datetime | None = None) -> int:
         """Price this account's still-unknown crypto commissions from posted ``CFEE`` activities.
 
-        Crypto fees are posted end of day, so fills are stored with a NULL commission and this pass
-        - run periodically by the daemon - fills them in once their trade date has been posted
-        (``CFEE_POSTING_DELAY``) and while they are inside ``COMMISSION_BACKFILL_LOOKBACK``. It
-        reads ``FILL``, ``CFEE`` and ``FEE`` activities over REST (alpaca-py has no activities
-        method), allocates each (pair, trade date)'s fee as documented in `live_runner.alpaca_fees`,
-        and
-        writes a group's commissions all or nothing. Every group that cannot be priced honestly
+        Crypto fees are posted in batches some time after the fills, so fills are stored with a
+        NULL commission and this pass - run periodically by the daemon - fills them in once the
+        batch covering them exists and while they are inside
+        ``COMMISSION_BACKFILL_LOOKBACK``. It reads ``CFEE`` activities first (``CFEE.date`` is the
+        posting date, not the trade date), works out which ``FILL`` window the relevant batches
+        cover, then reads ``FILL`` and ``FEE`` activities over REST (alpaca-py has no activities
+        method), allocates each (pair, batch)'s fee as documented in `live_runner.alpaca_fees`,
+        and writes a group's priced side all or nothing. Every group that cannot be priced honestly
         keeps NULL and is logged; nothing is ever written as ``0.0``.
 
         Returns the number of executions whose commission was set. Never raises for broker data or
@@ -1022,14 +1587,9 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                     f"not a crypto pair (symbol {row['symbol']!r} classifies as {kind}); no CFEE "
                     "applies and nothing else prices it"
                 )
-            elif not all(
-                fee_day_is_posted(day, now) for day in candidate_fee_days(row["timestamp"])
-            ):
-                reason = "its trade date's CFEE is not posted yet; retried on a later pass"
+                skipped.setdefault(reason, []).append(str(row["execution_id"]))
             else:
                 candidates.append(row)
-                continue
-            skipped.setdefault(reason, []).append(str(row["execution_id"]))
         for reason, execution_ids in skipped.items():
             logger.info(
                 "Alpaca commission backfill: skipping %s execution(s) with unknown commission: "
@@ -1042,20 +1602,120 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         if not candidates:
             return 0
 
-        days = {day for row in candidates for day in candidate_fee_days(row["timestamp"])}
-        window_start = day_start_utc(min(days)) - timedelta(days=1)
-        fill_window_end = min(day_start_utc(max(days)) + timedelta(days=2), now)
+        candidate_times = []
+        for row in candidates:
+            timestamp = row.get("timestamp")
+            if timestamp is None:
+                timestamp = now - COMMISSION_BACKFILL_LOOKBACK
+            elif timestamp.tzinfo is None:
+                timestamp = timestamp.replace(tzinfo=timezone.utc)
+            candidate_times.append(timestamp)
+
+        # CFEE first: its batches decide which fills can be priced at all, and how far back the
+        # FILL listing must reach to cover every relevant batch window. CFEE/FEE filter by New
+        # York calendar day (#149), so the listing is widened by a day on both sides and
+        # re-filtered here on the real timestamps.
+        cfee_after = min(candidate_times) - CFEE_LOOKBACK_MARGIN
         try:
+            raw_cfees = await asyncio.to_thread(
+                fetch_account_activities,
+                client,
+                "CFEE",
+                after=cfee_after - ACTIVITY_WINDOW_OVERLAP,
+                until=now + ACTIVITY_WINDOW_OVERLAP,
+            )
+            cfees = select_activity_window(
+                raw_cfees, after=cfee_after, until=now, field="created_at"
+            )
+            fill_start = fee_fill_window_start(candidate_times, cfees)
+        except Exception as exc:  # except-kind: money-decision
+            logger.warning(
+                "Alpaca commission backfill: reading CFEE activities failed; commissions stay "
+                "unknown until the next pass",
+                extra={"data": {"account_id": self.account_id, "error": str(exc)}},
+            )
+            return 0
+        if fill_start is None:
+            logger.info(
+                "Alpaca commission backfill: no posted CFEE batch can cover %s execution(s); "
+                "their fee batch is not posted yet - retried on a later pass: %s",
+                len(candidates),
+                ", ".join(str(row["execution_id"]) for row in candidates),
+                extra={
+                    "data": {
+                        "account_id": self.account_id,
+                        "execution_ids": [str(row["execution_id"]) for row in candidates],
+                    }
+                },
+            )
+            return 0
+
+        # Does an earlier CFEE batch exist before the first fetched one? If so its coverage
+        # window is truncated and it must fail closed when relevant. With no predecessor it is
+        # the account's first batch ever - then it is complete only if no *crypto* fills exist
+        # before the FILL fetch bound either (equity fills cannot sit in a crypto CFEE batch's
+        # coverage, so they must not open the window). The CFEE probe is a single request; the
+        # crypto-fill scan pages FILL ascending for the account's earliest crypto fill. A found
+        # instant never changes, so it is cached; an unfinished scan is cached as
+        # CRYPTO_FILL_SCAN_UNKNOWN and fails closed on every later pass exactly as re-scanning
+        # would; a ``None`` ("no crypto fill up to the scan's ``until``") is deliberately NOT
+        # cached - a fill posted after the scan can still predate ``fill_start`` later, so the
+        # next pass rescans. ``None`` with crypto candidates present is an anomaly, so the
+        # rescan is rare.
+        first_batch_open = False
+        try:
+            if cfees:
+                first_cfee_at = min(cfee_created_at(raw) for raw in cfees)
+                first_batch_open = await asyncio.to_thread(
+                    has_earlier_account_activity,
+                    client,
+                    "CFEE",
+                    before=first_cfee_at,
+                    field="created_at",
+                )
+            if not first_batch_open:
+                earliest = self._earliest_crypto_fill_at
+                if earliest is _CRYPTO_FILL_SCAN_PENDING:
+                    earliest = await asyncio.to_thread(
+                        earliest_crypto_fill_at,
+                        client,
+                        until=now + ACTIVITY_WINDOW_OVERLAP,
+                    )
+                    if earliest is not None:
+                        self._earliest_crypto_fill_at = earliest
+                if earliest is None:
+                    # Candidates are crypto-only (filtered above), so a completed scan that
+                    # found no crypto fill at all while crypto executions await a commission
+                    # means the broker account or symbol mapping is likely wrong. ``None`` is
+                    # deliberately not cached, so every pass re-pages the history until a fill
+                    # appears - warn so the anomaly is visible instead of silent request spend.
+                    logger.warning(
+                        "Alpaca commission backfill: the FILL-history scan found no crypto "
+                        "fills, yet %s crypto execution(s) await a commission; each pass "
+                        "rescans the history - check the account and symbol mapping",
+                        len(candidates),
+                        extra={"data": {"account_id": self.account_id}},
+                    )
+                # ``<=``: the FILL listing is ``(fill_start, now]``, exclusive of the bound,
+                # so a crypto fill exactly at ``fill_start`` is never fetched - it opens the
+                # window like any earlier one.
+                first_batch_open = earliest is CRYPTO_FILL_SCAN_UNKNOWN or (
+                    earliest is not None and earliest <= fill_start
+                )
             fills = await asyncio.to_thread(
-                fetch_account_activities, client, "FILL", after=window_start, until=fill_window_end
+                fetch_account_activities, client, "FILL", after=fill_start, until=now
             )
-            cfees = await asyncio.to_thread(
-                fetch_account_activities, client, "CFEE", after=window_start, until=now
+            raw_fees = await asyncio.to_thread(
+                fetch_account_activities,
+                client,
+                "FEE",
+                after=cfee_after - ACTIVITY_WINDOW_OVERLAP,
+                until=now + ACTIVITY_WINDOW_OVERLAP,
             )
-            usd_fees = await asyncio.to_thread(
-                fetch_account_activities, client, "FEE", after=window_start, until=now
+            usd_fees = select_activity_window(
+                raw_fees, after=cfee_after, until=now, field="created_at"
             )
-        except Exception as exc:
+        except Exception as exc:  # except-kind: money-decision
             logger.warning(
                 "Alpaca commission backfill: reading account activities failed; commissions stay "
                 "unknown until the next pass",
@@ -1075,13 +1735,14 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         local_rows = await asyncio.to_thread(
             list_live_executions_for_broker_orders, self.account_id, order_ids
         )
-        plans, unplaced = plan_commission_backfill(
+        plans, unplaced, pending = plan_commission_backfill(
             candidates=candidates,
             fill_activities=fills,
             cfee_activities=cfees,
             fee_activities=usd_fees,
             local_rows=local_rows,
             now=now,
+            first_batch_open=first_batch_open,
         )
         for message in unplaced:
             logger.warning(
@@ -1090,29 +1751,45 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 message,
                 extra={"data": {"account_id": self.account_id}},
             )
+        for message in pending:
+            logger.info(
+                "Alpaca commission backfill: %s",
+                message,
+                extra={"data": {"account_id": self.account_id}},
+            )
         updated = 0
         for plan in plans:
+            if plan.commissions:
+                applied = await asyncio.to_thread(
+                    apply_live_execution_commissions, self.account_id, plan.commissions
+                )
+                updated += applied
+                logger.info(
+                    "Alpaca commission backfill: priced %s execution(s) of %s on %s from CFEE",
+                    applied,
+                    plan.pair,
+                    plan.end.isoformat(),
+                    extra={
+                        "data": {"account_id": self.account_id, "commissions": plan.commissions}
+                    },
+                )
             if plan.problem is not None:
                 logger.warning(
-                    "Alpaca commission backfill: leaving the CFEE of %s on %s unallocated, "
-                    "commissions stay unknown: %s",
+                    "Alpaca commission backfill: leaving part of the CFEE of %s on %s "
+                    "unallocated, those commissions stay unknown: %s",
                     plan.pair,
-                    plan.day.isoformat(),
+                    plan.end.isoformat(),
                     plan.problem,
                     extra={"data": {"account_id": self.account_id}},
                 )
-                continue
-            applied = await asyncio.to_thread(
-                apply_live_execution_commissions, self.account_id, plan.commissions
-            )
-            updated += applied
-            logger.info(
-                "Alpaca commission backfill: priced %s execution(s) of %s on %s from CFEE",
-                applied,
-                plan.pair,
-                plan.day.isoformat(),
-                extra={"data": {"account_id": self.account_id, "commissions": plan.commissions}},
-            )
+            for warning in plan.warnings:
+                logger.warning(
+                    "Alpaca commission backfill: %s on %s posted %s",
+                    warning,
+                    plan.pair,
+                    plan.end.isoformat(),
+                    extra={"data": {"account_id": self.account_id}},
+                )
         return updated
 
     async def disconnect(self) -> None:
@@ -1137,7 +1814,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 result = stop()
                 if inspect.isawaitable(result):
                     await result
-        except Exception as exc:
+        except Exception as exc:  # except-kind: loop-survival
             logger.warning(
                 "Failed to stop Alpaca stream cleanly",
                 extra={"data": {"account_id": self.account_id, "error": str(exc)}},
@@ -1176,7 +1853,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 trading_client.get_order_by_client_id,
                 canonical_signal_id,
             )
-        except Exception as exc:
+        except Exception as exc:  # except-kind: money-decision
             raise RuntimeError(
                 "Alpaca canonical signal already exists and broker recovery failed; "
                 "refusing possible duplicate submission."
@@ -1246,6 +1923,18 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                     )
                 return float(stop_loss), float("nan")
             return float("nan"), float("nan")
+        # `missing` handled every None above: it either raised or returned, so
+        # both are prices here. Re-stated as a check rather than a suppression:
+        # mypy cannot correlate the `missing` scan with the loop below or with
+        # the return, and an explicit refusal keeps the invariant visible (and
+        # fails closed with a message instead of a TypeError) if the control
+        # flow above is ever reordered.
+        if stop_loss is None or take_profit is None:
+            raise ValueError(
+                "Refusing to submit Alpaca order with a missing level "
+                f"(signal_id={signal.id}, symbol={signal.symbol}); "
+                "opening an unbounded position is not allowed."
+            )
         for name, value in (("stop_loss", stop_loss), ("take_profit", take_profit)):
             if math.isnan(value) or math.isinf(value) or value <= 0:
                 raise ValueError(
@@ -1388,12 +2077,19 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         self,
         canonical_signal_id: str,
         broker_order_id: str,
+        *,
+        submitted_at: datetime | None = None,
+        acknowledged_at: datetime | None = None,
     ) -> None:
         normalized_order_id = _normalize_broker_order_id(broker_order_id)
         if normalized_order_id is None:
             raise RuntimeError("Alpaca order response has no valid broker order id.")
         persisted = await asyncio.to_thread(
-            set_live_signal_broker_order_id, canonical_signal_id, normalized_order_id
+            set_live_signal_broker_order_id,
+            canonical_signal_id,
+            normalized_order_id,
+            submitted_at=submitted_at,
+            acknowledged_at=acknowledged_at,
         )
         if not persisted:
             raise RuntimeError("Failed to persist Alpaca broker order id.")
@@ -1476,7 +2172,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         than asked. Raises :class:`ExitBelowStepError` below one step.
         """
         step = self.exit_qty_step(symbol)
-        floored = round_exit_qty_down(qty, step)
+        floored = floor_qty_to_step(qty, step)
         if floored <= 0.0:
             raise ExitBelowStepError(
                 f"Alpaca exit for {symbol} ignored: the requested qty {qty:g} is below "
@@ -1550,14 +2246,30 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 market_request_cls=market_request_cls,
                 client_order_id=canonical_signal_id,
             )
+        # #134: bracket the broker call with the order-timing stamps. The
+        # values are captured here, in memory, and persisted with the order id
+        # once the broker answers - never written speculatively before the
+        # request, so a lost response cannot fabricate a submission record.
+        submitted_at = datetime.now(timezone.utc)
         order = await asyncio.to_thread(trading_client.submit_order, order_data=request)
+        acknowledged_at = datetime.now(timezone.utc)
+        # #144: a bracket's legs are child orders with their own broker order ids, and Alpaca
+        # reports them nested in the parent it just created. Learning them here means a leg's
+        # fill is attributed to this signal even if it arrives before the first reconciliation
+        # pass (which runs on connect).
+        self._register_bracket_legs(canonical_signal_id, order)
         broker_order_id = _normalize_broker_order_id(getattr(order, "id", None))
         if broker_order_id is None:
             raise RuntimeError(
                 "Alpaca order response carried no valid positive broker order id "
                 f"(signal_id={signal.id}, symbol={signal.symbol})."
             )
-        await self._persist_submitted_order_id(canonical_signal_id, broker_order_id)
+        await self._persist_submitted_order_id(
+            canonical_signal_id,
+            broker_order_id,
+            submitted_at=submitted_at,
+            acknowledged_at=acknowledged_at,
+        )
         logger.info(
             "Submitted Alpaca live order",
             extra={
@@ -1575,10 +2287,117 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
     async def get_balance(self) -> tuple[float, float]:
         if not self._connected or self._trading_client is None:
             await self.connect()
-        account = await asyncio.to_thread(self._trading_client.get_account)
-        balance = _to_float(getattr(account, "cash", None), default=0.0)
-        equity = _to_float(getattr(account, "equity", None), default=balance)
-        return balance, equity
+        # Re-read after the await: `connect()` is what establishes the client, and
+        # mypy drops member narrowing across it, so without this a failed connect
+        # would raise AttributeError instead of saying the adapter is not ready.
+        trading_client = self._trading_client
+        if trading_client is None:
+            raise RuntimeError(
+                "Alpaca adapter must be connected before requesting the account"
+            )
+        account = await asyncio.to_thread(trading_client.get_account)
+        balance = parse_money(getattr(account, "cash", None))
+        equity = parse_optional(getattr(account, "equity", None))
+        return balance, balance if equity is None else equity
+
+    async def get_max_leverage(self, symbol: str) -> float | None:
+        """The account's overnight leverage ceiling — Alpaca's Reg T bound.
+
+        ``account.multiplier`` (1, 2 or 4) is the margin multiplier the broker
+        grants the account, but the 4x tier is intraday buying power: Reg T
+        caps overnight marginable-stock positions at 2x equity, and nothing
+        marks a platform order intraday-only, so the conservative ceiling the
+        pre-submit caps clamp against (#240) is ``min(multiplier, 2)``. Alpaca
+        offers no crypto margin, so crypto symbols stay at the 1x fail-closed
+        default (``None``). An unreadable or nonpositive multiplier is
+        ``None`` too — never a guess.
+        """
+        normalized_symbol = str(symbol or "").strip().upper()
+        if not normalized_symbol or classify_symbol(normalized_symbol) == "crypto":
+            return None
+        if not self._connected or self._trading_client is None:
+            await self.connect()
+        # Re-read after the await: `connect()` is what establishes the client, and
+        # mypy drops member narrowing across it (same pattern as get_balance).
+        trading_client = self._trading_client
+        if trading_client is None:
+            raise RuntimeError(
+                "Alpaca adapter must be connected before requesting the account"
+            )
+        account = await asyncio.to_thread(trading_client.get_account)
+        multiplier = parse_optional(getattr(account, "multiplier", None))
+        if multiplier is None or multiplier <= 0:
+            return None
+        return min(multiplier, _ALPACA_OVERNIGHT_MAX_LEVERAGE)
+
+    async def get_used_margin(self) -> float | None:
+        """Margin held against open positions, in USD (#359).
+
+        Primary source is the broker's own ``account.initial_margin`` — it
+        already prices marginable vs non-marginable and crypto positions
+        correctly, which a notional/multiplier approximation would not. When
+        the account does not report it, falls back to Σ |market value| /
+        effective leverage per position — 1x for crypto and non-marginable
+        assets, ``min(multiplier, 2)`` otherwise (the same overnight Reg T
+        ceiling :meth:`get_max_leverage` applies; an unreadable multiplier
+        degrades to 1x, the conservative direction). ``None`` when neither
+        figure can be determined — the pre-submit caps fail closed on it.
+
+        ``asset_marginable is not True`` maps to 1x: only an explicit broker
+        ``True`` earns the overnight leverage, so a missing flag is treated
+        like non-marginable. Shorts' higher maintenance requirement is not
+        modelled — it only matters when ``initial_margin`` is absent, since
+        the broker's own figure already prices it correctly.
+        """
+        if not self._connected or self._trading_client is None:
+            await self.connect()
+        trading_client = self._trading_client
+        if trading_client is None:
+            raise RuntimeError(
+                "Alpaca adapter must be connected before requesting the account"
+            )
+        account = await asyncio.to_thread(trading_client.get_account)
+        # A present-but-unreadable ``initial_margin`` raises ``MoneyParseError``
+        # (the caps then refuse); only an absent field falls back to the
+        # notional/leverage approximation.
+        initial_margin = parse_optional(getattr(account, "initial_margin", None))
+        if initial_margin is not None:
+            return initial_margin
+
+        multiplier = parse_optional(getattr(account, "multiplier", None))
+        overnight_leverage = (
+            min(multiplier, _ALPACA_OVERNIGHT_MAX_LEVERAGE)
+            if multiplier is not None and multiplier > 0
+            else 1.0
+        )
+        try:
+            rows = await asyncio.to_thread(trading_client.get_all_positions)
+        except Exception as exc:  # except-kind: money-decision
+            logger.warning(
+                "Alpaca positions lookup for used margin failed",
+                extra={"data": {"error": repr(exc)}},
+            )
+            return None
+        total = 0.0
+        for row in rows:
+            # ``parse_money`` raises on a missing or garbage market value: a
+            # partial sum would understate used margin and overstate free
+            # margin, the unsafe direction.
+            notional = abs(parse_money(getattr(row, "market_value", None)))
+            if _is_flat(notional):
+                continue
+            symbol = str(getattr(row, "symbol", "") or "").strip().upper()
+            asset_class = str(getattr(row, "asset_class", "") or "").strip().lower()
+            marginable = getattr(row, "asset_marginable", None)
+            leverage = overnight_leverage
+            if (
+                asset_class == "crypto"
+                or classify_symbol(symbol) == "crypto"
+                or marginable is not True
+            ):
+                leverage = 1.0
+            total += notional / leverage
+        return total
 
     async def get_pip_value(self, symbol: str) -> LivePipValue:
         """One share (or coin) moves the USD account by 1.0 per 1.0 USD move (#146).
@@ -1600,7 +2419,12 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             )
         if not self._connected or self._trading_client is None:
             await self.connect()
-        account = await asyncio.to_thread(self._trading_client.get_account)
+        trading_client = self._trading_client
+        if trading_client is None:
+            raise RuntimeError(
+                "Alpaca adapter must be connected before requesting the account"
+            )
+        account = await asyncio.to_thread(trading_client.get_account)
         currency = str(getattr(account, "currency", "") or "").strip().upper()
         if currency != "USD":
             raise ValueError(
@@ -1630,6 +2454,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         differently from the one that was validated.
         """
         from alpaca.common.enums import Sort
+        from alpaca.data.enums import Adjustment, DataFeed
         from alpaca.data.requests import StockBarsRequest
 
         normalized_symbol = str(symbol or "").strip().upper()
@@ -1645,15 +2470,22 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             raise RuntimeError(
                 "Alpaca adapter must be connected before requesting market data"
             )
+        # Bound after the guard and used by the closures below: mypy does not
+        # carry a member narrowing into a nested function, so reaching through
+        # `self` there would need a suppression (and would read the attribute
+        # twice, which a concurrent disconnect could turn into None).
+        historical_client = self._historical_data_client
 
         def _fetch_crypto(slack_multiplier: float) -> pd.DataFrame:
             from alpaca.data.historical import CryptoHistoricalDataClient
             from alpaca.data.requests import CryptoBarsRequest
 
-            if self._crypto_data_client is None:
-                self._crypto_data_client = CryptoHistoricalDataClient(
+            crypto_client = self._crypto_data_client
+            if crypto_client is None:
+                crypto_client = CryptoHistoricalDataClient(
                     self.api_key, self.secret_key
                 )
+                self._crypto_data_client = crypto_client
             request = CryptoBarsRequest(
                 symbol_or_symbols=[normalized_symbol],
                 timeframe=resolved_timeframe,
@@ -1663,7 +2495,12 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 limit=1000,
                 sort=Sort.DESC,
             )
-            return self._crypto_data_client.get_crypto_bars(request).df
+            # `get_crypto_bars` is declared `BarSet | RawData`: the RawData
+            # branch only happens when the client was built with
+            # `use_raw_data=True`, which this adapter never does (see the
+            # construction above), so the answer is the BarSet and `.df` is on
+            # it. Stated because mypy cannot see that construction flag.
+            return crypto_client.get_crypto_bars(request).df  # type: ignore[union-attr]
 
         def _fetch(slack_multiplier: float) -> pd.DataFrame:
             if is_crypto:
@@ -1675,14 +2512,19 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                     timeframe, bounded_limit, slack_multiplier=slack_multiplier
                 ),
                 limit=1000,
-                adjustment="raw",
-                feed="iex",
+                # alpaca-py's own enum members, not the wire strings: the
+                # request model declares these fields as `Adjustment`/`DataFeed`,
+                # so a misspelled or deleted member is a type error instead of a
+                # runtime validation failure buried in a broker call. Both are
+                # `str` enums, so the serialised request is byte-identical.
+                adjustment=Adjustment.RAW,
+                feed=DataFeed.IEX,
                 # Newest first. The response is capped at `limit`, so an
                 # ascending request over a widened window would return the
                 # oldest bars in it. Sorted back to ascending below.
                 sort=Sort.DESC,
             )
-            return self._historical_data_client.get_stock_bars(request).df
+            return historical_client.get_stock_bars(request).df
 
         frame = await asyncio.to_thread(_fetch, 1.0)
         if frame is not None and len(frame.index) < bounded_limit:
@@ -1718,21 +2560,90 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             )
         newest = pd.Timestamp(frame["timestamp"].iloc[-1])
         now = pd.Timestamp.now(tz="UTC")
-        # Intraday bars can legitimately be days old across a market closure: a
-        # Friday close to a Tuesday open is ~89 hours once a holiday Monday is
-        # included, and IEX has no pre/post session to shorten the gap. 72 hours
-        # rejected that valid data; a week still catches a feed that has stopped.
+        self._raise_if_market_data_stale(
+            normalized_symbol, timeframe, is_crypto, newest, now
+        )
+        return frame
+
+    @staticmethod
+    def _raise_if_market_data_stale(
+        symbol: str,
+        timeframe: str,
+        is_crypto: bool,
+        newest: pd.Timestamp,
+        now: pd.Timestamp,
+    ) -> None:
+        """Closed-vs-stale check driven by the venue calendar (#133).
+
+        A bar gap while the market is CLOSED is expected, not stale; the same
+        gap while a session is OPEN means the feed stopped. When the venue
+        cannot be resolved the legacy flat-age rule applies as a fallback.
+        """
         max_age = (
             timedelta(days=7)
             if str(timeframe).strip().lower() == "1d"
             else timedelta(days=5)
         )
-        if newest < now - max_age:
-            raise ValueError(
-                f"Alpaca market data is stale for {normalized_symbol}: "
-                f"newest bar {newest.isoformat()} exceeds {max_age}"
+        try:
+            calendar = venue_calendar.resolve_venue_calendar(
+                symbol=symbol,
+                timeframe=timeframe,
+                asset_class="crypto" if is_crypto else "equity",
+                source="alpaca",
+                data_dir=str(DATA_DIR),
             )
-        return frame
+        except Exception:  # except-kind: loop-survival
+            logger.warning(
+                "Venue calendar resolution failed for %s; using flat staleness age",
+                symbol,
+                exc_info=True,
+            )
+            calendar = None
+        if calendar is None:
+            if newest < now - max_age:
+                raise ValueError(
+                    f"Alpaca market data is stale for {symbol}: "
+                    f"newest bar {newest.isoformat()} exceeds {max_age}"
+                )
+            return
+        state = calendar.session_state(now)
+        if state == "unknown":
+            # The calendar cannot speak for ``now`` (e.g. an exchange-session
+            # cache whose fetched range does not reach it): same flat-age
+            # fallback as an unresolved venue — never assume closed.
+            if newest < now - max_age:
+                raise ValueError(
+                    f"Alpaca market data is stale for {symbol}: "
+                    f"newest bar {newest.isoformat()} exceeds {max_age}"
+                )
+            return
+        if state == "closed":
+            # Legitimate closures (weekends, holidays) can stack to several
+            # days; beyond that the feed itself is presumed dead.
+            if newest < now - timedelta(days=10):
+                raise ValueError(
+                    f"Alpaca market data is stale for {symbol}: "
+                    f"newest bar {newest.isoformat()} is over 10 days old "
+                    "while the venue reports closed"
+                )
+            return
+        step_minutes = _ALPACA_TIMEFRAME_STEP_MINUTES.get(
+            str(timeframe).strip().lower(), 60.0
+        )
+        # While a session is open the newest bar should be at most ~one
+        # trading day behind; three bar-steps floor keeps tiny timeframes
+        # from tripping on ordinary bar jitter. The 780-minute floor is
+        # roughly two NYSE sessions — 1440 trading minutes would let a dead
+        # equity feed go unnoticed for nearly four sessions.
+        limit_minutes = max(3.0 * step_minutes, 780.0)
+        trading_age = calendar.trading_minutes_between(newest, now)
+        if trading_age > limit_minutes:
+            raise ValueError(
+                f"Alpaca market data is stale for {symbol}: "
+                f"newest bar {newest.isoformat()} is {trading_age:.0f} "
+                f"trading minutes old while the venue is open "
+                f"(limit {limit_minutes:.0f})"
+            )
 
     async def get_quote(self, symbol: str) -> LiveQuote:
         """Latest top-of-book quote for the #125 entry-deviation gate.
@@ -1741,6 +2652,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         or non-numeric side raises instead of returning an invented price; the
         daemon additionally rejects zero, non-finite and crossed quotes.
         """
+        from alpaca.data.enums import DataFeed
         from alpaca.data.requests import StockLatestQuoteRequest
 
         normalized_symbol = str(symbol or "").strip().upper()
@@ -1748,7 +2660,13 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             raise ValueError("symbol is required for an Alpaca quote")
         if not self._connected or self._historical_data_client is None:
             raise RuntimeError("Alpaca adapter must be connected before requesting a quote")
-        request = StockLatestQuoteRequest(symbol_or_symbols=[normalized_symbol], feed="iex")
+        request = StockLatestQuoteRequest(
+            symbol_or_symbols=[normalized_symbol],
+            # The alpaca-py `DataFeed` member, not the wire string, for the same
+            # reason as `get_market_data` above; `DataFeed` is a `str` enum, so
+            # the request this sends is unchanged.
+            feed=DataFeed.IEX,
+        )
         response = await asyncio.to_thread(
             self._historical_data_client.get_stock_latest_quote, request
         )
@@ -1904,6 +2822,90 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                         ids.add(order_id)
         return ids
 
+    async def list_reconciliation_orders(self) -> list[BrokerOrderView]:
+        """Working orders with client ids and position-protection marks (#303)."""
+        client = await self._require_trading_client()
+        orders = await self._list_open_orders(client, nested=True)
+        protection_sides = await self._protection_sides_by_symbol()
+        protected_ids = self._reconciliation_protection_ids(orders, protection_sides)
+        views: list[BrokerOrderView] = []
+        seen: set[str] = set()
+        for order in orders:
+            for item in (order, *_order_legs(order)):
+                order_id = _control_order_id(_order_attr(item, "id"))
+                client_order_id = _control_order_id(_order_attr(item, "client_order_id"))
+                if order_id is None and client_order_id is None:
+                    continue
+                key = order_id or client_order_id or ""
+                if not key or key in seen:
+                    continue
+                seen.add(key)
+                views.append(
+                    BrokerOrderView(
+                        order_id=key,
+                        client_order_id=str(client_order_id or ""),
+                        symbol=_order_symbol(item),
+                        side=_order_side(item),
+                        qty=_order_remaining_qty(item),
+                        order_type=_order_type(item),
+                        protection=key in protected_ids,
+                    )
+                )
+        return views
+
+    async def get_order_state(self, order_id: str, *, client_order_id: str = "") -> str | None:
+        """Working/terminal state of one order for reconciliation (#303).
+
+        Tries the broker order id first, then the client order id (the
+        persisted signal id). ``None`` - an error, a 404 or an unrecognised
+        status - always fails closed: the reconciler keeps its finding.
+        """
+        client = await self._require_trading_client()
+        candidates: list[str] = []
+        for value in (order_id, client_order_id):
+            text = str(value or "").strip()
+            if text and text not in candidates:
+                candidates.append(text)
+        states = [
+            await self._alpaca_order_state(client, candidate)
+            for candidate in candidates
+        ]
+        if ORDER_STATE_WORKING in states:
+            return ORDER_STATE_WORKING
+        if ORDER_STATE_FILLED in states:
+            return ORDER_STATE_FILLED
+        if ORDER_STATE_TERMINAL in states:
+            return ORDER_STATE_TERMINAL
+        return None
+
+    async def _alpaca_order_state(self, client: Any, order_id: str) -> str | None:
+        order = None
+        get_by_id = getattr(client, "get_order_by_id", None)
+        if callable(get_by_id):
+            try:
+                order = await asyncio.to_thread(get_by_id, order_id)
+            except Exception:  # except-kind: money-decision
+                order = None
+        if order is None:
+            get_by_client = getattr(client, "get_order_by_client_id", None)
+            if callable(get_by_client):
+                try:
+                    order = await asyncio.to_thread(get_by_client, order_id)
+                except Exception:  # except-kind: money-decision
+                    order = None
+        if order is None:
+            return None
+        status = _order_status(order)
+        if status == "filled":
+            # The base contract distinguishes a fill from a dead order: a
+            # filled close is not a terminal failure a caller may resubmit.
+            return ORDER_STATE_FILLED
+        if status in _ALPACA_ACCOUNTED_ORDER_STATUSES:
+            return ORDER_STATE_TERMINAL
+        if status in _ALPACA_WORKING_ORDER_STATUSES:
+            return ORDER_STATE_WORKING
+        return None
+
     def exit_qty_step(self, symbol: str) -> float:
         """Alpaca's smallest quantity step (9 decimals): what an exit is floored to."""
         return 1e-9
@@ -1915,6 +2917,42 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         half a step absorbs float summation noise without hiding a real share.
         """
         return 0.5e-9
+
+    @staticmethod
+    def _reconciliation_protection_ids(
+        orders: list[Any], protection_side_by_symbol: dict[str, str]
+    ) -> set[str]:
+        """Ids of working orders that are position protection, not ledger orders.
+
+        Deliberately narrower than the cancel sweep's ``_protection_order_ids``:
+        the sweep spares *any* reduce-side order because a flatten follows it,
+        but reconciliation must still match the orders the ledger expects -
+        and this adapter's exits are market orders, so "reduces a position" alone
+        cannot mean protection here. Protection is a bracket leg nested under a
+        working parent, or a resting (non-market) reduce-side order such as an
+        orphaned take-profit/stop leg. A working market exit stays matchable.
+        """
+        protected: set[str] = set()
+        for order in orders:
+            for leg in _order_legs(order):
+                for attr in ("id", "client_order_id"):
+                    leg_id = _control_order_id(_order_attr(leg, attr))
+                    if leg_id is not None:
+                        protected.add(leg_id)
+            symbol = _order_symbol(order)
+            expected_side = protection_side_by_symbol.get(symbol)
+            raw_side = _order_attr(order, "side", "")
+            side = str(getattr(raw_side, "value", raw_side) or "").strip().lower()
+            if (
+                expected_side
+                and side == expected_side
+                and _order_type(order) != "market"
+            ):
+                for attr in ("id", "client_order_id"):
+                    order_id = _control_order_id(_order_attr(order, attr))
+                    if order_id is not None:
+                        protected.add(order_id)
+        return protected
 
     @staticmethod
     def _protection_order_ids(
@@ -2000,7 +3038,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             try:
                 await self._cancel_one(client, order_id)
                 cancel_accepted.add(order_id)
-            except Exception as exc:
+            except Exception as exc:  # except-kind: money-decision
                 if was_pending_cancel:
                     cancel_accepted.add(order_id)
                     logger.info(
@@ -2024,11 +3062,11 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         # dropped, which a count alone would report as done.
         try:
             remaining = await self._list_open_orders(client)
-        except Exception as exc:
+        except Exception as exc:  # except-kind: money-decision
             return ControlOutcome(
                 completed=completed,
                 unidentified=tuple(unidentified),
-                failed=tuple(failed) + (f"verify:{exc}",),
+                failed=(*failed, f"verify:{exc}"),
             )
         # Alpaca keeps listing a cancel it accepted as ``pending_cancel`` until the
         # cancel settles, so that status on an id this sweep cancelled without error
@@ -2043,13 +3081,16 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         def accepted_pending_cancel(order_id: str | None, order: Any) -> bool:
             return order_id in cancel_accepted and _order_status(order) == "pending_cancel"
 
+        # `_control_order_id` returns ``str | None``, so the None case is filtered
+        # in the comprehension (as in `pending_cancel` below) instead of being
+        # discarded from the finished set, which the checker cannot model.
         still_working = {
             order_id
             for order in remaining
-            if (order_id := _control_order_id(_order_attr(order, "id"))) not in protected
+            if (order_id := _control_order_id(_order_attr(order, "id"))) is not None
+            and order_id not in protected
             and not accepted_pending_cancel(order_id, order)
         }
-        still_working.discard(None)
         failed.extend(sorted(still_working))
         pending_cancel = sorted(
             {
@@ -2068,6 +3109,61 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             pending_cancel=tuple(pending_cancel),
         )
 
+    async def cancel_orders(
+        self, order_refs: Collection[str], *, symbol: str
+    ) -> ControlOutcome:
+        """Cancel the working orders ``order_refs`` names on ``symbol`` (#382).
+
+        Matches a working order on its broker ``id`` or ``client_order_id``
+        (the persisted signal id) and only when the order's symbol is
+        ``symbol``. Only top-level orders are considered - never nested
+        bracket legs, which are position protection, not entries. The order
+        book lock is held so the read and the cancels see one snapshot.
+        """
+        wanted_symbol = str(symbol or "").strip().upper()
+        refs = {str(ref).strip() for ref in order_refs if str(ref or "").strip()}
+        if not refs or not wanted_symbol:
+            return ControlOutcome()
+        async with self._order_book_lock():
+            client = await self._require_trading_client()
+            orders = await self._list_open_orders(client)
+            completed = 0
+            unidentified: list[str] = []
+            failed: list[str] = []
+            for order in orders:
+                if _order_symbol(order) != wanted_symbol:
+                    continue
+                order_id = _control_order_id(_order_attr(order, "id"))
+                client_order_id = _control_order_id(
+                    _order_attr(order, "client_order_id")
+                )
+                matched = (order_id is not None and order_id in refs) or (
+                    client_order_id is not None and client_order_id in refs
+                )
+                if not matched:
+                    continue
+                if order_id is None:
+                    unidentified.append(
+                        f"order:{client_order_id or _order_attr(order, 'id', None)!r}"
+                    )
+                    continue
+                try:
+                    await self._cancel_one(client, order_id)
+                except Exception as exc:  # except-kind: money-decision
+                    failed.append(f"{order_id}:{exc}")
+                    logger.warning(
+                        "Alpaca refused to cancel named order %s: %s.",
+                        order_id,
+                        exc,
+                    )
+                    continue
+                completed += 1
+        return ControlOutcome(
+            completed=completed,
+            unidentified=tuple(unidentified),
+            failed=tuple(failed),
+        )
+
     @staticmethod
     def _best_stop_price(orders: list[Any], symbol: str) -> float | None:
         """The stop price to restore if a close is refused.
@@ -2075,25 +3171,24 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         Taken from the protection about to be cancelled, so the position is
         restored to the stop the strategy chose rather than one invented from a
         stale quote. A nested stop leg is checked too, because a bracket's stop
-        is sometimes only visible there.
+        is sometimes only visible there. The book is already scoped to *symbol*
+        by the caller, and a held leg placed on it through its parent carries no
+        symbol of its own - so an empty top-level symbol is this symbol's order,
+        not another symbol's.
         """
         for order in orders:
-            if _order_symbol(order) != symbol:
+            if _order_symbol(order) not in {"", symbol}:
                 continue
             for candidate in (order, *_order_legs(order)):
                 candidate_symbol = _order_symbol(candidate)
                 if candidate_symbol not in {"", symbol}:
                     continue
-                price = _to_float(
-                    _order_attr(candidate, "stop_price", None), default=0.0
-                )
-                if price > 0:
+                price = _usable_stop_price(candidate)
+                if price is not None and price > 0:
                     return price
                 nested = _order_attr(candidate, "stop_loss", None)
-                nested_price = _to_float(
-                    _order_attr(nested, "stop_price", None), default=0.0
-                )
-                if nested_price > 0:
+                nested_price = _usable_stop_price(nested)
+                if nested_price is not None and nested_price > 0:
                     return nested_price
         return None
 
@@ -2115,11 +3210,14 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         not a protection: treating it as one after the position's own sell stop was
         cancelled reports the position as protected while it is naked. Only a stop
         on the reducing side counts, and a bracket's leg counts only if that leg
-        itself is on the reducing side.
+        itself is on the reducing side. The book is already scoped to *symbol*
+        by the caller, and a held leg placed on it through its parent carries no
+        symbol of its own - so an empty top-level symbol is this symbol's order,
+        not another symbol's.
         """
         wanted = "buy" if str(side).strip().lower() == "buy" else "sell"
         for order in orders:
-            if _order_symbol(order) != symbol:
+            if _order_symbol(order) not in {"", symbol}:
                 continue
             for candidate in (order, *_order_legs(order)):
                 candidate_symbol = _order_symbol(candidate)
@@ -2132,13 +3230,41 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                     return True
         return False
 
+    async def _live_position(self, symbol: str) -> _LivePosition:
+        """The broker's position on *symbol* as it stands right now.
+
+        Only a *readable, zero* quantity counts as flat, and only a readable,
+        non-zero one counts as a position to size a stop from. A listing that
+        cannot be read, or a row whose quantity cannot be read, says "unknown"
+        and is reported as such (logged, and neither flat nor sized): a restore
+        that skipped on evidence it does not have would leave a live position
+        naked, and one that guessed a quantity would sell a position that is no
+        longer there.
+        """
+        try:
+            positions = await self.get_positions()
+        except Exception as exc:  # except-kind: money-decision
+            logger.warning(
+                "Could not re-read positions before restoring a stop; the restore "
+                "is not sized from a position nobody could read",
+                extra={"data": {"symbol": symbol, "error": repr(exc)}},
+            )
+            return _LivePosition(flat=False)
+        for position in positions:
+            if str(position.get("symbol") or "").strip().upper() != symbol:
+                continue
+            if position.get("qty_unparseable"):
+                return _LivePosition(flat=False)
+            qty = _position_qty(position)
+            if _is_flat(qty):
+                return _LivePosition(flat=True)
+            return _LivePosition(
+                flat=False, stop_qty=abs(qty), stop_side="sell" if qty > 0 else "buy"
+            )
+        return _LivePosition(flat=True)
+
     async def _restore_stop(
-        self,
-        client: Any,
-        symbol: str,
-        qty: float,
-        side: str,
-        stop_price: float | None,
+        self, client: Any, symbol: str, stop_price: float | None
     ) -> bool:
         """Put a stop back on a position whose close was refused.
 
@@ -2148,19 +3274,59 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         logged at CRITICAL because it means live unprotected exposure.
 
         Returns whether the position is protected afterwards, which is also true
-        when a stop still works at the broker. Re-submitting in that case would
-        leave two stops on one position, and the second becomes an orphan the
-        moment the first fills - an orphaned sell-stop opens a short.
+        when a stop still works at the broker or the position is already flat.
+        Re-submitting next to a working stop would leave two stops on one
+        position, and the second becomes an orphan the moment the first fills -
+        an orphaned sell-stop opens a short. The same rule covers a working book
+        nobody could re-read: it cannot show that no stop works, so the restore is
+        refused rather than guessed, and the position is unprotected until the
+        next enforcement retry.
+
+        The stop is sized and sided from the position as the broker reports it
+        *now*, not from the snapshot the flatten started from: the leg that was
+        cancelled to unblock the close can have filled on its way out, and a stop
+        sized from the old quantity oversells what is left - into a short when it
+        triggers. A position the broker will not report is not sized either: the
+        restore refuses and says so rather than placing an order for a quantity
+        nobody read.
         """
-        try:
-            working = await self._list_open_orders(client)
-        except Exception as exc:  # pragma: no cover - defensive
+        live = await self._live_position(symbol)
+        # The position may already be flat: the stop that was cancelled to unblock the
+        # close can have been the thing that closed it (a cancel accepted and then the
+        # stop filling, or a race with the fill). Restoring a stop onto a flat position
+        # then creates the orphan this file's sweeps exist to remove - a triggered
+        # sell-stop with nothing to sell opens a short.
+        if live.flat:
             logger.warning(
-                "Could not re-read orders before restoring a stop; restoring anyway",
+                "Not restoring a stop: the broker reports the position flat",
+                extra={"data": {"symbol": symbol}},
+            )
+            return True
+        if live.stop_qty is None or live.stop_side is None:
+            logger.critical(
+                "Cannot restore a stop: the broker's live position could not be read, "
+                "so the position is unprotected until the next retry",
+                extra={"data": {"symbol": symbol}},
+            )
+            return False
+        try:
+            working = await self._working_book_on_symbol(client, symbol)
+        except Exception as exc:  # except-kind: money-decision
+            # Not restoring is the bounded failure. The re-read is what proves no stop
+            # still works, and a book nobody could read proves nothing - the held-leg
+            # lookup inside it is paged, so it is also the part that can fail. Restoring
+            # anyway would place a second stop beside whatever the broker kept: two
+            # stops reduce a position twice, and the extra one is an orphan the moment
+            # the first fills. The position is then unprotected until the next
+            # enforcement retry, which is the same state every other refusal below
+            # reports - and the sweep takes no unbounded risk.
+            logger.critical(
+                "Not restoring a stop: the working book could not be re-read, so it "
+                "cannot be shown that no stop still works",
                 extra={"data": {"symbol": symbol, "error": repr(exc)}},
             )
-            working = None
-        if working is not None and self._has_working_stop(working, symbol, side):
+            return False
+        if self._has_working_stop(working, symbol, live.stop_side):
             logger.warning(
                 "Not restoring a stop: one still works at the broker",
                 extra={"data": {"symbol": symbol}},
@@ -2170,27 +3336,29 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             logger.critical(
                 "Cannot restore a stop: the cancelled orders carried no stop price, "
                 "so the position is unprotected until the next retry",
-                extra={"data": {"symbol": symbol, "qty": qty}},
+                extra={"data": {"symbol": symbol, "qty": live.stop_qty}},
             )
             return False
         try:
             order_side, time_in_force, stop_request_cls = self._load_stop_order_types()
             request = stop_request_cls(
                 symbol=symbol,
-                qty=abs(qty),
-                side=order_side.SELL if side == "sell" else order_side.BUY,
+                qty=live.stop_qty,
+                side=order_side.SELL
+                if live.stop_side == "sell"
+                else order_side.BUY,
                 time_in_force=time_in_force.DAY,
                 stop_price=stop_price,
             )
             await asyncio.to_thread(client.submit_order, order_data=request)
-        except Exception as exc:
+        except Exception as exc:  # except-kind: money-decision
             logger.critical(
                 "Failed to restore a stop on a position whose close was refused; "
                 "the position is unprotected",
                 extra={
                     "data": {
                         "symbol": symbol,
-                        "qty": qty,
+                        "qty": live.stop_qty,
                         "stop_price": stop_price,
                         "error": repr(exc),
                     }
@@ -2200,7 +3368,11 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         logger.warning(
             "Restored a stop after the broker refused to close the position",
             extra={
-                "data": {"symbol": symbol, "qty": qty, "stop_price": stop_price}
+                "data": {
+                    "symbol": symbol,
+                    "qty": live.stop_qty,
+                    "stop_price": stop_price,
+                }
             },
         )
         return True
@@ -2209,8 +3381,6 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         self,
         client: Any,
         symbol: str,
-        qty: float,
-        side: str,
         stop_price: float | None,
         reason: str,
         *,
@@ -2223,32 +3393,34 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         failure is reported.
         """
         if removed_protection:
-            if not await self._restore_stop(client, symbol, qty, side, stop_price):
+            if not await self._restore_stop(client, symbol, stop_price):
                 return f"{reason};NO-STOP-RESTORED"
         return reason
 
-    async def _flatten_symbol(self, client: Any, symbol: str, qty: float) -> str | None:
+    async def _flatten_symbol(self, client: Any, symbol: str) -> str | None:
         """Flatten one symbol; see :meth:`_flatten_symbol_locked`."""
         async with self._order_book_lock():
-            return await self._flatten_symbol_locked(client, symbol, qty)
+            return await self._flatten_symbol_locked(client, symbol)
 
-    async def _flatten_symbol_locked(
-        self, client: Any, symbol: str, qty: float
-    ) -> str | None:
+    async def _flatten_symbol_locked(self, client: Any, symbol: str) -> str | None:
         """Cancel this symbol's working orders, then close its position.
 
         Returns ``None`` on success, or a short reason for the failure.
 
         The cancel is not optional. Alpaca reserves the quantity of every
-        reducing-side order, so `close_position` is refused with "insufficient
+        reducing-side order - a bracket's stop leg included, even though only the
+        filled parent lists it - so `close_position` is refused with "insufficient
         qty available" while the SL/TP legs are still working. That is the one
         place where "keep the protections until the flatten succeeds" cannot
         hold - the protections are exactly what blocks the flatten - so the stop
         is re-placed on every failure after a protection was removed.
+
+        Nothing here is sized from the position the flatten was handed: every
+        decision - which orders still rest, and the quantity and side a restored
+        stop needs - is read back from the broker, because the leg that fills on
+        its way out is exactly the case this sweep has to survive.
         """
-        side = "sell" if qty > 0 else "buy"
-        orders = await self._list_open_orders(client)
-        on_symbol = [order for order in orders if _order_symbol(order) == symbol]
+        on_symbol = await self._working_book_on_symbol(client, symbol)
         stop_price = self._best_stop_price(on_symbol, symbol)
 
         cancelled_any = False
@@ -2258,20 +3430,23 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 return await self._abandon_flatten(
                     client,
                     symbol,
-                    qty,
-                    side,
                     stop_price,
                     f"unreadable-order:{_order_attr(order, 'id', None)!r}",
                     removed_protection=cancelled_any,
                 )
             try:
                 await self._cancel_one(client, order_id)
-            except Exception as exc:
+            except Exception as exc:  # except-kind: money-decision
+                # The broker's OCO may already have removed this leg with the
+                # sibling just cancelled. A refused cancel of an order that is no
+                # longer resting is not a dropped cancel; treating it as one
+                # would fail - and restore a stop on - every bracket flatten.
+                if await self._cancel_already_gone(client, order_id):
+                    cancelled_any = True
+                    continue
                 return await self._abandon_flatten(
                     client,
                     symbol,
-                    qty,
-                    side,
                     stop_price,
                     f"cancel:{order_id}:{exc}",
                     removed_protection=cancelled_any,
@@ -2279,15 +3454,15 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             cancelled_any = True
 
         # A cancel the broker accepted but did not apply still reserves the
-        # quantity, and the close would then be refused. Confirm by re-read.
+        # quantity, and the close would then be refused. Confirm by re-read,
+        # held legs included: a stop leg the broker kept listing is exactly what
+        # must stop this flatten from closing a position it did not dis-arm.
         try:
-            remaining_orders = await self._list_open_orders(client)
-        except Exception as exc:
+            remaining_orders = await self._working_book_on_symbol(client, symbol)
+        except Exception as exc:  # except-kind: money-decision
             return await self._abandon_flatten(
                 client,
                 symbol,
-                qty,
-                side,
                 stop_price,
                 f"verify:{exc}",
                 removed_protection=cancelled_any,
@@ -2295,14 +3470,11 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         still_working = [
             _control_order_id(_order_attr(order, "id"))
             for order in remaining_orders
-            if _order_symbol(order) == symbol
         ]
         if still_working:
             return await self._abandon_flatten(
                 client,
                 symbol,
-                qty,
-                side,
                 stop_price,
                 "orders-still-working:"
                 + ",".join(str(order_id) for order_id in still_working),
@@ -2311,12 +3483,10 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
 
         try:
             await asyncio.to_thread(client.close_position, symbol)
-        except Exception as exc:
+        except Exception as exc:  # except-kind: money-decision
             return await self._abandon_flatten(
                 client,
                 symbol,
-                qty,
-                side,
                 stop_price,
                 f"close:{exc}",
                 removed_protection=cancelled_any,
@@ -2348,7 +3518,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             qty = _position_qty(position)
             if not symbol or _is_flat(qty):
                 continue
-            problem = await self._flatten_symbol(client, symbol, qty)
+            problem = await self._flatten_symbol(client, symbol)
             if problem is not None:
                 failed.append(f"{symbol}:{problem}")
 
@@ -2379,31 +3549,116 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         Called after a successful flatten, when every symbol is flat: what
         remains are the SL/TP legs detached from the positions they protected.
         An order on a symbol that still has a position is never touched, so this
-        cannot disarm a live position.
+        cannot disarm a live position - and a leg's symbol is read from the
+        parent it rests under when the leg itself carries none, because an empty
+        symbol would read as "no position" and cancel a live position's stop.
+        A bracket's held stop leg is in scope
+        (#245): it is absent from every ``status=open`` listing, so a sweep that
+        only read those would leave exactly the leg that can still trigger - and
+        a triggered sell-stop with nothing to sell opens a short.
+
+        The legs are looked up account-wide. A bracket's take profit names the symbol a
+        `held` stop leg rests on, but an OTO entry - which the adapter submits for an
+        unbounded take profit - has a stop leg and no take-profit sibling, so the symbols
+        the open listing names are not enough. The lookup's 20-page budget bounds the
+        history it reads, and it is the one caller that passes ``symbols=None``: these
+        helpers have no default scope, so no caller can reach one by omission.
+
+        The cancels are then verified by re-reading the book, as the flatten verifies
+        its own: the broker's acknowledgement is not proof the leg is gone, and Alpaca
+        keeps a cancel it accepted listed as ``pending_cancel`` until it settles - a leg
+        that can still fill. Everything this sweep cancelled that is still resting is
+        reported as a failure, so the sweep is incomplete and the daemon keeps the
+        deployment unenforced instead of stamping it stopped over a leg that can still
+        open a short.
         """
         client = await self._require_trading_client()
-        orders = await self._list_open_orders(client)
+        open_orders = await self._list_open_orders(client)
         open_symbols = {
             str(position.get("symbol") or "").strip().upper()
             for position in await self.get_positions()
             if not _is_flat(_position_qty(position))
         }
+        legs = await self._list_resting_legs(client, symbols=None)
+        # A bracket leg can arrive without its own symbol, and an empty one reads as
+        # "no position on this symbol": the sweep would then cancel the stop leg of a
+        # live position, which is the one thing this sweep promises never to do. The
+        # parent the leg rests under is what names the symbol, so the leg's symbol is
+        # resolved from it before anything is cancelled.
+        leg_symbols = {
+            leg_id: _order_symbol(resting.leg) or _order_symbol(resting.parent)
+            for resting in legs
+            if (leg_id := _control_order_id(_order_attr(resting.leg, "id"))) is not None
+        }
+        orders = self._merge_held_legs(open_orders, legs)
         completed = 0
         unidentified: list[str] = []
         failed: list[str] = []
+        cancelled: list[str] = []
+        cancelled_symbols: dict[str, str] = {}
         for order in orders:
             order_id = _control_order_id(_order_attr(order, "id"))
             if order_id is None:
                 unidentified.append(f"order:{_order_attr(order, 'id', None)!r}")
                 continue
-            if _order_symbol(order) in open_symbols:
+            symbol = _order_symbol(order) or leg_symbols.get(order_id, "")
+            if symbol in open_symbols:
                 continue
             try:
                 await self._cancel_one(client, order_id)
-            except Exception as exc:
+            except Exception as exc:  # except-kind: money-decision
+                # The broker's OCO may already have removed this leg with the
+                # sibling just cancelled; a refusal for an order that is no
+                # longer resting is not a failure the daemon must retry forever.
+                if await self._cancel_already_gone(client, order_id):
+                    continue
                 failed.append(f"{order_id}:{exc}")
                 continue
+            cancelled.append(order_id)
+            cancelled_symbols[order_id] = symbol
             completed += 1
+        if cancelled:
+            # A held leg is only ever visible under its filled parent, so the
+            # verification has to read the whole working book, not the open
+            # listing: the one order this sweep exists to remove is the one the
+            # open listing cannot show.
+            #
+            # Scoped to the symbols this sweep actually cancelled rather than read
+            # account-wide a second time: the daemon runs this sweep every sync tick
+            # and retries while it is incomplete, so two 20-page account-wide scans
+            # per pass is what turns a long history into a rate limit, and a rate
+            # limit fails the sweep closed - the retry then pays the same price. A
+            # leg is found under the filled parent of its own symbol, so those
+            # symbols are enough. An id whose symbol could not be resolved has no
+            # such bound, and the sweep reads account-wide rather than assume it.
+            #
+            # The bound is the symbols, not the count of cancels: one symbol can
+            # carry several cancels - both legs of an orphaned bracket, or two
+            # brackets on one symbol - and counting ids instead of the symbols they
+            # sit on would fall back to the account-wide re-read on exactly the
+            # ordinary bracket sweep. So only an unresolved symbol, which names no
+            # bound at all, widens the scope.
+            verify_symbols: set[str] | None = {
+                symbol for symbol in cancelled_symbols.values() if symbol
+            }
+            if any(not symbol for symbol in cancelled_symbols.values()):
+                verify_symbols = None
+            try:
+                remaining = await self._list_working_book(
+                    client, symbols=verify_symbols
+                )
+            except Exception as exc:  # except-kind: money-decision
+                failed.append(f"verify:{exc}")
+            else:
+                still_resting = {
+                    _control_order_id(_order_attr(order, "id")) for order in remaining
+                }
+                still_resting.discard(None)
+                failed.extend(
+                    f"{order_id}:still-working"
+                    for order_id in cancelled
+                    if order_id in still_resting
+                )
         return ControlOutcome(
             completed=completed,
             unidentified=tuple(unidentified),
@@ -2444,56 +3699,235 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         orders = await self._list_open_orders(client)
         orders.extend(await self._list_filled_parents_with_held_legs(client, set(reducing_sides)))
         stops: dict[str, ProtectiveStop] = {}
+        unreadable_symbols: set[str] = set()
         for order in orders:
             for candidate in _stop_candidates(order):
-                stop = _protective_stop_of(candidate, order, reducing_sides)
+                stop = _protective_stop_of(
+                    candidate, order, reducing_sides, unreadable_symbols
+                )
                 if stop is not None:
                     stops[stop.order_id] = stop
-        return list(stops.values())
+        # A symbol with an unreadable stop candidate is ambiguous: listing its
+        # readable stops would let trailing amend one while the malformed one
+        # stays put. Zero listed stops is the fail-closed answer.
+        return [
+            stop for stop in stops.values() if stop.symbol not in unreadable_symbols
+        ]
 
     async def _list_filled_parents_with_held_legs(
-        self, client: Any, symbols: set[str]
+        self, client: Any, symbols: set[str] | None
     ) -> list[Any]:
-        """Filled bracket parents whose stop leg is still ``held``.
+        """Filled bracket parents that still have a bracket leg resting at the broker.
 
         Observed on Alpaca paper (2026-11-16): once a bracket entry fills, the stop leg
         stays ``held`` and is absent from every ``status=open`` listing, nested or flat.
         It is only reachable as a leg of the filled parent in a ``status=all`` listing,
-        and it can be replaced like any working stop. Only parents of symbols with an
-        open position are requested. A failure to list is not swallowed: a missing stop
-        would be reported as "no stop" for a position that does have one.
+        and it can be replaced like any working stop. ``symbols`` scopes the lookup (the
+        positions being acted on); ``None`` looks account-wide, which only the orphan sweep
+        may ask for: its whole job is symbols that no longer have a position, and an OTO
+        entry's stop leg has no take-profit sibling that ``status=open`` would name. The
+        20-page budget bounds even the account-wide history, and there is no default
+        scope, so no caller reaches an account-wide scan by omission.
+
+        The listing is newest-first and capped at 500 rows, so one call is only the
+        newest 500 orders of the account's whole history - a mature account fills that
+        page with terminal orders. A full page therefore pages back over the history
+        until a page comes back not full (the end of the history) rather than failing:
+        an account that trades a bracket per day reaches 500 orders within two years,
+        and a flatten that then failed would leave the position open. The 20-page
+        budget is the end of that, and a 20th full page fails with it: a history of
+        exactly 10,000 orders cannot be told apart from a longer one, and either way
+        the pages past it hold orders this lookup cannot vouch for. A failure to list
+        is not swallowed either way: a missing stop would be reported as "no stop" for
+        a position that does have one.
         """
         get_orders = getattr(client, "get_orders", None)
-        if not symbols or not callable(get_orders):
+        if not callable(get_orders):
+            return []
+        if symbols is not None and not symbols:
             return []
         from alpaca.trading.enums import QueryOrderStatus
         from alpaca.trading.requests import GetOrdersRequest
 
-        request = GetOrdersRequest(
-            status=QueryOrderStatus.ALL,
-            symbols=sorted(symbols),
-            nested=True,
-            limit=_ALPACA_HELD_LEG_LOOKUP_LIMIT,
+        collected: dict[str, Any] = {}
+        until: datetime | None = None
+        for _ in range(_ALPACA_HELD_LEG_PAGE_LIMIT):
+            request = GetOrdersRequest(
+                status=QueryOrderStatus.ALL,
+                symbols=sorted(symbols) if symbols is not None else None,
+                nested=True,
+                limit=_ALPACA_HELD_LEG_LOOKUP_LIMIT,
+                until=until,
+            )
+            result = await asyncio.to_thread(get_orders, filter=request)
+            if not isinstance(result, (list, tuple)):
+                raise RuntimeError(
+                    f"Alpaca order list has an unrecognised shape ({type(result).__name__}); "
+                    "refusing to report a clean sweep"
+                )
+            for order in result:
+                row_key = _control_order_id(_order_attr(order, "id"))
+                collected[row_key or f"row-{len(collected)}"] = order
+            if len(result) < _ALPACA_HELD_LEG_LOOKUP_LIMIT:
+                return self._parents_with_resting_legs(collected.values())
+            until = _page_back_cursor(list(result))
+            if until is None:
+                raise RuntimeError(
+                    "Alpaca's order rows carry no submitted timestamp, so the next page "
+                    "cannot be asked for; refusing to treat the list as complete"
+                )
+        raise RuntimeError(
+            f"Alpaca's order history reached "
+            f"{_ALPACA_HELD_LEG_PAGE_LIMIT * _ALPACA_HELD_LEG_LOOKUP_LIMIT} orders "
+            "without an empty page; refusing to treat the list as complete"
         )
-        result = await asyncio.to_thread(get_orders, filter=request)
-        if not isinstance(result, (list, tuple)):
-            raise RuntimeError(
-                f"Alpaca order list has an unrecognised shape ({type(result).__name__}); "
-                "refusing to report a clean sweep"
-            )
-        if len(result) >= _ALPACA_HELD_LEG_LOOKUP_LIMIT:
-            # The listing is newest-first: a full page may have cut off the filled parent
-            # that owns the held stop leg, and "no stop" would then be a lie.
-            raise RuntimeError(
-                f"Alpaca returned {len(result)} orders, the page limit; "
-                "refusing to treat the list as complete"
-            )
+
+    @staticmethod
+    def _parents_with_resting_legs(orders: Any) -> list[Any]:
+        """Filled bracket parents that still have a bracket leg resting at the broker."""
         return [
             order
-            for order in result
+            for order in orders
             if _order_status(order) == "filled"
-            and any(_order_status(leg) == "held" for leg in _order_legs(order))
+            and any(_order_status(leg) in _RESTING_LEG_STATUSES for leg in _order_legs(order))
         ]
+
+    async def _list_resting_legs(
+        self, client: Any, *, symbols: set[str] | None
+    ) -> list[_RestingLeg]:
+        """The bracket legs themselves, the ones no ``status=open`` listing shows (#245).
+
+        A leg in ``pending_cancel`` still rests: its cancel has not settled and it can
+        still fill, so a sweep that dropped it would report a clean book while the leg
+        was still reserving quantity (#198). A leg whose cancel did settle says so in
+        the listing and is not resting. Each leg comes back with the parent it rests
+        under, so a caller can resolve a symbol the leg itself does not carry.
+        """
+        parents = await self._list_filled_parents_with_held_legs(client, symbols)
+        return [
+            _RestingLeg(leg=leg, parent=parent)
+            for parent in parents
+            for leg in _order_legs(parent)
+            if _order_status(leg) in _RESTING_LEG_STATUSES
+        ]
+
+    async def _list_working_book(
+        self, client: Any, *, symbols: set[str] | None
+    ) -> list[Any]:
+        """Every order still resting at the broker, or a hard failure - never a partial book.
+
+        ``status=open`` is not the book on a bracketed position: the stop leg stays
+        ``held`` and is absent from every open listing, so a sweep built on it alone
+        cannot see the leg - the one order that can still trigger on the position. That
+        is the probe's ``orders-still-working``/``NO-STOP-RESTORED`` result: ``held``
+        legs of filled parents are added here. The open listing itself is account-wide;
+        ``symbols`` scopes the held-leg lookup, and every caller filters the result it
+        gets back.
+        """
+        orders = await self._list_open_orders(client)
+        legs = await self._list_resting_legs(client, symbols=symbols)
+        return self._merge_held_legs(orders, legs)
+
+    async def _working_book_on_symbol(self, client: Any, symbol: str) -> list[Any]:
+        """The working book filtered to *symbol*, held legs placed by their parent.
+
+        A held leg can arrive without a symbol of its own, and the parent it rests
+        under is what names the symbol, exactly as the orphan sweep resolves it:
+        filtered by the leg's own symbol such a leg reads as "another symbol",
+        survives the cancel, its stop goes on reserving the position's quantity,
+        and the close is then refused for that reservation - a flatten that cannot
+        finish. The leg lookup is scoped to *symbol* already, so a leg without a
+        symbol of its own belongs to this flatten; one whose parent names another
+        symbol is still left out. A leg is placed by object identity as well as
+        by id: the lookup above was scoped to this symbol's parents, so a leg it
+        returns belongs here even when its id cannot be read - and dropping it
+        would let the flatten close over a protection nobody verified.
+        """
+        open_orders = await self._list_open_orders(client)
+        legs = await self._list_resting_legs(client, symbols={symbol})
+        orders = self._merge_held_legs(open_orders, legs)
+        leg_symbols = {
+            leg_id: _order_symbol(resting.leg) or _order_symbol(resting.parent)
+            for resting in legs
+            if (leg_id := _control_order_id(_order_attr(resting.leg, "id"))) is not None
+        }
+        leg_symbols_by_object = {
+            id(resting.leg): _order_symbol(resting.leg) or _order_symbol(resting.parent)
+            for resting in legs
+        }
+        on_symbol = []
+        for order in orders:
+            order_id = _control_order_id(_order_attr(order, "id"))
+            resolved = (
+                _order_symbol(order)
+                or leg_symbols_by_object.get(id(order))
+                or leg_symbols.get(order_id or "", "")
+            )
+            if resolved == symbol:
+                on_symbol.append(order)
+        return on_symbol
+
+    @staticmethod
+    def _merge_held_legs(
+        open_orders: list[Any], legs: Iterable[_RestingLeg]
+    ) -> list[Any]:
+        """One entry per resting order: the open listing plus the legs it cannot show.
+
+        A broker can list the same leg both ways, and an entry listed twice would hide
+        which orders actually remain. An unreadable id cannot be matched, so it is always
+        kept - the sweep still has to report it rather than silently drop it.
+        """
+        orders = list(open_orders)
+        listed = {
+            order_id
+            for order_id in (
+                _control_order_id(_order_attr(order, "id")) for order in orders
+            )
+            if order_id is not None
+        }
+        for resting in legs:
+            leg = resting.leg
+            leg_id = _control_order_id(_order_attr(leg, "id"))
+            if leg_id is None or leg_id not in listed:
+                orders.append(leg)
+                if leg_id is not None:
+                    listed.add(leg_id)
+        return orders
+
+    async def _cancel_already_gone(self, client: Any, order_id: str) -> bool:
+        """Whether a refused cancel was for an order that is no longer resting.
+
+        A bracket is an OCO pair: cancelling one leg cancels the other at the broker,
+        so the second cancel of the pair is refused for an order the broker has already
+        removed (paper probe 2026-11-20: the sibling the take profit took with it reads
+        back by id as ``canceled``). That refusal is not a dropped cancel - the read
+        below is the proof - and a sweep that reported it as one would fail, and in the
+        flatten restore a stop on, every real bracket.
+
+        "Not resting" is not itself the proof: an order also leaves the book by executing,
+        and a stop that fills on a position that is already flat opens a short. So the id
+        is read back and only an order that left *without executing* counts - in a
+        terminal state, and with nothing of its own filled. A broker that cannot find the
+        order, a row nobody could read or a quantity nobody could read proves nothing,
+        and answers "not gone" so the refusal stands.
+
+        The read is by id, not a fresh listing: a terminal state already proves the order
+        is not resting, and the book a re-list would fetch is the page-limited nested
+        history - up to 20 requests of 500 rows - which on a mature account is what turns
+        one refused bracket cancel into a rate limit, and a rate limit fails the sweep
+        closed. A sweep with several refusals must not pay that price per refusal.
+        """
+        get_order = getattr(client, "get_order_by_id", None)
+        if not callable(get_order):
+            return False
+        try:
+            order = await asyncio.to_thread(get_order, order_id)
+        except Exception:  # fail closed: a read that raises proves nothing  # except-kind: money-decision
+            return False
+        if _order_status(order) not in _GONE_WITHOUT_EXECUTING:
+            return False
+        filled_qty = _order_filled_qty(order)
+        return filled_qty is not None and filled_qty <= 0.0
 
     def round_stop_price(self, stop: ProtectiveStop, price: float) -> float:
         value = float(price)
@@ -2527,9 +3961,11 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 replace, stop.order_id, order_data=ReplaceOrderRequest(stop_price=price)
             )
         new_order_id = _control_order_id(_order_attr(replaced, "id"))
-        confirmed_price = _to_float(_order_attr(replaced, "stop_price", None), default=0.0)
-        if new_order_id is None or not math.isclose(
-            confirmed_price, price, rel_tol=0.0, abs_tol=1e-9
+        confirmed_price = parse_optional(_order_attr(replaced, "stop_price", None))
+        if (
+            new_order_id is None
+            or confirmed_price is None
+            or not math.isclose(confirmed_price, price, rel_tol=0.0, abs_tol=1e-9)
         ):
             # Not a confirmed amendment. The broker's own state decides what is in force; the
             # caller re-reads it on its next pass instead of trusting this response.
@@ -2537,6 +3973,31 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 f"Alpaca did not confirm the stop replacement for {stop.symbol} "
                 f"(order_id={new_order_id!r}, stop_price={confirmed_price!r}, "
                 f"requested={price!r})"
+            )
+        # #144: replacing an order gives it a NEW broker order id, so the leg-order-id ->
+        # signal map this adapter learned for the old id is stale from this moment on. The
+        # replaced order here is the bracket's stop leg whenever the pre-replacement id was
+        # learned as a leg, so its fill is re-learned against the same parent signal here
+        # rather than waiting for the next adapter connect (the only other pass).
+        previous_leg_key = _bracket_leg_key(stop.order_id)
+        new_leg_key = _bracket_leg_key(new_order_id)
+        parent_signal_id = (
+            self._bracket_leg_order_id_to_signal_id.pop(previous_leg_key, None)
+            if previous_leg_key is not None
+            else None
+        )
+        if parent_signal_id is not None and new_leg_key is not None:
+            self._bracket_leg_order_id_to_signal_id[new_leg_key] = parent_signal_id
+            logger.info(
+                "Amended Alpaca stop leg re-registered against its parent signal",
+                extra={
+                    "data": {
+                        "parent_signal_id": parent_signal_id,
+                        "previous_leg_order_id": str(stop.order_id),
+                        "leg_order_id": str(new_order_id),
+                        "symbol": stop.symbol,
+                    }
+                },
             )
         return ProtectiveStop(
             order_id=new_order_id,
@@ -2550,18 +4011,29 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         """Return open positions with pricing and unrealized PnL."""
         if not self._connected or self._trading_client is None:
             await self.connect()
-        rows = await asyncio.to_thread(self._trading_client.get_all_positions)
+        # Re-read after the await, for the same reason as `get_balance`: a
+        # `connect()` that left the client unset must raise, not AttributeError.
+        trading_client = self._trading_client
+        if trading_client is None:
+            raise RuntimeError(
+                "Alpaca adapter must be connected before listing positions"
+            )
+        rows = await asyncio.to_thread(trading_client.get_all_positions)
         payload: list[dict[str, Any]] = []
         for row in rows:
             raw_qty = getattr(row, "qty", None)
             entry: dict[str, Any] = {
                 "symbol": str(getattr(row, "symbol", "")).strip().upper(),
-                "qty": _to_float(raw_qty, default=0.0),
-                "entry_price": _to_float(getattr(row, "avg_entry_price", None), default=0.0),
-                "current_price": _to_float(getattr(row, "current_price", None), default=0.0),
-                "unrealized_pnl": _to_float(getattr(row, "unrealized_pl", None), default=0.0),
+                "qty": _display_float(raw_qty),
+                "entry_price": parse_money(getattr(row, "avg_entry_price", None)),
             }
-            if raw_qty is not None and not _is_parseable_qty(raw_qty):
+            entry["current_price"] = _optional_display_money(
+                getattr(row, "current_price", None), entry, "current_price"
+            )
+            entry["unrealized_pnl"] = _optional_display_money(
+                getattr(row, "unrealized_pl", None), entry, "unrealized_pnl"
+            )
+            if raw_qty is None or not _is_parseable_qty(raw_qty):
                 # Keep the coercion for display consumers, but remember that the
                 # broker's value could not be read: the risk paths that decide
                 # whether an account is flat must fail closed rather than treat
@@ -2571,9 +4043,13 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             payload.append(entry)
         return payload
 
-    def _parse_trade_update_event(
-        self, data: Any
-    ) -> tuple[str, Any, Any, UUID] | None:
+    def _trade_update_fill_order(self, data: Any) -> tuple[str, Any, Any] | None:
+        """The ``(event, order, client_order_id_text)`` of a fill event, or ``None``.
+
+        Split from the signal resolution below because a bracket leg's fill is a fill event whose
+        client order id names no signal of ours (#144): the order id decides that case, so the
+        event has to be readable before any client order id is interpreted.
+        """
         event = str(getattr(data, "event", "")).lower()
         if event not in {"fill", "partial_fill"}:
             return None
@@ -2587,16 +4063,149 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         if not client_order_id:
             logger.warning("Trade update missing client_order_id")
             return None
+        return event, order, client_order_id
 
-        try:
-            signal_uuid = UUID(str(client_order_id))
-        except ValueError:
+    async def _record_bracket_leg_fill(
+        self,
+        parent_signal_id: str,
+        data: Any,
+        order: Any,
+        *,
+        broker_order_id: str,
+        event: str,
+    ) -> None:
+        """Book one bracket leg fill against the parent signal's deployment ledger (#144).
+
+        The dedupe key is derived from the leg's own broker order id and its cumulative filled
+        quantity - the ONE derivation this path and the reconciliation pass below share, so a fill
+        the stream stored is a skip there rather than a second row, whichever of the two sees the
+        fill first. Alpaca's per-fill ``execution_id`` is deliberately NOT used for a leg: the
+        reconciliation pass reads the leg off the parent order, where no execution id exists, and
+        two derivations for one fill would let the same fill be stored twice.
+        """
+        skip, filled_qty_value = self._resolve_trade_update_qty(
+            data,
+            order,
+            event=event,
+            client_order_id=_order_attr(order, "client_order_id"),
+        )
+        if skip:
+            return
+        cumulative_filled_qty = parse_optional(getattr(order, "filled_qty", None))
+        broker_cumulative_filled_qty = (
+            0.0 if cumulative_filled_qty is None else cumulative_filled_qty
+        )
+        # The event's OWN quantity, not the cumulative fallback `_resolve_trade_update_qty` may
+        # have substituted: only that proves this fill is the whole leg.
+        event_qty = getattr(data, "qty", None)
+        if event_qty is None:
+            event_qty = getattr(data, "filled_qty", None)
+        actual_price, price_observed = _resolve_fill_price(
+            (getattr(data, "fill_price", None), getattr(data, "price", None)),
+            order_avg_price=getattr(order, "filled_avg_price", None),
+            event_qty=event_qty,
+            cumulative_qty=broker_cumulative_filled_qty,
+        )
+        event_filled_qty = parse_optional(filled_qty_value)
+        filled_qty = 0.0 if event_filled_qty is None else event_filled_qty
+        raw_fill_ts = getattr(data, "timestamp", None)
+        fill_ts = _broker_fill_timestamp(
+            raw_fill_ts, getattr(order, "filled_at", None), getattr(order, "updated_at", None)
+        )
+        execution_id = str(getattr(data, "execution_id", "") or "")
+        dedupe_key = _alpaca_fill_dedupe_key(
+            # Empty on purpose: see the docstring - the leg's id and cumulative quantity are the
+            # identity a reconciliation pass can reproduce without an execution id.
+            execution_id="",
+            broker_order_id=broker_order_id,
+            event=_LEG_FILL_EVENT_LABEL,
+            cumulative_filled_qty=broker_cumulative_filled_qty,
+            raw_timestamp=raw_fill_ts,
+            filled_qty=filled_qty,
+        )
+        if dedupe_key is None:
             logger.warning(
-                "Trade update client_order_id is not a UUID",
-                extra={"data": {"client_order_id": str(client_order_id)}},
+                "Alpaca bracket leg fill carries no execution id, no cumulative leg quantity and "
+                "no usable timestamp; refusing to derive a dedupe key that could count it twice "
+                "or drop a sibling. reconcile_executions backfills it from the parent order",
+                extra={
+                    "data": {
+                        "account_id": self.account_id,
+                        "parent_signal_id": parent_signal_id,
+                        "leg_order_id": broker_order_id,
+                        "event": event,
+                    }
+                },
             )
-            return None
-        return event, order, client_order_id, signal_uuid
+            return
+        if fill_ts is None:
+            logger.warning(
+                "Alpaca bracket leg fill carries no usable timestamp on the event or its order; "
+                "no execution row was stored (never an invented time), so the deployment's "
+                "ledger still counts the closed shares until the next adapter connect runs "
+                "reconciliation and the leg reports a fill time",
+                extra={
+                    "data": {
+                        "account_id": self.account_id,
+                        "parent_signal_id": parent_signal_id,
+                        "leg_order_id": broker_order_id,
+                        "event": event,
+                        "execution_id": execution_id,
+                        "filled_qty": filled_qty,
+                    }
+                },
+            )
+            return
+        persisted_qty = await asyncio.to_thread(
+            record_live_broker_side_close_fill,
+            parent_signal_id=parent_signal_id,
+            close_reason=_bracket_leg_close_reason(order),
+            filled_qty=filled_qty,
+            actual_price=actual_price,
+            actual_price_observed=price_observed,
+            commission=_known_commission(order),
+            timestamp=fill_ts,
+            broker_order_id=broker_order_id,
+            # The leg's broker cumulative caps the booking inside the insert: a
+            # delayed event whose slice a reconcile pass already covered is skipped
+            # there rather than double-counted here.
+            cumulative_filled_qty=(
+                broker_cumulative_filled_qty
+                if broker_cumulative_filled_qty > 0.0
+                else None
+            ),
+            cumulative_avg_price=_positive_finite(
+                getattr(order, "filled_avg_price", None)
+            ),
+            dedupe_key=dedupe_key,
+            # The leg's own side, cross-checked against the side the parent's action implies: a
+            # leg that would extend the position is refused, not recorded.
+            close_side=_order_side(order),
+            order_type=_order_type(order) or None,
+            requested_qty=_requested_order_qty(order),
+        )
+        logger.info(
+            (
+                "Persisted Alpaca bracket leg close fill"
+                if persisted_qty > 0.0
+                else "No new Alpaca bracket leg close fill persisted "
+                "(duplicate or refused; the reason is logged by the insert path)"
+            ),
+            extra={
+                "data": {
+                    "parent_signal_id": parent_signal_id,
+                    "close_signal_id": broker_close_signal_id(parent_signal_id),
+                    "leg_order_id": broker_order_id,
+                    "close_reason": _bracket_leg_close_reason(order),
+                    "event": event,
+                    "filled_qty": filled_qty,
+                    "persisted_qty": persisted_qty,
+                    "actual_price": actual_price,
+                    "actual_price_observed": price_observed,
+                    "broker_cumulative_filled_qty": broker_cumulative_filled_qty,
+                }
+            },
+        )
 
     def _resolve_trade_update_qty(
         self,
@@ -2638,10 +4247,10 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
 
     async def _on_trade_update(self, data: Any) -> None:
         try:
-            parsed = self._parse_trade_update_event(data)
-            if parsed is None:
+            fill = self._trade_update_fill_order(data)
+            if fill is None:
                 return
-            event, order, client_order_id, signal_uuid = parsed
+            event, order, client_order_id = fill
             raw_broker_order_id = getattr(order, "id", None)
             broker_order_id = _normalize_broker_order_id(raw_broker_order_id)
             if broker_order_id is None:
@@ -2657,14 +4266,40 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 )
                 return
 
+            # #144: a bracket leg's fill closes this signal's position. Booked BEFORE the
+            # client_order_id path below, because a leg may carry the parent's client order id -
+            # and booking that against the parent signal would ADD the leg's quantity to the
+            # long side (the ledger signs by the parent signal's action) instead of reducing
+            # it, leaving the ledger further from the broker position than before.
+            parent_signal_id = self._parent_signal_id_for_broker_order(broker_order_id)
+            if parent_signal_id is not None:
+                await self._record_bracket_leg_fill(
+                    parent_signal_id,
+                    data,
+                    order,
+                    broker_order_id=broker_order_id,
+                    event=event,
+                )
+                return
+
+            try:
+                signal_uuid = UUID(str(client_order_id))
+            except ValueError:
+                logger.warning(
+                    "Trade update client_order_id is not a UUID",
+                    extra={"data": {"client_order_id": str(client_order_id)}},
+                )
+                return
+
             skip, filled_qty_value = self._resolve_trade_update_qty(
                 data, order, event=event, client_order_id=client_order_id
             )
             if skip:
                 return
 
-            broker_cumulative_filled_qty = _to_float(
-                getattr(order, "filled_qty", None), default=0.0
+            cumulative_filled_qty = parse_optional(getattr(order, "filled_qty", None))
+            broker_cumulative_filled_qty = (
+                0.0 if cumulative_filled_qty is None else cumulative_filled_qty
             )
             # The event's OWN quantity, not the cumulative fallback `_resolve_trade_update_qty`
             # may have substituted: only that proves this fill is the whole order.
@@ -2680,7 +4315,8 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 cumulative_qty=broker_cumulative_filled_qty,
             )
 
-            filled_qty = _to_float(filled_qty_value)
+            event_filled_qty = parse_optional(filled_qty_value)
+            filled_qty = 0.0 if event_filled_qty is None else event_filled_qty
             # alpaca-py has no commission field on TradeUpdate or Order; a crypto fee is posted end
             # of day and backfilled, so here it is unknown unless it is a known zero (#124).
             commission = _known_commission(order)
@@ -2743,6 +4379,8 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 timestamp=fill_ts,
                 broker_order_id=broker_order_id,
                 dedupe_key=dedupe_key,
+                order_type=_order_type(order) or None,
+                requested_qty=_requested_order_qty(order),
             )
             persisted_qty = await self._persist_execution_fill(
                 execution, broker_cumulative_filled_qty
@@ -2768,7 +4406,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                     }
                 }
             )
-        except Exception as exc:
+        except Exception as exc:  # except-kind: money-decision
             logger.warning(
                 "Failed to process trade update",
                 extra={"data": {"account_id": self.account_id, "error": str(exc)}},
@@ -2798,10 +4436,13 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 # alternative in alpaca-py). The thread is released when run
                 # returns/raises; on error the stream is stopped below before
                 # discard so a healthy stream never leaks a thread per retry.
-                await asyncio.to_thread(self._trading_stream.run)
+                # Bound above in the `is None` branch and re-assigned on
+                # reconnect, so mypy still sees `Any | None` here even though the
+                # `is None` check just established it.
+                await asyncio.to_thread(self._trading_stream.run)  # type: ignore[union-attr]
             except asyncio.CancelledError:
                 raise
-            except Exception as exc:
+            except Exception as exc:  # except-kind: loop-survival
                 logger.warning(
                     "Alpaca trade stream disconnected, retrying",
                     extra={
@@ -2828,8 +4469,11 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                             result = stop()
                             if inspect.isawaitable(result):
                                 await result
-                    except Exception:
-                        pass
+                    except Exception as exc:  # except-kind: loop-survival
+                        logger.warning(
+                            "Alpaca trading stream stop failed during disconnect",
+                            extra={"data": {"error": str(exc)}},
+                        )
                 await asyncio.sleep(backoff_seconds)
                 backoff_seconds = min(backoff_seconds * 2, 30)
             else:

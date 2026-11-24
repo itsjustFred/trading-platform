@@ -9,13 +9,17 @@ from typing import Any, Callable
 
 import pandas as pd
 
-from risk.config import RiskConfig
+from risk.config import (
+    RiskConfig,
+    effective_max_leverage,
+    effective_max_notional_per_trade,
+)
 from risk.engine import RiskEngine
 from risk.models import TradeSignal as RiskTradeSignal
 from risk.models import realized_risk_amount, realized_risk_percent
 from runner.engines import contract
-from runner.engines.contract import resolve_same_bar_exit
 from runner.fees import resolve_fee_model
+from runner.slippage import BarSpreadSlippage, resolve_slippage_model
 from runner.stats import compute_stats_for_result
 from shared.constants import DATA_DIR, VALID_TIMEFRAMES, normalize_timeframe
 from shared.models import BacktestMeta, BacktestResult, EquityPoint, Trade, TradeExit
@@ -234,6 +238,12 @@ class SignalReplayAdapter:
     close. If the flip bar is the last bar of the data the position is closed
     like every other open position at the end of the data. See
     :meth:`_check_flip_bar` for the full per-bar ordering.
+
+    Gap fills (#287, extended by the 2026-11-13 owner decision): BOTH the
+    ``supertrend_flip`` workflow and the plain protective path fill at the
+    bar's OPEN when the bar opens beyond the level
+    (``contract.resolve_protective_exit``); intrabar touches keep the level
+    fill.
     """
 
     def __init__(
@@ -246,15 +256,34 @@ class SignalReplayAdapter:
         signal_processor_config: dict[str, Any] | None = None,
         fee_model: Any | None = None,
         fee_params: dict[str, Any] | None = None,
+        slippage_model: Any | None = None,
+        slippage_params: dict[str, Any] | None = None,
+        asset_class_by_symbol: dict[str, str] | None = None,
+        max_leverage: float | None = None,
     ) -> None:
         self.risk_config = risk_config or RiskConfig()
         self.risk_engine = RiskEngine(self.risk_config)
+        # #240: the declared broker maximum leverage for the account/asset —
+        # replay has no broker connection, so the operator declares it; unset
+        # means unknown and the notional ceiling fails closed to 1x.
+        self._max_leverage = max_leverage
         self.initial_capital = float(initial_capital)
         self.default_timeframe = normalize_timeframe(default_timeframe) or default_timeframe
         # #84: explicit fee model (no silent gross); resolved at run() so
         # per-run metadata can also declare costs.
         self._fee_model = fee_model
         self._fee_params = dict(fee_params or {})
+        # #130: fill-price slippage model(s), resolved per symbol at run()
+        # (asset class can differ across replayed symbols). ``None`` asset
+        # classes record an explicit ``none`` — never a silent gross default.
+        self._slippage_model = slippage_model
+        self._slippage_params = dict(slippage_params or {})
+        self._asset_class_by_symbol = {
+            str(symbol).strip().upper(): str(asset_class or "")
+            for symbol, asset_class in (asset_class_by_symbol or {}).items()
+        }
+        self._slippage_models: dict[str, Any] = {}
+        self._slippage_meta: dict[str, dict[str, Any]] = {}
         self.signal_processor_name = str(signal_processor_name or "").strip().lower()
         self.signal_processor = (
             get_signal_processor(self.signal_processor_name, signal_processor_config)
@@ -312,6 +341,66 @@ class SignalReplayAdapter:
             self._position_risk_amount(position) for position in open_positions.values()
         )
         return max(0.0, risk_amount / equity)
+
+    def _open_position_notionals(
+        self,
+        open_positions: dict[str, _OpenPosition],
+        frames: dict[str, pd.DataFrame],
+        as_of: pd.Timestamp,
+    ) -> float:
+        """Aggregate open notional marked at each symbol's latest close.
+
+        Same marking convention as :meth:`_sizing_account_balance`: the last
+        bar at or before ``as_of`` per symbol, falling back to the entry
+        price when a symbol has no frame coverage (fail toward the larger,
+        already-committed notional).
+        """
+        total = 0.0
+        for symbol, position in open_positions.items():
+            mark = float(position.entry_price)
+            frame = frames.get(symbol)
+            if frame is not None and not frame.empty:
+                bars = frame[frame["timestamp"] <= as_of]
+                if not bars.empty:
+                    mark = float(bars.iloc[-1]["close"])
+            total += float(position.quantity) * mark
+        return total
+
+    def _free_margin_quantity_cap(
+        self,
+        *,
+        open_positions: dict[str, _OpenPosition],
+        frames: dict[str, pd.DataFrame],
+        as_of: pd.Timestamp,
+        equity: float,
+        entry_price: float,
+    ) -> float:
+        """Largest quantity the declared-leverage free-margin rule affords (#240).
+
+        Mirrors the native engine's MT5-style check (#347): a new position's
+        notional must fit in ``free_margin * L`` — equity minus used margin,
+        times the declared broker maximum ``L`` (1x when unknown). Used margin
+        is open notional / ``L``, so the bound reduces to
+        ``notional_new <= equity * L - sum(open_notional)``. Replay has no
+        broker connection, so ``L`` is the operator-declared ``max_leverage``;
+        an undeterminable one fails closed to 1x. Returns 0.0 when nothing
+        fits — the caller skips the entry, matching the native "clamped to
+        zero" outcome.
+        """
+        if (
+            not math.isfinite(entry_price)
+            or entry_price <= 0
+            or not math.isfinite(equity)
+            or equity <= 0
+        ):
+            return 0.0
+        leverage = effective_max_leverage(self._max_leverage)
+        open_notional = self._open_position_notionals(open_positions, frames, as_of)
+        available_notional = equity * leverage - open_notional
+        if available_notional <= 0:
+            return 0.0
+        # pip_value is 1.0 in replay, so notional = qty * price.
+        return available_notional / entry_price
 
     def _sizing_account_balance(
         self,
@@ -387,6 +476,34 @@ class SignalReplayAdapter:
             position.stop_loss = float(next_stop)
             position.trailing_updates += 1
 
+    def _slippage_for(self, symbol: str) -> Any:
+        """Resolved slippage model for ``symbol`` (#130, lazy like fees)."""
+        key = str(symbol or "").strip().upper()
+        model = self._slippage_models.get(key)
+        if model is None:
+            if self._slippage_model is not None:
+                model = self._slippage_model
+            else:
+                model = resolve_slippage_model(
+                    dict(self._slippage_params),
+                    asset_class=self._asset_class_by_symbol.get(key, ""),
+                )
+            self._slippage_models[key] = model
+        return model
+
+    def _slip(
+        self, price: float, side: str, symbol: str, bar: Any = None
+    ) -> float:
+        """Adverse slippage adjustment on one replay fill price (#130).
+
+        ``side`` is the trader's side: entries buy on LONG / sell on SHORT;
+        exits are the mirror. Applied at every fill choke point so the
+        recorded price, PnL and equity path carry the same cost.
+        """
+        return float(
+            self._slippage_for(symbol).slip_price(float(price), side, bar)
+        )
+
     def _close_position(
         self,
         position: _OpenPosition,
@@ -395,7 +512,16 @@ class SignalReplayAdapter:
         exit_price: float,
         exit_reason: str,
         exit_bar_index: int,
+        bar: pd.Series | None = None,
     ) -> Trade:
+        # #130: the exit leg slips adversely before PnL is computed — a
+        # LONG exit sells lower, a SHORT exit buys higher.
+        exit_price = self._slip(
+            exit_price,
+            "sell" if position.direction == "LONG" else "buy",
+            position.symbol,
+            bar,
+        )
         if position.direction == "LONG":
             pnl = (exit_price - position.entry_price) * position.quantity
         else:
@@ -428,6 +554,11 @@ class SignalReplayAdapter:
         pnl_pct = (pnl / gross_notional) * 100.0 if gross_notional > 0 else 0.0
         r_multiple = (pnl / risk_amount) if risk_amount > 0 else None
         signal_price = float(position.signal_entry_price)
+        # #130: since the fill-price slippage model landed, entry_price
+        # already carries the model's adverse adjustment, so this
+        # signal-vs-fill difference now includes BOTH the signal's own
+        # price gap AND the resolved slippage model — it is no longer a
+        # pure execution-slippage measurement.
         slippage = float(position.entry_price - signal_price)
         slippage_bps = (slippage / signal_price) * 10_000 if signal_price > 0 else 0.0
         fill_delay_seconds = int(
@@ -513,31 +644,32 @@ class SignalReplayAdapter:
         stop-first tie-break applies when both levels are hit.
         """
         self._update_excursions(position, bar)
-        event = resolve_same_bar_exit(
+        stop_level = float(position.stop_loss) if position.stop_loss is not None else None
+        tp_level = float(position.take_profit) if position.take_profit is not None else None
+        # Owner decision 2026-11-13: a bar that OPENS beyond a level gapped
+        # through it. The open is the bar's first event, so that exit wins over
+        # a later same-bar touch of the other level and fills at the OPEN (the
+        # price actually available), not at the skipped level - the gap is
+        # checked BEFORE the stop-first range test, mirroring native
+        # _check_stops. Intrabar touches keep filling at the level.
+        bar_open = float(bar["open"])
+        event, gapped = contract.resolve_protective_exit(
             direction=position.direction,
+            bar_open=bar_open,
             high=float(bar["high"]),
             low=float(bar["low"]),
-            stop_price=float(position.stop_loss) if position.stop_loss is not None else None,
-            take_profit_price=(
-                float(position.take_profit) if position.take_profit is not None else None
-            ),
+            stop_price=stop_level,
+            take_profit_price=tp_level,
         )
         if event is None:
             self._apply_trailing_stop(position, bar)
             return None
+        level = stop_level if event == "stop" else tp_level
+        assert level is not None  # a hit is only reported for a set level
+        exit_price = bar_open if gapped else level
         if event == "stop":
-            exit_price = (
-                float(position.stop_loss)
-                if position.stop_loss is not None
-                else float(bar["close"])
-            )
             reason = "trailing_stop" if position.trailing_updates > 0 else "stop_loss"
         else:
-            exit_price = (
-                float(position.take_profit)
-                if position.take_profit is not None
-                else float(bar["close"])
-            )
             reason = "take_profit"
         return self._close_position(
             position,
@@ -545,6 +677,7 @@ class SignalReplayAdapter:
             exit_price=exit_price,
             exit_reason=reason,
             exit_bar_index=int(index),
+            bar=bar,
         )
 
     def _process_protective_exits(
@@ -643,13 +776,15 @@ class SignalReplayAdapter:
 
         1. Open: a flip exit decided at the previous bar's close fills here,
            at the open. Nothing else is evaluated on this bar.
-        2. Intrabar: before TP1, the stop and the TP1 level go through the
-           adapter's shared same-bar policy (``resolve_same_bar_exit``,
-           stop-first when both are touched — the whole position then stops
-           out and TP1 does not happen). After TP1 only the stop is checked.
-           A stop moved to breakeven on the TP1 bar takes effect from the
-           next bar: inside the TP1 bar the order of the touches is unknown,
-           the same rule the ``percent`` trail follows.
+        2. Intrabar: before TP1, the stop and the TP1 level go through
+           ``contract.resolve_protective_exit`` — the gap-at-open check first
+           (#287: a bar opening beyond a level fills at the open), then the
+           adapter's shared same-bar policy (stop-first when both levels are
+           touched — the whole position then stops out and TP1 does not
+           happen). After TP1 only the stop is checked, with the same gap
+           rule. A stop moved to breakeven on the TP1 bar takes effect from
+           the next bar: inside the TP1 bar the order of the touches is
+           unknown, the same rule the ``percent`` trail follows.
         3. Close: the Supertrend of this bar (from bars up to and including
            it) is evaluated once TP1 has happened — from the bar AFTER the
            TP1 bar, never on the TP1 bar's own close: nothing that happens at
@@ -670,27 +805,46 @@ class SignalReplayAdapter:
                 exit_price=open_price,
                 exit_reason="supertrend_flip",
                 exit_bar_index=index,
+                bar=bar,
             )
 
         self._update_excursions(position, bar)
+        bar_open = float(bar["open"])
         high = float(bar["high"])
         low = float(bar["low"])
         stop_price = float(position.stop_loss) if position.stop_loss is not None else None
         if flip.phase == _FLIP_PHASE_BEFORE_TP1:
             return self._check_flip_bar_before_tp1(
-                position, bar_time=bar_time, index=index, high=high, low=low, stop_price=stop_price
-            )
-        if (
-            resolve_same_bar_exit(
-                direction=position.direction,
+                position,
+                bar=bar,
+                bar_time=bar_time,
+                index=index,
+                bar_open=bar_open,
                 high=high,
                 low=low,
                 stop_price=stop_price,
-                take_profit_price=None,
             )
-            == "stop"
-        ):
-            return self._close_flip_at_stop(position, bar_time, index)
+        # #287: the open is the bar's first event — a bar that opens beyond the
+        # stop gapped through it and fills at the open, beating any later
+        # same-bar touch (mirrors ``resolve_protective_exit`` / native
+        # ``_check_stops``). Intrabar touches keep the level fill.
+        stop_event, gapped = contract.resolve_protective_exit(
+            direction=position.direction,
+            bar_open=bar_open,
+            high=high,
+            low=low,
+            stop_price=stop_price,
+            take_profit_price=None,
+        )
+        if stop_event == "stop":
+            assert stop_price is not None  # a hit is only reported for a set level
+            return self._close_flip_at_stop(
+                position,
+                bar,
+                bar_time,
+                index,
+                exit_price=bar_open if gapped else stop_price,
+            )
 
         ready = bool(supertrend["supertrend_ready"])
         if not ready:
@@ -709,8 +863,10 @@ class SignalReplayAdapter:
         self,
         position: _OpenPosition,
         *,
+        bar: pd.Series,
         bar_time: pd.Timestamp,
         index: int,
+        bar_open: float,
         high: float,
         low: float,
         stop_price: float | None,
@@ -718,20 +874,61 @@ class SignalReplayAdapter:
         """Intrabar step of a flip position that has not reached TP1 yet."""
         flip = position.flip
         assert flip is not None
-        event = resolve_same_bar_exit(
+        # #287: gap checked first — a bar that opens beyond the stop or TP1
+        # fills at the open; otherwise the shared stop-first same-bar policy.
+        event, gapped = contract.resolve_protective_exit(
             direction=position.direction,
+            bar_open=bar_open,
             high=high,
             low=low,
             stop_price=stop_price,
             take_profit_price=flip.plan.tp1_price,
         )
         if event == "stop":
-            return self._close_flip_at_stop(position, bar_time, index)
+            assert stop_price is not None  # a hit is only reported for a set level
+            return self._close_flip_at_stop(
+                position,
+                bar,
+                bar_time,
+                index,
+                exit_price=bar_open if gapped else stop_price,
+            )
         if event != "tp":
             return None
-        trade = self._take_tp1(position, bar_time, index)
+        tp1_level = float(flip.plan.tp1_price)
+        trade = self._take_tp1(
+            position,
+            bar,
+            bar_time,
+            index,
+            fill_price=bar_open if gapped else tp1_level,
+        )
         if trade is not None:
             return trade
+        # A gap through TP1 makes the open the bar's first event, but the
+        # bar's remaining range is still live for the remainder: live keeps
+        # the remainder's ORIGINAL stop working all bar (the breakeven
+        # amendment only takes effect on the next bar, #176), so a later
+        # same-bar trade through that stop exits the remainder at the stop
+        # level. The fill cannot itself be a gap — the open already sat
+        # beyond TP1, on the stop's safe side. An intrabar (non-gap) TP1
+        # fill needs no check: ``resolve_same_bar_exit`` only returns "tp"
+        # when the stop was not touched.
+        if gapped and stop_price is not None:
+            stopped = (
+                low <= stop_price
+                if position.direction == "LONG"
+                else high >= stop_price
+            )
+            if stopped:
+                return self._close_position(
+                    position,
+                    exit_time=bar_time,
+                    exit_price=float(stop_price),
+                    exit_reason="stop_loss",
+                    exit_bar_index=index,
+                    bar=bar,
+                )
         # The TP1 bar after the TP1 fill is dead for the workflow: its close is
         # not read (no activation, no flip) and its range is not checked against
         # the stop moved on it — the next bar's intrabar pass is the first one
@@ -739,10 +936,18 @@ class SignalReplayAdapter:
         return None
 
     def _take_tp1(
-        self, position: _OpenPosition, bar_time: pd.Timestamp, index: int
+        self,
+        position: _OpenPosition,
+        bar: pd.Series,
+        bar_time: pd.Timestamp,
+        index: int,
+        *,
+        fill_price: float,
     ) -> Trade | None:
-        """Exit the whole-share TP1 tranche at the TP1 price; returns a trade
-        if nothing is left.
+        """Exit the whole-share TP1 tranche; returns a trade if nothing is left.
+
+        ``fill_price`` is the TP1 level, or the bar's open when the bar gapped
+        through it (#287).
 
         The tranche is ``quantity * tp1_exit_fraction`` floored to whole shares
         — the original bot's arithmetic (``shared.trailing.tp1_partial_quantity``),
@@ -768,21 +973,32 @@ class SignalReplayAdapter:
         flip.phase = _FLIP_PHASE_AWAIT_GREEN
         flip.tp1_time = bar_time
         if exit_quantity >= float(position.quantity):
+            # Full close routes through _close_position, which applies the
+            # adverse slippage itself — pass the pre-slippage fill price.
             return self._close_position(
                 position,
                 exit_time=bar_time,
-                exit_price=plan.tp1_price,
+                exit_price=fill_price,
                 exit_reason="tp1",
                 exit_bar_index=index,
+                bar=bar,
             )
+        # #130: the TP1 partial leg is a fill like any other — it slips
+        # adversely (LONG sells lower, SHORT buys higher) before PnL books.
+        tp1_fill = self._slip(
+            fill_price,
+            "sell" if position.direction == "LONG" else "buy",
+            position.symbol,
+            bar,
+        )
         if position.direction == "LONG":
-            pnl = (plan.tp1_price - position.entry_price) * exit_quantity
+            pnl = (tp1_fill - position.entry_price) * exit_quantity
         else:
-            pnl = (position.entry_price - plan.tp1_price) * exit_quantity
+            pnl = (position.entry_price - tp1_fill) * exit_quantity
         position.partial_exits.append(
             TradeExit(
                 time=_to_iso(bar_time),
-                price=float(plan.tp1_price),
+                price=float(tp1_fill),
                 quantity=exit_quantity,
                 pnl=float(pnl),
                 reason="tp1",
@@ -799,7 +1015,13 @@ class SignalReplayAdapter:
         return None
 
     def _close_flip_at_stop(
-        self, position: _OpenPosition, bar_time: pd.Timestamp, index: int
+        self,
+        position: _OpenPosition,
+        bar: pd.Series,
+        bar_time: pd.Timestamp,
+        index: int,
+        *,
+        exit_price: float,
     ) -> Trade:
         flip = position.flip
         assert flip is not None and position.stop_loss is not None
@@ -811,9 +1033,10 @@ class SignalReplayAdapter:
         return self._close_position(
             position,
             exit_time=bar_time,
-            exit_price=float(position.stop_loss),
+            exit_price=exit_price,
             exit_reason="breakeven_stop" if at_breakeven else "stop_loss",
             exit_bar_index=index,
+            bar=bar,
         )
 
     def _apply_signal_processor(
@@ -883,12 +1106,43 @@ class SignalReplayAdapter:
                 merged_fee_params.update(metadata["fee_params"])
             fee_model = resolve_fee_model(merged_fee_params)
         self._active_fee_model = fee_model
+        # #130: resolve the fill-price slippage model per symbol (asset
+        # class can differ across replayed symbols) and record each in the
+        # run metadata — mandatory even when the model is ``none``.
+        slippage_params = dict(self._slippage_params)
+        if metadata and isinstance(metadata.get("slippage_params"), dict):
+            slippage_params.update(metadata["slippage_params"])
+        self._slippage_params = slippage_params
+        self._slippage_models = {}
+        self._slippage_meta = {}
         # #168: per-run Supertrend cache (keyed by frame identity).
         self._supertrend_cache = {}
         normalized_timeframe = normalize_timeframe(timeframe) or self.default_timeframe
         frames = self._prepare_replay_frames(ohlcv_by_symbol)
         if not frames:
             raise ValueError("No OHLCV data available for replay")
+        for replay_symbol, replay_frame in frames.items():
+            asset_class = self._asset_class_by_symbol.get(replay_symbol, "")
+            model = self._slippage_model or resolve_slippage_model(
+                slippage_params, asset_class=asset_class
+            )
+            self._slippage_models[replay_symbol] = model
+            # #130: same price-basis rule as the native adapter —
+            # "bid_ask" only when the bar-spread model can use the ask
+            # columns; fixed/none models fill on the canonical (bid)
+            # series even when ask columns happen to be present.
+            has_two_sided = any(
+                str(col).startswith("ask_") for col in replay_frame.columns
+            )
+            price_basis = (
+                "bid_ask"
+                if has_two_sided and isinstance(model, BarSpreadSlippage)
+                else ("bid" if has_two_sided else "single_price")
+            )
+            self._slippage_meta[replay_symbol] = {
+                **model.describe(),
+                "price_basis": price_basis,
+            }
 
         replay_signals = self._select_replay_signals(signals, frames)
         if not replay_signals:
@@ -972,9 +1226,17 @@ class SignalReplayAdapter:
             if filled is None:
                 continue
             fill_index, fill_bar = filled
-            fill_price = float(fill_bar["close"])
+            raw_fill_price = float(fill_bar["close"])
             fill_time = pd.Timestamp(fill_bar["timestamp"])
             target_direction = "LONG" if effective_signal.action == "buy" else "SHORT"
+            # #130: the entry leg slips adversely (buy pays up, sell receives
+            # down) before sizing and before the position records its price.
+            fill_price = self._slip(
+                raw_fill_price,
+                "buy" if target_direction == "LONG" else "sell",
+                signal.symbol,
+                fill_bar,
+            )
             exit_only = bool(effective_signal.metadata.get("exit_only"))
 
             if current_position is not None:
@@ -985,9 +1247,12 @@ class SignalReplayAdapter:
                 flip_trade = self._close_position(
                     current_position,
                     exit_time=fill_time,
-                    exit_price=fill_price,
+                    # Raw bar close: _close_position applies the adverse
+                    # slippage for the EXIT side itself (bar passed through).
+                    exit_price=raw_fill_price,
                     exit_reason="signal_flip",
                     exit_bar_index=int(fill_index),
+                    bar=fill_bar,
                 )
                 closed_trades.append(flip_trade)
                 realized_pnl += _net_pnl_of(flip_trade)
@@ -1024,8 +1289,27 @@ class SignalReplayAdapter:
                 account_balance=account_balance,
                 pip_value=1.0,
                 current_exposure=exposure,
+                # #240: max_notional_per_trade may exceed 1 (leverage); the
+                # declared broker maximum bounds it, 1x when unknown.
+                max_notional_per_trade=effective_max_notional_per_trade(
+                    self.risk_config.max_notional_per_trade, self._max_leverage
+                ),
             )
             quantity = float(sized.position_size)
+            # #240: the per-trade ceiling alone does not bound the AGGREGATE —
+            # the same free-margin rule the native engine and the live
+            # pre-submit caps apply: total open notional stays within
+            # equity * declared leverage. Clamped to zero skips the entry.
+            quantity = min(
+                quantity,
+                self._free_margin_quantity_cap(
+                    open_positions=open_positions,
+                    frames=frames,
+                    as_of=fill_time,
+                    equity=account_balance,
+                    entry_price=fill_price,
+                ),
+            )
             if quantity <= 0:
                 emit(10.0 + ((index / total_signals) * 80.0), _REPLAY_PROGRESS_MESSAGE)
                 continue
@@ -1077,6 +1361,7 @@ class SignalReplayAdapter:
                 exit_price=float(last_bar["close"]),
                 exit_reason="end_of_data",
                 exit_bar_index=last_index,
+                bar=last_bar,
             )
             closed_trades.append(closed)
             realized_pnl += _net_pnl_of(closed)
@@ -1130,11 +1415,13 @@ class SignalReplayAdapter:
                 "symbols": sorted(frames.keys()),
                 "timeframes": [normalized_timeframe],
                 "source": ",".join(signal_sources) if signal_sources else "internal",
+                # #130: mandatory slippage-model record per symbol.
+                "slippage": {"models": self._slippage_meta},
             },
             initial_capital=float(self.initial_capital),
             risk_per_trade_pct=float(self.risk_config.max_risk_per_trade),
             max_position_exposure_pct=float(self.risk_config.max_notional_per_trade),
-            max_leverage=None,
+            max_leverage=self._max_leverage,
             modeling_resolution=normalized_timeframe,
             signal_exit_fill="close",
             allow_fallback_stop=self.risk_config.allow_fallback_stop,
@@ -1144,6 +1431,15 @@ class SignalReplayAdapter:
                 "max_risk_per_trade": float(self.risk_config.max_risk_per_trade),
                 "max_total_exposure": float(self.risk_config.max_total_exposure),
                 "max_positions": int(self.risk_config.max_positions),
+                "max_notional_per_trade": float(self.risk_config.max_notional_per_trade),
+                "max_leverage": self._max_leverage,
+                # #240: the ceilings that actually bound sizing — the
+                # configured cap clamped by the declared broker maximum
+                # (1x when unknown), recorded next to the raw declarations.
+                "effective_max_notional_per_trade": effective_max_notional_per_trade(
+                    self.risk_config.max_notional_per_trade, self._max_leverage
+                ),
+                "effective_max_leverage": effective_max_leverage(self._max_leverage),
                 "signal_processor": self.signal_processor_name or None,
                 **(metadata or {}),
             },
@@ -1226,14 +1522,24 @@ class SignalReplayEngine:
         signal_processor_name: str | None = None,
         fee_model: Any | None = None,
         fee_params: dict[str, Any] | None = None,
+        slippage_model: Any | None = None,
+        slippage_params: dict[str, Any] | None = None,
+        max_leverage: float | None = None,
     ) -> None:
         self.data_dir = Path(data_dir or DATA_DIR).expanduser().resolve()
         self.risk_config = risk_config or RiskConfig()
         self.default_timeframe = normalize_timeframe(default_timeframe) or "1h"
         self.signal_processor_name = str(signal_processor_name or "").strip().lower()
+        # #240: declared broker maximum leverage, forwarded to the adapter.
+        self._max_leverage = max_leverage
         # #84: explicit fee declaration, forwarded to the inner adapter.
         self._fee_model = fee_model
         self._fee_params = dict(fee_params or {})
+        # #130: fill-price slippage declaration + per-symbol asset classes
+        # learned while loading OHLCV, forwarded to the inner adapter.
+        self._slippage_model = slippage_model
+        self._slippage_params = dict(slippage_params or {})
+        self._asset_class_by_symbol: dict[str, str] = {}
 
     @staticmethod
     def _infer_replay_timeframe(
@@ -1286,6 +1592,12 @@ class SignalReplayEngine:
         matches = sorted(ohlcv_root.rglob(f"**/{normalized_symbol}/{normalized_timeframe}.parquet"))
         if not matches:
             return None
+        # #130: classify the instrument from the OHLCV layout so the
+        # slippage defaults apply per asset class (first match wins, same
+        # convention as the native adapter).
+        self._asset_class_by_symbol[normalized_symbol] = contract.ohlcv_path_metadata(
+            matches[0]
+        )["asset_class"]
 
         frames: list[pd.DataFrame] = []
         for path in matches:
@@ -1350,6 +1662,8 @@ class SignalReplayEngine:
         progress_callback: ProgressCallback | None = None,
         fee_model: Any | None = None,
         fee_params: dict[str, Any] | None = None,
+        slippage_model: Any | None = None,
+        slippage_params: dict[str, Any] | None = None,
     ) -> BacktestResult:
         if not signals:
             raise ValueError("signals must not be empty")
@@ -1401,6 +1715,9 @@ class SignalReplayEngine:
         merged_fee_params = dict(self._fee_params)
         if fee_params:
             merged_fee_params.update(fee_params)
+        merged_slippage_params = dict(self._slippage_params)
+        if slippage_params:
+            merged_slippage_params.update(slippage_params)
         adapter = SignalReplayAdapter(
             risk_config=self.risk_config,
             initial_capital=float(initial_capital),
@@ -1408,6 +1725,12 @@ class SignalReplayEngine:
             signal_processor_name=processor_name or None,
             fee_model=fee_model if fee_model is not None else self._fee_model,
             fee_params=merged_fee_params,
+            slippage_model=(
+                slippage_model if slippage_model is not None else self._slippage_model
+            ),
+            slippage_params=merged_slippage_params,
+            asset_class_by_symbol=dict(self._asset_class_by_symbol),
+            max_leverage=self._max_leverage,
         )
         result = adapter.run(
             signals=replay_signals,

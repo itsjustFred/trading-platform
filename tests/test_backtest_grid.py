@@ -276,6 +276,75 @@ def test_in_process_uses_resolved_dates_for_daily_equity(monkeypatch, tmp_path):
     assert result["end"] == "2024-02-01"
 
 
+def test_native_grid_refuses_use_trailing_sl_before_running_cells(monkeypatch, tmp_path):
+    """A native grid whose params request trailing stops must fail fast.
+
+    The maintainer decision (2026-11-23) makes ``use_trailing_sl=true`` an
+    unsupported native configuration; the grid must refuse it up front instead
+    of dispatching cells that would each compute a fixed stop.
+    """
+    strategy = tmp_path / "custom_swings_supertrend.py"
+    strategy.write_text(
+        "STRATEGY_META = {'name': 'custom_swings_supertrend'}\n"
+        "def generate_signals(df, params):\n"
+        "    import pandas as pd\n"
+        "    return pd.Series(False, index=df.index), pd.Series(False, index=df.index), {}, []\n",
+        encoding="utf-8",
+    )
+
+    def fail_if_cell_runs(**kwargs):
+        raise AssertionError("grid cells must not run for a refused config")
+
+    monkeypatch.setattr(bg, "run_one_backtest", fail_if_cell_runs)
+
+    with pytest.raises(ValueError, match="trailing stops are not modelled by the native engine"):
+        run_backtest_grid(
+            strategy=str(strategy),
+            symbols=["AAPL"],
+            timeframes=["1d"],
+            start="2024-01-01",
+            end="2024-01-31",
+            engine="native",
+            params={"use_trailing_sl": True},
+            output_dir=tmp_path / "out",
+            save_sqlite=False,
+        )
+
+
+def test_native_grid_cell_refuses_use_trailing_sl(monkeypatch, tmp_path):
+    """A direct in-process native cell carries the same refusal."""
+    strategy = tmp_path / "custom_swings_supertrend.py"
+    strategy.write_text(
+        "STRATEGY_META = {'name': 'custom_swings_supertrend'}\n"
+        "def generate_signals(df, params):\n"
+        "    import pandas as pd\n"
+        "    return pd.Series(False, index=df.index), pd.Series(False, index=df.index), {}, []\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(bg, "ensure_backtest_data", lambda **kwargs: [])
+
+    result = bg.run_one_backtest_in_process(
+        bg.CellRequest(
+            strategy=str(strategy),
+            symbol="AAPL",
+            timeframe="1d",
+            start="2024-01-01",
+            end="2024-01-31",
+            engine="native",
+            capital=10_000.0,
+            risk_pct=0.01,
+            params={"use_trailing_sl": True},
+            output_dir=tmp_path / "out",
+            data_dir=str(tmp_path / "data"),
+            skip_existing=False,
+            save_sqlite=False,
+        )
+    )
+
+    assert result["status"] == "failed"
+    assert "trailing stops are not modelled by the native engine" in result["error"]
+
+
 def test_subprocess_command_does_not_pass_grid_only_flags(tmp_path):
     """Regression (F3): runner.cli run has no --keep-indicators flag."""
     cmd = build_cli_command(
@@ -632,6 +701,61 @@ def test_in_process_cell_stamps_its_identity(monkeypatch, tmp_path):
     assert stamped["data"] is not None, "the stamp must record the data it read"
     # The point of the stamp: the very next resume accepts it.
     assert _cell_record(request)["status"] == "skipped_existing"
+
+
+def test_in_process_out_of_scope_engine_stamps_not_modeled_slippage(
+    monkeypatch, tmp_path
+):
+    """#130: an in-process vectorbt cell must record the explicit 'not
+    modeled' slippage note on its artifact — never silence. Guards the
+    ``meta.data['slippage']`` setdefault in ``_run_backtest_in_process_body``."""
+    from dataclasses import replace
+
+    from shared.models import BacktestMeta, BacktestResult
+
+    request, artifact, _parquet = _identity_fixture(tmp_path, stamp=False)
+    request = replace(request, engine="vectorbt")
+    artifact.unlink()
+    monkeypatch.setattr(bg, "require_generated_strategy_approval", lambda strategy: None)
+    monkeypatch.setattr(bg, "detect_strategy_type", lambda path: bg.StrategyType.MARKET_DATA)
+    monkeypatch.setattr(
+        bg, "resolve_strategy_parameters", lambda strategy, params: dict(params or {})
+    )
+    monkeypatch.setattr(bg, "ensure_backtest_data", lambda **kwargs: [])
+    monkeypatch.setattr(bg, "attach_daily_equity", lambda result, **kwargs: result)
+    monkeypatch.setattr(bg, "merge_canonical_stats", lambda result: None)
+
+    class FakeEngine:
+        def validate_config(self, config):
+            return []
+
+        def run(self, config, strategy):
+            return BacktestResult(
+                meta=BacktestMeta(
+                    id=bg.build_run_id(strategy, "AAPL", "1d"),
+                    created_at="2024-01-06T00:00:00+00:00",
+                    engine="vectorbt",
+                    strategies=["demo"],
+                    backtest_start="2024-01-01",
+                    backtest_end="2024-01-05",
+                    initial_capital=10_000.0,
+                    data={"symbols": ["AAPL"], "timeframes": ["1d"]},
+                ),
+                trades=[],
+                equity_curve=[],
+                stats={},
+            )
+
+    monkeypatch.setattr(bg, "get_engine", lambda engine: FakeEngine())
+
+    result = bg.run_one_backtest_in_process(request)
+
+    assert result["status"] == "ok"
+    slippage = json.loads(artifact.read_text(encoding="utf-8"))["meta"]["data"][
+        "slippage"
+    ]
+    assert slippage["models"] == {}
+    assert "does not apply a slippage model" in slippage["note"]
 
 
 def test_subprocess_cell_stamps_its_identity(monkeypatch, tmp_path):

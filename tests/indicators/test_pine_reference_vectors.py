@@ -73,7 +73,7 @@ def _ohlc(df: pd.DataFrame) -> tuple[pd.Series, pd.Series, pd.Series]:
 def _assert_close(actual, expected, *, msg: str = "") -> None:
     """Element-wise exact-or-NaN comparison against literal vectors."""
     assert len(actual) == len(expected), msg
-    for i, (a, e) in enumerate(zip(actual, expected)):
+    for i, (a, e) in enumerate(zip(actual, expected, strict=True)):
         if isinstance(e, float) and math.isnan(e):
             assert math.isnan(float(a)), f"{msg} bar {i}: expected NaN, got {a}"
         else:
@@ -207,7 +207,10 @@ def test_wavetrend_zero_denominator_is_nan_not_floor() -> None:
 # ── LuxAlgo SuperTrend Oscillator chain ────────────────────────────────
 
 # 21-bar frame: rally, then a sharp drop that flips the direction bearish.
-SUPEROSC_CLOSE = FRAME_A_CLOSE + [106.0, 103.0, 100.0, 96.0, 92.0, 95.0, 99.0]
+SUPEROSC_CLOSE = [
+    *FRAME_A_CLOSE,
+    106.0, 103.0, 100.0, 96.0, 92.0, 95.0, 99.0,
+]
 SUPEROSC_OSC = [
     math.nan, math.nan, math.nan, math.nan, math.nan, 1.0,
     0.42549371633752275,

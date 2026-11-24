@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import inspect
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -12,13 +13,21 @@ from runner.engine import TradeEngine
 from runner.engines import contract
 from runner.engines._drawings import _normalize_drawings
 from runner.engines.base import (
+    NATIVE_TRAILING_SL_PARAM,
     BacktestConfig,
     EngineAdapter,
     ProgressCallback,
+    native_parameter_errors,
     resolve_strategy_parameters,
 )
+from runner.engines.mtm_equity import (
+    build_mark_to_market_curve,
+    closes_from_frame,
+    describe_basis,
+)
+from runner.slippage import BarSpreadSlippage
 from shared.constants import DATA_DIR
-from shared.models import BacktestMeta, BacktestResult, EquityPoint
+from shared.models import BacktestMeta, BacktestResult
 
 TIMEFRAME_ORDER = contract.TIMEFRAME_ORDER
 
@@ -40,15 +49,30 @@ def _load_strategy_module(path: str):
     return module
 
 
-def _load_ohlcv(data_root: Path, symbol: str, timeframe: str, start: str, end: str) -> pd.DataFrame | None:
+def _signature_parameter_default(func: Any, name: str) -> Any:
+    try:
+        parameter = inspect.signature(func).parameters.get(name)
+    except (TypeError, ValueError):
+        return None
+    if parameter is None or parameter.default is inspect.Parameter.empty:
+        return None
+    return parameter.default
+
+
+def _find_ohlcv_path(data_root: Path, symbol: str, timeframe: str) -> Path | None:
     matches = sorted(
         (data_root / "ohlcv").rglob(f"**/{symbol}/{timeframe}.parquet"),
         key=lambda path: path.as_posix(),
     )
-    if not matches:
+    return matches[0] if matches else None
+
+
+def _load_ohlcv(data_root: Path, symbol: str, timeframe: str, start: str, end: str) -> pd.DataFrame | None:
+    match = _find_ohlcv_path(data_root, symbol, timeframe)
+    if match is None:
         return None
 
-    df = pd.read_parquet(matches[0])
+    df = pd.read_parquet(match)
     df.columns = [str(col).lower() for col in df.columns]
     df = contract.normalize_ohlcv_frame(df)
     if "timestamp" not in df.columns:
@@ -92,6 +116,11 @@ class NativeAdapter(EngineAdapter):
     def name(self) -> str:
         return "native"
 
+    def validate_config(self, config: BacktestConfig) -> list[str]:
+        errors = super().validate_config(config)
+        errors.extend(native_parameter_errors(config.parameters))
+        return errors
+
     def run(
         self,
         config: BacktestConfig,
@@ -113,12 +142,26 @@ class NativeAdapter(EngineAdapter):
 
         data_root = Path(config.data_dir) if config.data_dir else DATA_DIR
         resolved_parameters = resolve_strategy_parameters(strategy_path, config.parameters)
+        effective_parameters = dict(resolved_parameters)
+        if NATIVE_TRAILING_SL_PARAM not in effective_parameters:
+            signature_default = _signature_parameter_default(
+                strategy_module.generate_signals, NATIVE_TRAILING_SL_PARAM
+            )
+            if signature_default is not None:
+                effective_parameters[NATIVE_TRAILING_SL_PARAM] = signature_default
+        parameter_errors = native_parameter_errors(effective_parameters)
+        if parameter_errors:
+            raise ValueError("; ".join(parameter_errors))
 
         all_trades = []
         all_drawings: list[dict[str, Any]] = []
         used_timeframes = [config.timeframe]
         symbols_total = max(len(config.symbols), 1)
         total_loaded_bars = 0
+        symbol_closes: dict[str, pd.Series] = {}
+        # #130: the slippage model each symbol's engine resolved — recorded
+        # in run metadata regardless of which model won.
+        slippage_models: dict[str, dict[str, Any]] = {}
 
         for symbol_index, symbol in enumerate(config.symbols):
             # warmup_start extends the
@@ -134,6 +177,9 @@ class NativeAdapter(EngineAdapter):
                     "refusing to run a silent empty backtest"
                 )
             total_loaded_bars += len(data)
+            closes = closes_from_frame(data)
+            if closes is not None:
+                symbol_closes[symbol] = closes
 
             symbol_start = 10.0 + (80.0 * symbol_index / symbols_total)
             symbol_end = 10.0 + (80.0 * (symbol_index + 1) / symbols_total)
@@ -156,6 +202,13 @@ class NativeAdapter(EngineAdapter):
                 used_timeframes.append(config.modeling_resolution)
 
             symbol_config = config.model_copy(update={"symbols": [symbol], "parameters": resolved_parameters})
+            # #130: classify the instrument from the OHLCV layout
+            # (ohlcv/{source}/{asset_class}/...) so the slippage defaults
+            # apply per asset class; unclassifiable paths record "none".
+            match = _find_ohlcv_path(data_root, symbol, config.timeframe)
+            asset_class = (
+                contract.ohlcv_path_metadata(match)["asset_class"] if match else ""
+            )
             engine = TradeEngine(
                 symbol_config,
                 symbol=symbol,
@@ -163,8 +216,26 @@ class NativeAdapter(EngineAdapter):
                 progress_callback=progress_callback,
                 progress_start=symbol_start,
                 progress_end=symbol_end,
+                asset_class=asset_class,
             )
             symbol_result = engine.run(data, strategy_module.generate_signals)
+            # #130: report the basis the resolved model actually prices
+            # on — "bid_ask" only when the bar-spread model can use the
+            # ask columns; fixed/none models fill on the canonical (bid)
+            # series even when ask columns happen to be present.
+            has_two_sided = any(
+                str(col).startswith("ask_") for col in data.columns
+            )
+            price_basis = (
+                "bid_ask"
+                if has_two_sided
+                and isinstance(engine.slippage_model, BarSpreadSlippage)
+                else ("bid" if has_two_sided else "single_price")
+            )
+            slippage_models[symbol] = {
+                **engine.slippage_model.describe(),
+                "price_basis": price_basis,
+            }
 
             all_trades.extend(symbol_result.trades)
             # Normalize exactly as the vectorbt adapter does. The native engine
@@ -187,46 +258,36 @@ class NativeAdapter(EngineAdapter):
         # 1; the replay re-scales quantities chronologically from shared
         # equity (position size is linear in equity). Single-symbol runs keep
         # the legacy path bit-identical (no replay).
-        # Realized-PnL portfolio curve over EXIT time (Cleanup 16-D1, F5):
-        # per-symbol engines each compound sizing from full capital; a
-        # portfolio curve must not sum those per-symbol equities (it would
-        # multiply capital by the symbol count). The aggregate curve replays
-        # closed PnL once per portfolio, credited at exit — documented in the
-        # cross-engine contract.
-        equity_curve: list[EquityPoint] = [
-            EquityPoint(
-                time=f"{config.start_date}T00:00:00+00:00"
-                if len(config.start_date) == 10
-                else config.start_date,
-                equity=round(config.initial_capital, 2),
-            )
-        ]
+        # Reporting equity is MARK-TO-MARKET (portfolio, one observation per
+        # bar): drawdown / Sharpe / volatility must see the paper drawdown of
+        # open positions. Sizing is unaffected - it stays on realized cash
+        # (``TradeEngine._sizing_equity``). Per-symbol engines each compound
+        # sizing from full capital, so the portfolio curve is rebuilt once from
+        # the (shared-equity-replayed) trades rather than summing per-symbol
+        # equities, which would multiply capital by the symbol count.
+        curve_start = (
+            f"{config.start_date}T00:00:00+00:00"
+            if len(config.start_date) == 10
+            else config.start_date
+        )
         shared_summary: dict[str, Any] = {}
         if len(config.symbols) > 1 and all_trades:
             from runner.engines._shared import replay_shared_equity
 
-            all_trades, replayed_curve, shared_summary = replay_shared_equity(
+            all_trades, _, shared_summary = replay_shared_equity(
                 all_trades,
                 config.initial_capital,
-                start_time=equity_curve[0].time,
+                start_time=curve_start,
             )
             all_trades.sort(key=lambda trade: (trade.entry_time, trade.id))
             for index, trade in enumerate(all_trades, start=1):
                 trade.id = index
-            equity_curve = replayed_curve
-        else:
-            running = config.initial_capital
-            for trade in sorted(all_trades, key=lambda item: item.last_exit_time):
-                running += (
-                    float(trade.net_pnl)
-                    if trade.net_pnl is not None
-                    else float(trade.pnl) - float(trade.fees or 0.0)
-                )
-                point = EquityPoint(time=trade.last_exit_time, equity=round(running, 2))
-                if equity_curve[-1].time == point.time:
-                    equity_curve[-1] = point
-                else:
-                    equity_curve.append(point)
+        equity_curve, unmarked_symbols = build_mark_to_market_curve(
+            all_trades,
+            symbol_closes,
+            config.initial_capital,
+            start_time=curve_start,
+        )
         emit_progress(90.0, "Calculating statistics...")
 
         now = datetime.now(timezone.utc)
@@ -257,6 +318,11 @@ class NativeAdapter(EngineAdapter):
                 # A-M4 (D5): shared-equity replay summary for multi-symbol
                 # runs (empty for single-symbol legacy path).
                 "shared_equity": shared_summary,
+                **describe_basis(unmarked_symbols),
+                # #130: mandatory slippage-model record — which model each
+                # symbol's fills were priced with (or the explicit "none"
+                # parity opt-out / unclassified outcome).
+                "slippage": {"models": slippage_models},
             },
             initial_capital=config.initial_capital,
             risk_per_trade_pct=config.risk_per_trade_pct,

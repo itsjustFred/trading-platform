@@ -36,6 +36,27 @@ class TestResolveFeeModel:
         model = resolve_fee_model({"fee_rate": 0.001})
         assert model.fee_for_trade(100.0, 100.0, 5.0) == pytest.approx(1.0)
 
+    @pytest.mark.parametrize(
+        ("key", "value"),
+        [
+            ("fee_rate", -0.001),
+            ("fee_rate", float("nan")),
+            ("fee_rate", float("inf")),
+            ("fee_rate", float("-inf")),
+            ("fee_flat_per_trade", -1.0),
+            ("fee_flat_per_trade", float("nan")),
+            ("fee_flat_per_trade", float("inf")),
+            ("fee_flat_per_trade", float("-inf")),
+            ("fee_rate", True),
+            ("fee_rate", False),
+            ("fee_flat_per_trade", True),
+            ("fee_flat_per_trade", False),
+        ],
+    )
+    def test_invalid_rate_keys_are_rejected(self, key: str, value: object) -> None:
+        with pytest.raises(ValueError, match="finite and non-negative"):
+            resolve_fee_model({key: value})
+
     def test_explicit_model_passes_through(self) -> None:
         sentinel = ZeroFeeModel()
         assert resolve_fee_model({"fee_model": sentinel}) is sentinel
@@ -43,6 +64,21 @@ class TestResolveFeeModel:
     def test_non_model_rejected(self) -> None:
         with pytest.raises(ValueError, match="fee_for_trade"):
             resolve_fee_model({"fee_model": object()})
+
+    def test_round_trip_only_model_rejected(self) -> None:
+        """A model that cannot price a single leg is rejected, not half-used.
+
+        An engine holding already-paid legs out of spendable cash
+        (``TradeEngine._refresh_sizing_equity``) needs per-leg prices; a
+        model without them must fail closed instead of mis-accounting.
+        """
+
+        class RoundTripOnly:
+            def fee_for_trade(self, entry_price, exit_price, quantity):
+                return 1.0
+
+        with pytest.raises(ValueError, match="entry_fee"):
+            resolve_fee_model({"fee_model": RoundTripOnly()})
 
     def test_fees_zero_conflicts_with_rate(self) -> None:
         # resolve itself accepts the keys (rate wins by precedence); the CLI
@@ -60,9 +96,42 @@ class TestNotionalFeeModel:
         with pytest.raises(ValueError, match="non-negative"):
             NotionalFeeModel(flat_per_trade=-1.0)
 
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {"rate": True},
+            {"rate": False},
+            {"flat_per_trade": True},
+            {"flat_per_trade": False},
+        ],
+    )
+    def test_bool_fee_values_rejected(self, kwargs: dict) -> None:
+        with pytest.raises(ValueError, match="finite and non-negative"):
+            NotionalFeeModel(**kwargs)
+
     def test_uses_absolute_values(self) -> None:
         model = NotionalFeeModel(rate=0.001)
         assert model.fee_for_trade(-100.0, 101.0, -10.0) == pytest.approx(2.01)
+
+    def test_legs_add_up_to_the_round_trip(self) -> None:
+        """The contract engines rely on: ``fee_for_trade == entry + exit``.
+
+        ``entry_fee`` carries the per-trade surcharge (the trade, and its
+        surcharge, exists from the moment it is opened); ``exit_fee`` does not.
+        """
+        model = NotionalFeeModel(rate=0.001, flat_per_trade=2.0)
+        # entry leg 0.001 * 100 * 10 + 2.0 surcharge = 3.0
+        assert model.entry_fee(100.0, 10.0) == pytest.approx(3.0)
+        # exit leg 0.001 * 101 * 10 = 1.01 (no second surcharge)
+        assert model.exit_fee(101.0, 10.0) == pytest.approx(1.01)
+        assert (
+            model.entry_fee(100.0, 10.0) + model.exit_fee(101.0, 10.0)
+            == pytest.approx(model.fee_for_trade(100.0, 101.0, 10.0))
+        )
+
+    def test_zero_model_prices_every_leg_at_zero(self) -> None:
+        assert ZeroFeeModel().entry_fee(100.0, 10.0) == 0.0
+        assert ZeroFeeModel().exit_fee(101.0, 10.0) == 0.0
 
 
 class TestEngineHardError:
@@ -101,7 +170,9 @@ class TestEngineHardError:
             end_date="2024-01-31",
             initial_capital=100_000,
             modeling_resolution="main_timeframe",
-            parameters={},
+            # Slippage is declared so the run reaches the FEE gate this
+            # test exercises; an undeclared slippage refuses even earlier.
+            parameters={"slippage": "none"},
         )
         engine = TradeEngine(cfg, symbol="TEST")
         with pytest.raises(ValueError, match="Missing fee/slippage config"):

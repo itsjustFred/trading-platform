@@ -32,6 +32,73 @@ from shared.models import (
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 
+def _wait_for_viewer_task(viewer_app_module, task_id: str, *, timeout: float = 5.0):
+    """Join the task's worker thread instead of polling ``DATA_TASKS``."""
+    task = viewer_app_module.DATA_TASKS[task_id]
+    thread = task.get("thread")
+    assert isinstance(thread, threading.Thread), f"task {task_id} has no worker thread"
+    thread.join(timeout=timeout)
+    assert not thread.is_alive(), f"task {task_id} worker did not finish"
+    return viewer_app_module.DATA_TASKS[task_id]
+
+
+def _tiny_replay_ohlcv_df() -> pd.DataFrame:
+    """Three-bar 1h frame shared by the stubbed signal-replay tests."""
+    return pd.DataFrame(
+        {
+            "timestamp": [
+                "2024-01-01T12:00:00+00:00",
+                "2024-01-01T13:00:00+00:00",
+                "2024-01-01T14:00:00+00:00",
+            ],
+            "open": [100.0, 101.0, 102.0],
+            "high": [101.0, 102.0, 103.0],
+            "low": [99.0, 100.0, 101.0],
+            "close": [100.5, 101.5, 102.5],
+            "volume": [1000, 1100, 1200],
+        }
+    )
+
+
+def _completed_signal_replay_result(result_id: str, source: str) -> BacktestResult:
+    """Minimal completed replay result shared by the stubbed-adapter tests."""
+    return BacktestResult(
+        meta=BacktestMeta(
+            id=result_id,
+            created_at="2026-03-12T12:00:00Z",
+            engine="signal-replay",
+            strategies=["Signal Replay"],
+            backtest_start="2024-01-01",
+            backtest_end="2024-01-02",
+            data={"symbols": ["AAPL"], "timeframes": ["1h"], "source": source},
+            initial_capital=100000.0,
+            tags=["signal-replay"],
+            notes="Signal Replay",
+        ),
+        trades=[],
+        equity_curve=[],
+    )
+
+
+class _ImmediateExitProc:
+    """Popen double whose child 'exits' immediately so the fill-bar watchdog
+    thread terminates instead of blocking pytest shutdown."""
+
+    def __init__(self, lines: list[str]):
+        self.stdout = iter(lines)
+        self.pid = 4242
+        self._killed = False
+
+    def wait(self, timeout=None):
+        return 0
+
+    def poll(self):
+        return 0
+
+    def kill(self):
+        self._killed = True
+
+
 def test_get_dukascopy_genesis(viewer_client, tmp_path):
     (tmp_path / "dukascopy_genesis.json").write_text(json.dumps({
         "EURUSD": {
@@ -1825,27 +1892,61 @@ def test_coalesced_cleanup_state_updates_are_serialized(tmp_path, monkeypatch):
         real_write(state)
 
     monkeypatch.setattr(viewer_app_module, "_write_coalesced_cleanup_state", blocking_write)
+
+    # Spy on the state lock itself: ``second_attempted`` must fire when the
+    # second thread *attempts* the acquire — proving it was actually blocked
+    # on the lock while the first writer held it, not merely scheduled late.
+    real_lock = viewer_app_module._COALESCED_CLEANUP_STATE_LOCK
+    second_attempted = threading.Event()
+
+    class _AcquireSpyLock:
+        def acquire(self, *args, **kwargs):
+            if threading.current_thread().name == "second-writer":
+                second_attempted.set()
+            return real_lock.acquire(*args, **kwargs)
+
+        def release(self):
+            real_lock.release()
+
+        def __enter__(self):
+            self.acquire()
+            return self
+
+        def __exit__(self, *exc):
+            self.release()
+            return False
+
+    monkeypatch.setattr(
+        viewer_app_module, "_COALESCED_CLEANUP_STATE_LOCK", _AcquireSpyLock()
+    )
+
     first = threading.Thread(
         target=viewer_app_module._update_coalesced_cleanup_state,
         args=("cleanup-0001",),
         kwargs={"attempts": 1, "exhausted": False},
+        name="first-writer",
     )
-    second = threading.Thread(
-        target=viewer_app_module._update_coalesced_cleanup_state,
-        args=("cleanup-0002",),
-        kwargs={"attempts": 1, "exhausted": False},
-    )
+
+    def run_second():
+        viewer_app_module._update_coalesced_cleanup_state(
+            "cleanup-0002", attempts=1, exhausted=False
+        )
+
+    second = threading.Thread(target=run_second, name="second-writer")
     first.start()
     assert first_write_started.wait(timeout=2)
     second.start()
-    time.sleep(0.05)
+    assert second_attempted.wait(timeout=2)
     assert len(write_calls) == 1
     release_first_write.set()
     first.join(timeout=2)
     second.join(timeout=2)
+    assert not first.is_alive() and not second.is_alive()
 
     state = viewer_app_module._load_coalesced_cleanup_state()
     assert set(state) == {"cleanup-0001", "cleanup-0002"}
+    assert set(write_calls[0]) == {"cleanup-0001"}
+    assert set(write_calls[1]) == {"cleanup-0001", "cleanup-0002"}
 
 
 def test_coalesced_cleanup_failure_persists_retryable_marker(
@@ -3024,13 +3125,7 @@ def test_start_data_task_writes_task_logs_and_refreshes_catalog(
         total_items=1,
     )
 
-    for _ in range(50):
-        task = viewer_app_module.DATA_TASKS[task_id]
-        if task["status"] in {"completed", "failed"}:
-            break
-        time.sleep(0.1)
-
-    task = viewer_app_module.DATA_TASKS[task_id]
+    task = _wait_for_viewer_task(viewer_app_module, task_id)
     assert task["status"] == "completed"
     assert Path(task["log_file"]).parent == tmp_path / "logs" / "tasks"
     assert task["pause_event"].is_set() is False
@@ -3044,10 +3139,6 @@ def test_start_data_task_writes_task_logs_and_refreshes_catalog(
     assert refresh_calls == ["refreshed"]
     assert any("stdout line" in line for line in routed_logs)
     assert any("stderr line" in line for line in routed_logs)
-    thread = task.get("thread")
-    if isinstance(thread, threading.Thread):
-        thread.join(timeout=5)
-        assert not thread.is_alive()
 
 
 def test_optimization_run_starts_background_task(viewer_client, monkeypatch, tmp_path):
@@ -3105,13 +3196,7 @@ def test_optimization_run_starts_background_task(viewer_client, monkeypatch, tmp
     assert run_payload["task_id"] == run_payload["job_id"]
     job_id = run_payload["job_id"]
 
-    for _ in range(50):
-        task = viewer_app_module.DATA_TASKS[job_id]
-        if task["status"] in {"completed", "failed"}:
-            break
-        time.sleep(0.05)
-
-    task = viewer_app_module.DATA_TASKS[job_id]
+    task = _wait_for_viewer_task(viewer_app_module, job_id)
     assert task["status"] == "completed"
     assert task["kind"] == "optimization"
     assert task["optimization_id"] == "opt_base-demo_20260311_100000"
@@ -3170,27 +3255,10 @@ def test_backtest_run_registers_task_manager_progress(viewer_client, monkeypatch
     monkeypatch.setattr(viewer_app_module, "_dolthub_pull", lambda: None)
     monkeypatch.setattr(viewer_app_module, "_ensure_backtest_data_availability", lambda **kwargs: [])
 
-    class _FakeProc:
-        def __init__(self, lines: list[str]):
-            self.stdout = iter(lines)
-            self.pid = 4242
-            self._killed = False
-
-        def wait(self, timeout=None):
-            return 0
-
-        def poll(self):
-            # The fake child "exits" immediately so the fill-bar watchdog
-            # thread terminates instead of blocking pytest shutdown.
-            return 0
-
-        def kill(self):
-            self._killed = True
-
     def fake_popen(cmd, *args, **kwargs):
         assert cmd[:4] == [sys.executable, "-u", "-m", "runner.cli"]
         assert "--progress-stdout" in cmd
-        return _FakeProc(
+        return _ImmediateExitProc(
             [
                 '{"message":"Auto-detected date range: 2024-01-01 to 2024-12-31"}\n',
                 "PROGRESS:5.00:Loading market data...\n",
@@ -3223,13 +3291,7 @@ def test_backtest_run_registers_task_manager_progress(viewer_client, monkeypatch
     assert payload["status"] == "queued"
     task_id = payload["task_id"]
 
-    for _ in range(50):
-        task = viewer_app_module.DATA_TASKS[task_id]
-        if task["status"] in {"completed", "failed"}:
-            break
-        time.sleep(0.05)
-
-    task = viewer_app_module.DATA_TASKS[task_id]
+    task = _wait_for_viewer_task(viewer_app_module, task_id)
     assert task["kind"] == "backtest"
     assert task["status"] == "completed"
     assert task["progress"] == 100.0
@@ -3262,11 +3324,50 @@ def test_backtest_run_registers_task_manager_progress(viewer_client, monkeypatch
     assert "Completed - " in log_text
 
 
+def test_backtest_run_rejects_native_use_trailing_sl(viewer_client, monkeypatch, tmp_path):
+    """Native backtests must refuse ``use_trailing_sl=true`` at the API edge.
+
+    The maintainer decision (2026-11-23) makes the parameter unsupported on
+    native; the viewer must return 400 instead of queueing a child run that
+    would compute a fixed stop.
+    """
+    import viewer.main as viewer_app_module
+
+    strategies_dir = tmp_path / "strategies"
+    strategies_dir.mkdir(parents=True, exist_ok=True)
+    (strategies_dir / "custom_swings_supertrend.py").write_text(
+        "STRATEGY_META = {'name': 'custom_swings_supertrend'}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(viewer_app_module, "STRATEGIES_DIR", strategies_dir)
+    monkeypatch.setattr(viewer_app_module.legacy_viewer, "STRATEGIES_DIR", strategies_dir)
+    monkeypatch.setattr(viewer_app_module, "_dolthub_pull", lambda: None)
+
+    response = viewer_client.post(
+        "/api/backtests/run",
+        json={
+            "strategy": "custom_swings_supertrend.py",
+            "engine": "native",
+            "symbols": ["AAPL"],
+            "timeframe": "1d",
+            "capital": 100000,
+            "parameters": {"use_trailing_sl": True},
+        },
+    )
+
+    assert response.status_code == 400
+    assert "trailing stops are not modelled by the native engine" in str(
+        response.json()["detail"]
+    )
+    assert viewer_app_module.DATA_TASKS == {}
+
+
 def test_backtest_run_signals_registers_task_manager_progress(viewer_client, monkeypatch, tmp_path):
     import viewer.main as viewer_app_module
 
     replay_query_args: dict[str, object] = {}
     adapter_init_kwargs: dict[str, object] = {}
+    adapter_run_kwargs: dict[str, object] = {}
 
     monkeypatch.setattr(
         viewer_app_module,
@@ -3305,20 +3406,7 @@ def test_backtest_run_signals_registers_task_manager_progress(viewer_client, mon
     monkeypatch.setattr(
         viewer_app_module.legacy_viewer,
         "_load_ohlcv_df",
-        lambda symbol, timeframe: pd.DataFrame(
-            {
-                "timestamp": [
-                    "2024-01-01T12:00:00+00:00",
-                    "2024-01-01T13:00:00+00:00",
-                    "2024-01-01T14:00:00+00:00",
-                ],
-                "open": [100.0, 101.0, 102.0],
-                "high": [101.0, 102.0, 103.0],
-                "low": [99.0, 100.0, 101.0],
-                "close": [100.5, 101.5, 102.5],
-                "volume": [1000, 1100, 1200],
-            }
-        ),
+        lambda symbol, timeframe: _tiny_replay_ohlcv_df(),
     )
 
     class _FakeSignalReplayAdapter:
@@ -3328,26 +3416,12 @@ def test_backtest_run_signals_registers_task_manager_progress(viewer_client, mon
             adapter_init_kwargs.update(kwargs)
 
         def run(self, **kwargs):
+            adapter_run_kwargs.update(kwargs)
             progress_callback = kwargs.get("progress_callback")
             if callable(progress_callback):
                 progress_callback(50.0, "halfway")
                 progress_callback(100.0, "done")
-            return BacktestResult(
-                meta=BacktestMeta(
-                    id="signal-replay-unit",
-                    created_at="2026-03-12T12:00:00Z",
-                    engine="signal-replay",
-                    strategies=["Signal Replay"],
-                    backtest_start="2024-01-01",
-                    backtest_end="2024-01-02",
-                    data={"symbols": ["AAPL"], "timeframes": ["1h"], "source": "discord"},
-                    initial_capital=100000.0,
-                    tags=["signal-replay"],
-                    notes="Signal Replay",
-                ),
-                trades=[],
-                equity_curve=[],
-            )
+            return _completed_signal_replay_result("signal-replay-unit", "discord")
 
     monkeypatch.setattr(viewer_app_module, "SignalReplayAdapter", _FakeSignalReplayAdapter)
 
@@ -3361,6 +3435,7 @@ def test_backtest_run_signals_registers_task_manager_progress(viewer_client, mon
             "end_date": "2024-01-02",
             "timeframe": "1h",
             "auto_download": False,
+            "fees_zero": True,
         },
     )
 
@@ -3370,13 +3445,7 @@ def test_backtest_run_signals_registers_task_manager_progress(viewer_client, mon
     assert payload["status"] == "queued"
     task_id = payload["task_id"]
 
-    for _ in range(50):
-        task = viewer_app_module.DATA_TASKS[task_id]
-        if task["status"] in {"completed", "failed"}:
-            break
-        time.sleep(0.05)
-
-    task = viewer_app_module.DATA_TASKS[task_id]
+    task = _wait_for_viewer_task(viewer_app_module, task_id)
     assert task["kind"] == "backtest"
     assert task["status"] == "completed"
     assert task["result"]["backtest_id"] == "signal-replay-unit"
@@ -3387,6 +3456,15 @@ def test_backtest_run_signals_registers_task_manager_progress(viewer_client, mon
     assert replay_query_args["source"] == "discord"
     assert replay_query_args["limit"] == 20000
     assert adapter_init_kwargs["signal_processor_name"] == "ramjet"
+    # #361: the declared fee params reach the adapter — before the fix the
+    # adapter got none and run() died on the #84 fail-closed fee check.
+    assert adapter_init_kwargs["fee_params"] == {"fees": "zero"}
+    # ...and the cost model is recorded where the saved result and the task
+    # record can see it: run() metadata lands in BacktestMeta.parameters,
+    # restart_config keeps it for the task lifecycle.
+    assert adapter_run_kwargs["metadata"]["fee_params"] == {"fees": "zero"}
+    task_record = viewer_app_module.DATA_TASKS[task_id]
+    assert task_record["restart_config"]["fee_params"] == {"fees": "zero"}
 
 
 def test_backtest_run_from_signals_csv_forwards_to_replay(viewer_client, monkeypatch, tmp_path):
@@ -3421,6 +3499,7 @@ def test_backtest_run_from_signals_csv_forwards_to_replay(viewer_client, monkeyp
             "start_date": "2026-02-23",
             "end_date": "2026-02-24",
             "auto_download": True,
+            "fees_zero": True,
         },
     )
 
@@ -3432,6 +3511,7 @@ def test_backtest_run_from_signals_csv_forwards_to_replay(viewer_client, monkeyp
     assert forwarded.timeframe == "1m"
     assert forwarded.signal_processor == "ramjet"
     assert forwarded.signal_source is None
+    assert forwarded.fees_zero is True
     assert len(forwarded.signals) == 2
     assert str(forwarded.signals[0].source).startswith("csv:")
 
@@ -3466,14 +3546,310 @@ def test_backtest_run_from_signals_csv_date_only_end_is_inclusive(viewer_client,
             "signal_processor": "ramjet",
             "start_date": "2026-02-23",
             "end_date": "2026-02-23",
+            "fees_zero": True,
         },
     )
 
     assert response.status_code == 202
     forwarded = captured["payload"]
     assert forwarded is not None
+    assert forwarded.fees_zero is True
     assert len(forwarded.signals) == 1
     assert forwarded.signals[0].symbol == "AAPL"
+
+
+def test_backtest_run_signals_requires_an_explicit_fee_declaration(viewer_client):
+    """#361/#84: without fee fields the request is a 400 at the boundary —
+    before the fix the task was accepted and died in the worker on the
+    adapter's fail-closed ``resolve_fee_model`` check."""
+    response = viewer_client.post(
+        "/api/backtests/run-signals",
+        json={
+            "signals": [
+                {
+                    "timestamp": "2024-01-01T12:00:00Z",
+                    "symbol": "AAPL",
+                    "action": "buy",
+                    "entry_price": 100.0,
+                }
+            ],
+            "start_date": "2024-01-01",
+            "end_date": "2024-01-02",
+        },
+    )
+
+    assert response.status_code == 400
+    assert "fee" in str(response.json()["detail"]).lower()
+
+
+def test_backtest_run_signals_rejects_conflicting_fee_flags(viewer_client):
+    response = viewer_client.post(
+        "/api/backtests/run-signals",
+        json={
+            "signals": [
+                {
+                    "timestamp": "2024-01-01T12:00:00Z",
+                    "symbol": "AAPL",
+                    "action": "buy",
+                    "entry_price": 100.0,
+                }
+            ],
+            "start_date": "2024-01-01",
+            "end_date": "2024-01-02",
+            "fees_zero": True,
+            "fee_rate": 0.001,
+        },
+    )
+
+    assert response.status_code == 400
+    assert "conflict" in str(response.json()["detail"]).lower()
+
+
+def test_backtest_run_from_signals_requires_an_explicit_fee_declaration(viewer_client):
+    """The discord-history branch forwards to run-signals, so the same
+    fail-closed fee check applies before any signal gathering."""
+    response = viewer_client.post(
+        "/api/backtests/run-from-signals",
+        json={
+            "signal_source": "discord-history",
+            "start_date": "2024-01-01",
+            "end_date": "2024-01-02",
+        },
+    )
+
+    assert response.status_code == 400
+    assert "fee" in str(response.json()["detail"]).lower()
+
+
+def test_signal_replay_fee_params_map_cli_style_flags():
+    import viewer.main as viewer_app_module
+
+    payload = viewer_app_module.BacktestRunSignalsRequest(
+        start_date="2024-01-01",
+        end_date="2024-01-02",
+        fee_rate=0.001,
+        fee_flat_per_trade=2.0,
+    )
+    assert viewer_app_module._validated_signal_replay_fee_params(payload) == {
+        "fee_rate": 0.001,
+        "fee_flat_per_trade": 2.0,
+    }
+
+    payload = viewer_app_module.BacktestRunSignalsRequest(
+        start_date="2024-01-01",
+        end_date="2024-01-02",
+        fee_rate=0.001,
+    )
+    assert viewer_app_module._validated_signal_replay_fee_params(payload) == {
+        "fee_rate": 0.001
+    }
+
+    # fee_rate=0.0 is a declared (zero-rate) cost model, not "missing": the
+    # `is not None` check must keep it.
+    payload = viewer_app_module.BacktestRunSignalsRequest(
+        start_date="2024-01-01",
+        end_date="2024-01-02",
+        fee_rate=0.0,
+    )
+    assert viewer_app_module._validated_signal_replay_fee_params(payload) == {
+        "fee_rate": 0.0
+    }
+
+
+@pytest.mark.parametrize(
+    "fee_json",
+    [
+        '"fee_rate": -0.001',
+        '"fee_rate": NaN',
+        '"fee_rate": Infinity',
+        '"fee_flat_per_trade": -1.0',
+        '"fee_flat_per_trade": NaN',
+        '"fee_rate": true',
+        '"fee_rate": false',
+        '"fee_flat_per_trade": true',
+        '"fee_flat_per_trade": false',
+    ],
+)
+def test_backtest_run_signals_rejects_negative_or_nonfinite_fee_params(
+    viewer_client, fee_json
+):
+    """#361: negative, NaN, infinite or boolean fee declarations must be a 400 —
+    ``NotionalFeeModel``/``resolve_fee_model`` reject them, and the boundary
+    mirrors that validation instead of letting a bad request become a
+    zero-cost run or non-finite fees. NaN/Infinity are sent as raw JSON:
+    httpx's ``json=`` refuses to emit them, but Python's ``json.loads`` (and
+    so the API) accepts the literals."""
+    body = (
+        '{"signals": [{"timestamp": "2024-01-01T12:00:00Z", "symbol": "AAPL",'
+        ' "action": "buy", "entry_price": 100.0}],'
+        ' "start_date": "2024-01-01", "end_date": "2024-01-02", '
+        + fee_json
+        + "}"
+    )
+    response = viewer_client.post(
+        "/api/backtests/run-signals",
+        content=body,
+        headers={"Content-Type": "application/json"},
+    )
+
+    assert response.status_code == 400
+    assert "non-negative" in str(response.json()["detail"])
+
+
+def test_backtest_run_from_signals_discord_forwards_fee_fields(viewer_client, monkeypatch):
+    """The discord-history branch forwards the fee declaration to run-signals."""
+    import viewer.main as viewer_app_module
+
+    captured: dict[str, object] = {}
+
+    async def _fake_run_backtest_signals(payload):
+        captured["payload"] = payload
+        return {"task_id": "sigdisc1", "job_id": "sigdisc1", "status": "queued"}
+
+    monkeypatch.setattr(viewer_app_module, "run_backtest_signals", _fake_run_backtest_signals)
+
+    response = viewer_client.post(
+        "/api/backtests/run-from-signals",
+        json={
+            "signal_source": "discord-history",
+            "start_date": "2024-01-01",
+            "end_date": "2024-01-02",
+            "fee_rate": 0.001,
+            "fee_flat_per_trade": 2.0,
+        },
+    )
+
+    assert response.status_code == 202
+    forwarded = captured["payload"]
+    assert forwarded.fee_rate == 0.001
+    assert forwarded.fee_flat_per_trade == 2.0
+    assert forwarded.fees_zero is False
+
+
+def test_backtest_run_from_signals_csv_forwards_fee_rate(viewer_client, monkeypatch, tmp_path):
+    """The csv branch forwards fee_rate/fee_flat_per_trade, not only fees_zero."""
+    import viewer.main as viewer_app_module
+
+    csv_path = tmp_path / "ohlcv" / "signals.csv"
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    csv_path.write_text(
+        "\n".join(
+            [
+                "Symbol;Signal Price;Datum;Zeit;Signal Type",
+                "AAPL;173,79;2026-02-23;09:32:00-05:00;BUY",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    captured: dict[str, object] = {}
+
+    async def _fake_run_backtest_signals(payload):
+        captured["payload"] = payload
+        return {"task_id": "sigcsv03", "job_id": "sigcsv03", "status": "queued"}
+
+    monkeypatch.setattr(viewer_app_module, "run_backtest_signals", _fake_run_backtest_signals)
+
+    response = viewer_client.post(
+        "/api/backtests/run-from-signals",
+        json={
+            "signal_source": "csv",
+            "filepath": str(csv_path),
+            "start_date": "2026-02-23",
+            "end_date": "2026-02-24",
+            "fee_rate": 0.001,
+            "fee_flat_per_trade": 1.5,
+        },
+    )
+
+    assert response.status_code == 202
+    forwarded = captured["payload"]
+    assert forwarded.fee_rate == 0.001
+    assert forwarded.fee_flat_per_trade == 1.5
+    assert forwarded.fees_zero is False
+
+
+def test_backtest_run_from_signals_rejects_conflicting_fee_flags(viewer_client):
+    """fees_zero + fee_rate through run-from-signals is the same 400 conflict
+    the CLI enforces — the discord branch forwards before any signal gather."""
+    response = viewer_client.post(
+        "/api/backtests/run-from-signals",
+        json={
+            "signal_source": "discord-history",
+            "start_date": "2024-01-01",
+            "end_date": "2024-01-02",
+            "fees_zero": True,
+            "fee_rate": 0.001,
+        },
+    )
+
+    assert response.status_code == 400
+    assert "conflict" in str(response.json()["detail"]).lower()
+
+
+def test_backtest_run_signals_real_adapter_records_fees(viewer_client, tmp_path):
+    """#361 regression guard with the REAL ``SignalReplayAdapter``: the stubbed
+    tests are exactly why the missing fee wiring went unnoticed, so this runs
+    a fee_rate replay end to end through the endpoint on a tiny OHLCV fixture
+    and asserts the task completes with non-zero fees in the saved result."""
+    import viewer.main as viewer_app_module
+
+    ohlcv_dir = tmp_path / "ohlcv" / "test_source" / "equities" / "AAPL"
+    ohlcv_dir.mkdir(parents=True)
+    periods = 72
+    base = 100.0
+    frame = pd.DataFrame(
+        {
+            "timestamp": pd.date_range(
+                "2024-01-01T00:00:00Z", periods=periods, freq="1h", tz="UTC"
+            ),
+            "open": [base + i * 0.05 for i in range(periods)],
+            "high": [base + 0.4 + i * 0.05 for i in range(periods)],
+            "low": [base - 0.4 + i * 0.05 for i in range(periods)],
+            "close": [base + 0.2 + i * 0.05 for i in range(periods)],
+            "volume": [1000] * periods,
+        }
+    )
+    frame.to_parquet(ohlcv_dir / "1h.parquet", index=False)
+
+    response = viewer_client.post(
+        "/api/backtests/run-signals",
+        json={
+            "signals": [
+                {
+                    "timestamp": "2024-01-01T10:00:00Z",
+                    "symbol": "AAPL",
+                    "action": "buy",
+                    "entry_price": 100.0,
+                    "stop_loss": 95.0,
+                    "take_profit": 200.0,
+                    "timeframe": "1h",
+                }
+            ],
+            "start_date": "2024-01-01",
+            "end_date": "2024-01-04",
+            "timeframe": "1h",
+            "auto_download": False,
+            "fee_rate": 0.001,
+        },
+    )
+
+    assert response.status_code == 202
+    task_id = response.json()["task_id"]
+    for _ in range(100):
+        task = viewer_app_module.DATA_TASKS[task_id]
+        if task["status"] in {"completed", "failed"}:
+            break
+        time.sleep(0.05)
+
+    task = viewer_app_module.DATA_TASKS[task_id]
+    assert task["status"] == "completed", task.get("error")
+    output_path = Path(task["result"]["output_path"])
+    saved = json.loads(output_path.read_text(encoding="utf-8"))
+    # The declared cost model is recorded in the saved result's parameters...
+    assert saved["meta"]["parameters"]["fee_params"] == {"fee_rate": 0.001}
+    # ...and the run actually priced costs: not a silent zero-fee replay.
+    assert saved["trades"], "expected the replay to open a trade"
+    assert all((t.get("fees") or 0.0) > 0 for t in saved["trades"])
 
 
 def test_thread_bound_task_log_handler_emits_without_shadowing_handle(viewer_client, tmp_path):
@@ -4704,7 +5080,14 @@ def test_create_portfolio_persists_p_value_and_psr(viewer_client, tmp_path):
             )
         ],
         equity_curve=_equity_curve_from_returns(
-            [0.010, 0.012, 0.009, 0.014, 0.011, 0.013, 0.008, 0.012, 0.010, 0.011, 0.009, 0.013]
+            # Weekend rows no longer count toward the PSR observation
+            # minimum (#229 trading-day filter), so the fixture needs
+            # comfortably more than ten trading-day returns.
+            [
+                0.010, 0.012, 0.009, 0.014, 0.011, 0.013, 0.008, 0.012,
+                0.010, 0.011, 0.009, 0.013, 0.010, 0.012, 0.009, 0.011,
+                0.013, 0.008, 0.012, 0.010,
+            ]
         ),
     )
     result.save(backtests_dir / "portfolio-source.trades.json")
@@ -7979,3 +8362,160 @@ def test_deduplicate_portfolios_recheck_error_skips_item_and_reports_rest(
     assert payload["skipped_ids"] == ["c"]
     assert payload["items"][1] == {"id": "c", "status": "skipped", "reason": "recheck_failed"}
     assert "c" in alive
+
+
+def _stub_signal_replay_pipeline(viewer_app_module, monkeypatch, adapter_init_kwargs):
+    """Shared stubs for run-signals tests: capture adapter kwargs, return a
+    minimal completed BacktestResult from the fake adapter."""
+    monkeypatch.setattr(
+        viewer_app_module, "_ensure_backtest_data_availability", lambda **_kwargs: []
+    )
+    monkeypatch.setattr(viewer_app_module, "_upsert_backtest_meta_cache", lambda _backtest_id: None)
+    monkeypatch.setattr(
+        viewer_app_module.legacy_viewer,
+        "_load_ohlcv_df",
+        lambda symbol, timeframe: _tiny_replay_ohlcv_df(),
+    )
+
+    class _FakeSignalReplayAdapter:
+        def __init__(self, *args, **kwargs):
+            adapter_init_kwargs.update(kwargs)
+
+        def run(self, **kwargs):
+            return _completed_signal_replay_result("signal-replay-leverage", "manual")
+
+    monkeypatch.setattr(viewer_app_module, "SignalReplayAdapter", _FakeSignalReplayAdapter)
+
+
+def _leverage_replay_payload(**overrides):
+    payload = {
+        "signals": [
+            {
+                "timestamp": "2024-01-01T12:00:00Z",
+                "symbol": "AAPL",
+                "action": "buy",
+                "entry_price": 100.0,
+                "stop_loss": 98.0,
+                "take_profit": 104.0,
+                "timeframe": "1h",
+            }
+        ],
+        "start_date": "2024-01-01",
+        "end_date": "2024-01-02",
+        "timeframe": "1h",
+        "auto_download": False,
+        "fees_zero": True,
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_backtest_run_signals_forwards_leverage_declarations(viewer_client, monkeypatch):
+    """#240: max_notional_per_trade / max_leverage on /api/backtests/run-signals
+    reach the SignalReplayAdapter (RiskConfig cap + max_leverage kwarg) and
+    the task's restart_config."""
+    import viewer.main as viewer_app_module
+
+    adapter_init_kwargs: dict[str, object] = {}
+    _stub_signal_replay_pipeline(viewer_app_module, monkeypatch, adapter_init_kwargs)
+
+    response = viewer_client.post(
+        "/api/backtests/run-signals",
+        json=_leverage_replay_payload(max_notional_per_trade=5.0, max_leverage=3.0),
+    )
+
+    assert response.status_code == 202
+    task_id = response.json()["task_id"]
+    task = _wait_for_viewer_task(viewer_app_module, task_id)
+    assert task["status"] == "completed"
+
+    assert adapter_init_kwargs["max_leverage"] == 3.0
+    assert adapter_init_kwargs["risk_config"].max_notional_per_trade == 5.0
+    restart_config = viewer_app_module.DATA_TASKS[task_id]["restart_config"]
+    assert restart_config["max_notional_per_trade"] == 5.0
+    assert restart_config["max_leverage"] == 3.0
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("max_notional_per_trade", 0.0),
+        ("max_notional_per_trade", -1.0),
+        ("max_leverage", 0.0),
+        ("max_leverage", -2.5),
+    ],
+)
+def test_backtest_run_signals_rejects_nonpositive_leverage_fields(
+    viewer_client, field, value
+):
+    """#240: leverage declarations are validated at the boundary — a
+    non-positive or non-finite value is a 400, never a silently ignored
+    field."""
+    response = viewer_client.post(
+        "/api/backtests/run-signals",
+        json=_leverage_replay_payload(**{field: value}),
+    )
+    assert response.status_code == 400, response.text
+
+
+def test_backtest_run_signals_rejects_nonfinite_leverage_field(viewer_client):
+    """#240: a NaN leverage declaration parses as a float but fails the
+    finite check — still a 400."""
+    body = json.dumps(_leverage_replay_payload(max_leverage=0.0))
+    body = body.replace('"max_leverage": 0.0', '"max_leverage": NaN')
+    response = viewer_client.post(
+        "/api/backtests/run-signals",
+        content=body,
+        headers={"Content-Type": "application/json"},
+    )
+    assert response.status_code == 400, response.text
+
+
+def test_backtest_run_accepts_position_pct_above_one(viewer_client, monkeypatch, tmp_path):
+    """#240: BacktestRunRequest.max_position_pct > 1 is accepted (the le=1.0
+    bound was lifted for leverage) and forwarded to the engine command,
+    which bounds it by max_leverage — 1x when unset."""
+    import viewer.main as viewer_app_module
+
+    strategies_dir = tmp_path / "strategies"
+    strategies_dir.mkdir(parents=True, exist_ok=True)
+    (strategies_dir / "demo_strategy.py").write_text(
+        "class DemoStrategy:\n    pass\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(viewer_app_module, "STRATEGIES_DIR", strategies_dir)
+    monkeypatch.setattr(viewer_app_module.legacy_viewer, "STRATEGIES_DIR", strategies_dir)
+    monkeypatch.setattr(viewer_app_module, "_dolthub_pull", lambda: None)
+    monkeypatch.setattr(
+        viewer_app_module, "_ensure_backtest_data_availability", lambda **kwargs: []
+    )
+
+    captured_cmd: list[str] = []
+    saved_line = json.dumps({"message": f"Saved to: {tmp_path}/out.trades.json"}) + "\n"
+
+    def fake_popen(cmd, *args, **kwargs):
+        captured_cmd.extend(cmd)
+        return _ImmediateExitProc([saved_line, "PROGRESS:100.00:Completed\n"])
+
+    monkeypatch.setattr(viewer_app_module.subprocess, "Popen", fake_popen)
+
+    response = viewer_client.post(
+        "/api/backtests/run",
+        json={
+            "strategy": "demo_strategy.py",
+            "engine": "native",
+            "symbols": ["AAPL"],
+            "timeframe": "1d",
+            "capital": 100000,
+            "max_position_pct": 5.0,
+            "max_leverage": 3.0,
+        },
+    )
+
+    assert response.status_code == 202, response.text
+    task_id = response.json()["task_id"]
+    task = _wait_for_viewer_task(viewer_app_module, task_id)
+    assert task["status"] == "completed", task.get("error")
+    assert "--max-position-pct" in captured_cmd
+    assert "5.0" in captured_cmd[captured_cmd.index("--max-position-pct") + 1]
+    assert "--max-leverage" in captured_cmd
+    assert "3.0" in captured_cmd[captured_cmd.index("--max-leverage") + 1]

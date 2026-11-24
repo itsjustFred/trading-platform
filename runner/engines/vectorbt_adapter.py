@@ -390,12 +390,14 @@ def _process_symbol(
     # intrabar stop — exit detection keeps using the real stop_loss series.
     sizing_stop_series = _find_sizing_stop_series(execution_signals, execution_indicators)
     sizing_basis_series = sizing_stop_series if sizing_stop_series is not None else stop_loss_series
-    take_profit_series = _find_take_profit_series(execution_signals, execution_indicators)
     entry_stop_series = _find_entry_stop_series(execution_signals, execution_indicators)
     atr_series = _find_atr_series(execution_signals, execution_indicators)
     direction_series = _find_direction_series(execution_signals, execution_indicators)
     exit_price_series = _find_exit_price_series(execution_signals, execution_indicators)
     exit_reason_series = _find_exit_reason_series(execution_signals, execution_indicators)
+    exit_order_type_series = _find_exit_order_type_series(
+        execution_signals, execution_indicators
+    )
 
     trades: list[Trade] = []
     in_trade = False
@@ -446,13 +448,93 @@ def _process_symbol(
                 # (in_trade=False above); skip before sizing/equity.
                 continue
             trade_counter += 1
+            # Explicit exit order type (#243): "market" ignores exit_price and
+            # fills at the signal-exit convention price; "level" fills at
+            # exit_price (a missing/unusable level falls back to the market
+            # fill and is flagged). Unspecified keeps the legacy rule — a
+            # usable exit_price is a level. The order type is only evaluated
+            # on a real exit signal: the forced end-of-data close on the last
+            # bar keeps the convention fill and ignores exit_price entirely,
+            # matching native's end_of_data close.
+            is_signal_exit = bool(exits.iloc[i])
+            exit_order_type = None
+            order_type_invalid = False
+            level_missing_price = False
+            level_unreachable = False
+            level_gapped = False
+            effective_exit_price_series = exit_price_series
+            if is_terminal_bar and not is_signal_exit:
+                effective_exit_price_series = None
+            if is_signal_exit:
+                exit_order_type, order_type_invalid = _exit_order_type_at(
+                    exit_order_type_series, i
+                )
+                if order_type_invalid:
+                    _warn_once(
+                        (symbol, config.timeframe, "exit_order_type_invalid"),
+                        "%s/%s: unrecognized exit_order_type value; expected "
+                        "'market' or 'level'. Falling back to the legacy rule "
+                        "(a usable exit_price fills at the level).",
+                        symbol,
+                        config.timeframe,
+                        warning_keys=warning_keys,
+                    )
+                if exit_order_type == contract.EXIT_ORDER_TYPE_MARKET:
+                    effective_exit_price_series = None
+                elif exit_order_type == contract.EXIT_ORDER_TYPE_LEVEL and (
+                    contract.usable_exit_price(
+                        exit_price_series.iloc[i]
+                        if exit_price_series is not None
+                        else None
+                    )
+                    is None
+                ):
+                    effective_exit_price_series = None
+                    level_missing_price = True
+            # A level is only honored inside the exit bar's traded range.
+            # Beyond it on the untraded side the order could never have
+            # filled — fall back to the market fill rather than book a
+            # fantasy price. Beyond it on the marketable side the order was
+            # marketable at the open, so it fills at the bar's open
+            # (gap-through-level). This applies to every level fill,
+            # explicit or legacy implicit.
+            level_fill_price = (
+                contract.usable_exit_price(effective_exit_price_series.iloc[i])
+                if effective_exit_price_series is not None
+                else None
+            )
+            if level_fill_price is not None and is_signal_exit:
+                # A-H4 (D3)/A-L5: a SHORT exit buys the ask, so reachability
+                # is judged on the ask range when ask-side data is enabled —
+                # mirroring native _close_position/_ask_bar.
+                bar_high = exit_row.get("high")
+                bar_low = exit_row.get("low")
+                if direction != "LONG":
+                    ask_high, ask_low = _vbt_ask_bar(exit_row, resolved_parameters)
+                    if ask_high is not None:
+                        bar_high = ask_high
+                    if ask_low is not None:
+                        bar_low = ask_low
+                level_disposition = contract.exit_level_disposition(
+                    direction=direction,
+                    level=level_fill_price,
+                    high=bar_high,
+                    low=bar_low,
+                )
+                if level_disposition == contract.EXIT_LEVEL_UNREACHABLE:
+                    effective_exit_price_series = None
+                    level_unreachable = True
+                elif level_disposition == contract.EXIT_LEVEL_GAPPED:
+                    effective_exit_price_series = None
+                    level_gapped = True
             exit_price = _resolve_exit_price(
                 exit_row,
                 i,
-                exit_price_series,
+                effective_exit_price_series,
                 signal_exit_fill=getattr(config, "signal_exit_fill", "close"),
                 parameters=resolved_parameters,
                 direction=direction,
+                gap_open=level_gapped,
             )
             exit_reason = _resolve_exit_reason(i, exit_reason_series)
             if is_terminal_bar and not bool(exits.iloc[i]):
@@ -460,8 +542,14 @@ def _process_symbol(
             entry_ts = str(entry_row.get("timestamp", entry_row.name))
             exit_ts = str(exit_row.get("timestamp", exit_row.name))
             trade_meta = _extract_trade_meta(execution_signals, execution_indicators, entry_idx, i)
+            if exit_order_type is not None:
+                # Canonical value, matching native's position.meta — the
+                # indicator extraction above may have recorded the raw cell.
+                trade_meta["exit_order_type"] = exit_order_type
             stop_price = _resolve_level_value(stop_loss_series, entry_idx)
-            take_profit_price = _resolve_level_value(take_profit_series, entry_idx)
+            take_profit_price = _resolve_take_profit_price(
+                execution_signals, execution_indicators, entry_idx
+            )
             risk_target_usd: float | None = None
             stop_distance: float | None = None
             max_position_exposure_pct: float | None = None
@@ -489,6 +577,72 @@ def _process_symbol(
                 exit_ts = intrabar_exit["time"]
                 exit_reason = intrabar_exit["reason"]
                 trade_meta["modeling_resolution"] = intrabar_exit["resolution"]
+            elif is_signal_exit:
+                # The level governed the exit only when no protective
+                # stop/TP superseded the signal exit — flag and warn then,
+                # never for trades that actually left on a stop or TP.
+                if level_missing_price:
+                    _warn_once(
+                        (symbol, config.timeframe, "exit_level_missing_price"),
+                        "%s/%s: exit_order_type='level' but no usable "
+                        "exit_price on the exit bar; falling back to the "
+                        "market fill.",
+                        symbol,
+                        config.timeframe,
+                        warning_keys=warning_keys,
+                    )
+                    trade_meta["exit_level_missing_price"] = True
+                if level_unreachable:
+                    _warn_once(
+                        (symbol, config.timeframe, "exit_level_unreachable"),
+                        "%s/%s: exit level %.6f is outside the exit bar's "
+                        "traded range; falling back to the market fill.",
+                        symbol,
+                        config.timeframe,
+                        level_fill_price if level_fill_price is not None else float("nan"),
+                        warning_keys=warning_keys,
+                    )
+                    trade_meta["exit_level_unreachable"] = True
+                if level_gapped:
+                    _warn_once(
+                        (symbol, config.timeframe, "exit_level_gapped"),
+                        "%s/%s: exit level %.6f gapped the exit bar's open; "
+                        "filling at the open instead of the level.",
+                        symbol,
+                        config.timeframe,
+                        level_fill_price if level_fill_price is not None else float("nan"),
+                        warning_keys=warning_keys,
+                    )
+                    trade_meta["exit_level_gapped"] = True
+
+            # Inverted SIZING-only stop guard (mirrors native
+            # `_fill_pending_orders`, which skips a market order whose
+            # sizing stop is on the wrong side of the fill). The protective
+            # inverted-stop guard below only sees the protective stop series;
+            # a sizing-only stop (e.g. ``sizing_sl_price``) left above a LONG
+            # entry by a gap down would otherwise be sized on
+            # abs(entry - stop), i.e. on a risk distance that does not exist.
+            # Skip before sizing so no fantasy risk reaches the equity path.
+            if sizing_stop_series is not None:
+                sizing_stop_value = _resolve_level_value(sizing_stop_series, entry_idx)
+                if sizing_stop_value is not None and (
+                    (direction == "LONG" and sizing_stop_value >= entry_price)
+                    or (direction != "LONG" and sizing_stop_value <= entry_price)
+                ):
+                    inverted_stop_drops += 1
+                    _warn_once(
+                        (symbol, config.timeframe, "inverted_sizing_stop"),
+                        "Skipping %s/%s trade at %s: %s sizing stop %.6f is on "
+                        "the wrong side of entry %.6f",
+                        symbol,
+                        config.timeframe,
+                        entry_ts,
+                        direction,
+                        sizing_stop_value,
+                        entry_price,
+                        warning_keys=warning_keys,
+                    )
+                    continue
 
             sizing = _size_trade(
                 config=config,
@@ -653,6 +807,31 @@ def _process_symbol(
     return trades, extra_timeframes, drawings, indicator_series, len(df), inverted_stop_drops
 
 
+def _frozen_signal_exit_fill(config: BacktestConfig) -> BacktestConfig:
+    """Refuse the native-only ``next_open`` exit model on this frozen adapter.
+
+    ADR ``docs/adr/0001-native-single-strategy-engine.md``: frozen engines
+    keep their existing semantics until removal and get fail-loud guards, not
+    silent re-interpretation. ``next_open`` is the native default, so a
+    ``BacktestConfig`` that never touched the field would otherwise simulate
+    the legacy signal-bar fill while the persisted meta claimed otherwise —
+    refuse instead of warn-and-run.
+    """
+    # normalize first: a config that bypassed BacktestConfig validation still
+    # fails loudly on the removed "open" mode (issue #153) instead of silently
+    # keeping an unsupported fill.
+    mode = contract.normalize_signal_exit_fill(
+        getattr(config, "signal_exit_fill", "close") or "close"
+    )
+    if mode == contract.SIGNAL_EXIT_FILL_NEXT_OPEN:
+        raise ValueError(
+            "engine 'vectorbt' does not implement signal_exit_fill='next_open'; "
+            "frozen engines keep their legacy signal-bar fill — pass "
+            "signal_exit_fill='close' explicitly, or run the native engine"
+        )
+    return config
+
+
 @dataclass
 
 
@@ -669,7 +848,24 @@ class VectorbtAdapter(EngineAdapter):
         strategy_path: str,
         progress_callback: ProgressCallback | None = None,
     ) -> BacktestResult:
+        # #240: the frozen vectorbt engine has no broker-leverage concept —
+        # its sizing resolves an unset max_leverage to the 2.0x migration-gate
+        # default, so a per-position cap above 1x could size past 1x equity
+        # with no declared broker maximum. Refuse it outright, the same
+        # fail-closed rule PyneCore applies; use the native engine for
+        # leverage. (The 2.0x aggregate default itself is unchanged — it is
+        # migration-gate parity behaviour.)
+        if (
+            config.max_position_exposure_pct is not None
+            and config.max_position_exposure_pct > 1
+        ):
+            raise ValueError(
+                "vectorbt max_position_exposure_pct must be <= 1 "
+                "(per-position leverage above 1x is not supported by the "
+                "frozen vectorbt engine; use the native engine)"
+            )
         require_generated_strategy_approval(strategy_path)
+        config = _frozen_signal_exit_fill(config)
         strategy_mod = _load_strategy_module(strategy_path)
         if not hasattr(strategy_mod, "generate_signals"):
             raise ValueError(f"Strategy {strategy_path} must define generate_signals(df, params)")
@@ -1061,6 +1257,18 @@ def _is_exit_column(name: str, explicit_roles: Mapping[str, str] | None = None) 
     )
 
 
+def _exit_order_type_at(
+    series: pd.Series | None, idx: int
+) -> tuple[str | None, bool]:
+    """``(canonical exit_order_type, unrecognized_value_present)`` at ``idx``."""
+    if series is None:
+        return None, False
+    raw = series.iloc[idx]
+    order_type = contract.normalize_exit_order_type(raw)
+    invalid = order_type is None and contract.exit_order_type_is_present(raw)
+    return order_type, invalid
+
+
 def _prepare_next_open_execution_data(
     signals: pd.DataFrame,
     indicators: IndicatorMap,
@@ -1092,6 +1300,7 @@ def _prepare_next_open_execution_data(
             "entry_stop",
             "exit_price",
             "exit_reason",
+            "exit_order_type",
         }
         for column in signals.columns:
             if str(column).lower() not in canonical and str(column) not in roles:
@@ -1182,7 +1391,7 @@ def _infer_indicator_when(name: str, explicit_when: str) -> str:
 
 def _indicator_meta_key(name: str) -> str:
     lowered = name.lower()
-    if lowered in {"exit_price", "exit_reason"}:
+    if lowered in {"exit_price", "exit_reason", "exit_order_type"}:
         return lowered
     if lowered.startswith("exit_"):
         return name[5:]
@@ -1191,6 +1400,46 @@ def _indicator_meta_key(name: str) -> str:
     if lowered in {"take_profit", "tp_price"}:
         return "tp_price"
     return name
+
+
+#: Protective-level aliases in canonical-first order (#237). A strategy that
+#: publishes both spellings of one level must resolve identically in every
+#: engine, so the winner can never depend on the indicators dict's insertion
+#: order. The order is the one ``risk.live._LIVE_SL_KEYS``/``_LIVE_TP_KEYS``
+#: and the native ``TradeEngine._extract_levels`` use.
+_LEVEL_ALIASES: dict[str, tuple[str, ...]] = {
+    "sizing_stop": ("sizing_stop", "sizing_sl_price", "sizing_sl"),
+    "stop_loss": ("stop_loss", "sl_price"),
+    "take_profit": ("take_profit", "tp_price"),
+}
+
+#: Alias spellings that share one ``trade.meta`` key with their canonical
+#: spelling. When a strategy publishes both, only the canonical one records
+#: itself, so the reported level never follows the dict's insertion order.
+_SHADOWED_ALIASES: dict[str, str] = {
+    "sl_price": "stop_loss",
+    "tp_price": "take_profit",
+}
+
+
+def _find_alias_indicator_series(
+    indicators: IndicatorMap, desired_when: str, alias: str
+) -> pd.Series | None:
+    """One spelling of a level alias, ``None`` when the strategy emits none."""
+    for name, (series, explicit_when) in indicators.items():
+        if _infer_indicator_when(name, explicit_when) != desired_when:
+            continue
+        if name.lower() == alias:
+            return series
+    return None
+
+
+def _alias_is_shadowed(indicators: IndicatorMap, name: str, when: str) -> bool:
+    """True when the canonical spelling of ``name``'s level is also published."""
+    canonical = _SHADOWED_ALIASES.get(name.lower())
+    if canonical is None:
+        return False
+    return _find_alias_indicator_series(indicators, when, canonical) is not None
 
 
 def _find_indicator_series(
@@ -1208,29 +1457,38 @@ def _find_indicator_series(
         return signals["exit_price"]
     if kind == "exit_reason" and "exit_reason" in signals.columns:
         return signals["exit_reason"]
+    if kind == "exit_order_type" and "exit_order_type" in signals.columns:
+        return signals["exit_order_type"]
     if kind == "atr":
         for column in signals.columns:
             if str(column).lower().startswith("atr"):
                 return signals[column]
 
-    desired_when = "exit" if kind in {"exit_price", "exit_reason"} else "entry"
+    desired_when = (
+        "exit" if kind in {"exit_price", "exit_reason", "exit_order_type"} else "entry"
+    )
+    aliases = _LEVEL_ALIASES.get(kind)
+    if aliases is not None:
+        # Two passes, canonical spelling first: the alias resolution must not
+        # depend on the order the strategy emitted the spellings in.
+        for alias in aliases:
+            series = _find_alias_indicator_series(indicators, desired_when, alias)
+            if series is not None:
+                return series
+        return None
     for name, (series, explicit_when) in indicators.items():
         when = _infer_indicator_when(name, explicit_when)
         if when != desired_when:
             continue
 
         lowered = name.lower()
-        if kind == "sizing_stop" and lowered in {"sizing_stop", "sizing_sl_price", "sizing_sl"}:
-            return series
         if kind == "direction" and lowered == "direction":
-            return series
-        if kind == "stop_loss" and lowered in {"stop_loss", "sl_price"}:
-            return series
-        if kind == "take_profit" and lowered in {"take_profit", "tp_price"}:
             return series
         if kind == "exit_price" and lowered == "exit_price":
             return series
         if kind == "exit_reason" and lowered == "exit_reason":
+            return series
+        if kind == "exit_order_type" and lowered == "exit_order_type":
             return series
         if kind == "entry_stop" and lowered == "entry_stop":
             return series
@@ -1266,6 +1524,12 @@ def _find_exit_price_series(signals: pd.DataFrame, indicators: IndicatorMap) -> 
 
 def _find_exit_reason_series(signals: pd.DataFrame, indicators: IndicatorMap) -> pd.Series | None:
     return _find_indicator_series(signals, indicators, kind="exit_reason")
+
+
+def _find_exit_order_type_series(
+    signals: pd.DataFrame, indicators: IndicatorMap
+) -> pd.Series | None:
+    return _find_indicator_series(signals, indicators, kind="exit_order_type")
 
 
 def _find_entry_stop_series(signals: pd.DataFrame, indicators: IndicatorMap) -> pd.Series | None:
@@ -1323,20 +1587,30 @@ def _resolve_exit_price(
     signal_exit_fill: str = "close",
     parameters: dict[str, Any] | None = None,
     direction: str | None = None,
+    gap_open: bool = False,
 ) -> float:
-    # D4 (Phase 3, A-M1 — implemented): unified Fill-zum-Trigger-Close.
-    # Signal exits stay on the trigger bar (see
-    # _prepare_next_open_execution_data) and fill at its close (or open with
-    # signal_exit_fill="open", mirroring native _close_position); stop/TP
+    # Frozen engine (ADR 0001): signal exits stay on the trigger bar (see
+    # _prepare_next_open_execution_data) and fill at its close — the frozen
+    # adapter refuses ``next_open`` upstream and the lookahead-prone ``open``
+    # mode was removed (issue #153). Stop/TP
     # legs resolve via the intrabar walk at their levels. An explicit
-    # strategy exit_price level always wins.
+    # strategy exit_price level always wins — except a level that gapped
+    # the bar's open (gap_open=True), which fills at the open under the
+    # gap-through-level convention regardless of signal_exit_fill.
+    # Normalize anyway so a bypassed config still fails loudly on the
+    # removed "open" mode (#153).
+    contract.normalize_signal_exit_fill(signal_exit_fill or "close")
     # Spread mirrors native: only open-fills carry it, and only SHORT exits
     # pay it (closing a SHORT buys the ask); LONG exits sell the bid.
-    if exit_price_series is not None:
-        exit_price = exit_price_series.iloc[exit_idx]
-        if pd.notna(exit_price) and float(exit_price) > 0:
-            return float(exit_price)
-    fill_at_open = str(signal_exit_fill or "close").lower() == "open"
+    if exit_price_series is not None and not gap_open:
+        # Same usability rule as the explicit ``level`` contract
+        # (contract.usable_exit_price): positive, finite — an inf/NaN level
+        # falls back to the convention fill instead of booking a fantasy
+        # price.
+        level = contract.usable_exit_price(exit_price_series.iloc[exit_idx])
+        if level is not None:
+            return level
+    fill_at_open = gap_open
     open_value = exit_row.get("open")
     close_value = exit_row.get("close")
     open_ok = open_value is not None and pd.notna(open_value)
@@ -1422,6 +1696,49 @@ def _resolve_level_value(series: pd.Series | None, idx: int) -> float | None:
     if numeric <= 0:
         return None
     return numeric
+
+
+def _usable_take_profit_value(series: pd.Series | None, idx: int) -> float | None:
+    """One spelling's take-profit value at ``idx``, or ``None`` when unusable.
+
+    Mirrors ``TradeEngine._armable_take_profit``: live refuses a
+    present-but-unusable level (non-numeric, non-finite or ``<= 0``) rather
+    than trading it, and a LONG take-profit of ``0`` is reached by every bar
+    (``bar_high >= 0``), so neither engine may arm one (#237).
+    """
+    if series is None:
+        return None
+    value = series.iloc[idx]
+    if pd.isna(value):
+        return None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(numeric) or numeric <= 0:
+        return None
+    return numeric
+
+
+def _resolve_take_profit_price(
+    signals: pd.DataFrame, indicators: IndicatorMap, idx: int
+) -> float | None:
+    """The take-profit price for one entry bar, canonical alias spelling first.
+
+    Same resolution as ``TradeEngine._extract_levels``: a spelling whose value
+    is not usable is not a level, and the fallback spelling supplies the price
+    instead (#237). A signals-frame column wins over an indicator series, as in
+    ``_find_indicator_series``.
+    """
+    for alias in _LEVEL_ALIASES["take_profit"]:
+        if alias in signals.columns:
+            series: pd.Series | None = signals[alias]
+        else:
+            series = _find_alias_indicator_series(indicators, "entry", alias)
+        price = _usable_take_profit_value(series, idx)
+        if price is not None:
+            return price
+    return None
 
 
 def _resolve_stop_distance(
@@ -1661,9 +1978,21 @@ def _extract_trade_meta(
         serialized = _serialize_meta_value(series.iloc[sample_idx])
         if serialized is None:
             continue
+        if _alias_is_shadowed(indicators, name, when):
+            # Both spellings of one level are published: the alias must not
+            # overwrite the level the engine actually resolved (#237).
+            continue
         trade_meta[meta_key] = serialized
         if meta_key == "sl_price":
             trade_meta.setdefault("sl_price", serialized)
+
+    # The reported take-profit level is the one the engine resolved, never the
+    # shadowed alias spelling and never a price that could not be armed (#237).
+    resolved_take_profit = _resolve_take_profit_price(signals, indicators, entry_idx)
+    if resolved_take_profit is not None:
+        trade_meta["tp_price"] = resolved_take_profit
+    else:
+        trade_meta.pop("tp_price", None)
 
     return trade_meta
 

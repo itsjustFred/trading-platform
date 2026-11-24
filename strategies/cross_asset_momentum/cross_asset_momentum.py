@@ -34,12 +34,15 @@ The source is a MULTI-ASSET system; this adapter runs one symbol:
 
 STRATEGY_META = {
     "name": "Cross-Asset Momentum",
-    "version": "1.1.0",
+    "version": "1.2.0",
     "source_url": "https://github.com/desenyon/quantconnect-strategies/blob/main/cross_asset_momentum.py",
     "notes": (
         "Single-symbol proxy of a multi-asset system. Source-exact: "
         "lookbacks [21, 63, 126, 252], weights [0.35, 0.30, 0.20, 0.15], "
-        "vol window 60. Dropped (not single-symbol-expressible): "
+        "vol window 60. 1.2.0: market exits (signal / momentum / drawdown) "
+        "carry no exit_price=close and fill at the next open; the ATR stop "
+        "level travels in sl_price (exit-bar exit_price is a level only "
+        "with exit_order_type='level'). Dropped (not single-symbol-expressible): "
         "cross-sectional ranking, risk-parity weighting + caps, vol "
         "targeting, SPY crash-protection leg. ATR stop / momentum-break "
         "exit / drawdown exit are opt-in only (default OFF)."
@@ -57,6 +60,7 @@ import numpy as np
 import pandas as pd
 
 from shared.indicators import presets
+from shared.strategy_markers import entry_exit_markers
 
 
 def generate_signals(df: pd.DataFrame, params: dict):
@@ -76,7 +80,7 @@ def generate_signals(df: pd.DataFrame, params: dict):
     high = df["high"]
     low = df["low"]
     composite = pd.Series(0.0, index=df.index)
-    for lookback, weight in zip(lookbacks, weights):
+    for lookback, weight in zip(lookbacks, weights, strict=False):
         composite += close.pct_change(lookback).fillna(0) * weight
 
     vol = close.pct_change().rolling(vol_window).std() * np.sqrt(252)
@@ -124,17 +128,20 @@ def generate_signals(df: pd.DataFrame, params: dict):
             )
             if stop_hit or signal_break or momentum_break or drawdown_break:
                 exits.iloc[i] = True
+                # The ATR stop's level travels in sl_price (the protective
+                # stop fills it); the exit-bar exit_price is only honored as
+                # a level with exit_order_type="level", which is not emitted
+                # here. The signal / momentum / drawdown exits are
+                # close-triggered MARKET exits: no explicit exit_price, so
+                # they fill at the next bar's open under next_open.
                 if stop_hit:
                     exit_price.iloc[i] = active_stop
                     exit_reason.iloc[i] = "stop_loss"
                 elif momentum_break:
-                    exit_price.iloc[i] = float(close.iloc[i])
                     exit_reason.iloc[i] = "momentum_break"
                 elif drawdown_break:
-                    exit_price.iloc[i] = float(close.iloc[i])
                     exit_reason.iloc[i] = "drawdown_break"
                 else:
-                    exit_price.iloc[i] = float(close.iloc[i])
                     exit_reason.iloc[i] = "signal_break"
                 in_trade = False
                 active_stop = np.nan
@@ -150,35 +157,6 @@ def generate_signals(df: pd.DataFrame, params: dict):
         "exit_price": exit_price,
         "exit_reason": exit_reason,
     }
-    drawings: list[dict] = []
-    if "timestamp" in df.columns:
-        entry_times = pd.to_datetime(
-            df.loc[entries[entries].index, "timestamp"], utc=True, errors="coerce"
-        ).dropna()
-        exit_times = pd.to_datetime(
-            df.loc[exits[exits].index, "timestamp"], utc=True, errors="coerce"
-        ).dropna()
-        for ts in entry_times.iloc[:30]:
-            drawings.append(
-                {
-                    "type": "marker",
-                    "time": ts.isoformat(),
-                    "position": "belowBar",
-                    "shape": "arrowUp",
-                    "color": "#22c55e",
-                    "text": "Entry",
-                }
-            )
-        for ts in exit_times.iloc[:30]:
-            drawings.append(
-                {
-                    "type": "marker",
-                    "time": ts.isoformat(),
-                    "position": "aboveBar",
-                    "shape": "arrowDown",
-                    "color": "#ef4444",
-                    "text": "Exit",
-                }
-            )
+    drawings = entry_exit_markers(df, entries, exits)
 
     return entries, exits, indicators_dict, drawings

@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import math
 from abc import ABC, abstractmethod
-from contextlib import contextmanager
+from collections.abc import Collection
+from contextlib import AbstractAsyncContextManager, contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Iterator
 
+from live_runner.account_order_lock import account_order_placement
 from shared.logging import get_logger
 from shared.models import LiveSignal
 
@@ -45,12 +47,12 @@ def order_not_submitted() -> Iterator[None]:
     """
     try:
         yield
-    except BaseException as exc:
+    except BaseException as exc:  # except-kind: money-decision
         try:
             setattr(exc, _ORDER_NOT_SUBMITTED_ATTR, True)
-        except Exception:  # pragma: no cover - exotic exception types
-            # An exception that refuses attributes degrades to "outcome
-            # unknown", which is the safe default for every caller.
+        except Exception:  # pragma: no cover  # except-kind: money-decision
+            # An exception that refuses attributes (exotic exception types)
+            # degrades to "outcome unknown", the safe default for every caller.
             pass
         raise
 
@@ -129,7 +131,7 @@ def money_digits_from_trader(trader: Any) -> int:
             pass
 
     try:
-        digits = int(raw)
+        digits = int(raw)  # type: ignore[call-overload]  # raw is validated by the surrounding try/except
     except (TypeError, ValueError, OverflowError):
         return _money_digits_fallback("moneyDigits is not an integer", raw)
     if isinstance(raw, bool) or not (0 <= digits <= MAX_MONEY_DIGITS):
@@ -142,13 +144,16 @@ def money_scale(money_digits: int) -> int:
     return 10**money_digits
 
 
-def commission_cost(signed_cash_flow: float) -> float:
+def commission_from_signed_cash_flow(signed_cash_flow: float) -> float:
     """``live_executions.commission`` convention: a charge is a POSITIVE cost.
 
     Net PnL is ``gross - commission`` everywhere (viewer, ``net_pnl``), so every adapter must
-    store what the fill cost as a positive number and a rebate as a negative one. A broker that
-    reports a signed cash flow (cTrader: ``ProtoOADeal.commission`` is negative for a charge)
-    is converted with this helper. ``0`` stays ``0.0`` (never ``-0.0``).
+    store what the fill cost as a positive number. A broker that reports a signed cash flow
+    (cTrader: ``ProtoOADeal.commission`` is negative for a charge) is converted with this
+    helper; ``0`` stays ``0.0`` (never ``-0.0``). This is the ONLY sanctioned way to turn a
+    broker-signed commission into the stored convention - the result still has to pass the
+    ``commission`` write guard (`shared.models.validate_commission_cost`), which refuses a
+    negative value, so a broker rebate (a positive cash flow here) cannot be stored.
 
     Raises ``ValueError`` on a non-finite value: ``0.0`` is a KNOWN zero fee, so garbage must not
     be turned into one. A caller that wants "unknown" handles it before calling (cTrader stores
@@ -231,6 +236,41 @@ def validate_live_quote_prices(
     return bid, ask
 
 
+#: How far a quote time may lie in the future before it is treated as a clock
+#: or feed fault rather than skew between our clock and the broker's (#125).
+LIVE_QUOTE_FUTURE_SKEW_SECONDS = 2.0
+
+#: Freshness verdicts of :func:`live_quote_time_rule`.
+QUOTE_TIME_RULE_MISSING = "quote_time_missing"
+QUOTE_TIME_RULE_INVALID = "quote_time_invalid"
+QUOTE_TIME_RULE_IN_FUTURE = "quote_time_in_future"
+QUOTE_TIME_RULE_STALE = "quote_stale"
+
+
+def live_quote_time_rule(
+    timestamp: object, *, now: datetime, max_age_seconds: float
+) -> tuple[str | None, float | None]:
+    """Freshness verdict and age in seconds for a quote time (#125).
+
+    Fails closed: a missing time, anything but a timezone-aware datetime, a
+    time beyond :data:`LIVE_QUOTE_FUTURE_SKEW_SECONDS` in the future, or a
+    quote older than ``max_age_seconds`` all reject. One implementation for
+    every layer that gates or sizes on a broker quote — the entry-deviation
+    gate, the pip-value conversion check and the pre-submit caps (#302) must
+    agree on what "current" means.
+    """
+    if timestamp is None:
+        return QUOTE_TIME_RULE_MISSING, None
+    if not isinstance(timestamp, datetime) or timestamp.utcoffset() is None:
+        return QUOTE_TIME_RULE_INVALID, None
+    age = (now - timestamp).total_seconds()
+    if -age > LIVE_QUOTE_FUTURE_SKEW_SECONDS:
+        return QUOTE_TIME_RULE_IN_FUTURE, age
+    if age > max_age_seconds:
+        return QUOTE_TIME_RULE_STALE, age
+    return None, age
+
+
 @dataclass(frozen=True)
 class LivePipValue:
     """What one qty unit of a symbol gains or loses per 1.0 price move (#146).
@@ -311,7 +351,7 @@ class ControlOutcome:
         )
 
 
-def coerce_positive_live_qty(value: object, *, field_name: str = "qty") -> float:
+def coerce_positive_live_qty(value: Any, *, field_name: str = "qty") -> float:
     if isinstance(value, bool):
         raise ValueError(f"{field_name} must be numeric")
     try:
@@ -321,6 +361,34 @@ def coerce_positive_live_qty(value: object, *, field_name: str = "qty") -> float
     if not math.isfinite(parsed) or parsed <= 0:
         raise ValueError(f"{field_name} must be finite and positive")
     return parsed
+
+
+#: Values :meth:`BaseLiveAdapter.get_order_state` may return. ``None`` means
+#: "unknown" and always fails closed in the reconciler. ``ORDER_STATE_FILLED``
+#: distinguishes a fully executed order from other terminal outcomes so
+#: fill-aware workflows (the supertrend_flip closes, #168) can tell "filled"
+#: from "died unfilled" without a second broker call.
+ORDER_STATE_WORKING = "working"
+ORDER_STATE_TERMINAL = "terminal"
+ORDER_STATE_FILLED = "filled"
+
+
+@dataclass(frozen=True)
+class BrokerOrderView:
+    """One working broker order, normalized for reconciliation (#303).
+
+    ``protection`` marks position-protection orders (bracket legs, attached
+    stop/target orders) so the reconciler does not mistake them for untracked
+    entry or exit orders.
+    """
+
+    order_id: str
+    client_order_id: str = ""
+    symbol: str = ""
+    side: str = ""
+    qty: float | None = None
+    order_type: str = ""
+    protection: bool = False
 
 
 @dataclass(frozen=True)
@@ -350,6 +418,32 @@ class BaseLiveAdapter(ABC):
     #: every per-broker lookup treats as the fail-closed baseline.
     broker_name: str = ""
 
+    @property
+    def order_placement_account_id(self) -> str:
+        """The ``live_accounts.id`` whose broker book this adapter mutates.
+
+        Adapters name the broker account differently (Alpaca stores the live
+        account id directly; cTrader stores the cTrader trader id separately
+        from the configured account id), but the shared order-placement lock
+        must key on the same account the daemon's deployments use.
+        """
+        for attr in ("account_id", "account_config_id"):
+            value = getattr(self, attr, None)
+            if value:
+                return str(value)
+        return ""
+
+    def order_placement_lock(self) -> AbstractAsyncContextManager[None]:
+        """The shared per-account critical section for adapter-internal paths.
+
+        Adapter code that reads broker position/order state and then writes -
+        outside the daemon's submit chokepoints - takes this same lock so it
+        serialises with signal submissions and STOPPED/kill-switch flattens
+        (#362). It is not re-entrant: a path already inside the daemon's
+        ``submit_order`` call must not take it again.
+        """
+        return account_order_placement(self.order_placement_account_id)
+
     @abstractmethod
     async def connect(self) -> None:
         """Initialize broker REST/stream clients and validate connectivity."""
@@ -372,6 +466,20 @@ class BaseLiveAdapter(ABC):
     async def get_balance(self) -> tuple[float, float]:
         """Return current account (balance, equity)."""
 
+    async def get_equity(self) -> float:
+        """Account equity including unrealized P&L, for the loss breaker (#301).
+
+        Defaults to ``get_balance()[1]``: adapters whose balance tuple already
+        carries true equity (Alpaca's ``account.equity``) need no override.
+        Adapters whose ``get_balance`` equity slot is really balance (cTrader,
+        per the #267 decision that sizing stays on realized balance) override
+        this so ONLY the breaker sees equity-with-unrealized-P&L. Sizing must
+        keep reading ``get_balance`` - this method exists so the breaker never
+        changes what sizing sees.
+        """
+        _, equity = await self.get_balance()
+        return float(equity)
+
     async def get_quote(self, symbol: str) -> LiveQuote:
         """Return the current broker bid/ask for ``symbol``.
 
@@ -392,6 +500,44 @@ class BaseLiveAdapter(ABC):
         treats that (and any other failure) as "unknown" and refuses the entry.
         """
         raise NotImplementedError(f"{type(self).__name__} cannot provide a pip value")
+
+    async def resolve_exit_position_target(
+        self, symbol: str, entry_signal_id: str
+    ) -> int | None:
+        """The broker position id that ``entry_signal_id``'s order opened (#382).
+
+        Per-lot exits name the entry signal they close; on a hedging broker
+        each entry is its own position, so the close must be pinned to that
+        position rather than sized off an ambiguous book. Adapters whose
+        positions carry no addressable id (netting books) return ``None`` and
+        the caller sizes the close off the single symbol position as before.
+        Implementations must return ``None`` only when no open position
+        resolves - never guess - and may raise when the lookup itself is
+        unreadable, which fails the exit closed.
+        """
+        return None
+
+    async def get_max_leverage(self, symbol: str) -> float | None:
+        """The broker's maximum leverage for this account and ``symbol``.
+
+        ``None`` means the broker maximum cannot be determined; callers must
+        treat that as 1x (fail safe), never guess a higher ceiling (#240).
+        """
+        return None
+
+    async def get_used_margin(self) -> float | None:
+        """Margin the broker already holds against open positions, account ccy.
+
+        The pre-submit leverage ceiling is MT5-style free margin — account
+        equity minus this figure, times the maximum leverage (#359, the live
+        half of the #347 backtest rule). ``None`` means it cannot be
+        determined; callers must treat that as unverifiable and refuse the
+        order (fail closed), never guess a lower figure — an understated used
+        margin would overstate free margin.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} cannot report used margin"
+        )
 
     # ── Operator safety controls ──────────────────────────────────────────────────────────────
     #
@@ -418,6 +564,16 @@ class BaseLiveAdapter(ABC):
         """Whether this adapter can safely amend a broker-side protective stop."""
         return False
 
+    @property
+    def supports_supertrend_flip(self) -> bool:
+        """Whether this adapter instance can run the live ``supertrend_flip``
+        workflow (#168): native partial closes, protective-stop listing and
+        in-place amendment, market data for the signal timeframe, and a
+        provably demo/paper account. Default ``False``: an adapter that cannot
+        prove every one of those must never be managed by the flip loop.
+        """
+        return False
+
     async def list_protective_stops(self) -> list[ProtectiveStop]:
         """Working stop orders on the reducing side of each open position.
 
@@ -425,6 +581,26 @@ class BaseLiveAdapter(ABC):
         from, including after a daemon restart.
         """
         raise NotImplementedError(f"{type(self).__name__} cannot list protective stops")
+
+    async def list_reconciliation_orders(self) -> list[BrokerOrderView]:
+        """Every working order on the account, normalized for reconciliation.
+
+        Unlike :meth:`working_order_ids`, this view keeps the client order id and
+        marks position-protection orders so the reconciler can tell an untracked
+        entry/exit from a bracket leg or attached stop/target (#303).
+        """
+        raise NotImplementedError(f"{type(self).__name__} cannot list reconciliation orders")
+
+    async def get_order_state(self, order_id: str, *, client_order_id: str = "") -> str | None:
+        """Classify one order the ledger expects, by broker or client order id.
+
+        Returns ``"working"`` when the broker still has it open,
+        ``"terminal"`` when it reached a final state other than filled
+        (cancelled, expired, rejected), ``"filled"`` when it executed,
+        and ``None`` when the state cannot be determined - an unknown answer
+        must never suppress a reconciliation finding (#303).
+        """
+        raise NotImplementedError(f"{type(self).__name__} cannot look up order state")
 
     def round_stop_price(self, stop: ProtectiveStop, price: float) -> float:
         """Round a computed stop to a price the broker accepts.
@@ -463,6 +639,25 @@ class BaseLiveAdapter(ABC):
         """
         raise NotImplementedError(f"{type(self).__name__} cannot cancel open orders")
 
+    async def cancel_orders(
+        self, order_refs: Collection[str], *, symbol: str
+    ) -> ControlOutcome:
+        """Cancel the working orders ``order_refs`` names on ``symbol``.
+
+        ``order_refs`` carries broker order ids and client order ids (the
+        persisted signal id) of orders the caller owns - the internal
+        strategy runner uses it to retire one deployment's still-working
+        entry orders before a strategy exit (#382). The adapter cancels
+        exactly the working orders it can match on either id, on the named
+        symbol, and nothing else: other deployments' orders and position
+        protections are never touched. Raises NotImplementedError when the
+        broker cannot cancel a named subset, so a caller cannot mistake a
+        silent no-op for "the orders are gone".
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} cannot cancel named orders"
+        )
+
     async def close_all_positions(self) -> ControlOutcome:
         """Flatten every open position for this account.
 
@@ -480,6 +675,25 @@ class BaseLiveAdapter(ABC):
         """
         raise NotImplementedError(
             f"{type(self).__name__} cannot identify orphaned protections"
+        )
+
+    async def opening_signal_id_for_position(self, position_id: int) -> str | None:
+        """The persisted entry signal whose order opened ``position_id`` (#168).
+
+        The live ``supertrend_flip`` manager binds its plan to a broker
+        position only when this read proves the position was opened by the
+        entry's own order - never by size or timing coincidence. ``None``
+        means PROVEN foreign/ambiguous (the broker read the position's
+        orders and none, or several, resolve to a persisted signal); an
+        unreadable order list or a failed read must RAISE so the caller can
+        retry a transient failure instead of treating it as foreign
+        ownership. Callers must treat ``None`` as fail-closed. The default
+        cannot prove anything, so it RAISES: returning ``None`` would read
+        as "proven foreign" and silently end every first-sight plan on an
+        adapter that never implemented the read.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} cannot prove which signal opened a position"
         )
 
     async def backfill_commissions(self) -> int:

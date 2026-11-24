@@ -13,11 +13,23 @@ This module intentionally ports the strategy's portable core:
 It does not attempt a full 1:1 reproduction of the original Pine source's
 stateful swing/BOS, MTF `request.security(...)`, session gating, or partial-exit
 management. Those differences are documented in the accompanying README.
+
+Exits (1.1.0): the Supertrend flip is a close-triggered MARKET exit with no
+explicit ``exit_price``; under the default ``signal_exit_fill="next_open"`` it
+fills at the next bar's open. Stop-loss and fixed-RRR take-profit carry their
+level in ``exit_price``, which engines honor only with
+``exit_order_type="level"`` (not emitted here): on native the protective
+``stop_loss``/``sl_price`` covers the stop, while the take-profit level is
+not enforced as a resting order. ``use_trailing_sl`` is unsupported on the
+native engine (maintainer decision 2026-11-23): native refuses a resolved
+``use_trailing_sl=true`` config before running — as well as any value that is
+not an unambiguous boolean or a known true/false token — while
+``false``/absent keeps only the initial stop protective.
 """
 
 STRATEGY_META = {
     "name": "Custom Swings + Supertrend",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "tags": {
         "type": ["trend-following"],
         "source": "Pine Script v5 — DTFX Structure Swings + Supertrend Strategie",
@@ -112,6 +124,15 @@ def generate_signals(
         breakeven_r = float(params.get("breakeven_r", breakeven_r))
         use_trailing_sl = _coerce_bool(params.get("use_trailing_sl", use_trailing_sl))
         trade_direction = str(params.get("trade_direction", trade_direction))
+
+    # The native engine calls generate_signals kwargs-style, bypassing the
+    # legacy params-dict branch above. Coerce the boolean switches
+    # unconditionally so string values from JSON/CLI params cannot stay
+    # truthy (a non-empty "false" would otherwise trail the stop).
+    ema_filter_enabled = _coerce_bool(ema_filter_enabled)
+    use_rrr = _coerce_bool(use_rrr)
+    use_breakeven = _coerce_bool(use_breakeven)
+    use_trailing_sl = _coerce_bool(use_trailing_sl)
 
     trade_direction = str(trade_direction).strip().lower()
 
@@ -247,11 +268,12 @@ def generate_signals(
                     exit_price_arr[i] = round(ep_exit, 6)
 
                 # Check Supertrend flip to DOWN
+                # Close-triggered MARKET exit: no explicit exit_price (it fills
+                # at the next bar's open under next_open; a price equal to this
+                # bar's close would contradict that fill).
                 elif sell_signal[i]:
                     exited = True
-                    ep_exit = close[i]
                     reason = "supertrend_flip"
-                    exit_price_arr[i] = round(ep_exit, 6)
 
                 # Update current stop
                 current_sl = sl
@@ -289,11 +311,10 @@ def generate_signals(
                     exit_price_arr[i] = round(ep_exit, 6)
 
                 # Check Supertrend flip to UP
+                # Close-triggered MARKET exit: no explicit exit_price (see LONG).
                 elif buy_signal[i]:
                     exited = True
-                    ep_exit = close[i]
                     reason = "supertrend_flip"
-                    exit_price_arr[i] = round(ep_exit, 6)
 
                 # Update current stop
                 current_sl = sl

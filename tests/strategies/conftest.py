@@ -28,6 +28,7 @@ import pytest
 
 from runner.engines.contract import parse_date_bound
 from shared.constants import DATA_DIR
+from tests.helpers import resolve_ohlcv_root
 
 # Opt-in strict mode: missing local market data fails instead of skipping.
 FAIL_ON_MISSING_DATA = str(os.environ.get("FAIL_ON_MISSING_DATA", "")).strip().lower() in {
@@ -108,9 +109,11 @@ def _ohlcv_root() -> Path:
     """Dataset root the gate reads from: the explicit opt-in if set, else ``DATA_DIR/ohlcv``.
 
     Read-only by design, so pointing it at a real dataset cannot trip the repo data-dir guard.
+    Resolution is shared with the cross-directory dataset users through
+    :func:`tests.helpers.resolve_ohlcv_root`, so the gate and the engine tests
+    can never disagree about which directory the opt-in names.
     """
-    override = str(os.environ.get(TEST_OHLCV_DIR_ENV, "")).strip()
-    return Path(override) if override else Path(DATA_DIR) / "ohlcv"
+    return resolve_ohlcv_root(DATA_DIR)
 
 
 def _candidate_ohlcv_paths(symbol: str, timeframe: str) -> list[Path]:

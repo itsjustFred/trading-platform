@@ -30,7 +30,7 @@ deployments: []
         """,
     )
 
-    with pytest.raises(ValueError, match="duplicate account id.*shared-account"):
+    with pytest.raises(ValueError, match=r"duplicate account id.*shared-account"):
         parse_live_deployments_config(config_path)
 
 
@@ -50,7 +50,7 @@ deployments: []
         """,
     )
 
-    with pytest.raises(ValueError, match="cTrader broker account.*12345"):
+    with pytest.raises(ValueError, match=r"cTrader broker account.*12345"):
         parse_live_deployments_config(config_path)
 
 
@@ -72,7 +72,7 @@ deployments: []
         """,
     )
 
-    with pytest.raises(ValueError, match="cTrader broker account.*123"):
+    with pytest.raises(ValueError, match=r"cTrader broker account.*123"):
         parse_live_deployments_config(config_path)
 
 

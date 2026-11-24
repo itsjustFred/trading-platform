@@ -248,8 +248,7 @@ class DeltaReportBuilder:
 
         # Convert comparison results to matched trade deltas
         matched_trades: list[TradeDelta] = []
-        for comp in comparison_results:
-            matched_trades.append(cls._comparison_result_to_delta(comp))
+        matched_trades.extend(cls._comparison_result_to_delta(comp) for comp in comparison_results)
 
         # Convert anomalies to appropriate buckets
         missing_trades: list[TradeDelta] = []

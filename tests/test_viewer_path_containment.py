@@ -287,6 +287,422 @@ def test_portfolio_delete_rejects_path_traversal_id(security_client, tmp_path):
     assert secret.exists()
 
 
+def test_optimization_get_encoded_slash_never_reaches_handler(
+    security_client, tmp_path
+):
+    """Routing smoke test: %2F decodes to '/' and the router 404s first.
+
+    The handler-level regression coverage lives in
+    test_optimization_get_handler_rejects_traversal_id below.
+    """
+    secret = tmp_path / "secret.json"
+    secret.write_text(
+        json.dumps({"id": "secret", "secret_marker": "LEAKED"}), encoding="utf-8"
+    )
+
+    response = security_client.get("/api/optimizations/..%2Fsecret")
+
+    assert response.status_code in {404, 422}
+    assert "LEAKED" not in response.text
+    assert secret.exists()
+
+
+def test_optimization_get_handler_rejects_traversal_id(security_client, tmp_path):
+    """Handler-level containment: '../secret' must not read tmp/secret.json."""
+    import asyncio
+
+    import viewer.main as viewer_app_module
+
+    secret = tmp_path / "secret.json"
+    secret.write_text(
+        json.dumps({"id": "secret", "secret_marker": "LEAKED"}), encoding="utf-8"
+    )
+
+    with pytest.raises(viewer_app_module.HTTPException) as exc_info:
+        asyncio.run(viewer_app_module.get_optimization("../secret"))
+    assert exc_info.value.status_code == 404
+    assert secret.exists()
+
+
+def test_portfolio_get_encoded_slash_never_reaches_handler(
+    security_client, tmp_path
+):
+    """Routing smoke test: %2F decodes to '/' and the router 404s first.
+
+    The handler-level regression coverage lives in
+    test_portfolio_get_handler_rejects_traversal_id below.
+    """
+    secret = tmp_path / "secret.json"
+    secret.write_text(
+        json.dumps({"id": "secret", "name": "LEAKED"}), encoding="utf-8"
+    )
+
+    response = security_client.get("/api/portfolios/..%2Fsecret")
+
+    assert response.status_code in {404, 422}
+    assert "LEAKED" not in response.text
+    assert secret.exists()
+
+
+def test_portfolio_get_handler_rejects_traversal_id(security_client, tmp_path):
+    """Handler-level containment: '../secret' must not read tmp/secret.json."""
+    import asyncio
+
+    import viewer.main as viewer_app_module
+
+    secret = tmp_path / "secret.json"
+    secret.write_text(
+        json.dumps({"id": "secret", "name": "LEAKED"}), encoding="utf-8"
+    )
+
+    with pytest.raises(viewer_app_module.HTTPException) as exc_info:
+        asyncio.run(viewer_app_module.get_portfolio("../secret"))
+    assert exc_info.value.status_code == 404
+    assert secret.exists()
+
+
+def test_portfolio_compare_rejects_query_string_traversal(security_client, tmp_path):
+    portfolios_dir = tmp_path / "portfolios"
+    portfolios_dir.mkdir(parents=True, exist_ok=True)
+    secret = tmp_path / "secret.json"
+    secret.write_text(
+        json.dumps({"id": "secret", "name": "LEAKED"}), encoding="utf-8"
+    )
+
+    response = security_client.get("/api/portfolios/compare", params={"ids": "../secret"})
+
+    assert response.status_code == 200
+    assert "LEAKED" not in response.text
+    assert secret.exists()
+
+
+def test_optimization_loader_rejects_path_traversal_id(security_client, tmp_path):
+    from viewer import core as legacy_viewer
+
+    portfolios_dir = tmp_path / "portfolios"
+    portfolios_dir.mkdir(parents=True, exist_ok=True)
+    optimizations_dir = tmp_path / "optimizations"
+    optimizations_dir.mkdir(parents=True, exist_ok=True)
+    secret = tmp_path / "secret.json"
+    secret.write_text(
+        json.dumps({"id": "secret", "secret_marker": "LEAKED"}), encoding="utf-8"
+    )
+
+    assert legacy_viewer._load_optimization_payload("../secret") is None
+    assert legacy_viewer._load_optimization_payload("..\\secret") is None
+
+
+def test_portfolio_payload_loader_rejects_path_traversal_id(security_client, tmp_path):
+    import viewer.main as viewer_app_module
+
+    portfolios_dir = tmp_path / "portfolios"
+    portfolios_dir.mkdir(parents=True, exist_ok=True)
+    secret = tmp_path / "secret.json"
+    secret.write_text(
+        json.dumps({"id": "secret", "name": "LEAKED"}), encoding="utf-8"
+    )
+
+    with pytest.raises(viewer_app_module.HTTPException) as exc_info:
+        viewer_app_module._load_portfolio_payload("../secret")
+    assert exc_info.value.status_code == 404
+    with pytest.raises(viewer_app_module.HTTPException):
+        viewer_app_module._load_portfolio_payload("..\\secret")
+
+
+def test_portfolio_rename_encoded_slash_never_reaches_handler(
+    security_client, tmp_path
+):
+    """Routing smoke test: %2F decodes to '/' and the router 404s first.
+
+    The handler-level regression coverage lives in
+    test_portfolio_rename_handler_rejects_traversal_id below.
+    """
+    secret = tmp_path / "secret.json"
+    original = json.dumps({"id": "secret", "name": "original"})
+    secret.write_text(original, encoding="utf-8")
+
+    response = security_client.patch(
+        "/api/portfolios/..%2Fsecret",
+        json={"name": "pwned"},
+    )
+
+    assert response.status_code in {404, 422}
+    assert secret.read_text(encoding="utf-8") == original
+
+
+def test_portfolio_rename_handler_rejects_traversal_id(security_client, tmp_path):
+    """Handler-level containment: '../secret' must not rewrite tmp/secret.json."""
+    import asyncio
+
+    import viewer.main as viewer_app_module
+
+    secret = tmp_path / "secret.json"
+    original = json.dumps({"id": "secret", "name": "original"})
+    secret.write_text(original, encoding="utf-8")
+
+    with pytest.raises(viewer_app_module.HTTPException) as exc_info:
+        asyncio.run(
+            viewer_app_module.rename_portfolio(
+                "../secret",
+                viewer_app_module.NameUpdateRequest(name="pwned"),
+            )
+        )
+    assert exc_info.value.status_code == 404
+    assert secret.read_text(encoding="utf-8") == original
+
+
+def test_portfolio_rename_missing_id_returns_404_and_creates_no_file(
+    security_client, tmp_path
+):
+    """Rename of an id with no portfolio file or DB record 404s and writes nothing."""
+    import asyncio
+
+    import viewer.main as viewer_app_module
+
+    portfolios_dir = tmp_path / "portfolios"
+    portfolios_dir.mkdir(parents=True, exist_ok=True)
+    missing_id = f"missing-{uuid.uuid4().hex}"
+
+    with pytest.raises(viewer_app_module.HTTPException) as exc_info:
+        asyncio.run(
+            viewer_app_module.rename_portfolio(
+                missing_id,
+                viewer_app_module.NameUpdateRequest(name="new-name"),
+            )
+        )
+    assert exc_info.value.status_code == 404
+    assert list(portfolios_dir.glob("*.json")) == []
+
+
+def test_portfolio_rename_updates_enumerated_portfolio_file(
+    security_client, tmp_path, monkeypatch
+):
+    """The rename write target comes from the directory listing, and the
+    updated JSON is persisted under the same enumerated path."""
+    import asyncio
+
+    import viewer.main as viewer_app_module
+
+    portfolios_dir = tmp_path / "portfolios"
+    portfolios_dir.mkdir(parents=True, exist_ok=True)
+    portfolio_id = f"pf-{uuid.uuid4().hex[:12]}"
+    target = portfolios_dir / f"{portfolio_id}.json"
+    target.write_text(
+        json.dumps({"id": portfolio_id, "name": "old-name", "components": []}),
+        encoding="utf-8",
+    )
+    saved: list[object] = []
+    monkeypatch.setattr(
+        viewer_app_module, "save_portfolio_record", saved.append
+    )
+
+    result = asyncio.run(
+        viewer_app_module.rename_portfolio(
+            portfolio_id,
+            viewer_app_module.NameUpdateRequest(name="new-name"),
+        )
+    )
+
+    assert result == {"id": portfolio_id, "name": "new-name", "status": "updated"}
+    assert len(saved) == 1
+    rewritten = json.loads(target.read_text(encoding="utf-8"))
+    assert rewritten["name"] == "new-name"
+    assert rewritten["id"] == portfolio_id
+
+
+def test_portfolio_rename_db_only_portfolio_skips_file_write(
+    security_client, tmp_path, monkeypatch
+):
+    """A portfolio that exists only as a DB record still renames: the record
+    save persists it and no new JSON file is created for it."""
+    import asyncio
+
+    import viewer.main as viewer_app_module
+
+    portfolios_dir = tmp_path / "portfolios"
+    portfolios_dir.mkdir(parents=True, exist_ok=True)
+    portfolio_id = f"dbonly-{uuid.uuid4().hex[:12]}"
+    record_payload = {
+        "id": portfolio_id,
+        "name": "db-name",
+        "created_at": "2024-01-01T00:00:00+00:00",
+        "account_capital": 100000.0,
+        "components": [],
+        "combined_stats": {},
+        "combined_equity": [],
+        "trades": [],
+    }
+    monkeypatch.setattr(
+        viewer_app_module, "load_portfolio_record", lambda _id: record_payload
+    )
+    saved: list[object] = []
+    monkeypatch.setattr(
+        viewer_app_module, "save_portfolio_record", saved.append
+    )
+
+    result = asyncio.run(
+        viewer_app_module.rename_portfolio(
+            portfolio_id,
+            viewer_app_module.NameUpdateRequest(name="renamed"),
+        )
+    )
+
+    assert result["status"] == "updated"
+    assert len(saved) == 1
+    assert list(portfolios_dir.glob("*.json")) == []
+
+
+def test_portfolio_rename_failed_dump_leaves_original_file_intact(
+    security_client, tmp_path, monkeypatch
+):
+    """A json.dump failure mid-write must not truncate the portfolio JSON.
+
+    The write used to stream into ``open("w")``, so a non-serialisable value
+    raised *after* the truncate and left a permanently unreadable file -
+    ``_load_portfolio_payload`` has no DB fallback once the JSON is corrupt.
+    The rename now serialises into a temp file and ``os.replace``s it, so the
+    original survives any dump failure and no ``.tmp`` file is left behind.
+    """
+    import asyncio
+
+    import viewer.main as viewer_app_module
+
+    portfolios_dir = tmp_path / "portfolios"
+    portfolios_dir.mkdir(parents=True, exist_ok=True)
+    portfolio_id = f"pf-{uuid.uuid4().hex[:12]}"
+    target = portfolios_dir / f"{portfolio_id}.json"
+    original_text = json.dumps(
+        {"id": portfolio_id, "name": "old-name", "components": []}
+    )
+    target.write_text(original_text, encoding="utf-8")
+
+    def failing_dump(obj, fp, *args, **kwargs):
+        fp.write('{"name": "truncated')
+        raise TypeError("Object of type int64 is not JSON serializable")
+
+    monkeypatch.setattr(viewer_app_module.json, "dump", failing_dump)
+    saved: list[object] = []
+    monkeypatch.setattr(
+        viewer_app_module, "save_portfolio_record", saved.append
+    )
+
+    with pytest.raises(viewer_app_module.HTTPException) as exc_info:
+        asyncio.run(
+            viewer_app_module.rename_portfolio(
+                portfolio_id,
+                viewer_app_module.NameUpdateRequest(name="new-name"),
+            )
+        )
+
+    assert exc_info.value.status_code == 500
+    assert target.read_text(encoding="utf-8") == original_text
+    leftovers = list(portfolios_dir.glob("*.tmp")) + list(
+        portfolios_dir.glob(".*.tmp")
+    )
+    assert leftovers == []
+
+
+def test_portfolio_rename_skips_symlinked_json_entry(
+    security_client, tmp_path, monkeypatch
+):
+    """A symlinked ``{id}.json`` must not become the rename's write target.
+
+    Without the ``is_symlink`` guard, ``a.json -> b.json`` inside
+    PORTFOLIOS_DIR plus a DB record for ``a`` would let renaming ``a``
+    overwrite ``b.json`` through the resolved path. The read side already
+    refuses symlinks, so the write side must skip them too: the rename then
+    persists only the DB record and ``b.json`` stays byte-identical.
+    """
+    import asyncio
+
+    import viewer.main as viewer_app_module
+
+    portfolios_dir = tmp_path / "portfolios"
+    portfolios_dir.mkdir(parents=True, exist_ok=True)
+    victim = portfolios_dir / "victim.json"
+    victim_text = json.dumps({"id": "victim", "name": "do-not-touch"})
+    victim.write_text(victim_text, encoding="utf-8")
+    link = portfolios_dir / "linked.json"
+    try:
+        link.symlink_to(victim.name)
+    except OSError:
+        pytest.skip("symlinks are not permitted in this environment")
+
+    record_payload = {
+        "id": "linked",
+        "name": "linked-name",
+        "created_at": "2024-01-01T00:00:00+00:00",
+        "account_capital": 100000.0,
+        "components": [],
+        "combined_stats": {},
+        "combined_equity": [],
+        "trades": [],
+    }
+    monkeypatch.setattr(
+        viewer_app_module,
+        "load_portfolio_record",
+        lambda _id: record_payload if _id == "linked" else None,
+    )
+    saved: list[object] = []
+    monkeypatch.setattr(
+        viewer_app_module, "save_portfolio_record", saved.append
+    )
+
+    result = asyncio.run(
+        viewer_app_module.rename_portfolio(
+            "linked",
+            viewer_app_module.NameUpdateRequest(name="renamed"),
+        )
+    )
+
+    assert result["status"] == "updated"
+    assert len(saved) == 1
+    assert victim.read_text(encoding="utf-8") == victim_text
+
+
+def test_portfolio_rename_unsafe_id_with_db_record_returns_404(
+    security_client, tmp_path, monkeypatch
+):
+    """An id that cannot name a file inside PORTFOLIOS_DIR 404s before the DB
+    write, even when a record exists: the safe-id guard is what keeps a
+    legacy unsafe-id record from being written back under a path-unsafe name.
+    """
+    import asyncio
+
+    import viewer.main as viewer_app_module
+
+    portfolios_dir = tmp_path / "portfolios"
+    portfolios_dir.mkdir(parents=True, exist_ok=True)
+    record_payload = {
+        "id": "../evil",
+        "name": "evil-name",
+        "created_at": "2024-01-01T00:00:00+00:00",
+        "account_capital": 100000.0,
+        "components": [],
+        "combined_stats": {},
+        "combined_equity": [],
+        "trades": [],
+    }
+    monkeypatch.setattr(
+        viewer_app_module, "load_portfolio_record", lambda _id: record_payload
+    )
+    saved: list[object] = []
+    monkeypatch.setattr(
+        viewer_app_module, "save_portfolio_record", saved.append
+    )
+
+    with pytest.raises(viewer_app_module.HTTPException) as exc_info:
+        asyncio.run(
+            viewer_app_module.rename_portfolio(
+                "../evil",
+                viewer_app_module.NameUpdateRequest(name="pwned"),
+            )
+        )
+
+    assert exc_info.value.status_code == 404
+    assert saved == []
+
+
 # ---------------------------------------------------------------------------
 # Seam 6: CSV signal replay containment
 # ---------------------------------------------------------------------------
@@ -384,6 +800,7 @@ def test_signal_replay_accepts_csv_inside_data_dir(
             "filepath": str(csv_path),
             "start_date": "2026-02-23",
             "end_date": "2026-02-24",
+            "fees_zero": True,
         },
     )
 
@@ -906,3 +1323,228 @@ def test_failed_maintenance_rollback_retains_journal_and_requires_manual_cleanup
         db_delete=lambda _asset_id: True,
     )
     assert journal.exists()
+
+
+# ---------------------------------------------------------------------------
+# Seam 8: backtest result paths loaded by id (#230)
+# ---------------------------------------------------------------------------
+
+
+def _trades_result(backtest_id: str):
+    from shared.models import BacktestMeta, BacktestResult
+
+    return BacktestResult(
+        meta=BacktestMeta(
+            id=backtest_id,
+            created_at="2026-01-01T00:00:00Z",
+            engine="native",
+            strategies=["Demo"],
+        ),
+        trades=[],
+        stats={},
+    )
+
+
+def test_contained_backtest_result_path_refuses_escape(monkeypatch, tmp_path):
+    from viewer import core
+
+    backtests_dir = tmp_path / "backtests"
+    backtests_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(core, "BACKTESTS_DIR", backtests_dir)
+
+    expected = (backtests_dir / "abc-123_X.Y").resolve()
+    assert (
+        core._contained_backtest_result_path("abc-123_X.Y")
+        == expected.with_name("abc-123_X.Y.trades.json")
+    )
+
+    for raw in (
+        "../escape",
+        "..",
+        ".",
+        "",
+        "   ",
+        "a/b",
+        "a\\b",
+        "/abs/path",
+        "C:\\temp\\x",
+        "a:b",
+        "..%2Fescape",
+        "id name",
+        None,
+    ):
+        assert core._contained_backtest_result_path(raw) is None, f"{raw!r} must be refused"
+
+    # A symlink planted inside the tree must not be followed out of it.
+    outside = tmp_path / "outside.trades.json"
+    _trades_result("outside").save(outside)
+    link = backtests_dir / "link.trades.json"
+    try:
+        link.symlink_to(outside)
+    except OSError:
+        pytest.skip("symlink creation not permitted on this platform")
+    assert core._contained_backtest_result_path("link") is None
+
+
+def test_backtest_result_load_root_confines_reads(tmp_path):
+    from shared.models import BacktestResult
+
+    backtests_dir = tmp_path / "backtests"
+    backtests_dir.mkdir(parents=True, exist_ok=True)
+    inside = backtests_dir / "ok.trades.json"
+    outside = tmp_path / "outside.trades.json"
+    _trades_result("ok").save(inside)
+    _trades_result("outside").save(outside)
+
+    assert BacktestResult.load(inside, root=backtests_dir).meta.id == "ok"
+    with pytest.raises(ValueError):
+        BacktestResult.load(outside, root=backtests_dir)
+    # A `..` segment that resolves outside the root is refused after resolving.
+    with pytest.raises(ValueError):
+        BacktestResult.load(backtests_dir / ".." / "outside.trades.json", root=backtests_dir)
+    # Without root the CLI contract is unchanged: any path loads as given.
+    assert BacktestResult.load(outside).meta.id == "outside"
+
+
+def test_backtest_stats_endpoint_never_reads_outside_backtests_dir(
+    security_client, tmp_path, monkeypatch
+):
+    """An id that escapes BACKTESTS_DIR is a 404, not a file read (#230).
+
+    The spy proves the stats handler's ``_load_result`` fallback never
+    reaches ``BacktestResult.load`` for a rejected id: containment refuses
+    before any file read, not merely after a failed open.
+    """
+    import viewer.main as viewer_app_module
+
+    backtests_dir = tmp_path / "backtests"
+    backtests_dir.mkdir(parents=True, exist_ok=True)
+    # Pin the stored-row lookup to miss so the JSON fallback — the path the
+    # bare join used to take — is what the spy observes.
+    monkeypatch.setattr(viewer_app_module, "load_backtest_result", lambda _id: None)
+    load_calls = _spy_backtest_result_load(monkeypatch)
+
+    # A perfectly valid artifact parked OUTSIDE the backtests tree: if the
+    # loader still joined the raw id it would be served.
+    secret = tmp_path / "escape.trades.json"
+    _trades_result("escape").save(secret)
+
+    for bad_id in ("../escape", "..%2Fescape", "a/b", "/etc/passwd"):
+        response = security_client.get(f"/api/backtest/{bad_id}/stats")
+        assert response.status_code in {400, 404, 422}, (bad_id, response.status_code)
+        assert response.status_code != 200
+    assert secret.exists()
+    assert load_calls == []
+
+    # The contained id still serves normally.
+    _trades_result("real-run").save(backtests_dir / "real-run.trades.json")
+    response = security_client.get("/api/backtest/real-run/stats")
+    assert response.status_code == 200, response.text
+    assert load_calls == [str((backtests_dir / "real-run.trades.json").resolve())]
+
+
+def test_backtest_rename_refuses_an_id_that_escapes_backtests_dir(
+    security_client, tmp_path, monkeypatch
+):
+    """The write side of the same join must not rename-save outside the tree."""
+    import asyncio
+
+    from fastapi import HTTPException
+
+    import viewer.main as viewer_app_module
+
+    result = _trades_result("row-loaded")
+    monkeypatch.setattr(viewer_app_module, "_load_result", lambda _id: result)
+
+    response = security_client.patch(
+        "/api/backtests/..%2Fescape",
+        json={"name": "new title"},
+    )
+    assert response.status_code in {400, 404, 422}, response.status_code
+
+    # Routing cannot deliver a raw separator, but the guard must refuse the
+    # id itself: a stored row loaded by id is never written outside the tree.
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(
+            viewer_app_module.rename_backtest(
+                "../escape", viewer_app_module.NameUpdateRequest(name="x")
+            )
+        )
+    assert exc_info.value.status_code == 400
+    assert not (tmp_path / "escape.trades.json").exists()
+
+
+def _spy_backtest_result_load(monkeypatch) -> list[str]:
+    """Record every ``BacktestResult.load`` call; delegate to the real one.
+
+    Patches the classmethod on the shared model, so both viewer loaders
+    (``viewer.core`` and ``viewer.main``) are observed through one spy.
+    """
+    from shared.models import BacktestResult
+
+    calls: list[str] = []
+    real_load = BacktestResult.load.__func__
+
+    def _spy(cls, path, *, root=None):
+        calls.append(str(path))
+        return real_load(cls, path, root=root)
+
+    monkeypatch.setattr(BacktestResult, "load", classmethod(_spy))
+    return calls
+
+
+def test_core_load_result_never_reads_outside_backtests_dir(monkeypatch, tmp_path):
+    """``viewer.core._load_result`` must refuse escape ids before any read (#230).
+
+    A valid artifact is planted at every location the OLD bare
+    ``BACKTESTS_DIR / f"{id}.trades.json"`` join would have resolved to —
+    outside the tree for ``..``/absolute ids, inside it for an id with a
+    space — so a regression to the bare join is caught by the spy, not just
+    by the return value.
+    """
+    from viewer import core
+
+    backtests_dir = tmp_path / "backtests"
+    backtests_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(core, "BACKTESTS_DIR", backtests_dir)
+    calls = _spy_backtest_result_load(monkeypatch)
+
+    _trades_result("escape").save(tmp_path / "escape.trades.json")
+    absolute_id = str(tmp_path / "abs")
+    _trades_result("abs").save(tmp_path / "abs.trades.json")
+    _trades_result("id name").save(backtests_dir / "id name.trades.json")
+    _trades_result("real").save(backtests_dir / "real.trades.json")
+
+    for bad_id in ("../escape", "..", "a/b", absolute_id, "id name"):
+        assert core._load_result(bad_id) is None, bad_id
+    # The contained id still loads — proving the spy observes real calls.
+    assert core._load_result("real") is not None
+    assert calls == [str((backtests_dir / "real.trades.json").resolve())]
+
+
+def test_main_load_result_never_reads_outside_backtests_dir(monkeypatch, tmp_path):
+    """``viewer.main._load_result`` JSON fallback is contained the same way.
+
+    The stored-row lookup is pinned to miss so the JSON fallback is what
+    runs — exactly the path the bare join used to take — regardless of what
+    other tests left in the shared test database.
+    """
+    import viewer.main as viewer_app_module
+
+    backtests_dir = tmp_path / "backtests"
+    backtests_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(viewer_app_module, "BACKTESTS_DIR", backtests_dir)
+    monkeypatch.setattr(viewer_app_module, "load_backtest_result", lambda _id: None)
+    monkeypatch.setattr(viewer_app_module, "save_result_to_sqlite", lambda _r: None)
+    calls = _spy_backtest_result_load(monkeypatch)
+
+    _trades_result("escape").save(tmp_path / "escape.trades.json")
+    absolute_id = str(tmp_path / "abs")
+    _trades_result("abs").save(tmp_path / "abs.trades.json")
+    _trades_result("id name").save(backtests_dir / "id name.trades.json")
+    _trades_result("real").save(backtests_dir / "real.trades.json")
+
+    for bad_id in ("../escape", "..", "a/b", absolute_id, "id name"):
+        assert viewer_app_module._load_result(bad_id) is None, bad_id
+    assert viewer_app_module._load_result("real") is not None
+    assert calls == [str((backtests_dir / "real.trades.json").resolve())]

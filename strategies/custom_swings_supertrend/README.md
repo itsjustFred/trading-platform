@@ -26,6 +26,8 @@ Die Quelle kombiniert mehrere Exit-Mechaniken:
 - optionale Partial Exits
 - Exit bei Gegen-Flip des Supertrends
 
+**Fill-Konvention (Version 1.1.0):** Marktausstiege auf Close-Basis (Supertrend-Gegen-Flip) tragen kein `exit_price` mehr (kein Close-Fill) und fuellen am naechsten Bar-Open (`signal_exit_fill="next_open"`). Stop-Loss und fester RRR-Take-Profit tragen ihr Level in `exit_price`, das Engines nur mit `exit_order_type="level"` als Level ausfuehren (wird hier nicht gesetzt): der protective `stop_loss`/`sl_price` deckt den Stop ab, das Take-Profit-Level ist auf native kein ruhender Order. `use_trailing_sl` ist auf native seit der Maintainer-Decision 2026-11-23 nicht mehr lauffähig: der Engine-Contract lehnt `use_trailing_sl=true` ab, weil Trailing-Stops nicht modelliert werden; `false`/weggelassen bleibt erlaubt und nur der initiale Stop ist protective.
+
 ### Stop-Loss
 Im Original nicht rein statisch, sondern struktur- bzw. bandbasiert:
 
@@ -77,6 +79,8 @@ Folgende Pine-spezifische bzw. stark zustandsbehaftete Teile sind **nicht vollst
 | Breakeven-Level   | `breakeven_r`        | `1.0`   |
 | Trailing          | `use_trailing_sl`    | `False` |
 | Richtung          | `trade_direction`    | `both`  |
+
+`use_trailing_sl=true` wird vom nativen Engine-Contract abgelehnt (Decision 2026-11-23); fuer native-Laeufe `false` verwenden.
 
 ### Indikator-Semantik (P3, #317)
 ATR ist `ta.atr` (Wilder/RMA mit SMA-Seed, `ta.tr(true)` mit `high-low` als Bar 0), nicht mehr die alte null-gesetzte SMA(TR); EMAs sind `ta.ema` (SMA-Seed, NaN-Warm-up). Warm-up-Bars sind `NaN`, nie `0`.

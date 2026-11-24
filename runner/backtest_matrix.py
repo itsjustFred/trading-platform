@@ -42,6 +42,8 @@ from runner.backtest_grid import (
     run_backtest_grid,
 )
 from runner.engines.base import resolve_legacy_max_position_kwarg
+from runner.engines.contract import default_signal_exit_fill_for_engine
+from runner.slippage import assert_slippage_supported
 from shared.constants import DATA_DIR
 from shared.database import save_grid_result
 from shared.logging import get_logger
@@ -114,6 +116,9 @@ def run_strategy_grid(
                     end_date=end,
                     initial_capital=capital,
                     risk_per_trade_pct=risk_per_trade_pct,
+                    # Frozen engines refuse next_open; declare the legacy
+                    # close fill they simulate so meta stays truthful.
+                    signal_exit_fill=default_signal_exit_fill_for_engine(getattr(engine, "name", "")),
                 )
                 result = engine.run(config, str(entry.file_path))
 
@@ -128,7 +133,7 @@ def run_strategy_grid(
                 # never read raw.
                 def _num_or_none(*keys: str) -> float | None:
                     for key in keys:
-                        value = stats.get(key)
+                        value = stats.get(key)  # noqa: B023 - helper is only called within this iteration
                         if value is None:
                             continue
                         try:
@@ -495,6 +500,13 @@ def run_backtest_matrix(
         )
     if not entries:
         raise ValueError("No matching strategies found")
+
+    # #130: fail fast when a declared slippage model cannot be honoured —
+    # each strategy may resolve to a different engine (``--engine`` empty
+    # means the strategy's own detected engine), and run_backtest_grid
+    # repeats the check per strategy as a second line of defence.
+    for entry in entries:
+        assert_slippage_supported(engine or entry.engine, params)
 
     all_rows: list[dict[str, Any]] = []
     all_daily_rows: list[dict[str, Any]] = []

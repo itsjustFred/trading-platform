@@ -15,12 +15,16 @@ Meta/tags below describe the implemented single-instrument behavior.
 
 STRATEGY_META = {
     "name": "Volatility-Regime Long (single instrument)",
-    "version": "1.1.0",
+    "version": "1.2.0",
     "source_url": "https://github.com/desenyon/quantconnect-strategies/blob/main/risk_parity_strategy.py",
     "notes": (
         "- Implementiert NICHT die Multi-Asset-Risk-Parity-Allokation des "
         "Originals; diese Strategie handelt ein einzelnes Instrument "
         "long/flat mit Volatilitaets-Regime- und SMA-Trendfilter.\n"
+        "- 1.2.0: Regime- und Trend-Ausstiege sind Market-Exits ohne "
+        "exit_price=close (Fill am naechsten Open); das ATR-Stop-Level "
+        "reist in sl_price (exit-bar exit_price ist nur mit "
+        "exit_order_type='level' ein Level).\n"
         "- Die echte Multi-Asset-Risk-Parity-Gewichtung liegt in "
         "scripts/run_risk_parity_backtest.py (QuantConnect-Reimplementierung) "
         "und runner/risk_parity_optimizer.py."
@@ -40,6 +44,8 @@ STRATEGY_META = {
 
 import numpy as np
 import pandas as pd
+
+from shared.strategy_markers import entry_exit_markers
 
 
 def generate_signals(df: pd.DataFrame, params: dict):
@@ -98,14 +104,18 @@ def generate_signals(df: pd.DataFrame, params: dict):
             trend_break = not bool(uptrend.iloc[i])
             if stop_hit or regime_break or trend_break:
                 exits.iloc[i] = True
+                # The ATR stop's level travels in sl_price (the protective
+                # stop fills it); the exit-bar exit_price is only honored as
+                # a level with exit_order_type="level", which is not emitted
+                # here. The regime / trend breaks are close-triggered MARKET
+                # exits: no explicit exit_price, so they fill at the next
+                # bar's open.
                 if stop_hit:
                     exit_price.iloc[i] = active_stop
                     exit_reason.iloc[i] = "stop_loss"
                 elif regime_break:
-                    exit_price.iloc[i] = float(close.iloc[i])
                     exit_reason.iloc[i] = "regime_break"
                 else:
-                    exit_price.iloc[i] = float(close.iloc[i])
                     exit_reason.iloc[i] = "trend_break"
                 in_trade = False
                 active_stop = np.nan
@@ -126,35 +136,6 @@ def generate_signals(df: pd.DataFrame, params: dict):
         "exit_price": exit_price,
         "exit_reason": exit_reason,
     }
-    drawings: list[dict] = []
-    if "timestamp" in df.columns:
-        entry_times = pd.to_datetime(
-            df.loc[entries[entries].index, "timestamp"], utc=True, errors="coerce"
-        ).dropna()
-        exit_times = pd.to_datetime(
-            df.loc[exits[exits].index, "timestamp"], utc=True, errors="coerce"
-        ).dropna()
-        for ts in entry_times.iloc[:30]:
-            drawings.append(
-                {
-                    "type": "marker",
-                    "time": ts.isoformat(),
-                    "position": "belowBar",
-                    "shape": "arrowUp",
-                    "color": "#22c55e",
-                    "text": "Entry",
-                }
-            )
-        for ts in exit_times.iloc[:30]:
-            drawings.append(
-                {
-                    "type": "marker",
-                    "time": ts.isoformat(),
-                    "position": "aboveBar",
-                    "shape": "arrowDown",
-                    "color": "#ef4444",
-                    "text": "Exit",
-                }
-            )
+    drawings = entry_exit_markers(df, entries, exits)
 
     return entries, exits, indicators_dict, drawings
