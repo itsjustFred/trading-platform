@@ -1,0 +1,25 @@
+live_runner/alpaca_adapter.py
+  s_f1c7734ad2ce5c::t_2b42dab4fd29ff 8,19,123-131,1466-1475,1569-1572,1574-1619,1625-1628,3800-3803,3994-3995,4419-4420,4422,5761-5763,5766-5768,5770-5772,5851-5860,5923,6156-6162,6165-6175,6177-6188,6840-6865,6880-6881,6888-6894,6908-6910,7005-7016
+shared/database.py
+  s_f1c7734ad2ce5c::t_871327b651be19 1183-1192,1207-1224,1230-1235,1240-1241,1255-1256
+tests/test_alpaca_adapter.py
+  s_f1c7734ad2ce5c::t_68d047e6b70d0e 14,4153-4276,4381-4463,4511-4512,4527-4530,5384-5448,5508-5633,5677-5684,5692-5698,5783-5788,5797-5798
+tests/test_database_control_plane.py
+  s_f1c7734ad2ce5c::t_a9d98300e04cc3 558-577
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "78553a862d62dedab9e43fa18469b7878c702bd5",
+  "prompts": {},
+  "sessions": {
+    "s_f1c7734ad2ce5c": {
+      "agent_id": {
+        "tool": "devin",
+        "id": "s_f1c7734ad2ce5c",
+        "model": "unknown"
+      },
+      "human_author": "itsjustFred <justfred.business@gmail.com>"
+    }
+  }
+}
