@@ -6856,7 +6856,8 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         deals: list[Any] = []
         # id(deal) -> the top-level ``[from, to)`` window that returned it:
         # the fallback retry window for a deal whose own timestamp is
-        # unreadable when its processing fails.
+        # unreadable when its processing fails. ``id`` keys are safe only
+        # because ``deals`` keeps every deal object alive for the whole pass.
         deal_scan_ranges: dict[int, list[int]] = {}
         remaining_pending: list[list[int]] = []
         consecutive_failures = 0
@@ -7020,6 +7021,22 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                             }
                         },
                     )
+                except BaseException:
+                    # ``asyncio.CancelledError`` and ``KeyboardInterrupt``
+                    # bypass ``except Exception``: this deal and every deal
+                    # not yet reached stay unprocessed, so their windows go
+                    # back on the cursor before the interrupt propagates -
+                    # the ``finally`` below must never persist a cursor that
+                    # marks them covered.
+                    deal_retry_pending.extend(
+                        self._broker_close_deal_retry_ranges(
+                            deals[index:],
+                            deal_scan_ranges,
+                            floor_ms=floor_ms,
+                            now_ms=now_ms,
+                        )
+                    )
+                    raise
         finally:
             # The cursor advances only now - after every gathered deal was
             # processed or re-queued - so a transient read error can never
@@ -7030,7 +7047,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                     for start, end in uncovered_pending + deal_retry_pending
                 ]
             )
-            self._persist_broker_close_scan_state(
+            await self._persist_broker_close_scan_state(
                 final_pending, floor_ms=floor_ms, now_ms=now_ms
             )
         exposure_pending = [
@@ -7117,12 +7134,19 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 ranges.append([int(floor_ms), int(now_ms)])
         return ranges
 
-    def _persist_broker_close_scan_state(
+    async def _persist_broker_close_scan_state(
         self, pending: list[list[int]], *, floor_ms: int, now_ms: int
     ) -> None:
-        """Write the scan cursor; a DB failure is loud but never fatal."""
+        """Write the scan cursor off the event loop; a DB failure is loud but never fatal.
+
+        ``set_live_adapter_state`` takes ``BEGIN IMMEDIATE`` with the shared
+        30 s busy timeout: run inline it would stall every cTrader connection's
+        reactor heartbeats while another writer holds the lock, so it goes
+        through ``asyncio.to_thread`` like every other DB call in the pass.
+        """
         try:
-            set_live_adapter_state(
+            await asyncio.to_thread(
+                set_live_adapter_state,
                 self.account_config_id,
                 BROKER_CLOSE_SCAN_STATE_KEY,
                 {

@@ -1894,6 +1894,98 @@ def test_reconcile_retries_unprocessed_deals_after_an_order_list_api_error(
     assert _ledger(database) == pytest.approx(0.0)
 
 
+def test_reconcile_retries_unprocessed_deals_after_a_cancellation(
+    database,
+) -> None:
+    """C1: ``asyncio.CancelledError`` is a ``BaseException`` - the ``finally``
+    used to persist the cursor as fully covered anyway, and every deal not
+    yet processed was lost forever. The interrupted deal AND the one never
+    reached must go back on the cursor so the next healthy pass books them."""
+    signal_id = _persist_entry(database, qty=10.0)
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    deal_old = _close_deal(
+        deal_id=9811, order_id=CLOSE_ORDER_ID, volume=4.0,
+        timestamp_ms=now_ms - 2 * 86_400_000,
+    )
+    deal_new = _close_deal(
+        deal_id=9812, order_id=779, volume=6.0,
+        timestamp_ms=now_ms - 86_400_000,
+    )
+    order_details = {
+        CLOSE_ORDER_ID: _closing_order(order_id=CLOSE_ORDER_ID, volume=4.0),
+        779: _closing_order(order_id=779, volume=6.0),
+    }
+    first = _reconcilable_adapter(
+        database,
+        position_orders={POSITION_ID: [_entry_order(signal_id)]},
+        deal_list=[deal_old, deal_new],
+        order_details=order_details,
+    )
+    inner_send = first._send_request_with_refresh_retry
+    cancelled_once = {"done": False}
+
+    async def cancel_order_list_once(request: Any, **kwargs: Any) -> Any:
+        if isinstance(request, _OrderListReq) and not cancelled_once["done"]:
+            cancelled_once["done"] = True
+            raise asyncio.CancelledError()
+        return await inner_send(request, **kwargs)
+
+    first._send_request_with_refresh_retry = cancel_order_list_once  # type: ignore[assignment]
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(first.reconcile_executions())
+
+    assert _ledger(database) == pytest.approx(10.0)
+
+    second = _reconcilable_adapter(
+        database,
+        position_orders={POSITION_ID: [_entry_order(signal_id)]},
+        deal_list=[deal_old, deal_new],
+        order_details=order_details,
+    )
+    asyncio.run(second.reconcile_executions())
+
+    # The cancelled deal and the one never reached are both booked on pass 2.
+    assert _ledger(database) == pytest.approx(0.0)
+
+
+def test_reconcile_persists_the_scan_cursor_off_the_event_loop(
+    database, monkeypatch
+) -> None:
+    """S-new: the cursor write runs through ``asyncio.to_thread`` like every
+    other DB call in the pass - a locked SQLite file must not stall the event
+    loop (and every cTrader connection's heartbeats) for the 30 s busy
+    timeout."""
+    import threading
+
+    import shared.database as db
+
+    signal_id = _persist_entry(database, qty=10.0)
+    close = _close_deal(deal_id=9903, timestamp_ms=T0_MS + 3_600_000)
+    adapter = _reconcilable_adapter(
+        database,
+        position_orders={POSITION_ID: [_entry_order(signal_id)]},
+        deal_list=[close],
+        order_details={CLOSE_ORDER_ID: _closing_order()},
+    )
+    write_threads: list[threading.Thread] = []
+    real_set_state = db.set_live_adapter_state
+
+    def recording_set_state(*args: Any, **kwargs: Any) -> Any:
+        write_threads.append(threading.current_thread())
+        return real_set_state(*args, **kwargs)
+
+    monkeypatch.setattr(
+        "live_runner.ctrader_adapter.set_live_adapter_state",
+        recording_set_state,
+    )
+    asyncio.run(adapter.reconcile_executions())
+
+    assert _ledger(database) == pytest.approx(0.0)
+    assert write_threads
+    main_thread = threading.main_thread()
+    assert all(thread is not main_thread for thread in write_threads)
+
+
 def test_reconcile_scan_gap_overlaps_the_previous_covered_top(database) -> None:
     """S1: the fresh gap starts a margin BELOW the last covered top, so a
     deal the deal list had not yet shown - or one stamped before it by clock
