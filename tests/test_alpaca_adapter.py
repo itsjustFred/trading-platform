@@ -2129,6 +2129,7 @@ def test_get_order_state_maps_broker_statuses() -> None:
     rest fail closed (#303)."""
     orders = {
         "ord-expired": SimpleNamespace(status="expired"),
+        "ord-filled": SimpleNamespace(status="filled"),
         "ord-working": SimpleNamespace(status="new"),
         "ord-weird": SimpleNamespace(status="some_future_status"),
         "ord-done-for-day": SimpleNamespace(status="done_for_day"),
@@ -2147,6 +2148,8 @@ def test_get_order_state_maps_broker_statuses() -> None:
     adapter = _adapter(client)
 
     assert asyncio.run(adapter.get_order_state("ord-expired")) == "terminal"
+    # A fill is not a dead order: callers must never resubmit it as terminal.
+    assert asyncio.run(adapter.get_order_state("ord-filled")) == "filled"
     assert asyncio.run(adapter.get_order_state("ord-working")) == "working"
     assert asyncio.run(adapter.get_order_state("ord-weird")) is None
     assert asyncio.run(adapter.get_order_state("ord-missing")) is None
@@ -2615,3 +2618,105 @@ def test_a_refused_cancel_is_not_excused_by_an_unreadable_filled_qty() -> None:
     adapter = _adapter(client)
 
     assert asyncio.run(adapter._cancel_already_gone(client, "entry-1")) is False
+
+
+# ── #382: cancel_orders adapter-level pins ───────────────────────────────────
+#
+# The runner-level tests only stub ``cancel_orders``; these pin the broker
+# side. Only top-level working orders on the named symbol may be cancelled -
+# nested bracket legs are position protection and are never even listed.
+
+
+def test_cancel_orders_cancels_matching_orders_by_id_and_client_id() -> None:
+    client = _FakeTradingClient(
+        orders=[
+            _FakeOrder("o1", "AAPL", "buy"),
+            _FakeOrder("o2", "AAPL", "sell"),
+            _FakeOrder("o3", "MSFT", "buy"),
+        ]
+    )
+    client.orders[1].client_order_id = "sig-2"
+
+    outcome = asyncio.run(
+        _adapter(client).cancel_orders({"o1", "sig-2"}, symbol="AAPL")
+    )
+
+    assert sorted(client.cancelled) == ["o1", "o2"]
+    assert outcome.completed == 2
+    assert outcome.unidentified == ()
+    assert outcome.failed == ()
+
+
+def test_cancel_orders_leaves_other_symbols_and_unmatched_orders() -> None:
+    client = _FakeTradingClient(
+        orders=[
+            _FakeOrder("o1", "MSFT", "buy"),  # ref names it, wrong symbol
+            _FakeOrder("o2", "AAPL", "buy"),  # right symbol, no ref names it
+        ]
+    )
+    client.orders[0].client_order_id = "sig-1"
+
+    outcome = asyncio.run(
+        _adapter(client).cancel_orders({"o1", "sig-1", "missing"}, symbol="AAPL")
+    )
+
+    assert client.cancelled == []
+    assert outcome.completed == 0
+
+
+def test_cancel_orders_never_lists_nested_bracket_legs() -> None:
+    """A bracket leg's id in the refs must not reach it: legs are position
+    protection, listed only under their parent - never by the open-orders
+    read this sweep uses."""
+    leg = _FakeOrder("leg-1", "AAPL", "sell", order_type="stop")
+    parent = _FakeOrder(
+        "parent-1", "AAPL", "buy", order_class="bracket", legs=[leg]
+    )
+    client = _FakeTradingClient(orders=[parent])
+
+    outcome = asyncio.run(
+        _adapter(client).cancel_orders({"leg-1"}, symbol="AAPL")
+    )
+
+    assert client.cancelled == []
+    assert outcome.completed == 0
+
+
+def test_cancel_orders_reports_a_refused_cancel_as_failed() -> None:
+    client = _FakeTradingClient(
+        orders=[
+            _FakeOrder("o1", "AAPL", "buy"),
+            _FakeOrder("o2", "AAPL", "buy"),
+        ]
+    )
+
+    def _cancel(order_id: str) -> None:
+        client.cancelled.append(order_id)
+        if order_id == "o1":
+            raise RuntimeError("broker refused the cancel")
+
+    client.cancel_order_by_id = _cancel
+
+    outcome = asyncio.run(
+        _adapter(client).cancel_orders({"o1", "o2"}, symbol="AAPL")
+    )
+
+    assert client.cancelled == ["o1", "o2"]
+    assert outcome.completed == 1
+    assert len(outcome.failed) == 1 and outcome.failed[0].startswith("o1:")
+
+
+def test_cancel_orders_matched_order_without_id_is_unidentified() -> None:
+    client = _FakeTradingClient(orders=[])
+    client.orders.append(
+        SimpleNamespace(
+            id=None, client_order_id="sig-x", symbol="AAPL", side="buy"
+        )
+    )
+
+    outcome = asyncio.run(
+        _adapter(client).cancel_orders({"sig-x"}, symbol="AAPL")
+    )
+
+    assert client.cancelled == []
+    assert outcome.unidentified == ("order:'sig-x'",)

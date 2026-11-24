@@ -96,37 +96,37 @@ Central definition: `shared/trailing.py` (`LIVE_SUPPORTED_TRAILING_MODES_BY_BROK
 
 | Broker  | `none` | `percent` | `supertrend_flip` |
 |---------|--------|-----------|-------------------|
-| Alpaca  | yes    | yes       | no (see below)    |
-| cTrader | yes    | no        | no                |
+| Alpaca  | yes    | yes       | no                |
+| cTrader | yes    | no        | opt-in only       |
 
-cTrader stays on `none`: the daemon has no cTrader market data to trail on, and the adapter does
-not declare the `supports_stop_amendment` capability. Unknown brokers get `none` only.
+cTrader `percent` stays off: the adapter deliberately does not declare
+`supports_stop_amendment`, so the percent trail and the broker reconciler treat every cTrader
+account exactly as before. `supertrend_flip` runs live on cTrader ONLY for a deployment that
+carries the explicit opt-in and whose account is provably demo/paper:
 
-**Why `supertrend_flip` is not live yet (#168)**
+- **Opt-in key:** `settings.live_supertrend_flip` on the `LiveDeploymentConfig` (truthy:
+  `true`, `"true"`, `"1"`, `"yes"`, `"on"`). Absent or unrecognized values fail closed - the
+  mode is refused at deployment validation and at signal time.
+- **Account gate:** the adapter must be a cTrader demo/paper account
+  (`supports_supertrend_flip` + the daemon's `_adapter_is_demo` check). Live cTrader accounts
+  and every non-opted deployment behave exactly as on `main`.
+- **Workflow** (`live_runner/supertrend_flip.py`): TP1 partial close sized to the broker's
+  volume step, intent persisted before every submit, confirmation from broker-reported closed
+  volume (position drop AND the execution ledger - a partial fill completes the tranche and is
+  never resubmitted), the plan bound to the broker `position_id` recorded at entry fill
+  (mismatch = alert + no action), breakeven stop after the TP1 bar (never loosens a tighter
+  stop), then Supertrend-flip exit of the remainder at market. Flip closes route through the
+  daemon's per-symbol exit lock and in-flight-exit check.
+- **Live/replay differences (accepted):** live TP1 triggers on bid polling, so an intrapoll
+  wick that replay's bar-high would catch can be missed; live closes the remainder at market
+  while replay fills at the next bar's open. cTrader serves only sub-day bars
+  (`1m`/`5m`/`15m`/`30m`/`1h`) for this workflow because the broker anchors `4h`/`1d`/`1w` to
+  its server day/week, not the UTC alignment replay uses.
 
-The replay backtest executes it (`runner/engines/signal_replay_adapter.py`); live rejects it on
-every broker, at deployment validation and at signal time like any other unsupported mode. The
-blocker is the entry order, not the trailing loop:
-
-- The Alpaca entry is a BRACKET for the full quantity. Its take-profit leg sits at the signal's
-  `take_profit`, which for RamJet *is* the TP1 price, so a `supertrend_flip` entry would close
-  100 % at TP1 instead of `tp1_exit_percent`.
-- Alpaca reserves the quantity of every working reducing-side order. While the bracket's stop
-  leg holds the full quantity, no separate TP1 limit (or partial market) order for part of it
-  is accepted, and shrinking the stop first would leave the TP1 part without a stop.
-
-Proposed design for the follow-up: for `supertrend_flip` entries, submit the position as two
-orders with deterministic client order ids derived from the signal id: a BRACKET for the TP1
-tranche (take profit at TP1, stop at the initial stop) and an OTO for the remainder (stop only).
-Tranche quantities must be whole shares (Alpaca brackets refuse fractional quantities) and the
-rounding must be mirrored by the replay. The trailing loop then (a) detects TP1 as the tranche
-bracket's take-profit fill and amends the remainder's stop to breakeven with the existing
-replace, (b) evaluates the RamJet Supertrend on each closed bar, with enough history to match the
-replay's warm-up, and (c) on the first red bar after activation closes the remainder through the
-adapter's locked flatten path (cancel, close, restore the stop on failure), so no stop is left
-orphaned. The only state that is not derivable from the broker is "activated"; it would be
-persisted on the entry signal row (`live_signals.metadata`). This changes order submission,
-recovery and fill reconciliation, which today assume one broker order per signal.
+**Alpaca remains replay-only** (#168 route (a), built on #350): the Alpaca entry is a
+full-quantity bracket whose take-profit leg sits at the TP1 price, so a partial TP1 exit needs
+a different entry order structure first - see #350. cTrader needed none of that: it closes
+part of a position natively.
 
 **Replay semantics to mirror live (decided 2026-11-16, `#176`)**
 
@@ -367,22 +367,55 @@ pre-existing ACTIVE row from a new one, so the flag gates all of them.
   engine uses for sizing). Live never runs unprotected.
 - Entries per symbol are capped by `settings["internal_max_open_per_symbol"]`
   (falling back to a same-named `STRATEGY_META` parameter): **default 1 open
-  position per deployment+symbol**. Only `1` is accepted today — N>1 is not
-  supported end-to-end (per-position sizing, protection and exits on the
-  qty-netted live ledger are unresolved; maintainer decision 2026-11-22:
-  N=1, N>1 is #382), so any other value fails closed: **entries are disabled
-  for the deployment but exits keep flowing** — a bad cap must never
-  suppress an exit on an open position. Open positions are counted from the
-  deployment's own persisted ledger with oldest-first FIFO attribution of
-  reducing fills; an entry with no fills counts only while the broker still
-  lists its order as working or holds a non-zero position in the symbol
-  (a filled-but-unbooked entry is not working, so the position is what
-  proves it open), so a canceled or expired unfilled order does not lock
-  the symbol. The count is updated within a pass so same-pass signals
-  cannot exceed the cap, and the deployment total is capped at the engine
-  maximum of 5. If the ledger, the broker's working-order list or its
-  positions cannot be read, entries fail closed the same way — exits still
-  evaluate.
+  position per deployment+symbol**. Integer values `1` through
+  `TRADE_ENGINE_MAX_POSITIONS` (5) are accepted (#382); each entry is an
+  independent lot with its own persisted fills, bracket, stop and TP. A
+  strategy exit closes **every** open lot for the deployment+symbol: when
+  more than one filled lot is open the runner emits one targeted exit per
+  lot (`exit_target_signal_id` names the entry it closes), so a hedging
+  broker can pin each close to the position its entry opened and a netting
+  broker still nets the aggregate. Anything else — 0, negatives,
+  non-integers, booleans, or values above 5 — fails closed: **entries are
+  disabled for the deployment but exits keep flowing** — a bad cap must
+  never suppress an exit on an open position. Open positions are counted
+  from the deployment's own persisted ledger; a reducing fill is credited
+  to the entry it names first — `exit_target_signal_id` on a targeted
+  per-lot exit, `parent_signal_id` on a broker-side close — before any
+  oldest-first FIFO pooling of unattributed reductions, and a named lot
+  floors at zero rather than lending excess to siblings. An entry with
+  no fills counts only while
+  the broker still lists its order as working or holds a non-zero position
+  in the symbol (a filled-but-unbooked entry is not working, so the
+  position is what proves it open), so a canceled or expired unfilled
+  order does not lock the symbol. The count is updated within a pass so
+  same-pass signals cannot exceed the cap, and the deployment total is
+  capped at the engine maximum of 5. If the ledger, the broker's
+  working-order list or its positions cannot be read, entries fail closed
+  the same way — exits still evaluate; if the per-lot ledger cannot be
+  read, exits fall back to a single untargeted close (a hedging broker
+  then refuses the ambiguous close rather than guess).
+  **Account-shape refusals (cap > 1):** the cap above 1 is refused —
+  entries disabled, exits still evaluated — on Alpaca accounts until
+  #350 lands (a netted book cannot prove a per-lot exit against
+  bracket-leg reservations), on cTrader accounts that cannot prove they
+  hedge positions (`ProtoOAAccountType` NETTED or unreadable: a netted
+  book merges several entries into one position whose per-lot exit cannot
+  be sized safely), and on any deployment carrying the
+  `live_supertrend_flip` opt-in (the flip workflow manages exactly one
+  position per symbol). On a *hedging* cTrader book each targeted exit is
+  pinned to the position its entry opened — but only when that position's
+  opening orders belong exclusively to the entry's signal; a position
+  shared with other openers (a netted book, or a scale-in the ledger
+  cannot attribute) resolves to no pin and the exit sizes off the lot
+  residual on the single broker row instead. The resolver's per-position
+  order reads are cached inside the account lock only while the
+  position's broker volume is unchanged — a cached read may never be the
+  stale proof that pins a lot to a shared position.
+  **Entry-order retirement:** a strategy exit also cancels this
+  deployment's still-working *entry* orders for the symbol (by broker
+  order id or client order id, inside the per-account order-placement
+  lock) before the exits go out, so a late fill cannot open a lot past
+  the close. Position protections are never in the cancellable set.
   A same-bar reversal (exit + new entry on one bar) emits the exit but the
   entry waits one bar: the closing position still counts against the cap
   until the next evaluation.
@@ -459,6 +492,34 @@ gets the fallback-distance broker stop, so the daemon's SL/TP guard always
 sees a real stop. A *stale* exit is skipped like a stale entry — with the
 unbounded-TP policy the position is then held until the fallback stop or
 the next exit signal.
+
+**Order-placement serialization (#362).** Every broker position/quantity read
+that feeds sizing, the pre-submit caps, leverage or exit quantity, and the
+`adapter.submit_order` call it feeds, runs inside one per-account critical
+section (`account_order_placement` in `live_runner/account_order_lock.py`;
+the daemon reaches it through `_account_order_placement`). Two of this
+daemon's own signal submissions of the same account — entries and exits of
+any deployment, Discord or internal — can never interleave another of this
+daemon's signal submissions, or a STOPPED/kill-switch flatten, between the
+read and the write; submissions of *different* accounts are unaffected. The
+lock does **not** make the read→write atomic against the broker: a working
+order can still fill inside the section (a resting entry, a bracket leg, a
+broker-side close or a manual trade), and broker reconciliation remains the
+backstop for that residual race. The wait is bounded
+(`ACCOUNT_ORDER_LOCK_TIMEOUT_SECONDS`, 120 s): a submission that cannot start
+inside it is refused (`decision.refused` with reason
+`account_order_lock_timeout` on the leased path,
+`AccountOrderLockTimeoutError` from `submit_order_with_risk`) — it never
+sizes or submits on a read that may be stale. Signal age is re-checked after
+the lock is acquired, so a signal that expired while queued is refused
+(`signal_aged_out_during_lock_wait`). Exits still hold the per-account+symbol
+`_exit_lock` first; the account lock is always the inner one, and adapter
+code must not take `_exit_lock` inside it. STOPPED enforcement and
+kill-switch flatten sweeps take the same account lock; adapter-internal
+read→write paths outside the submit chokepoints use
+`adapter.order_placement_lock()` (not re-entrant — never inside
+`submit_order`). Trailing-stop amendments and broker reconciliation keep
+their own adapter-level serialization and are not queued behind this lock.
 
 **Idempotency.** Each emitted intent carries a producer-stable
 `metadata.idempotency_key` derived from deployment, symbol, timeframe, bar
@@ -1206,6 +1267,17 @@ database.
 | `GET /api/live/kill-switch` | the state the daemon enforces, plus every scope's mode, since, by and reason |
 | `POST /api/live/kill-switch/halt` | halt one scope; `confirmed_scope` required for `orders` and `flatten` |
 | `POST /api/live/kill-switch/resume` | lift the halt on one scope; `confirmed_scope` required |
+
+The Live Hub page carries the same control: a kill-switch panel above the account grid shows
+the enforced state per scope (global, every live account, and any halted scope the account list
+does not name), offers all three modes, keeps `entries` one click, and puts `orders`, `flatten`
+and resume behind a confirmation dialog that echoes the scope. A scope that is already halted
+offers only the stricter modes as escalation (`entries` → orders/flatten, `orders` → flatten) -
+a weaker mode is refused by the server, so resuming first is never required to escalate. An
+unreadable state is displayed as fail-closed, not as "nothing halted": halt controls stay
+available while Resume is hidden. A failed refresh after a good read marks the panel stale -
+statuses read "last known:" and Resume is disabled - rather than passing the old state off as
+current.
 
 `entries` is deliberately unconfirmed: it refuses new entries and can cost nothing, so it stays
 one click in an incident. The modes that move money, and resuming trading, are confirmed on the

@@ -36,6 +36,7 @@ from pathlib import Path
 from typing import Any
 
 from live_runner.base_adapter import (
+    ORDER_STATE_FILLED,
     ORDER_STATE_TERMINAL,
     ORDER_STATE_WORKING,
     BaseLiveAdapter,
@@ -511,7 +512,14 @@ async def _broker_state(
     stops: tuple[ProtectiveStop, ...] = ()
     stops_supported = False
     list_stops = getattr(adapter, "list_protective_stops", None)
-    if callable(list_stops):
+    # Only adapters that declare stop-amendment capability feed the
+    # reconciler's protective-stop view. cTrader keeps its flip-workflow stop
+    # primitives for opted-in demo deployments but deliberately declares no
+    # ``supports_stop_amendment``, so every cTrader account reconciles exactly
+    # as on main (#168 review: no silent capability leak).
+    if callable(list_stops) and (
+        getattr(adapter, "supports_stop_amendment", False) is True
+    ):
         try:
             stops = tuple(
                 await _shielded_read(
@@ -841,7 +849,11 @@ class BrokerReconciliationManager:
             )
         except Exception:  # except-kind: money-decision
             return None
-        return state if state in (ORDER_STATE_WORKING, ORDER_STATE_TERMINAL) else None
+        return (
+            state
+            if state in (ORDER_STATE_WORKING, ORDER_STATE_TERMINAL, ORDER_STATE_FILLED)
+            else None
+        )
 
     async def _resolve_terminal_missing_orders(
         self,
@@ -898,7 +910,7 @@ class BrokerReconciliationManager:
                 timeout=min(remaining, BROKER_READ_TIMEOUT_SECONDS),
             )
             detail["broker_order_state"] = state or "unknown"
-            if state == ORDER_STATE_TERMINAL:
+            if state in (ORDER_STATE_TERMINAL, ORDER_STATE_FILLED):
                 terminal_ids.append(order_id or signal_id)
                 continue
             kept.append(ReconciliationFinding(kind=finding.kind, detail=detail))

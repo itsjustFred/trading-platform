@@ -637,6 +637,10 @@ def test_restore_reprobes_the_open_database_before_the_swap(
         for holder in holder_box:
             holder.terminate()
             holder.wait(timeout=10)
+        # The late opener was armed for the refused restore only: the retry
+        # below must run the real backup path, or it leaks another
+        # lock-holding subprocess the finally can no longer reap.
+        monkeypatch.setattr(db_backup, "backup_db", real_backup_db)
 
     # The live database was never swapped and no staged file was left behind.
     assert _read_state(db_path) == ([1.0], ["m1"])

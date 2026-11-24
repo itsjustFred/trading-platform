@@ -8,7 +8,7 @@ import os
 import re
 import subprocess
 import threading
-from collections.abc import Collection, Mapping
+from collections.abc import Collection, Iterable, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -4431,29 +4431,37 @@ def get_live_deployment_net_filled_qty(deployment_id: str, symbol: str) -> float
     return net
 
 
-def list_live_deployment_unfilled_entry_order_refs(deployment_id: str) -> set[str]:
+def list_live_deployment_unfilled_entry_order_refs(
+    deployment_id: str, symbol: str | None = None
+) -> set[str]:
     """Order references of this deployment's entries that have no fills yet (#360).
 
     Returns every broker order id *and* signal id (the broker's client order
     id is the canonical signal id) carried by entry signals whose persisted
     fill quantity is at most ``_EXIT_FILL_TOLERANCE``. Only the broker can say
     whether such an order is still working or dead, so the caller asks for the
-    working-order list only when this set is non-empty.
+    working-order list only when this set is non-empty. ``symbol`` narrows
+    the refs to one symbol's entries (#382: a strategy exit retires only that
+    symbol's still-working entries).
     """
     normalized_deployment_id = str(deployment_id or "").strip()
     if not normalized_deployment_id:
         raise ValueError("A deployment id is required for the unfilled entry refs")
+    normalized_symbol = str(symbol or "").strip().upper()
     init_db()
     with get_session() as session:
-        signal_rows = session.exec(
-            select(
-                LiveSignalModel.id,
-                LiveSignalModel.symbol,
-                LiveSignalModel.broker_order_id,
-                LiveSignalModel.source,
-                LiveSignalModel.metadata_json,
-            ).where(LiveSignalModel.deployment_id == normalized_deployment_id)
-        ).all()
+        statement = select(
+            LiveSignalModel.id,
+            LiveSignalModel.symbol,
+            LiveSignalModel.broker_order_id,
+            LiveSignalModel.source,
+            LiveSignalModel.metadata_json,
+        ).where(LiveSignalModel.deployment_id == normalized_deployment_id)
+        if normalized_symbol:
+            statement = statement.where(
+                func.upper(LiveSignalModel.symbol) == normalized_symbol
+            )
+        signal_rows = session.exec(statement).all()
         fill_rows = session.exec(
             select(
                 LiveExecutionModel.signal_id,
@@ -4493,15 +4501,16 @@ def list_live_deployment_open_entry_counts_by_symbol(
 
     An *open entry* is a persisted entry signal — not exit-only and not a
     broker-side close — that still holds quantity: its filled quantity minus
-    the reducing fills attributed to it, allocated oldest-first, is above
-    ``_EXIT_FILL_TOLERANCE``. Reducing fills are every fill on the
-    deployment's exit-only signals plus every broker-side close signal for
-    the symbol: the same rows the net ledger sums with the opposite sign.
-
-    FIFO attribution is an approximation — a deployment-level FULL_EXIT is
-    not tied to one entry — but it is conservative in the direction that
-    matters: a partially closed oldest entry keeps counting until its own
-    residual reaches zero.
+    the reducing fills credited to it, is above ``_EXIT_FILL_TOLERANCE``. A
+    reducing fill is credited to the entry it names first —
+    ``exit_target_signal_id`` on a targeted exit, ``parent_signal_id`` on a
+    broker-side close — and only unattributed reductions (deployment-level
+    exits, closes with no recorded parent) are allocated oldest-first. This
+    is the same attribution :func:`list_live_deployment_open_position_lots`
+    uses, so the lots always sum to this count; FIFO remains the fallback
+    for reductions no entry was named for, conservative in the direction
+    that matters: a partially closed oldest entry keeps counting until its
+    own residual reaches zero.
 
     An entry with no fills yet counts as one open position **only while the
     broker still lists its order as working** — a DAY entry that expired
@@ -4552,6 +4561,7 @@ def list_live_deployment_open_entry_counts_by_symbol(
                 LiveSignalModel.id,
                 LiveSignalModel.symbol,
                 LiveSignalModel.timestamp,
+                LiveSignalModel.action,
                 LiveSignalModel.broker_order_id,
                 LiveSignalModel.source,
                 LiveSignalModel.metadata_json,
@@ -4568,46 +4578,17 @@ def list_live_deployment_open_entry_counts_by_symbol(
         ).all()
     filled_by_signal = {str(signal_id): float(filled or 0.0) for signal_id, filled in fill_rows}
 
-    by_symbol: dict[str, list[dict[str, Any]]] = {}
-    for signal_id, symbol, timestamp, broker_order_id, source, metadata in signal_rows:
-        normalized_symbol = str(symbol or "").strip().upper()
+    by_symbol: dict[str, list[tuple[Any, ...]]] = {}
+    for row in signal_rows:
+        normalized_symbol = str(row[1] or "").strip().upper()
         if not normalized_symbol:
             continue
-        by_symbol.setdefault(normalized_symbol, []).append(
-            {
-                "signal_id": str(signal_id),
-                "timestamp": timestamp,
-                "broker_order_id": str(broker_order_id or ""),
-                "source": str(source or ""),
-                "metadata": metadata if isinstance(metadata, dict) else {},
-                "filled_qty": filled_by_signal.get(str(signal_id), 0.0),
-            }
-        )
+        by_symbol.setdefault(normalized_symbol, []).append(row)
 
     counts: dict[str, int] = {}
-    for symbol, signals in by_symbol.items():
-        reducing_qty = 0.0
-        entries: list[dict[str, Any]] = []
-        for signal in signals:
-            metadata = signal["metadata"]
-            is_close = (
-                _is_exit_only_signal_metadata(metadata)
-                or str(signal["source"] or "") == BROKER_CLOSE_SIGNAL_SOURCE
-            )
-            if is_close:
-                reducing_qty += max(0.0, signal["filled_qty"])
-            else:
-                entries.append(signal)
-        entries.sort(
-            key=lambda item: (
-                item["timestamp"] is None,
-                item["timestamp"] or datetime.min.replace(tzinfo=timezone.utc),
-                item["signal_id"],
-            )
-        )
-        remaining_reduction = reducing_qty
+    for symbol, rows in by_symbol.items():
         open_count = 0
-        for entry in entries:
+        for entry in _position_lot_entries(rows, filled_by_signal):
             entry_qty = max(0.0, entry["filled_qty"])
             if entry_qty <= _EXIT_FILL_TOLERANCE:
                 if working is None:
@@ -4629,13 +4610,165 @@ def list_live_deployment_open_entry_counts_by_symbol(
                 if still_open:
                     open_count += 1
                 continue
-            closed = min(entry_qty, remaining_reduction)
-            remaining_reduction -= closed
-            if entry_qty - closed > _EXIT_FILL_TOLERANCE:
+            if entry["residual_qty"] > _EXIT_FILL_TOLERANCE:
                 open_count += 1
         if open_count:
             counts[symbol] = open_count
     return counts
+
+
+def _reduction_target_signal_id(metadata: Mapping[str, Any]) -> str:
+    """The entry signal a reducing fill names, or ``""`` when it names none.
+
+    A targeted per-lot exit carries ``exit_target_signal_id`` (#382); a
+    broker-side close carries ``parent_signal_id`` — the entry whose position
+    the broker closed (#144). Both are exact attributions: on a hedging book
+    each lot is its own position and broker-side closes happen in any order,
+    so FIFO would mis-size every later per-lot exit.
+    """
+    for key in ("exit_target_signal_id", BROKER_CLOSE_PARENT_SIGNAL_KEY):
+        target = str(metadata.get(key) or "").strip()
+        if target:
+            return target
+    return ""
+
+
+def _position_lot_entries(
+    signal_rows: Iterable[tuple[Any, ...]],
+    filled_by_signal: dict[str, float],
+) -> list[dict[str, Any]]:
+    """FIFO-ordered entry lots with per-lot residual quantities.
+
+    Every row is either an entry or a reducing fill. A reducing fill is
+    credited to the entry it names (``exit_target_signal_id`` for a targeted
+    exit, ``parent_signal_id`` for a broker-side close) before anything else;
+    only unattributed reductions — deployment-level exits and closes no
+    parent was recorded for — are consumed oldest-first across the entries'
+    residuals. Each returned entry carries ``residual_qty``: its filled
+    quantity minus its attributed reductions minus its share of the
+    unattributed pool, floored at zero. Entries are sorted oldest-first.
+    """
+    unattributed_reducing_qty = 0.0
+    attributed_reducing_qty: dict[str, float] = {}
+    entries: list[dict[str, Any]] = []
+    for signal_id, sig_symbol, timestamp, action, broker_order_id, source, metadata in signal_rows:
+        metadata_dict = metadata if isinstance(metadata, dict) else {}
+        is_close = (
+            _is_exit_only_signal_metadata(metadata_dict)
+            or str(source or "") == BROKER_CLOSE_SIGNAL_SOURCE
+        )
+        if is_close:
+            qty = max(0.0, filled_by_signal.get(str(signal_id), 0.0))
+            target = _reduction_target_signal_id(metadata_dict)
+            if target:
+                attributed_reducing_qty[target] = (
+                    attributed_reducing_qty.get(target, 0.0) + qty
+                )
+            else:
+                unattributed_reducing_qty += qty
+        else:
+            entries.append(
+                {
+                    "signal_id": str(signal_id),
+                    "symbol": str(sig_symbol or "").strip().upper(),
+                    "timestamp": timestamp,
+                    "action": str(action or "").strip().lower(),
+                    "broker_order_id": str(broker_order_id or ""),
+                    "filled_qty": max(0.0, filled_by_signal.get(str(signal_id), 0.0)),
+                }
+            )
+    entries.sort(
+        key=lambda item: (
+            item["timestamp"] is None,
+            item["timestamp"] or datetime.min.replace(tzinfo=timezone.utc),
+            item["signal_id"],
+        )
+    )
+    remaining_reduction = unattributed_reducing_qty
+    for entry in entries:
+        entry_qty = entry["filled_qty"]
+        # The named lot's own closes come off first; an attribution that
+        # overshoots its entry (a ledger inconsistency) floors at zero rather
+        # than lending its excess to a sibling lot.
+        residual = max(
+            0.0,
+            entry_qty - attributed_reducing_qty.get(entry["signal_id"], 0.0),
+        )
+        closed = min(residual, remaining_reduction)
+        remaining_reduction -= closed
+        entry["residual_qty"] = residual - closed
+    return entries
+
+
+def list_live_deployment_open_position_lots(
+    deployment_id: str,
+    symbol: str,
+) -> list[dict[str, Any]]:
+    """The deployment's open position lots for ``symbol`` (#382).
+
+    One lot is one persisted *entry* signal whose residual filled quantity —
+    its fills minus the reducing fills credited to it — is still above
+    ``_EXIT_FILL_TOLERANCE``. A reducing fill is credited to the entry it
+    names first (``exit_target_signal_id`` on a targeted exit,
+    ``parent_signal_id`` on a broker-side close); only unattributed
+    reductions are allocated oldest-first. That is the same attribution
+    :func:`list_live_deployment_open_entry_counts_by_symbol` uses, so the
+    lots returned here always sum to the count that function reports for
+    the symbol.
+
+    Only *filled* residuals are returned: an unfilled entry is a working
+    order, not a position, and there is nothing for an exit to close. Each
+    row carries ``signal_id`` (the entry's stable identity — also the broker
+    client order id), ``symbol``, ``action`` (``buy``/``sell``, the side the
+    lot opens), ``qty`` (the residual quantity, always positive) and
+    ``timestamp``. Flat symbols return an empty list.
+    """
+    normalized_deployment_id = str(deployment_id or "").strip()
+    normalized_symbol = str(symbol or "").strip().upper()
+    if not normalized_deployment_id or not normalized_symbol:
+        raise ValueError("A deployment id and a symbol are required for position lots")
+    init_db()
+    with get_session() as session:
+        signal_rows = session.exec(
+            select(
+                LiveSignalModel.id,
+                LiveSignalModel.symbol,
+                LiveSignalModel.timestamp,
+                LiveSignalModel.action,
+                LiveSignalModel.broker_order_id,
+                LiveSignalModel.source,
+                LiveSignalModel.metadata_json,
+            ).where(LiveSignalModel.deployment_id == normalized_deployment_id)
+            .where(func.upper(LiveSignalModel.symbol) == normalized_symbol)
+        ).all()
+        fill_rows = session.exec(
+            select(
+                LiveExecutionModel.signal_id,
+                func.coalesce(func.sum(LiveExecutionModel.filled_qty), 0.0),
+            )
+            .join(LiveSignalModel, LiveExecutionModel.signal_id == LiveSignalModel.id)
+            .where(LiveSignalModel.deployment_id == normalized_deployment_id)
+            .where(func.upper(LiveSignalModel.symbol) == normalized_symbol)
+            .group_by(LiveExecutionModel.signal_id)
+        ).all()
+    filled_by_signal = {str(signal_id): float(filled or 0.0) for signal_id, filled in fill_rows}
+
+    entries = _position_lot_entries(signal_rows, filled_by_signal)
+    lots: list[dict[str, Any]] = []
+    for entry in entries:
+        residual = entry["residual_qty"]
+        if residual > _EXIT_FILL_TOLERANCE:
+            lots.append(
+                {
+                    "signal_id": entry["signal_id"],
+                    "symbol": entry["symbol"],
+                    "action": entry["action"],
+                    "qty": residual,
+                    "timestamp": entry["timestamp"],
+                    "broker_order_id": entry["broker_order_id"],
+                }
+            )
+    return lots
 
 
 def get_account_net_filled_qty_by_deployment(account_id: str, symbol: str) -> dict[str, float]:
@@ -4894,6 +5027,9 @@ def _list_unfilled_exit_orders(
                 "requested_qty": requested_qty,
                 "filled_qty": filled_qty,
                 "action": str(action or "").strip().lower(),
+                # ``exit_target_signal_id`` (#382) lets the in-flight guard
+                # tell a per-lot exit of one position from a close of another.
+                "metadata": metadata,
             }
         )
     return pending
@@ -4958,6 +5094,32 @@ def get_live_signal_broker_order_id(signal_id: str) -> str | None:
             return None
         broker_order_id = str(record.broker_order_id or "").strip()
     return broker_order_id or None
+
+
+def merge_live_signal_metadata(signal_id: str, updates: Mapping[str, Any]) -> bool:
+    """Merge ``updates`` into a signal's ``metadata_json`` and return success.
+
+    Read-modify-write under ``BEGIN IMMEDIATE`` like the other signal-state
+    writers, so two writers cannot lose each other's keys. Used by the live
+    ``supertrend_flip`` workflow (#168) to persist its per-position state on
+    the entry signal - the same row that already carries the plan, so the
+    workflow survives a daemon restart without a second store.
+    """
+    normalized_signal_id = str(signal_id or "").strip()
+    if not normalized_signal_id or not updates:
+        return False
+    init_db()
+    with get_session() as session:
+        session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        record = session.get(LiveSignalModel, normalized_signal_id)
+        if record is None:
+            return False
+        metadata = dict(record.metadata_json or {})
+        metadata.update(dict(updates))
+        record.metadata_json = metadata
+        session.add(record)
+        session.commit()
+    return True
 
 
 def get_live_signal_metadata(signal_id: str) -> dict[str, Any] | None:

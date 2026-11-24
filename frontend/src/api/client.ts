@@ -20,6 +20,10 @@ import type {
   LiveDeploymentConfig,
   LiveDeploymentDeleteResponse,
   LiveDeploymentStatusUpdateResponse,
+  LiveKillSwitchHaltResponse,
+  LiveKillSwitchMode,
+  LiveKillSwitchResumeResponse,
+  LiveKillSwitchState,
   LiveSignalLogResponse,
   LivePositionsResponse,
   LiveQuoteResponse,
@@ -444,6 +448,35 @@ export const deleteLiveDeployment = (deploymentId: string) =>
       `?confirm_deployment_id=${encodeURIComponent(deploymentId)}`,
     { method: "DELETE" },
   );
+
+// Kill switch. The state read is what the daemon enforces, so `readable:
+// false` must reach the UI as its own state rather than as "nothing halted".
+export const getLiveKillSwitch = () =>
+  fetchJSON<LiveKillSwitchState>("/live/kill-switch");
+// The modes that move money (`orders`, `flatten`) and every resume are
+// confirmed by echoing the scope back, exactly like the deployment controls:
+// the server refuses a bare call with 428, and the echo is what proves the
+// operator confirmed *this* scope. `entries` stays unconfirmed on purpose -
+// it can cost nothing and must remain one click in an incident.
+export const haltLiveKillSwitch = (
+  scope: string,
+  mode: LiveKillSwitchMode,
+  options?: { reason?: string; confirmedScope?: string },
+) =>
+  fetchJSON<LiveKillSwitchHaltResponse>("/live/kill-switch/halt", {
+    method: "POST",
+    body: JSON.stringify({
+      scope,
+      mode,
+      reason: options?.reason ?? "",
+      confirmed_scope: options?.confirmedScope ?? null,
+    }),
+  });
+export const resumeLiveKillSwitch = (scope: string, confirmedScope: string) =>
+  fetchJSON<LiveKillSwitchResumeResponse>("/live/kill-switch/resume", {
+    method: "POST",
+    body: JSON.stringify({ scope, confirmed_scope: confirmedScope }),
+  });
 
 // Services
 export const getServices = (type?: ServiceType) => {

@@ -36,6 +36,9 @@ DEPLOYMENT_ID = str(uuid4())
 
 class FakeAdapter:
     broker_name = "fake"
+    # The reconciler only trusts protective-stop listings from adapters that
+    # declare stop-amendment capability (cTrader deliberately does not, #168).
+    supports_stop_amendment = True
 
     def __init__(
         self,
@@ -1088,3 +1091,60 @@ def test_entries_halt_marker_mirrors_the_claim_sql_predicate(value, halted):
             (settings,),
         ).fetchone()
     assert (not not_halted) is halted
+
+
+# ── #168 gates: protective-stop listing and FILLED order state ──────────────
+
+
+def test_protective_stops_are_only_read_from_amend_capable_adapters() -> None:
+    """The stop-listing gate: no ``supports_stop_amendment`` -> stops unread.
+
+    cTrader deliberately declares no stop-amendment capability, so its flip
+    workflow's position-addressed stops must never leak into the reconciler's
+    protective-stop view (#168 review). Removing the gate makes this fail.
+    """
+    import asyncio
+
+    import live_runner.broker_reconciliation as recon
+
+    adapter = FakeAdapter(
+        positions=[{"symbol": "AAPL", "qty": 10.0}],
+        stops=[ProtectiveStop(order_id="stop-1", symbol="AAPL", side="sell", stop_price=95.0)],
+    )
+    adapter.supports_stop_amendment = False  # type: ignore[attr-defined]
+
+    snapshot = asyncio.run(recon._broker_state(adapter))
+
+    assert snapshot.protective_stops_supported is False
+    assert snapshot.protective_stops == ()
+
+    # Control: the same adapter WITH the capability does feed the view.
+    capable = FakeAdapter(
+        positions=[{"symbol": "AAPL", "qty": 10.0}],
+        stops=[ProtectiveStop(order_id="stop-1", symbol="AAPL", side="sell", stop_price=95.0)],
+    )
+    snapshot = asyncio.run(recon._broker_state(capable))
+    assert snapshot.protective_stops_supported is True
+    assert len(snapshot.protective_stops) == 1
+
+
+def test_filled_expected_order_is_not_a_finding(isolated_db, tmp_path) -> None:
+    """``ORDER_STATE_FILLED`` resolves a missing working order like terminal.
+
+    An order the broker reports FILLED is not "missing" - reverting the
+    filled-state handling turns this into a ``missing_working_order`` finding.
+    """
+    from live_runner.base_adapter import ORDER_STATE_FILLED
+
+    database, _engine, _data_dir = isolated_db
+    _seed_db(database)
+    _unfilled_signal(DEPLOYMENT_ID, broker_order_id="ord-filled")
+
+    deployment = _deployment()
+    adapter = _adapter_with_order_states({"ord-filled": ORDER_STATE_FILLED})
+    manager = _manager(tmp_path, [])
+
+    report = _reconcile(manager, [deployment], {ACCOUNT_ID: adapter})
+
+    assert report[ACCOUNT_ID].ok is True
+    assert report[ACCOUNT_ID].findings == ()
