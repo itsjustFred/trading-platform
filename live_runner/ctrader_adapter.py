@@ -7021,7 +7021,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                             }
                         },
                     )
-                except BaseException:
+                except BaseException:  # except-kind: money-decision
                     # ``asyncio.CancelledError`` and ``KeyboardInterrupt``
                     # bypass ``except Exception``: this deal and every deal
                     # not yet reached stay unprocessed, so their windows go
