@@ -1820,7 +1820,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         )
         try:
             response_message = await deferred.asFuture(self._loop)
-        except Exception as exc:
+        except Exception as exc:  # except-kind: money-decision
             request_exc: Any = exc
             with contextlib.suppress(AttributeError):
                 request_exc.ctrader_request_payload_type = type(request).__name__
