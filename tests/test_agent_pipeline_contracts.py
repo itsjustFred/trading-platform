@@ -1205,7 +1205,10 @@ def test_the_pre_mortem_skips_drafts_and_forks() -> None:
     for step in _steps(agent):
         if step.get("name") == "Mark running":
             continue
-        assert "secrets." not in str(_step_env(agent, step)) + _run(step), (
+        # The one secret an agent step may hold is the NVIDIA key, gated on an
+        # `nvidia/...` model (test_the_nvidia_key_reaches_only_the_probe_and_agent_steps).
+        env_text = str(_step_env(agent, step)).replace(NVIDIA_KEY_EXPR, "")
+        assert "secrets." not in env_text + _run(step), (
             f"the agent job receives a secret ({step.get('name')!r})"
         )
 
@@ -1701,7 +1704,7 @@ def test_the_free_model_quota_is_a_skip_not_a_failure() -> None:
     # grepped over the raw stream and stderr at both, so a cap on a zero exit takes
     # the quota path instead of going red. Only on those paths - a produced report's
     # own text may mention "quota".
-    dead_end_grep = f"grep -qiE '{transient}' \"$out.raw\" \"$out.stderr\""
+    dead_end_grep = f"grep -qiE '{transient}' \"$out.raw\" \"$out.stderr.final\""
     assert body.count(dead_end_grep) == 2, (
         "the two zero-exit dead ends do not both classify the quota signature"
     )
@@ -1911,6 +1914,30 @@ case "${STUB_OPENCODE_MODE:-ok}" in
     printf 'OK\\n'
     exit 0
     ;;
+  nvidia-429)
+    printf '! retrying (attempt 1): HTTP 429: Too Many Requests\\n' >&2
+    printf 'Error: Provider request failed with HTTP 429: Too Many Requests\\n' >&2
+    exit 1
+    ;;
+  nvidia-retry-ok)
+    printf '! retrying (attempt 1): HTTP 429: Too Many Requests\\n' >&2
+    printf 'OK\\n'
+    exit 0
+    ;;
+  nvidia-cut)
+    for n in 1 2 3; do
+      printf '! retrying (attempt %s): HTTP 429: Too Many Requests\\n' "$n" >&2
+    done
+    exit 1
+    ;;
+  leak)
+    printf '**Summary:** leaked %s\\n**Verdict: PASS**\\n' "${NVIDIA_API_KEY:-}"
+    exit 0
+    ;;
+  leak-fail)
+    printf 'Error: env says NVIDIA_API_KEY=%s\\n' "${NVIDIA_API_KEY:-}" >&2
+    exit 1
+    ;;
 esac
 """
 
@@ -2018,6 +2045,22 @@ def test_the_quota_probe_reports_only_a_positive_quota_signature(tmp_path) -> No
         "a provider error opencode did not retry skipped the agent job - a broken request "
         "would go grey"
     )
+    # NVIDIA's 429 ("Too Many Requests") is a cap like Zen's: grey, not red.
+    result, written = _run_probe_step(tmp_path, "nvidia-429")
+    assert result.returncode == 0, f"probe step failed on nvidia-429: {result.stderr}"
+    assert "available=false" in written, "an NVIDIA 429 did not skip the agent job"
+    # Grey only once all retries are through: a 429 that cleared on a retry is a
+    # reachable model, and its retry line on stderr does not count.
+    result, written = _run_probe_step(tmp_path, "nvidia-retry-ok")
+    assert result.returncode == 0, f"probe step failed on nvidia-retry-ok: {result.stderr}"
+    assert "available=true" in written and "available=false" not in written, (
+        "a 429 that cleared on a retry skipped the agent job"
+    )
+    # A probe cut off mid-retry (its last stderr line a 429 retry) is a cap too:
+    # its retries are over, so that line is the final word.
+    result, written = _run_probe_step(tmp_path, "nvidia-cut")
+    assert result.returncode == 0, f"probe step failed on nvidia-cut: {result.stderr}"
+    assert "available=false" in written, "a probe cut off mid-retry on a 429 ran the agent job"
     result, written = _run_probe_step(tmp_path, "kilo-retry-ok")
     assert result.returncode == 0, f"probe step failed on kilo-retry-ok: {result.stderr}"
     assert "available=true" in written and "available=false" not in written, (
@@ -2039,6 +2082,70 @@ def _kilo_config(model_id: str) -> dict:
 
 
 ZEN_CONFIG = '{"$schema":"https://opencode.ai/config.json","update":"disable"}'
+NVIDIA_KEY_EXPR = (
+    "${{ startsWith(env.MODEL, 'nvidia/') && secrets.ACTIONS_NVIDIA_API_KEY || '' }}"
+)
+
+
+def _nvidia_config(model_id: str) -> dict:
+    """The config an `nvidia/<model_id>` stage must get: opencode's built-in NVIDIA
+    provider (it reads NVIDIA_API_KEY) with the model declared, like Kilo's."""
+    return {
+        "$schema": "https://opencode.ai/config.json",
+        "update": "disable",
+        "providers": {"nvidia": {"models": {model_id: {}}}},
+    }
+
+
+@pytest.mark.parametrize("name", AGENT_WORKFLOWS)
+def test_the_nvidia_key_reaches_only_the_probe_and_agent_steps(name) -> None:
+    """The workflows were built to hold no secret besides GITHUB_TOKEN. The NVIDIA key is
+    the one exception, and it is as narrow as it can be: exactly the probe step and the
+    agent step get it, as NVIDIA_API_KEY, and only when the model is an `nvidia/...` one
+    (the expression yields '' otherwise). No other step, job or workflow-level env names
+    the secret."""
+    data = _load(name)
+    assert "ACTIONS_NVIDIA_API_KEY" not in str(data.get("env", {})), "workflow-level key"
+    holders = []
+    for job_name, job in data["jobs"].items():
+        assert "ACTIONS_NVIDIA_API_KEY" not in str(job.get("env", {})), f"{job_name}: job env"
+        for step in _steps(job):
+            if "secrets.ACTIONS_NVIDIA_API_KEY" in str(step.get("env", {})) + _run(step):
+                holders.append(step.get("name"))
+                assert step["env"].get("NVIDIA_API_KEY") == NVIDIA_KEY_EXPR, (
+                    f"{name}/{step.get('name')}: the key is not gated on an nvidia model"
+                )
+    agent_step = _find_step(_agent_job(data)[1], r"^Run .* agent$")["name"]
+    assert sorted(holders) == sorted(["Probe model quota", agent_step]), (
+        f"{name}: the key reaches {holders}"
+    )
+
+
+@needs_bash
+@pytest.mark.parametrize("name", AGENT_WORKFLOWS)
+def test_an_nvidia_model_without_the_key_fails_with_its_reason(name, tmp_path) -> None:
+    """Without the secret an `nvidia/...` model can only fail with a 401 that reads like
+    any broken run. The probe and the agent step both stop first and name the secret."""
+    data = _load(name)
+    for step in (
+        _find_step(data["jobs"]["quota-probe"], r"^Probe model quota$"),
+        _find_step(_agent_job(data)[1], r"^Run .* agent$"),
+    ):
+        case = tmp_path / step["name"].replace(" ", "-")
+        case.mkdir()
+        script = case / "step.sh"
+        script.write_text(_run(step), encoding="utf-8")
+        env = {**os.environ, "MODEL": "nvidia/stepfun-ai/step-5-preview", "NVIDIA_API_KEY": "",
+               "RUNNER_TEMP": str(case), "GITHUB_OUTPUT": str(case / "out")}
+        result = subprocess.run(
+            [shutil.which("bash") or "bash", str(script)], env=env, capture_output=True,
+            text=True, cwd=case,
+        )
+        assert result.returncode == 1, f"{name}/{step['name']}: ran without the key"
+        assert "ACTIONS_NVIDIA_API_KEY secret is not set" in result.stdout, (
+            f"{name}/{step['name']}: the failure does not name the missing secret"
+        )
+
 
 
 @needs_bash
@@ -2053,8 +2160,10 @@ def test_a_kilo_model_enables_the_kilo_provider_and_nothing_else_changes(name, t
     for model, expected in (
         ("kilo/reflection/beam-free", _kilo_config("reflection/beam-free")),
         ("kilo/inclusionai/ling-3.2-flash:free", _kilo_config("inclusionai/ling-3.2-flash:free")),
+        ("nvidia/stepfun-ai/step-5-preview", _nvidia_config("stepfun-ai/step-5-preview")),
         ("opencode/inkling-2-small-free", zen),
         ("kilonova/some-model", zen),
+        ("nvidiax/some-model", zen),
     ):
         home = tmp_path / model.replace("/", "_").replace(":", "_")
         home.mkdir()
@@ -2073,20 +2182,52 @@ def test_a_kilo_model_enables_the_kilo_provider_and_nothing_else_changes(name, t
         assert f'model: "{model}#high"' in agent, f"{name} {model}: probe pings another model"
 
 
+def _provider_choice(body: str) -> str:
+    """The `if [ "${MODEL%%/*}" = ... ]; then ... fi` block a config step writes."""
+    start = body.index('if [ "${MODEL%%/*}" = "kilo" ]; then\n')
+    return body[start : body.index("\nfi\n", start) + 4]
+
+
+@needs_bash
+@pytest.mark.parametrize("name", AGENT_WORKFLOWS)
+def test_a_model_without_a_provider_or_an_id_stops_with_its_name(name, tmp_path) -> None:
+    """MODEL is provider/model. `nvidia/` (empty id) or a bare `nvidia` would reach opencode
+    as a model it cannot resolve - a cryptic failure; both config steps stop first."""
+    data = _load(name)
+    steps = [
+        step
+        for job in data["jobs"].values()
+        for step in _steps(job)
+        if "opencode.json" in _run(step)
+    ]
+    for step in steps:
+        for model in ("nvidia/", "nvidia", "kilo/", ""):
+            label = f"{step['name']}-{model or 'empty'}"
+            home = tmp_path / label.replace("/", "_").replace(" ", "-")
+            home.mkdir()
+            script = home / "configure.sh"
+            script.write_text(_run(step), encoding="utf-8")
+            env = {**os.environ, "HOME": str(home), "MODEL": model, "VARIANT": "high",
+                   "RUNNER_TEMP": str(home)}
+            result = subprocess.run(
+                [shutil.which("bash") or "bash", str(script)], env=env, capture_output=True,
+                text=True, cwd=home,
+            )
+            assert result.returncode == 1, f"{name}/{step['name']}: accepted MODEL={model!r}"
+            assert "is not provider/model" in result.stdout, (
+                f"{name}/{step['name']}: MODEL={model!r} failed without naming why"
+            )
+            assert not (home / ".config" / "opencode" / "opencode.json").exists(), (
+                f"{name}/{step['name']}: wrote a config for MODEL={model!r}"
+            )
+
+
 def test_every_agent_config_step_writes_the_same_provider_choice() -> None:
     """The probe and the agent must resolve the same model the same way: a probe that
-    enables Kilo in front of an agent that does not would clear a run that cannot start.
-    Every step that writes the opencode config, in every agent workflow, carries the one
-    conditional."""
-    choice = (
-        'if [ "${MODEL%%/*}" = "kilo" ]; then\n'
-        '  jq -cn --arg model "${MODEL#kilo/}" \'{"$schema": "https://opencode.ai/config.json", '
-        'update: "disable", providers: {kilo: {settings: {baseURL: '
-        f'"{KILO_GATEWAY}"}}, models: {{($model): {{}}}}}}}}}}\' > "$conf/opencode.json"\n'
-        "else\n"
-        f"  printf '{ZEN_CONFIG}\\n' > \"$conf/opencode.json\"\n"
-        "fi\n"
-    )
+    enables a provider in front of an agent that does not would clear a run that cannot
+    start. Every step that writes the opencode config, in every agent workflow, carries
+    the one provider choice - Kilo, NVIDIA, or the Zen config it always had."""
+    seen = set()
     for name in AGENT_WORKFLOWS:
         writers = [
             step
@@ -2096,7 +2237,12 @@ def test_every_agent_config_step_writes_the_same_provider_choice() -> None:
         ]
         assert len(writers) == 2, f"{name}: expected the probe and the agent config steps"
         for step in writers:
-            assert choice in _run(step), f"{name}: {step.get('name')!r} skips the Kilo choice"
+            seen.add(_provider_choice(_run(step)))
+    assert len(seen) == 1, f"the provider choice drifted between config steps: {seen}"
+    choice = seen.pop()
+    assert f"baseURL: \"{KILO_GATEWAY}\"" in choice, "the Kilo branch lost its gateway"
+    assert 'elif [ "${MODEL%%/*}" = "nvidia" ]; then' in choice, "no NVIDIA branch"
+    assert f"printf '{ZEN_CONFIG}\\n' > \"$conf/opencode.json\"" in choice, "Zen config changed"
 
 
 def test_every_agent_step_names_an_exhausted_retry_before_classifying() -> None:
@@ -2223,9 +2369,12 @@ def test_the_mid_run_quota_skip_reports_instead_of_failing(tmp_path) -> None:
         ("quota-verdict", True),
         ("kilo-429", True),
         ("kilo-signup", True),
+        ("nvidia-429", True),
+        ("nvidia-cut", True),
         ("garbage", False),
         ("other", False),
         ("kilo-400", False),
+        ("nvidia-retry-ok", False),
     ):
         case = tmp_path / mode
         case.mkdir()
@@ -2762,3 +2911,18 @@ def test_pre_mortem_verdict_extraction(output: str, expected: str, tmp_path) -> 
     disagree. The `**Verdict:**` line must be the last non-empty line - a verdict quoted from
     the diff earlier in the output does not count."""
     assert _premortem_verdict(output, tmp_path) == expected
+
+
+def test_every_agent_step_checks_both_captured_streams_for_the_key() -> None:
+    """The leak check is executed in test_agent_sibling_hardening for the review and the
+    mutation copy; the pre-mortem copy carries the same calls - once after a failed run's
+    streams are captured and once after a clean run's - so none of the three can post or
+    upload an output that carries the NVIDIA key."""
+    for name in AGENT_WORKFLOWS:
+        body = _run(_find_step(_agent_job(_load(name))[1], r"^Run .* agent$"))
+        calls = [line.strip() for line in body.splitlines() if line.strip() == "refuse_leaked_key"]
+        assert len(calls) == 2, f"{name}: the key check runs {len(calls)} times, not on both paths"
+        failed = body.index('cat "$out.stderr" >> "$out.raw"\n')
+        assert body[failed:].split("\n", 2)[1].strip() == "refuse_leaked_key", (
+            f"{name}: a failed run's output is echoed before the key check"
+        )
