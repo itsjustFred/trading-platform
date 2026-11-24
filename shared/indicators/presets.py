@@ -127,6 +127,9 @@ def atr_pine_ta(
 
     This is the ATR the ``pine_*`` ports were always meant to compute; the
     legacy copies used a rolling SMA of a zero-seeded true range instead.
+    NaN inputs are skipped by the valid-position recursion (the output is
+    NaN at NaN positions), whereas Pine's builtin ``ta.atr`` would carry
+    ``na`` through — this only matters for OHLCV with NaN bars.
     """
     return atr(
         high,
@@ -189,7 +192,10 @@ def ema_pine_ta(series: pd.Series, length: int) -> pd.Series:
 
     The ``pine_*`` ports used ``ewm(span=length, adjust=False)`` seeded at
     the first value; TradingView seeds the recursion at the SMA of the
-    first ``length`` values instead.
+    first ``length`` values instead. NaN inputs are skipped by the
+    valid-position recursion (the output is NaN at NaN positions), whereas
+    Pine's builtin ``ta.ema`` would carry ``na`` through — this only
+    matters for OHLCV with NaN bars.
     """
     return ema(series, length, seed="sma")
 
@@ -199,6 +205,8 @@ def dema_pine_ta(series: pd.Series, length: int) -> pd.Series:
 
     The ``pine_supertrend_dema`` port used two first-seeded ``ewm`` calls;
     TradingView's double-EMA uses the SMA-seeded ``ta.ema`` at both stages.
+    Like :func:`ema_pine_ta`, NaN inputs are skipped by the valid-position
+    recursion rather than carried as ``na``.
     """
     first = ema_pine_ta(series, length)
     second = ema_pine_ta(first, length)

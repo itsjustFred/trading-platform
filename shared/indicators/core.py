@@ -233,10 +233,14 @@ def _ema_valid(
         # Pine ``ta.ema`` measured law: ``prev + alpha * (x - prev)``. The
         # algebraically equal ``alpha * x + (1 - alpha) * prev`` drifts from
         # TradingView on more than half of the bars (PyneCore probe m558).
-        # Only ``seed="sma"`` reaches this loop (``seed="first"`` is the
-        # pandas ``ewm`` path), so the Pine form stays scoped to the
-        # ``pine_*`` presets that call it.
-        previous = previous + alpha * (valid[k] - previous)
+        # Scoped to ``seed="sma"`` — the only seed the ``pine_*`` presets
+        # use; ``seed="first"`` keeps the historical
+        # ``alpha * x + (1 - alpha) * prev`` form so the skipna path stays
+        # bit-identical to the pre-P3 library.
+        if seed == "sma":
+            previous = previous + alpha * (valid[k] - previous)
+        else:
+            previous = alpha * valid[k] + (1.0 - alpha) * previous
         if k + 1 >= need:
             out_values[positions[k]] = previous
     return pd.Series(

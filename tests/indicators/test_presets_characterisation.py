@@ -653,7 +653,7 @@ def test_supertrend_chart_is_registered_ramjet_alias(ohlcv):
         )
 
 
-def test_supertrend_custom_swings_pine_exact(ohlcv):
+def test_supertrend_custom_swings_wiring(ohlcv):
     module = _load_strategy(
         "strategies/custom_swings_supertrend/custom_swings_supertrend.py",
         "char_cs",
@@ -679,7 +679,7 @@ def test_supertrend_custom_swings_pine_exact(ohlcv):
     assert result.atr.iloc[: period - 1].isna().all()
 
 
-def test_supertrend_pine_dema_pine_exact(ohlcv):
+def test_supertrend_pine_dema_wiring(ohlcv):
     module = _load_strategy(
         "strategies/pine_supertrend_dema/pine_supertrend_dema.py", "char_pd"
     )
@@ -700,7 +700,7 @@ def test_supertrend_pine_dema_pine_exact(ohlcv):
     assert result.atr.iloc[: period - 1].isna().all()
 
 
-def test_superosc_vumanchu_pine_exact(ohlcv):
+def test_superosc_vumanchu_wiring(ohlcv):
     module = _load_strategy(
         "strategies/pine_superosc_vumanchu/pine_superosc_vumanchu.py",
         "char_pso",

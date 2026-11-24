@@ -256,6 +256,48 @@ def test_superosc_zero_width_bands_yield_nan() -> None:
     assert osc.isna().all()
 
 
+# ── LuxAlgo flip on the *previous* bands (maintainer decision 2, #375) ──
+#
+# period=1 keeps ta.atr equal to TR. Hand trace (hl2 = (h+l)/2, mult=0.5):
+#   bar0: upper=101.10, lower=100.23 (raw bands; trend NaN).
+#   bar1: close[0]=100.61 < prev_upper -> upper[1]=min(106.14,101.10)=101.10;
+#         close[0]=100.61 > prev_lower -> lower[1]=max(102.33,100.23)=102.33;
+#         close[1]=104.19 > prev_upper -> trend=1.
+#   bar2: upper[2]=103.225, lower[2]=102.33 (lower ratchets up to prev 102.33).
+#         close[2]=101.62 > prev_upper=101.10 -> trend stays 1, so
+#         spt=lower[2] and osc=(101.62-102.33)/(103.225-102.33)=-0.7932960893854714.
+# A mutant flipping on the *current* bands sees 101.62 < lower[2]=102.33
+# and flips bearish -> spt=upper[2] and osc clips to -1.0.
+SO_FLIP_CLOSE = [100.61, 104.19, 101.62, 99.95, 97.53, 100.82]
+SO_FLIP_HIGH = [101.1, 104.42, 102.26, 100.51, 97.9, 101.56]
+SO_FLIP_LOW = [100.23, 104.05, 100.43, 98.84, 97.29, 99.95]
+SO_FLIP_OSC = [
+    math.nan, -1.0, -0.7932960893854714, -0.4010791366906506, -1.0, 1.0,
+]
+
+
+def test_superosc_luxalgo_flip_uses_previous_bands() -> None:
+    """Pin the maintainer-decided previous-band flip (decision 2, #375).
+
+    Bar 2 is the discriminator: ``close=101.62`` sits above the previous
+    upper band (101.1) but below the current lower band (102.33), so the
+    Pine rule keeps the bullish trend while a current-band mutant flips
+    bearish and clips the oscillator to -1.0.
+    """
+    idx = pd.date_range("2024-01-01", periods=6, freq="h")
+    df = pd.DataFrame(
+        {
+            "open": pd.Series(SO_FLIP_CLOSE, index=idx),
+            "high": pd.Series(SO_FLIP_HIGH, index=idx),
+            "low": pd.Series(SO_FLIP_LOW, index=idx),
+            "close": pd.Series(SO_FLIP_CLOSE, index=idx),
+        }
+    )
+    high, low, close = _ohlc(df)
+    osc = presets.superosc_luxalgo(high, low, close, 1, 0.5)
+    _assert_close(osc.tolist(), SO_FLIP_OSC, msg="superosc prev-band flip")
+
+
 # ── Manual Pine Supertrend: the up1-vs-lower[i] flip discriminator ─────
 
 # period=1, mult=1 keeps ta.atr equal to TR, so every band is hand-checkable.
@@ -289,3 +331,79 @@ def test_supertrend_pine_flip_compares_reference_band() -> None:
     # Sanity: the divergence the vector pins — bar 2 close sits strictly
     # between the reference band (9.5) and the current lower band (10.0).
     assert ST_B_LOWER[2] > ST_B_CLOSE[2] > ST_B_LOWER[1]
+
+
+# ── Same-band ratchet vs the opposite band (the #375 bug shape) ────────
+#
+# period=1, mult=2.0. The legacy ``pine_supertrend_dema`` bug ratcheted
+# each band on the *opposite* band's previous value (``close[i-1] >
+# upper_band[i-1]`` gating the lower band). Here at bar 1
+# close[0]=99.24 < prev_upper=100.975, so the real rule ratchets the upper
+# band down to min(raw 101.255, 100.975)=100.975; the opposite-band mutant
+# compares close[0] against prev_lower=96.695 instead, does not ratchet,
+# and keeps upper[1]=101.255. The lower band diverges symmetrically at
+# bar 3 (real 97.165 vs mutant 96.425).
+ST_C_HIGH = [99.37, 99.71, 100.22, 102.86, 102.97]
+ST_C_LOW = [98.3, 98.68, 99.11, 102.31, 101.51]
+ST_C_CLOSE = [99.24, 98.97, 99.78, 102.68, 102.28]
+ST_C_TREND = [1.0, 1.0, 1.0, 1.0, 1.0]
+ST_C_UPPER = [
+    100.97500000000002, 100.97500000000002, 100.97500000000002,
+    100.97500000000002, 105.16,
+]
+ST_C_LOWER = [
+    96.695, 97.13500000000002, 97.16499999999999,
+    97.16499999999999, 99.32000000000002,
+]
+
+
+def _st_frame(high, low, close) -> pd.DataFrame:
+    idx = pd.date_range("2024-01-01", periods=len(close), freq="h")
+    return pd.DataFrame(
+        {
+            "open": pd.Series(close, index=idx),
+            "high": pd.Series(high, index=idx),
+            "low": pd.Series(low, index=idx),
+            "close": pd.Series(close, index=idx),
+        }
+    )
+
+
+def test_supertrend_pine_ta_ratchet_uses_same_band() -> None:
+    """Pin the same-band ratchet: each band references its own previous
+    band, never the opposite one (the legacy ``pine_supertrend_dema`` bug)."""
+    df = _st_frame(ST_C_HIGH, ST_C_LOW, ST_C_CLOSE)
+    high, low, close = _ohlc(df)
+    result = presets.supertrend_pine_ta(high, low, close, 1, 2.0)
+    _assert_close(result.trend.tolist(), ST_C_TREND, msg="trend")
+    _assert_close(result.upper_band.tolist(), ST_C_UPPER, msg="upper")
+    _assert_close(result.lower_band.tolist(), ST_C_LOWER, msg="lower")
+
+
+# ── nz(band[1], band) fallback on the first usable-ATR bar ─────────────
+#
+# period=1, mult=0.4. At bar 0 there is no previous band, so the Pine
+# ``nz(up[1], up)``/``nz(dn[1], dn)`` fallback makes the reference bands
+# the raw ones: up1 = hl2 - mult*atr = 9.6 and dn1 = 10.4. close[0]=9.5
+# < up1 flips the direction bearish immediately; a mutant dropping the
+# fallback (up1/dn1 stay NaN) cannot flip and stays bullish. The bands
+# themselves are identical either way — only the trend pins the fallback.
+ST_NZ_HIGH = [10.5, 10.8]
+ST_NZ_LOW = [9.5, 10.2]
+ST_NZ_CLOSE = [9.5, 10.6]
+ST_NZ_TREND = [-1.0, 1.0]
+ST_NZ_UPPER = [10.4, 10.4]
+ST_NZ_LOWER = [9.6, 9.98]
+
+
+def test_supertrend_pine_ta_nz_fallback_first_usable_bar() -> None:
+    """Pin ``nz(band[1], band)``: without the fallback the first usable-ATR
+    bar has NaN reference bands and the direction cannot flip."""
+    df = _st_frame(ST_NZ_HIGH, ST_NZ_LOW, ST_NZ_CLOSE)
+    high, low, close = _ohlc(df)
+    result = presets.supertrend_pine_ta(high, low, close, 1, 0.4)
+    _assert_close(result.trend.tolist(), ST_NZ_TREND, msg="trend")
+    _assert_close(result.upper_band.tolist(), ST_NZ_UPPER, msg="upper")
+    _assert_close(result.lower_band.tolist(), ST_NZ_LOWER, msg="lower")
+    # Sanity: bar 0 close is strictly below the raw lower band.
+    assert ST_NZ_CLOSE[0] < 10.0 - 0.4 * (ST_NZ_HIGH[0] - ST_NZ_LOW[0])

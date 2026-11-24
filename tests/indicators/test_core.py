@@ -134,6 +134,36 @@ class TestEma:
         )
         assert ema(s, 5, seed="first").iloc[:4].isna().all()
 
+    def test_seed_first_skipna_keeps_historical_step_law(self):
+        """``seed="first"`` + ``skipna=True`` must stay bit-identical to the
+        pre-P3 ``alpha * x + (1 - alpha) * prev`` recursion: the Pine
+        ``prev + alpha * (x - prev)`` step is scoped to ``seed="sma"``.
+        The literals below were computed with the historical form on an
+        input (with NaN gaps) where the two forms differ in the last bits;
+        an exact comparison is required — ``rtol`` would hide the drift."""
+        values = pd.Series(
+            [
+                515908.805880605, -158856.83833831002, -482166.4994140733,
+                22549.44273721706, np.nan, 567597.1780695452,
+                -393374.5478421451, np.nan, 166764.07891006232,
+                816225.7703906703, 9373.711634780513, -436324.3112005923,
+                511608.40831444785,
+            ],
+            dtype=float,
+        )
+        out = ema(values, 5, seed="first", skipna=True)
+        expected = pd.Series(
+            [
+                np.nan, np.nan, np.nan, np.nan, np.nan,
+                208996.32063656728, 8206.03114366319, np.nan,
+                61058.7137324629, 312781.06595186534, 211645.28117950374,
+                -4344.5829471949255, 167639.74747335265,
+            ],
+            index=out.index,
+            dtype=float,
+        )
+        pd.testing.assert_series_equal(out, expected, check_exact=True)
+
 
 class TestRma:
     def test_seed_sma_hand_computed(self):
@@ -239,6 +269,36 @@ class TestAtr:
     def test_min_periods_rejected_where_ignored(self, kwargs, match):
         with pytest.raises(ValueError, match=match):
             atr_from_tr(pd.Series([1.0, 2.0, 3.0]), 2, **kwargs)
+
+    def test_atr_ema_seed_first_skipna_keeps_historical_step_law(self):
+        """Same pin as ``TestEma.test_seed_first_skipna_keeps_historical_step_law``
+        for the ``atr_from_tr(smoothing="ema", seed="first", skipna=True)``
+        route into ``_ema_valid``."""
+        tr = pd.Series(
+            [
+                515908.805880605, -158856.83833831002, np.nan,
+                22549.44273721706, -190131.7250991714, 567597.1780695452,
+                -393374.5478421451, -46806.09169528843, 166764.07891006232,
+                816225.7703906703, 9373.711634780513, -436324.3112005923,
+                511608.40831444785,
+            ],
+            dtype=float,
+        )
+        out = atr_from_tr(
+            tr, 3, smoothing="ema", seed="first", skipna=True
+        )
+        expected = pd.Series(
+            [
+                np.nan, np.nan, np.nan, 100537.71325418228,
+                -44797.00592249456, 261400.0860735253, -65987.23088430989,
+                -56396.66128979916, 55183.70881013158, 435704.7396004009,
+                222539.2256175907, -106892.5427915008, 202357.93276147352,
+            ],
+            index=out.index,
+            name=out.name,
+            dtype=float,
+        )
+        pd.testing.assert_series_equal(out, expected, check_exact=True)
 
     def test_rma_rejects_min_periods_for_sma_seed_and_skipna(self):
         s = pd.Series([1.0, 2.0, 3.0, 4.0])

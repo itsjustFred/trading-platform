@@ -274,9 +274,9 @@ _ALLOWED: dict[str, dict[str, int]] = {
     # parity migration (#317). PR #375 (P3) migrated
     # custom_swings_supertrend, ema_crossoiver_conversion_test,
     # pine_superosc_vumanchu and pine_supertrend_dema onto
-    # ``shared.indicators`` presets, so their entries are gone;
-    # ``scripts/bench_indicators_numba.py`` benchmarks the shared kernels
-    # in ``shared.indicators.core`` and carries no private copy.
+    # ``shared.indicators`` presets, so their entries are gone; the shared
+    # kernels are benchmarked by ``scripts/bench_indicator_kernels.py``,
+    # which carries no private copy.
     "strategies/channel_breakout/channel_breakout.py": {
         "ewm@generate_signals": 1,
         "rolling@generate_signals": 3,
