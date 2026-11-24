@@ -82,6 +82,9 @@ Folgende Pine-spezifische bzw. stark zustandsbehaftete Teile sind **nicht vollst
 
 `use_trailing_sl=true` wird vom nativen Engine-Contract abgelehnt (Decision 2026-11-23); fuer native-Laeufe `false` verwenden.
 
+### Indikator-Semantik (P3, #317)
+ATR ist `ta.atr` (Wilder/RMA mit SMA-Seed, `ta.tr(true)` mit `high-low` als Bar 0), nicht mehr die alte null-gesetzte SMA(TR); EMAs sind `ta.ema` (SMA-Seed, NaN-Warm-up). Warm-up-Bars sind `NaN`, nie `0`.
+
 ## Risk-Management
 - Stop-Distanz: Supertrend-Band am Entry-Bar (`stop_loss`)
 - Position Sizing: `risk_per_trade_pct`-basiert über den vectorbt-Adapter

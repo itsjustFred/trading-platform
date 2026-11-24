@@ -1,6 +1,4 @@
-import numpy as np
-import pandas as pd
-
+from shared.indicators import presets
 from shared.strategy_markers import entry_exit_markers
 
 STRATEGY_META = {
@@ -30,16 +28,12 @@ def generate_signals(df, params):
     atr_period = params.get('atr_period', 14)
     atr_multiplier = params.get('atr_multiplier', 2.0)
 
-    # Calculate EMAs
-    fast_ema = df['close'].ewm(span=fast_period, adjust=False).mean()
-    slow_ema = df['close'].ewm(span=slow_period, adjust=False).mean()
+    # Calculate EMAs (Pine ta.ema: SMA seed, NaN warm-up)
+    fast_ema = presets.ema_pine_ta(df['close'], fast_period)
+    slow_ema = presets.ema_pine_ta(df['close'], slow_period)
 
-    # Calculate ATR for stop-loss
-    high_low = df['high'] - df['low']
-    high_close = (df['high'] - df['close'].shift()).abs()
-    low_close = (df['low'] - df['close'].shift()).abs()
-    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-    atr = tr.rolling(window=atr_period).mean()
+    # Calculate ATR for stop-loss (Pine ta.atr: Wilder/RMA)
+    atr = presets.atr_pine_ta(df['high'], df['low'], df['close'], atr_period)
 
     # Entry trigger: Fast EMA crosses above Slow EMA
     entries = (fast_ema > slow_ema) & (fast_ema.shift(1) <= slow_ema.shift(1))
