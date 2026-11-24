@@ -410,3 +410,100 @@ def test_amend_preserves_gsl_and_trigger_flags() -> None:
     request = state["sent"][0]
     assert request.guaranteedStopLoss is True
     assert request.HasField("stopLossTriggerMethod")
+
+
+# ── Position take-profit amend (#168 fallback TP) ────────────────────────────
+
+
+def test_amend_position_tp_sets_tp_and_preserves_stop() -> None:
+    """The fallback TP amend sends the plan's TP price and echoes the
+    position's current stopLoss verbatim - the stop can never be dropped."""
+    adapter = _adapter()
+    position = _position(stop_loss=1.08000, take_profit=None)
+    state = _amend_state(adapter, [position])
+
+    def _applied(_request):
+        position.takeProfit = 1.10000
+        return _request
+
+    state["on_send"] = _applied
+
+    result = asyncio.run(adapter.amend_position_take_profit(7, 1.100004))
+
+    assert len(state["sent"]) == 1
+    request = state["sent"][0]
+    assert int(request.positionId) == 7
+    assert request.stopLoss == pytest.approx(1.08000)  # echoed, not recomputed
+    assert request.takeProfit == pytest.approx(1.10000)  # tick-rounded
+    assert result == pytest.approx(1.10000)
+
+
+def test_amend_position_tp_clear_leaves_stop_and_unsets_tp() -> None:
+    """Resume path: ``take_profit=None`` clears the TP, stop echoed back."""
+    adapter = _adapter()
+    position = _position(stop_loss=1.08000, take_profit=1.10000)
+    state = _amend_state(adapter, [position])
+
+    def _cleared(_request):
+        position.takeProfit = 0.0
+        return _request
+
+    state["on_send"] = _cleared
+
+    result = asyncio.run(adapter.amend_position_take_profit(7, None))
+
+    assert len(state["sent"]) == 1
+    request = state["sent"][0]
+    assert request.stopLoss == pytest.approx(1.08000)
+    assert not request.HasField("takeProfit")
+    assert result is None
+
+
+def test_amend_position_tp_is_idempotent_without_a_write() -> None:
+    """Already at the target (or already clear): broker state answers, no
+    request is sent - restart/retry safety."""
+    adapter = _adapter()
+    position = _position(stop_loss=1.08000, take_profit=1.10000)
+    state = _amend_state(adapter, [position])
+
+    assert asyncio.run(adapter.amend_position_take_profit(7, 1.10000)) == (
+        pytest.approx(1.10000)
+    )
+    assert state["sent"] == []
+
+    adapter2 = _adapter()
+    position2 = _position(stop_loss=1.08000, take_profit=None)
+    state2 = _amend_state(adapter2, [position2])
+    assert asyncio.run(adapter2.amend_position_take_profit(7, None)) is None
+    assert state2["sent"] == []
+
+
+def test_amend_position_tp_refuses_without_a_readable_stop() -> None:
+    """No readable stopLoss means nothing safe to echo: refuse before any
+    request - the amend could otherwise clear protection."""
+    adapter = _adapter()
+    position = _position(stop_loss=None, take_profit=None)
+    state = _amend_state(adapter, [position])
+
+    with pytest.raises(ValueError, match="stopLoss"):
+        asyncio.run(adapter.amend_position_take_profit(7, 1.10000))
+    assert state["sent"] == []
+
+
+def test_amend_position_tp_unconfirmed_fails_closed(monkeypatch) -> None:
+    import live_runner.ctrader_adapter as ctrader_adapter
+
+    monkeypatch.setattr(ctrader_adapter, "_AMEND_CONFIRM_INTERVAL_SECONDS", 0.001)
+    adapter = _adapter()
+    position = _position(stop_loss=1.08000, take_profit=None)
+    state = _amend_state(adapter, [position])
+
+    def _timeout(_request):
+        raise TimeoutError("no response")
+
+    state["on_send"] = _timeout
+
+    with pytest.raises(RuntimeError, match="did not confirm"):
+        asyncio.run(adapter.amend_position_take_profit(7, 1.10000))
+    # Broker state never showed the TP: previous state still in force.
+    assert not position.HasField("takeProfit") or position.takeProfit == 0

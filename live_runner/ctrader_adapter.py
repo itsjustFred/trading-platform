@@ -12,7 +12,7 @@ from collections import deque
 from collections.abc import Collection, Iterator, Mapping
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
-from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
+from decimal import ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP, Decimal
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -4967,6 +4967,207 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             stop_price=confirmed_price,
             qty=stop.qty,
         )
+
+    async def amend_position_take_profit(
+        self, position_id: int, take_profit: float | None
+    ) -> float | None:
+        """Set (or clear) a position's take profit; the stop is preserved exactly.
+
+        ``take_profit=None`` removes the TP; a price sets it. The position's
+        current ``stopLoss`` is echoed back verbatim into the same atomic
+        ``ProtoOAAmendPositionSLTPReq``, so the stop can never be dropped or
+        loosened by this call - and a position whose stop cannot be read is
+        refused outright. Exists for the flip workflow's fallback TP (#168):
+        placed when the workflow halts or gives up so the position keeps an
+        upside exit, and amended away again before the workflow resumes.
+
+        Confirmed by re-reading the position: only a broker-reported
+        ``takeProfit`` at the requested level (or absent/zero for a clear)
+        counts. Same ambiguity rule as :meth:`amend_protective_stop`: a send
+        failure that is not a definite broker refusal is verified against
+        broker state, and an unconfirmed outcome raises.
+        """
+        pid = self._positive_int(position_id)
+        if pid is None:
+            raise ValueError(
+                f"cTrader position id {position_id!r} is not usable; "
+                "refusing to amend its take profit."
+            )
+        if self._ProtoOAAmendPositionSLTPReq is None:
+            raise RuntimeError("cTrader amend-position-SLTP request type is not loaded")
+        position = await self._fetch_open_position(pid)
+        if position is None:
+            raise RuntimeError(
+                f"cTrader position {pid} is no longer open; "
+                "there is no take profit to amend."
+            )
+        trade_data = getattr(position, "tradeData", None)
+        symbol_id = (
+            self._positive_int(getattr(trade_data, "symbolId", 0))
+            if trade_data is not None
+            else None
+        )
+        if symbol_id is None:
+            raise ValueError(
+                f"cTrader position {pid} has no readable symbolId; "
+                "refusing to amend its take profit."
+            )
+        symbol = self._symbol_name_for_id(symbol_id).strip().upper()
+        digits = self._scale_for(symbol).price_digits
+
+        # The stop must be echoed exactly; without a readable one the amend
+        # could clear protection, so it is refused before any request.
+        stop_price = (
+            parse_optional(getattr(position, "stopLoss", None))
+            if self._has_proto_field(position, "stopLoss")
+            else None
+        )
+        if stop_price is None or stop_price <= 0:
+            raise ValueError(
+                f"cTrader position {pid} ({symbol}) has no readable stopLoss "
+                "to preserve; refusing to amend its take profit."
+            )
+        current_tp = (
+            parse_optional(getattr(position, "takeProfit", None))
+            if self._has_proto_field(position, "takeProfit")
+            else None
+        )
+        target = (
+            self._round_take_profit(symbol, take_profit)
+            if take_profit is not None
+            else None
+        )
+        tolerance = float(Decimal(1).scaleb(-max(0, int(digits)))) * 0.5 + 1e-12
+        if target is None:
+            if current_tp is None or current_tp <= 0:
+                return None  # already clear: idempotent, no write
+        elif (
+            current_tp is not None
+            and current_tp > 0
+            and math.isclose(current_tp, target, rel_tol=0.0, abs_tol=tolerance)
+        ):
+            return float(current_tp)  # already at the target: no write
+
+        request = self._build_position_tp_request(pid, position, stop_price, target)
+        send_error = await self._send_amend_position_request(request)
+        confirmed = await self._confirmed_tp_amendment(
+            position_id=pid,
+            symbol=symbol,
+            expected=target,
+            digits=digits,
+            send_error=send_error,
+        )
+        return None if target is None else float(confirmed)
+
+    def _round_take_profit(self, symbol: str, price: float) -> float:
+        """Quantize a take-profit onto the symbol's price grid (nearest tick)."""
+        value = float(price)
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError(
+                f"Invalid take-profit price for {symbol}: {price!r}; "
+                "refusing to amend."
+            )
+        digits = self._scale_for(symbol).price_digits
+        tick = Decimal(1).scaleb(-max(0, int(digits)))
+        rounded = float(
+            Decimal(repr(round(value, 8))).quantize(tick, rounding=ROUND_HALF_UP)
+        )
+        if rounded <= 0:
+            raise ValueError(
+                f"Take-profit price for {symbol} rounds to {rounded!r}; "
+                "refusing to amend."
+            )
+        return rounded
+
+    def _build_position_tp_request(
+        self,
+        position_id: int,
+        position: Any,
+        stop_price: float,
+        take_profit: float | None,
+    ) -> Any:
+        """The SLTP amendment: stop echoed verbatim, TP set or cleared."""
+        request = self._ProtoOAAmendPositionSLTPReq()
+        request.ctidTraderAccountId = self.ctid_trader_account_id
+        request.positionId = position_id
+        request.stopLoss = float(stop_price)
+        if take_profit is not None:
+            request.takeProfit = float(take_profit)
+        for field_name in (
+            "guaranteedStopLoss",
+            "trailingStopLoss",
+            "stopLossTriggerMethod",
+        ):
+            if self._has_proto_field(position, field_name):
+                setattr(request, field_name, getattr(position, field_name))
+        return request
+
+    async def _confirm_position_tp(
+        self, position_id: int, expected: float | None, *, digits: int
+    ) -> float | None:
+        """The broker-reported TP once it matches ``expected``.
+
+        ``expected=None`` confirms an absent/zero ``takeProfit`` and reports
+        ``0.0``; ``None`` means "not yet" (or the position is gone - the
+        caller's final read distinguishes the two, same as the stop path).
+        """
+        position = await self._fetch_open_position(position_id)
+        if position is None:
+            return None
+        broker_tp = (
+            parse_optional(getattr(position, "takeProfit", None))
+            if self._has_proto_field(position, "takeProfit")
+            else None
+        )
+        if expected is None:
+            return 0.0 if (broker_tp is None or broker_tp <= 0) else None
+        if broker_tp is None or broker_tp <= 0:
+            return None
+        tolerance = float(Decimal(1).scaleb(-max(0, int(digits)))) * 0.5 + 1e-12
+        if math.isclose(broker_tp, expected, rel_tol=0.0, abs_tol=tolerance):
+            return broker_tp
+        return None
+
+    async def _confirmed_tp_amendment(
+        self,
+        *,
+        position_id: int,
+        symbol: str,
+        expected: float | None,
+        digits: int,
+        send_error: BaseException | None,
+    ) -> float:
+        """Poll broker state until the TP shows (or clears), or fail closed."""
+        confirmed: float | None = None
+        for attempt in range(_AMEND_CONFIRM_ATTEMPTS):
+            try:
+                confirmed = await self._confirm_position_tp(
+                    position_id, expected, digits=digits
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # except-kind: money-decision
+                confirmed = None
+            if confirmed is not None:
+                break
+            if attempt + 1 < _AMEND_CONFIRM_ATTEMPTS:
+                await asyncio.sleep(_AMEND_CONFIRM_INTERVAL_SECONDS)
+        if confirmed is None:
+            position_now = await self._fetch_open_position(position_id)
+            if position_now is None:
+                raise RuntimeError(
+                    f"cTrader position {position_id} ({symbol}) closed while its "
+                    "take profit was being amended; the amendment outcome is moot "
+                    "but the close itself must be reconciled."
+                )
+            detail = f" send error: {send_error!r}" if send_error is not None else ""
+            raise RuntimeError(
+                f"cTrader did not confirm the take-profit amendment for position "
+                f"{position_id} ({symbol}): broker still reports takeProfit "
+                f"{getattr(position_now, 'takeProfit', None)!r}, requested "
+                f"{expected!r}.{detail}"
+            )
+        return confirmed
 
     async def _persist_execution_event(self, event: Any) -> None:
         execution_type = int(event.executionType)

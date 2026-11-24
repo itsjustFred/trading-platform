@@ -117,6 +117,20 @@ carries the explicit opt-in and whose account is provably demo/paper:
   (mismatch = alert + no action), breakeven stop after the TP1 bar (never loosens a tighter
   stop), then Supertrend-flip exit of the remainder at market. Flip closes route through the
   daemon's per-symbol exit lock and in-flight-exit check.
+- **Fallback take-profit on halt/give-up** (maintainer decision 2026-11-24): when the workflow
+  stops managing a position that is provably ours - a permanent halt or the give-up after
+  `FLIP_GIVE_UP_AFTER_SECONDS` - the broker stop stays in force AND the position gets a broker
+  take-profit at the plan's `tp1_price` (`amend_position_take_profit`, which echoes the current
+  stop loss verbatim into the same atomic `ProtoOAAmendPositionSLTPReq`, so the stop can never
+  be dropped or loosened). TP1 already done means there is no price level for the remainder -
+  it exits on the flip - so the position stays stop-only and the alert says so. Positions whose
+  provenance is unproven or whose `position_id` no longer matches are never touched (zero broker
+  writes). The placed TP is persisted as `fallback_tp_price` in the plan state, making restarts
+  idempotent; amend failures alert critical, keep the stop, and retry only on the workflow's own
+  backoff/probe pacing (`FLIP_FALLBACK_TP_MAX_ATTEMPTS`). When the outage recovers and the plan
+  resumes, the fallback TP is amended away BEFORE any TP1 close logic runs - a broker TP at
+  `tp1_price` would close the whole position instead of the tranche - and a failed removal
+  fails closed: no TP1 close goes out while the broker TP may still be in force.
 - **Live/replay differences (accepted):** live TP1 triggers on bid polling, so an intrapoll
   wick that replay's bar-high would catch can be missed; live closes the remainder at market
   while replay fills at the next bar's open. cTrader serves only sub-day bars
