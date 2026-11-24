@@ -1,0 +1,27 @@
+.github/workflows/agent-code-review.yml
+  s_cf18a1388ebe38::t_dd31ca848cf2ab 243-244,248-257,271,481-482
+.github/workflows/agent-mutation-testing.yml
+  s_cf18a1388ebe38::t_527548dd2c5e21 245-246,250-259,273,519-520
+.github/workflows/agent-pre-mortem.yml
+  s_cf18a1388ebe38::t_18382bed5261da 465-466,470-479,493,730-731
+tests/test_agent_pipeline_contracts.py
+  s_cf18a1388ebe38::t_16b0c444769630 2059-2063
+tests/test_agent_sibling_hardening.py
+  s_cf18a1388ebe38::t_78fd8ee00acc7e 33,925-960
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "2cebf1abdbac032e5e9d14ea1c9fada7301ea7ff",
+  "prompts": {},
+  "sessions": {
+    "s_cf18a1388ebe38": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "89a0ca19-4b09-4edb-8bd9-cc391f1b137d",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "itsjustFred <justfred.business@gmail.com>"
+    }
+  }
+}
