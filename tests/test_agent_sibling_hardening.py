@@ -30,6 +30,7 @@ import os
 import re
 import shutil
 import subprocess
+import textwrap
 from pathlib import Path
 
 import pytest
@@ -921,3 +922,39 @@ def test_an_agent_output_carrying_the_nvidia_key_is_never_kept(tmp_path) -> None
             left = [p.name for p in (runner_temp / stage).iterdir() if p.name.startswith("comment")]
             assert left == [], f"{name} ({mode}): {left} left behind for upload"
             assert key not in result.stdout, f"{name} ({mode}): the step echoed the key"
+
+
+def test_the_leak_guard_still_refuses_when_one_stream_is_missing(tmp_path) -> None:
+    """The guard greps both streams at once. GNU grep -q exits 0 on a match even when
+    another named file is missing (without -q, or under another grep, that is exit 2 -
+    read as no match), so a key in one stream must still be refused while the other
+    stream does not exist yet."""
+    key = "nvapi-test-0123456789"
+    steps = {**_AGENT_STEP, "agent-pre-mortem.yml": ("premortem", "Run pre-mortem agent")}
+    for name, (agent_name, step_name) in steps.items():
+        body = _run(_find_step(_load(name)["jobs"][agent_name], rf"^{re.escape(step_name)}$"))
+        match = re.search(r"^( *)refuse_leaked_key\(\) \{\n.*?^\1\}\n", body, re.M | re.S)
+        assert match, f"{name}: no refuse_leaked_key function"
+        for present in ("raw", "stderr"):
+            case = tmp_path / f"{name}-{present}"
+            case.mkdir()
+            out = case / "comment.md"
+            (case / f"comment.md.{present}").write_text(f"leaked {key}\n", encoding="utf-8")
+            script = case / "guard.sh"
+            script.write_text(
+                f"set -euo pipefail\nout={str(out)!r}\n{textwrap.dedent(match.group(0))}"
+                "refuse_leaked_key\necho kept\n",
+                encoding="utf-8",
+            )
+            result = subprocess.run(
+                [shutil.which("bash") or "bash", str(script)],
+                env={**os.environ, "NVIDIA_API_KEY": key},
+                capture_output=True,
+                text=True,
+            )
+            assert result.returncode == 1 and "kept" not in result.stdout, (
+                f"{name}: a key in .{present} was kept while the other stream was missing"
+            )
+            assert not (case / f"comment.md.{present}").exists(), (
+                f"{name}: the leaking .{present} stream was left behind"
+            )

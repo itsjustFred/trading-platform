@@ -462,9 +462,20 @@ jobs:
           # (attempt N): ... Too Many Requests"), also when a later retry succeeds.
           # A cap only counts once all retries are through, so the quota classifier
           # reads stderr without those lines (<file>.final); the final error line
-          # stays.
+          # stays, and so does note_exhausted_retries' synthetic line, which must
+          # therefore never contain "retrying (attempt".
           drop_retry_lines() {
             grep -v 'retrying (attempt' "$1" > "$1.final" || true
+          }
+          # A failed probe whose last stderr line is a retry line was cut off mid-retry:
+          # that line is why it failed, so it goes back into the classifier's view (only
+          # for a failed probe - after a retry that cleared it must not count).
+          keep_last_retry_line() {
+            local final_line
+            final_line=$(grep -v '^[[:space:]]*$' "$1" | tail -n 1) || true
+            case "$final_line" in
+              *'retrying (attempt'*) printf '%s\n' "$final_line" >> "$1.final" ;;
+            esac
           }
           # opencode has been seen exiting 0 on the cap for this tiny prompt,
           # so the exit status alone cannot clear the model: the quota
@@ -479,6 +490,7 @@ jobs:
           printf '%s\n' "$raw" > "$probe_dir/stdout"
           note_exhausted_retries "$probe_dir/stderr"
           drop_retry_lines "$probe_dir/stderr"
+          [ "$status" -eq 0 ] || keep_last_retry_line "$probe_dir/stderr"
           cat "$probe_dir/stdout" "$probe_dir/stderr" > "$probe_dir/combined"
           # Always logged, bounded like the agent step's echo: run 44962236033
           # passed this probe and hit "Free usage limit reached" 26 s later,
@@ -715,7 +727,8 @@ jobs:
           # (attempt N): ... Too Many Requests"), also when a later retry succeeds.
           # A cap only counts once all retries are through, so the quota classifier
           # reads stderr without those lines (<file>.final); the final error line
-          # stays.
+          # stays, and so does note_exhausted_retries' synthetic line, which must
+          # therefore never contain "retrying (attempt".
           drop_retry_lines() {
             grep -v 'retrying (attempt' "$1" > "$1.final" || true
           }

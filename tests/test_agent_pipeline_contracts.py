@@ -2056,6 +2056,11 @@ def test_the_quota_probe_reports_only_a_positive_quota_signature(tmp_path) -> No
     assert "available=true" in written and "available=false" not in written, (
         "a 429 that cleared on a retry skipped the agent job"
     )
+    # A probe cut off mid-retry (its last stderr line a 429 retry) is a cap too:
+    # its retries are over, so that line is the final word.
+    result, written = _run_probe_step(tmp_path, "nvidia-cut")
+    assert result.returncode == 0, f"probe step failed on nvidia-cut: {result.stderr}"
+    assert "available=false" in written, "a probe cut off mid-retry on a 429 ran the agent job"
     result, written = _run_probe_step(tmp_path, "kilo-retry-ok")
     assert result.returncode == 0, f"probe step failed on kilo-retry-ok: {result.stderr}"
     assert "available=true" in written and "available=false" not in written, (
