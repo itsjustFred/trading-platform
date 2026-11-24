@@ -3,9 +3,9 @@
 The live half of the replay-only workflow in
 ``runner/engines/signal_replay_adapter.py``: TP1 partial close, breakeven stop
 amendment, then exit of the remainder on the first red Supertrend bar after
-the first green one. Alpaca stays replay-only until #350's paper run passes;
-the per-deployment opt-in that lets a cTrader deployment ask for this mode is
-wired separately (daemon side, default off).
+the first green one. Alpaca stays replay-only until its paper run for this
+workflow passes; the per-deployment opt-in that lets a cTrader deployment
+ask for this mode is wired separately (daemon side, default off).
 
 Design, mirroring ``live_runner/trailing_stops.py`` where the guarantees are
 the same:
@@ -197,8 +197,8 @@ ExitInFlightCheck = Callable[
 
 #: Broker names the workflow may run against today. cTrader only: it is the
 #: adapter with native partial closes and in-place stop amendment wired for
-#: this workflow. Alpaca stays out until #350's paper run passes, so an
-#: opted-in Alpaca deployment is simply never managed.
+#: this workflow. Alpaca stays out until its paper run for this workflow
+#: passes, so an opted-in Alpaca deployment is simply never managed.
 FLIP_SUPPORTED_BROKERS = frozenset({"ctrader"})
 
 

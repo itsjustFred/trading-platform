@@ -90,7 +90,7 @@ Risk-policy notes (maintainer decision 2026-11-22):
   unfilled entries the broker still lists as working or holds a non-zero
   position for — and the total is
   capped at ``TRADE_ENGINE_MAX_POSITIONS``. A cap above 1 is refused
-  (entries disabled) on Alpaca accounts until #350 lands and on any
+  (entries disabled) on Alpaca accounts until #417 lands and on any
   deployment carrying the live ``supertrend_flip`` opt-in, and a strategy
   exit first cancels the deployment's still-working entry orders for the
   symbol.
@@ -321,7 +321,7 @@ async def _multi_lot_cap_refusal(
 
     Maintainer defaults for #382: ``internal_max_open_per_symbol > 1`` is
     refused (entries disabled, exits keep flowing - the same fail-closed
-    shape as an unusable cap) on Alpaca accounts until #350 lands, because a
+    shape as an unusable cap) on Alpaca accounts until #417 lands, because a
     netted Alpaca book reserves bracket-leg quantity a second lot's exit
     cannot prove; on cTrader accounts that cannot prove they hedge positions
     (``ProtoOAAccountType`` NETTED or unreadable), because a netted cTrader
@@ -336,9 +336,9 @@ async def _multi_lot_cap_refusal(
     if source == "alpaca":
         return (
             f"{MAX_OPEN_PER_SYMBOL_KEY}={cap} is refused on Alpaca accounts "
-            "until #350 lands: a netted book cannot prove a per-lot exit "
+            "until #417 lands: a netted book cannot prove a per-lot exit "
             "against bracket-leg quantity reservations. Set the cap to 1 "
-            "or wait for #350; entries are disabled, exits still evaluated."
+            "or wait for #417; entries are disabled, exits still evaluated."
         )
     if source == "ctrader":
         account_type = await _adapter_account_type(adapter)

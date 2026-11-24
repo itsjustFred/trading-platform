@@ -5306,6 +5306,100 @@ def earliest_live_signal_timestamp(
     return earliest
 
 
+def earliest_live_open_lot_entry_timestamp(
+    account_id: str, symbols: set[str] | list[str] | tuple[str, ...]
+) -> datetime | None:
+    """Earliest entry timestamp among the account's still-open position lots.
+
+    The ``after`` bound for ``status=all`` held-leg scans (#350 review): a
+    held bracket leg can only belong to an entry whose residual filled
+    quantity is still open, so history older than the oldest such entry
+    cannot hold a relevant order - and unlike
+    :func:`earliest_live_signal_timestamp` the bound ADVANCES as rounds
+    close. Uses the same lot attribution as
+    :func:`list_live_deployment_open_position_lots`, so the bound can never
+    exclude a lot that function would still report open. ``None`` when no
+    deployment on the account holds an open lot for ``symbols`` (the caller
+    falls back to the all-signals bound, the fail-closed direction).
+    """
+    normalized_account_id = str(account_id or "").strip()
+    normalized_symbols = {
+        str(symbol or "").strip().upper() for symbol in (symbols or ())
+    }
+    normalized_symbols.discard("")
+    if not normalized_account_id or not normalized_symbols:
+        return None
+    init_db()
+    earliest: datetime | None = None
+    with get_session() as session:
+        deployment_ids = [
+            str(row)
+            for row in session.exec(
+                select(LiveDeploymentModel.id).where(
+                    LiveDeploymentModel.account_id == normalized_account_id
+                )
+            ).all()
+        ]
+        for deployment_id in deployment_ids:
+            signal_rows = session.exec(
+                select(
+                    LiveSignalModel.id,
+                    LiveSignalModel.symbol,
+                    LiveSignalModel.timestamp,
+                    LiveSignalModel.action,
+                    LiveSignalModel.broker_order_id,
+                    LiveSignalModel.source,
+                    LiveSignalModel.metadata_json,
+                )
+                .where(LiveSignalModel.deployment_id == deployment_id)
+                .where(
+                    func.upper(func.trim(LiveSignalModel.symbol)).in_(
+                        normalized_symbols
+                    )
+                )
+            ).all()
+            if not signal_rows:
+                continue
+            fill_rows = session.exec(
+                select(
+                    LiveExecutionModel.signal_id,
+                    func.coalesce(func.sum(LiveExecutionModel.filled_qty), 0.0),
+                )
+                .join(
+                    LiveSignalModel,
+                    LiveExecutionModel.signal_id == LiveSignalModel.id,
+                )
+                .where(LiveSignalModel.deployment_id == deployment_id)
+                .where(
+                    func.upper(func.trim(LiveSignalModel.symbol)).in_(
+                        normalized_symbols
+                    )
+                )
+                .group_by(LiveExecutionModel.signal_id)
+            ).all()
+            filled_by_signal = {
+                str(signal_id): float(filled or 0.0)
+                for signal_id, filled in fill_rows
+            }
+            by_symbol: dict[str, list[tuple[Any, ...]]] = {}
+            for row in signal_rows:
+                symbol_key = str(row[1] or "").strip().upper()
+                if symbol_key in normalized_symbols:
+                    by_symbol.setdefault(symbol_key, []).append(row)
+            for symbol_rows in by_symbol.values():
+                for entry in _position_lot_entries(symbol_rows, filled_by_signal):
+                    if entry["residual_qty"] <= _EXIT_FILL_TOLERANCE:
+                        continue
+                    timestamp = entry["timestamp"]
+                    if timestamp is None:
+                        continue
+                    if timestamp.tzinfo is None:
+                        timestamp = timestamp.replace(tzinfo=timezone.utc)
+                    if earliest is None or timestamp < earliest:
+                        earliest = timestamp
+    return earliest
+
+
 def clear_live_signal_metadata_key(signal_id: str, key: str) -> bool:
     """Remove one key from a signal's persisted metadata (best-effort cleanup)."""
     normalized_signal_id = str(signal_id or "").strip()
