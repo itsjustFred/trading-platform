@@ -555,13 +555,16 @@ class InternalStrategyRunner:
         message: str,
         *,
         level: str = "error",
+        exc_info: Any = False,
         **extra: Any,
     ) -> None:
         marker = (key, category)
         if marker in self._reported:
             return
         self._reported.add(marker)
-        getattr(logger, level)(message, extra={"data": extra})
+        getattr(logger, level)(
+            message, extra={"data": extra}, exc_info=exc_info
+        )
 
     def _note_submit_failure(
         self,
@@ -1157,6 +1160,7 @@ class InternalStrategyRunner:
                 deployment_id=state_key[0],
                 symbol=symbol,
                 error=str(exc),
+                exc_info=exc,
             )
             return
         try:
