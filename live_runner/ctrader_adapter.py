@@ -384,11 +384,23 @@ def decode_trendbars_response(
 ) -> list[dict[str, Any]]:
     """Decode every bar of one ``ProtoOAGetTrendbarsRes``, oldest first.
 
-    The response's deprecated parallel ``timestamp`` array (unix ms) is used
-    only for bars that carry no ``utcTimestampInMinutes`` of their own.
+    Bars carry their own ``utcTimestampInMinutes``; a per-bar fallback array is
+    only honoured when the response's deprecated ``timestamp`` field is
+    genuinely iterable (it is a singular int64 in the shipped proto).
     """
     bars = list(getattr(response, "trendbar", []) or [])
-    timestamps = [int(value) for value in (getattr(response, "timestamp", []) or [])]
+    # ``ProtoOAGetTrendbarsRes.timestamp`` is a singular deprecated int64 (an
+    # echo of the request's ``toTimestamp`` - cTrader's docs say "simply don't
+    # use this field"), NOT the parallel per-bar unix-ms array an older proto
+    # shape had. Iterating the scalar raised ``TypeError: 'int' object is not
+    # iterable`` on every fetch the broker populated it on, which is what
+    # failed every cTrader internal-runner symbol in the 2026-11-24 soak. Only
+    # a genuinely iterable value can serve as a per-bar fallback; a scalar is
+    # ignored and bars keep their own ``utcTimestampInMinutes``.
+    raw_timestamps = getattr(response, "timestamp", None)
+    if isinstance(raw_timestamps, int):
+        raw_timestamps = None
+    timestamps = [int(value) for value in (raw_timestamps or [])]
     rows: list[dict[str, Any]] = []
     for index, bar in enumerate(bars):
         fallback = timestamps[index] if index < len(timestamps) else None
