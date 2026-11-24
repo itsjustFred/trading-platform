@@ -1,0 +1,19 @@
+live_runner/supertrend_flip.py
+  s_e1f8711dfc6ff1::t_6e9d712f5fbab6 1257-1259,1284-1315,1653-1744,1766,1768,1777,1780,1784,1786-1789,2574,3436,3443-3444
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "b069891d3279372fc1040c05792f3bf03e6f0fe5",
+  "prompts": {},
+  "sessions": {
+    "s_e1f8711dfc6ff1": {
+      "agent_id": {
+        "tool": "devin",
+        "id": "s_e1f8711dfc6ff1",
+        "model": "unknown"
+      },
+      "human_author": "itsjustFred <justfred.business@gmail.com>"
+    }
+  }
+}
