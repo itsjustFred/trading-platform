@@ -20,14 +20,22 @@ maintainer decision on #277.
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any
 from uuid import UUID
 
 import pytest
 
-from live_runner.ctrader_adapter import CTraderLiveAdapter, SymbolScale
+from live_runner.ctrader_adapter import (
+    BROKER_CLOSE_RECONCILE_MAX_DEAL_LIST_REQUESTS,
+    BROKER_CLOSE_RECONCILE_MAX_LOOKBACK_MS,
+    BROKER_CLOSE_RECONCILE_OPEN_MARGIN_MS,
+    BROKER_CLOSE_RECONCILE_WINDOW_MS,
+    CTraderApiError,
+    CTraderLiveAdapter,
+    SymbolScale,
+)
 from shared.models import LiveDeploymentConfig, LiveExecution, LiveSignal
 from tests.conftest import seed_live_deployments
 
@@ -201,7 +209,8 @@ def _adapter(
     *,
     position_orders: dict[int, list[Any]] | None = None,
     deal_list: list[Any] | None = None,
-    deal_list_has_more: bool = False,
+    deal_list_has_more: Any = False,
+    deal_list_fail_predicate: Any = None,
     order_details: dict[int, Any] | None = None,
 ) -> CTraderLiveAdapter:
     """A cTrader adapter whose broker reads are faked, on the isolated DB."""
@@ -231,8 +240,10 @@ def _adapter(
 
     orders_by_position = dict(position_orders or {})
     details_by_order = dict(order_details or {})
+    requests_log: list[Any] = []
 
     async def fake_send(request: Any, *, timeout_seconds: int = 10, _depth: int = 0) -> Any:
+        requests_log.append(request)
         if isinstance(request, _OrderListReq):
             return _OrderListRes(orders_by_position.get(int(request.positionId), []))
         if isinstance(request, _DealListReq):
@@ -241,6 +252,15 @@ def _adapter(
             # scan miss closes older than a week.
             from_ms = int(getattr(request, "fromTimestamp", 0) or 0)
             to_ms = int(getattr(request, "toTimestamp", 0) or 0)
+            failure = (
+                deal_list_fail_predicate(from_ms, to_ms)
+                if callable(deal_list_fail_predicate)
+                else None
+            )
+            if failure:
+                if isinstance(failure, BaseException):
+                    raise failure
+                raise CTraderApiError("TEST_FAILURE", "deal list window failed")
 
             def _deal_ts(deal: Any) -> int:
                 for attr in ("executionTimestamp", "utcLastUpdateTimestamp", "createTimestamp"):
@@ -257,7 +277,11 @@ def _adapter(
                     or from_ms <= _deal_ts(deal) < to_ms
                 ]
             )
-            response.hasMore = deal_list_has_more
+            response.hasMore = (
+                deal_list_has_more(from_ms, to_ms)
+                if callable(deal_list_has_more)
+                else deal_list_has_more
+            )
             return response
         if isinstance(request, _OrderDetailsReq):
             order = details_by_order.get(int(request.orderId))
@@ -265,6 +289,8 @@ def _adapter(
         raise AssertionError(f"unexpected broker request {type(request).__name__}")
 
     adapter._send_request_with_refresh_retry = fake_send  # type: ignore[assignment]
+    adapter._test_requests = requests_log
+    adapter._broker_close_deal_list_min_interval_seconds = 0.0
     return adapter
 
 
@@ -492,6 +518,20 @@ def _reconcilable_adapter(database, **kwargs) -> CTraderLiveAdapter:
     return adapter
 
 
+def _deal_list_requests(adapter: CTraderLiveAdapter) -> list[Any]:
+    return [r for r in adapter._test_requests if isinstance(r, _DealListReq)]
+
+
+def _order_list_requests(adapter: CTraderLiveAdapter) -> list[Any]:
+    return [r for r in adapter._test_requests if isinstance(r, _OrderListReq)]
+
+
+def _deal_windows(adapter: CTraderLiveAdapter) -> list[tuple[int, int]]:
+    return [
+        (int(r.fromTimestamp), int(r.toTimestamp)) for r in _deal_list_requests(adapter)
+    ]
+
+
 def test_reconcile_backfills_a_position_close_missed_while_down(database) -> None:
     signal_id = _persist_entry(database, qty=10.0)
     adapter = _reconcilable_adapter(
@@ -527,6 +567,343 @@ def test_reconcile_books_a_close_older_than_the_flat_week_window(database) -> No
 
     assert recovered >= 1
     assert _ledger(database) == pytest.approx(0.0)
+
+
+def test_reconcile_books_a_recent_close_when_an_older_window_fails(database) -> None:
+    """Newest-first coverage: a failed OLD window must not drop the recent
+    close the old forward scan would have reached only after paging from the
+    floor (#415 B1)."""
+    signal_id = _persist_entry(database, qty=10.0)
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    recent_close = _close_deal(
+        deal_id=9100,
+        timestamp_ms=now_ms - (24 * 60 * 60 * 1000),
+    )
+    cutoff_ms = now_ms - (30 * 24 * 60 * 60 * 1000)
+    adapter = _reconcilable_adapter(
+        database,
+        position_orders={POSITION_ID: [_entry_order(signal_id)]},
+        deal_list=[recent_close],
+        order_details={CLOSE_ORDER_ID: _closing_order()},
+        deal_list_fail_predicate=lambda from_ms, _to_ms: from_ms < cutoff_ms,
+    )
+
+    recovered = asyncio.run(adapter.reconcile_executions())
+
+    assert recovered >= 1
+    assert _ledger(database) == pytest.approx(0.0)
+    first_window = _deal_windows(adapter)[0]
+    assert first_window[0] >= cutoff_ms
+
+
+def test_reconcile_scans_back_only_to_the_oldest_open_exposure(database) -> None:
+    """Flat history is not open exposure: an old closed signal must not drag
+    the scan floor back months when the only live lot is newer (#415 B5)."""
+    import shared.database as db
+
+    old_signal = LiveSignal(
+        deployment_id=DEP_ENTRY,
+        symbol="AAPL",
+        action="buy",
+        theoretical_price=100.0,
+        timestamp=T0,
+        metadata={"broker_order_id": str(ENTRY_ORDER_ID)},
+    )
+    old_signal_id, created = db.save_live_signal(old_signal)
+    assert created
+    assert db.save_live_execution(
+        LiveExecution(
+            signal_id=UUID(old_signal_id),
+            actual_price=100.0,
+            actual_price_observed="observed",
+            filled_qty=10.0,
+            commission=0.0,
+            timestamp=T0,
+            broker_order_id=str(ENTRY_ORDER_ID),
+            dedupe_key=f"ctrader:test:entry:{old_signal_id}",
+        )
+    )
+    old_exit = LiveSignal(
+        deployment_id=DEP_ENTRY,
+        symbol="AAPL",
+        action="sell",
+        theoretical_price=95.0,
+        timestamp=T0 + timedelta(hours=1),
+        metadata={
+            "broker_order_id": str(ENTRY_ORDER_ID + 1),
+            "risk_sizing_mode": "exit_only",
+        },
+    )
+    old_exit_id, created = db.save_live_signal(old_exit)
+    assert created
+    assert db.save_live_execution(
+        LiveExecution(
+            signal_id=UUID(old_exit_id),
+            actual_price=95.0,
+            actual_price_observed="observed",
+            filled_qty=10.0,
+            commission=0.0,
+            timestamp=old_exit.timestamp,
+            broker_order_id=str(ENTRY_ORDER_ID + 1),
+            dedupe_key=f"ctrader:test:exit:{old_exit_id}",
+        )
+    )
+
+    open_timestamp = datetime(2026, 8, 1, 12, 0, 0, tzinfo=timezone.utc)
+    open_signal = LiveSignal(
+        deployment_id=DEP_ENTRY,
+        symbol="AAPL",
+        action="buy",
+        theoretical_price=100.0,
+        timestamp=open_timestamp,
+        metadata={"broker_order_id": str(ENTRY_ORDER_ID + 10)},
+    )
+    open_signal_id, created = db.save_live_signal(open_signal)
+    assert created
+    assert db.save_live_execution(
+        LiveExecution(
+            signal_id=UUID(open_signal_id),
+            actual_price=100.0,
+            actual_price_observed="observed",
+            filled_qty=10.0,
+            commission=0.0,
+            timestamp=open_timestamp,
+            broker_order_id=str(ENTRY_ORDER_ID + 10),
+            dedupe_key=f"ctrader:test:entry:{open_signal_id}",
+        )
+    )
+    adapter = _reconcilable_adapter(database, deal_list=[])
+
+    asyncio.run(adapter.reconcile_executions())
+
+    expected_floor_ms = int(open_timestamp.timestamp() * 1000) - (
+        BROKER_CLOSE_RECONCILE_OPEN_MARGIN_MS
+    )
+    windows = _deal_windows(adapter)
+    assert windows
+    assert min(from_ms for from_ms, _to_ms in windows) == expected_floor_ms
+    assert expected_floor_ms > T0_MS
+
+
+def test_reconcile_caps_deal_list_requests_when_has_more_persists(
+    database, caplog
+) -> None:
+    """A pathological ``hasMore`` account must not turn one pass into
+    thousands of deal-list requests (#415 B2)."""
+    import logging
+
+    signal_id = _persist_entry(database, qty=10.0)
+    adapter = _reconcilable_adapter(
+        database,
+        position_orders={POSITION_ID: [_entry_order(signal_id)]},
+        deal_list=[_close_deal()],
+        order_details={CLOSE_ORDER_ID: _closing_order()},
+        deal_list_has_more=lambda _from_ms, _to_ms: True,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        asyncio.run(adapter.reconcile_executions())
+
+    deal_requests = _deal_list_requests(adapter)
+    assert len(deal_requests) == BROKER_CLOSE_RECONCILE_MAX_DEAL_LIST_REQUESTS
+    has_more_warnings = [
+        record for record in caplog.records if "hasMore" in record.getMessage()
+    ]
+    assert len(has_more_warnings) == 1
+    assert "uncovered" in has_more_warnings[0].getMessage()
+
+
+def test_reconcile_processes_gathered_deals_when_a_window_times_out(database) -> None:
+    """A Twisted/asyncio timeout is a per-window failure, not a reason to
+    discard every newer window already gathered (#415 should-fix 6)."""
+    signal_id = _persist_entry(database, qty=10.0)
+    recent_close = _close_deal(
+        deal_id=9400,
+        timestamp_ms=int(datetime.now(timezone.utc).timestamp() * 1000)
+        - (24 * 60 * 60 * 1000),
+    )
+    cutoff_ms = int(datetime.now(timezone.utc).timestamp() * 1000) - (
+        30 * 24 * 60 * 60 * 1000
+    )
+    adapter = _reconcilable_adapter(
+        database,
+        position_orders={POSITION_ID: [_entry_order(signal_id)]},
+        deal_list=[recent_close],
+        order_details={CLOSE_ORDER_ID: _closing_order()},
+        deal_list_fail_predicate=lambda from_ms, _to_ms: (
+            TimeoutError("deal list timed out") if from_ms < cutoff_ms else None
+        ),
+    )
+
+    recovered = asyncio.run(adapter.reconcile_executions())
+
+    assert recovered >= 1
+    assert _ledger(database) == pytest.approx(0.0)
+
+
+def test_reconcile_does_not_reflag_a_resolved_close_after_restart(database) -> None:
+    """The durable flag set survives a new adapter on the same DB: an
+    unattributable close older than the old 7-day window must not be flagged
+    (and re-break a resolution) on every process start (#415 B3)."""
+    import shared.database as db
+
+    _persist_entry(database, qty=10.0)
+    old_close = _close_deal(deal_id=9501, timestamp_ms=T0_MS + 3_600_000)
+    first = _reconcilable_adapter(
+        database,
+        position_orders={POSITION_ID: []},
+        deal_list=[old_close],
+    )
+    asyncio.run(first.reconcile_executions())
+    assert len(_reconciliation_flags(database)) == 1
+
+    db.resolve_ledger_reconciliation_flag(
+        account_id=ACCOUNT,
+        symbol="AAPL",
+        actor="operator",
+        note="reconciled by hand",
+    )
+    second = _reconcilable_adapter(
+        database,
+        position_orders={POSITION_ID: []},
+        deal_list=[old_close],
+    )
+    asyncio.run(second.reconcile_executions())
+
+    assert len(_reconciliation_flags(database)) == 1
+    assert db.list_unresolved_ledger_reconciliation_flags(ACCOUNT) == []
+    assert _order_list_requests(second) == []
+
+
+def test_reconcile_skips_an_already_booked_close_before_broker_reads(database) -> None:
+    """Deal-id dedupe runs before position-order/order-detail reads: a close
+    the ledger already booked costs no extra broker requests on reconnect
+    (#415 B4)."""
+    signal_id = _persist_entry(database, qty=10.0)
+    first = _reconcilable_adapter(
+        database,
+        position_orders={POSITION_ID: [_entry_order(signal_id)]},
+        deal_list=[_close_deal(deal_id=9601)],
+        order_details={CLOSE_ORDER_ID: _closing_order()},
+    )
+    asyncio.run(first.reconcile_executions())
+    assert _ledger(database) == pytest.approx(0.0)
+
+    second = _reconcilable_adapter(
+        database,
+        position_orders={POSITION_ID: []},
+        deal_list=[_close_deal(deal_id=9601)],
+        order_details={},
+    )
+    asyncio.run(second.reconcile_executions())
+
+    assert _order_list_requests(second) == []
+    assert _reconciliation_flags(database) == []
+    assert _ledger(database) == pytest.approx(0.0)
+
+
+def test_fetch_broker_close_window_halves_has_more_and_keeps_second_half(
+    database,
+) -> None:
+    """The ``hasMore`` recursion must actually fetch both halves: a close in
+    the newer half of a truncated window is still booked (#415 should-fix 8)."""
+    start_ms = 1_700_000_000_000
+    end_ms = start_ms + (7 * 24 * 60 * 60 * 1000)
+    mid_ms = start_ms + (end_ms - start_ms) // 2
+    first_half_deal = _close_deal(
+        deal_id=9701, timestamp_ms=start_ms + (end_ms - start_ms) // 4
+    )
+    second_half_deal = _close_deal(
+        deal_id=9702, timestamp_ms=mid_ms + (end_ms - mid_ms) // 2
+    )
+    adapter = _adapter(
+        database,
+        deal_list=[first_half_deal, second_half_deal],
+        deal_list_has_more=lambda from_ms, to_ms: (from_ms, to_ms)
+        == (start_ms, end_ms),
+    )
+    budget = {
+        "remaining": 10,
+        "last_request_at": 0.0,
+        "exhausted": False,
+        "truncated_ranges": [],
+    }
+
+    deals = asyncio.run(
+        adapter._fetch_broker_close_deal_window(start_ms, end_ms, budget=budget)
+    )
+
+    assert deals is not None
+    assert {deal.dealId for deal in deals} == {9701, 9702}
+    assert len(_deal_list_requests(adapter)) == 3
+
+
+def test_reconcile_processes_a_timestamp_less_deal_once_per_pass(database) -> None:
+    """Boundary/duplicate deals returned by every window are processed once:
+    ``seen_deal_ids`` is the only guard that runs before broker reads (#415
+    should-fix 8)."""
+    _persist_entry(database, qty=10.0)
+    deal = _close_deal(deal_id=9801)
+    deal.executionTimestamp = 0
+    deal.utcLastUpdateTimestamp = 0
+    adapter = _reconcilable_adapter(
+        database,
+        position_orders={POSITION_ID: []},
+        deal_list=[deal],
+    )
+    calls = 0
+    original = adapter._reconcile_position_close_deal
+
+    async def counting(*args: Any, **kwargs: Any) -> int:
+        nonlocal calls
+        calls += 1
+        return await original(*args, **kwargs)
+
+    adapter._reconcile_position_close_deal = counting  # type: ignore[assignment]
+    asyncio.run(adapter.reconcile_executions())
+
+    assert calls == 1
+    assert len(_reconciliation_flags(database)) == 1
+
+
+def test_reconcile_without_open_exposure_keeps_the_recent_window_floor(
+    database,
+) -> None:
+    """``not_before_ms=None`` still means the old flat 7-day floor, not an
+    unbounded scan (#415 should-fix 8)."""
+    adapter = _reconcilable_adapter(database, deal_list=[])
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+
+    asyncio.run(adapter.reconcile_executions())
+
+    windows = _deal_windows(adapter)
+    assert len(windows) == 1
+    assert windows[0][1] - windows[0][0] <= BROKER_CLOSE_RECONCILE_WINDOW_MS
+    assert windows[0][0] >= now_ms - BROKER_CLOSE_RECONCILE_WINDOW_MS - 60_000
+
+
+def test_reconcile_position_order_lookup_uses_the_open_exposure_window(
+    database,
+) -> None:
+    """``OrderListByPositionId`` gets an explicit window reaching the opening
+    signal, so a ~60-day-old opener is not missed by a default recent lookup
+    (#415 should-fix 7)."""
+    signal_id = _persist_entry(database, qty=10.0)
+    old_close = _close_deal(deal_id=9901, timestamp_ms=T0_MS + 3_600_000)
+    adapter = _reconcilable_adapter(
+        database,
+        position_orders={POSITION_ID: [_entry_order(signal_id)]},
+        deal_list=[old_close],
+        order_details={CLOSE_ORDER_ID: _closing_order()},
+    )
+
+    asyncio.run(adapter.reconcile_executions())
+
+    order_requests = _order_list_requests(adapter)
+    assert order_requests
+    request = order_requests[0]
+    assert int(request.fromTimestamp) == T0_MS - BROKER_CLOSE_RECONCILE_OPEN_MARGIN_MS
+    assert int(request.toTimestamp) > T0_MS
 
 
 def test_reconcile_close_beyond_max_lookback_is_not_booked(database, caplog) -> None:
@@ -567,11 +944,20 @@ def test_reconcile_close_beyond_max_lookback_is_not_booked(database, caplog) -> 
         deal_list=[ancient_close],
     )
 
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
     with caplog.at_level(logging.WARNING):
         asyncio.run(adapter.reconcile_executions())
 
     assert _ledger(database) == pytest.approx(10.0)
     assert any("maximum lookback" in record.getMessage() for record in caplog.records)
+    windows = _deal_windows(adapter)
+    assert windows
+    oldest_from_ms = min(from_ms for from_ms, _to_ms in windows)
+    assert oldest_from_ms >= now_ms - BROKER_CLOSE_RECONCILE_MAX_LOOKBACK_MS - 60_000
+    ancient_close_ms = int(ancient * 1000) + 3_600_000
+    assert all(
+        not (from_ms <= ancient_close_ms < to_ms) for from_ms, to_ms in windows
+    )
 
 
 def test_reconcile_skips_a_close_our_own_exit_order_made(database) -> None:

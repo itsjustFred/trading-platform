@@ -4383,6 +4383,38 @@ def flag_live_ledger_reconciliation(
     )
 
 
+def list_live_ledger_reconciliation_deal_ids(account_id: str) -> set[int]:
+    """Deal ids already carrying a ``ledger_reconciliation_required`` flag.
+
+    The flag rows are the durable "already surfaced" set: a restart must not
+    write a second flag (and re-break an operator resolution) for the same
+    unattributable broker close. Resolved flags still count - resolution means
+    the operator handled that deal, not that the scan may flag it again.
+    """
+    normalized_account = str(account_id or "").strip()
+    if not normalized_account:
+        return set()
+    like_pattern = _ledger_flag_account_like(normalized_account)
+    init_db()
+    with get_session() as session:
+        rows = session.exec(
+            select(LiveControlAuditModel.detail_json)
+            .where(LiveControlAuditModel.action == LEDGER_RECONCILIATION_AUDIT_ACTION)
+            .where(LiveControlAuditModel.target_id.like(like_pattern, escape="\\"))
+        ).all()
+    deal_ids: set[int] = set()
+    for detail in rows:
+        if not isinstance(detail, dict):
+            continue
+        try:
+            deal_id = int(detail.get("deal_id") or 0)
+        except (TypeError, ValueError):
+            continue
+        if deal_id > 0:
+            deal_ids.add(deal_id)
+    return deal_ids
+
+
 def get_live_deployment_net_filled_qty(deployment_id: str, symbol: str) -> float:
     """The deployment's own signed net filled quantity for ``symbol`` (#121).
 
@@ -4768,6 +4800,97 @@ def list_live_deployment_open_position_lots(
                     "broker_order_id": entry["broker_order_id"],
                 }
             )
+    return lots
+
+
+def list_live_account_open_position_lots(account_id: str) -> list[dict[str, Any]]:
+    """Open position lots across every deployment on one account.
+
+    Same residual attribution as :func:`list_live_deployment_open_position_lots`,
+    grouped per ``(deployment_id, symbol)`` because each deployment keeps its own
+    ledger even when deployments share a netted broker symbol. The cTrader
+    broker-close scan uses the oldest lot timestamp as its floor: a close can
+    only belong to a position the ledger still holds, so flat history must not
+    widen the scan.
+    """
+    normalized_account_id = str(account_id or "").strip()
+    if not normalized_account_id:
+        raise ValueError("An account id is required for open position lots")
+    init_db()
+    with get_session() as session:
+        signal_rows = session.exec(
+            select(
+                LiveSignalModel.deployment_id,
+                LiveSignalModel.id,
+                LiveSignalModel.symbol,
+                LiveSignalModel.timestamp,
+                LiveSignalModel.action,
+                LiveSignalModel.broker_order_id,
+                LiveSignalModel.source,
+                LiveSignalModel.metadata_json,
+            )
+            .join(
+                LiveDeploymentModel,
+                LiveSignalModel.deployment_id == LiveDeploymentModel.id,
+            )
+            .where(LiveDeploymentModel.account_id == normalized_account_id)
+        ).all()
+        fill_rows = session.exec(
+            select(
+                LiveExecutionModel.signal_id,
+                func.coalesce(func.sum(LiveExecutionModel.filled_qty), 0.0),
+            )
+            .join(LiveSignalModel, LiveExecutionModel.signal_id == LiveSignalModel.id)
+            .join(
+                LiveDeploymentModel,
+                LiveSignalModel.deployment_id == LiveDeploymentModel.id,
+            )
+            .where(LiveDeploymentModel.account_id == normalized_account_id)
+            .group_by(LiveExecutionModel.signal_id)
+        ).all()
+    filled_by_signal = {str(signal_id): float(filled or 0.0) for signal_id, filled in fill_rows}
+
+    rows_by_lot_key: dict[tuple[str, str], list[tuple[Any, ...]]] = {}
+    for (
+        deployment_id,
+        signal_id,
+        symbol,
+        timestamp,
+        action,
+        broker_order_id,
+        source,
+        metadata,
+    ) in signal_rows:
+        normalized_symbol = str(symbol or "").strip().upper()
+        if not normalized_symbol:
+            continue
+        rows_by_lot_key.setdefault((str(deployment_id), normalized_symbol), []).append(
+            (signal_id, normalized_symbol, timestamp, action, broker_order_id, source, metadata)
+        )
+
+    lots: list[dict[str, Any]] = []
+    for (deployment_id, symbol), rows in rows_by_lot_key.items():
+        for entry in _position_lot_entries(rows, filled_by_signal):
+            residual = entry["residual_qty"]
+            if residual > _EXIT_FILL_TOLERANCE:
+                lots.append(
+                    {
+                        "deployment_id": deployment_id,
+                        "symbol": symbol,
+                        "signal_id": entry["signal_id"],
+                        "action": entry["action"],
+                        "qty": residual,
+                        "timestamp": entry["timestamp"],
+                        "broker_order_id": entry["broker_order_id"],
+                    }
+                )
+    lots.sort(
+        key=lambda item: (
+            item["timestamp"] is None,
+            item["timestamp"] or datetime.min.replace(tzinfo=timezone.utc),
+            item["signal_id"],
+        )
+    )
     return lots
 
 
