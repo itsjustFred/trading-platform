@@ -1,0 +1,29 @@
+shared/indicators/core.py
+  s_1a73a0cc1bdd76::t_7cd4197948df73 236-243
+shared/indicators/presets.py
+  s_1a73a0cc1bdd76::t_3160c732d8bd37 130-132,195-198,208-209
+tests/indicators/test_core.py
+  s_1a73a0cc1bdd76::t_0c4cabe3dedb56 137-166,273-302
+tests/indicators/test_pine_reference_vectors.py
+  s_1a73a0cc1bdd76::t_36fce8df6a448b 259-300,334-409
+tests/indicators/test_presets_characterisation.py
+  s_1a73a0cc1bdd76::t_40e2f6d36ab2b9 656,682,703
+tests/indicators/test_private_copy_guard.py
+  s_1a73a0cc1bdd76::t_97b9103e07d709 277-279
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "5963f44c49c7b1e4fb2667cd20db4d4f110dbc54",
+  "prompts": {},
+  "sessions": {
+    "s_1a73a0cc1bdd76": {
+      "agent_id": {
+        "tool": "devin",
+        "id": "s_1a73a0cc1bdd76",
+        "model": "unknown"
+      },
+      "human_author": "itsjustFred <justfred.business@gmail.com>"
+    }
+  }
+}
