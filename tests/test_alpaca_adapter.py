@@ -319,10 +319,11 @@ class _FakeTradingClient:
                         symbol=symbol,
                         side=side,
                         order_type="stop_limit" if sl_limit is not None else "stop",
+                        order_class="oco",
                         qty=qty,
                         stop_price=sl_price,
                         limit_price=sl_limit,
-                        status="new",
+                        status="held",
                     ),
                 ],
             )
@@ -407,6 +408,7 @@ class _BracketPositionClient(_FakeTradingClient):
             "AAPL",
             "sell",
             order_type="stop",
+            order_class="bracket",
             qty=qty,
             status="held",
             stop_price=stop_price,
@@ -416,6 +418,7 @@ class _BracketPositionClient(_FakeTradingClient):
             "AAPL",
             "sell",
             order_type="limit",
+            order_class="bracket",
             qty=qty,
             status="filled" if take_profit_filled else "new",
         )
@@ -2255,10 +2258,24 @@ def _filled_bracket(symbol: str = "AAPL", qty: float = 10.0) -> list[_FakeOrder]
         symbol=symbol,
         side="sell",
         order_type="stop",
+        order_class="bracket",
         qty=qty,
         stop_price=190.0,
         status="held",
     )
+    take_profit = _FakeOrder(
+        id="tp-1",
+        symbol=symbol,
+        side="sell",
+        order_type="limit",
+        order_class="bracket",
+        qty=qty,
+        limit_price=210.0,
+        status="new",
+    )
+    # Paper 2026-11-24: the filled parent nests BOTH legs and each leg carries
+    # the parent's ``bracket`` class; the take-profit leg additionally shows up
+    # top-level in the ``status=open`` listing.
     parent = _FakeOrder(
         id="parent-1",
         symbol=symbol,
@@ -2267,16 +2284,7 @@ def _filled_bracket(symbol: str = "AAPL", qty: float = 10.0) -> list[_FakeOrder]
         order_class="bracket",
         qty=qty,
         status="filled",
-        legs=[stop_leg],
-    )
-    take_profit = _FakeOrder(
-        id="tp-1",
-        symbol=symbol,
-        side="sell",
-        order_type="limit",
-        qty=qty,
-        limit_price=210.0,
-        status="new",
+        legs=[take_profit, stop_leg],
     )
     return [parent, take_profit]
 
@@ -2353,6 +2361,7 @@ def test_full_exit_over_a_stop_limit_protection_is_not_refused(
         symbol="AAPL",
         side="sell",
         order_type="stop_limit",
+        order_class="bracket",
         qty=10.0,
         stop_price=190.0,
         limit_price=189.0,
@@ -2438,7 +2447,8 @@ def test_partial_exit_reprotects_at_current_trailing_level(monkeypatch) -> None:
     """Trailing amended the broker stop: the remainder keeps THAT level (#145)."""
     orders = _filled_bracket()
     # Trailing moved the held stop leg from the entry's 190 to 195.
-    orders[0].legs[0].stop_price = 195.0
+    stop_leg = next(leg for leg in orders[0].legs if leg.order_type == "stop")
+    stop_leg.stop_price = 195.0
     client = _FakeTradingClient(
         orders=orders,
         positions=[_FakePosition("AAPL", 10.0)],
@@ -2483,9 +2493,10 @@ def test_second_partial_exit_releases_the_oco_pair(monkeypatch) -> None:
                         symbol="AAPL",
                         side="sell",
                         order_type="stop",
+                        order_class="oco",
                         qty=6.0,
                         stop_price=190.0,
-                        status="new",
+                        status="held",
                     ),
                 ],
             )
@@ -2748,6 +2759,7 @@ def test_list_protective_stops_sees_an_oco_stop_leg() -> None:
                         symbol="AAPL",
                         side="sell",
                         order_type="stop",
+                        order_class="oco",
                         qty=6.0,
                         stop_price=190.0,
                         status="held",
@@ -2843,9 +2855,10 @@ def _working_oco(qty: float = 6.0) -> _FakeOrder:
                 symbol="AAPL",
                 side="sell",
                 order_type="stop",
+                order_class="oco",
                 qty=qty,
                 stop_price=190.0,
-                status="new",
+                status="held",
             )
         ],
     )
@@ -3193,6 +3206,157 @@ def test_changed_protection_between_plan_and_release_refuses_before_cancel(
 
     assert client.cancelled == []
     assert client.submitted == []
+
+
+def test_filled_bracket_legs_carry_the_parent_class_and_are_found() -> None:
+    """Paper 2026-11-24: a filled bracket's legs carry ``order_class='bracket'``
+    like their parent, the take-profit leg is ALSO top-level in the open
+    listing, and the stop leg stays ``held`` under the filled parent. The class
+    alone cannot tell them from the entry parent - structure must (#350 fix).
+    """
+    client = _FakeTradingClient(
+        orders=_filled_bracket(),
+        positions=[_FakePosition("AAPL", 10.0)],
+    )
+    adapter = _adapter(client)
+
+    candidates = asyncio.run(adapter._exit_protection_candidates(client, "AAPL", "sell"))
+
+    assert {candidate["order_id"] for candidate in candidates} == {"tp-1", "sl-1"}
+
+
+def test_working_entry_bracket_is_not_exit_protection() -> None:
+    """A still-working bracket ENTRY parent with legs protects nothing yet.
+
+    Same ``bracket`` class on parent and legs, but the parent is not ``filled``
+    and not ``oco``, so neither it nor its legs may be cancelled for an exit -
+    they belong to a pending entry, not to open-position protection.
+    """
+    take_profit = _FakeOrder(
+        id="tp-wip",
+        symbol="AAPL",
+        side="sell",
+        order_type="limit",
+        order_class="bracket",
+        qty=10.0,
+        limit_price=210.0,
+        status="new",
+    )
+    stop_leg = _FakeOrder(
+        id="sl-wip",
+        symbol="AAPL",
+        side="sell",
+        order_type="stop",
+        order_class="bracket",
+        qty=10.0,
+        stop_price=190.0,
+        status="held",
+    )
+    entry_parent = _FakeOrder(
+        id="entry-wip",
+        symbol="AAPL",
+        side="buy",
+        order_type="market",
+        order_class="bracket",
+        qty=10.0,
+        status="new",
+        legs=[take_profit, stop_leg],
+    )
+    client = _FakeTradingClient(orders=[entry_parent])
+    adapter = _adapter(client)
+
+    candidates = asyncio.run(adapter._exit_protection_candidates(client, "AAPL", "sell"))
+
+    assert candidates == []
+
+
+class _DelayedCancelClient(_FakeTradingClient):
+    """Alpaca's asynchronous cancel: an accepted cancel sits ``pending_cancel``
+    (still working) for a few working-book reads before it settles to
+    ``canceled`` (#350 paper fix)."""
+
+    def __init__(self, *args: Any, settle_after_reads: int = 2, **kwargs: Any) -> None:
+        super().__init__(*args, cancel_settles=False, **kwargs)
+        self._settle_after_reads = settle_after_reads
+        self._post_cancel_reads = 0
+        self._cancel_seen = False
+
+    def cancel_order_by_id(self, order_id: str) -> None:
+        self._cancel_seen = True
+        super().cancel_order_by_id(order_id)
+
+    def get_orders(self, filter=None):  # noqa: A002 - mirrors alpaca-py
+        if self._cancel_seen:
+            self._post_cancel_reads += 1
+            if self._post_cancel_reads > self._settle_after_reads:
+                resting = [
+                    *self.orders,
+                    *[leg for parent in self.orders for leg in getattr(parent, "legs", [])],
+                ]
+                for resting_order in resting:
+                    if _status_text(resting_order) == "pending_cancel":
+                        resting_order.status = "canceled"
+        return super().get_orders(filter)
+
+
+def test_partial_exit_succeeds_when_the_cancel_lands_a_few_reads_late(
+    monkeypatch,
+) -> None:
+    """Paper 2026-11-24: one immediate re-read still listed the cancelled
+    take-profit as working (``pending_cancel``) and the exit was refused. The
+    bounded re-read wait lets a cancel that lands within it through."""
+    monkeypatch.setattr(alpaca_module, "_CANCEL_CONFIRM_INTERVAL_SECONDS", 0.001)
+    client = _DelayedCancelClient(
+        orders=_filled_bracket(),
+        positions=[_FakePosition("AAPL", 10.0)],
+        settle_after_reads=3,
+    )
+    adapter = _adapter(client)
+    captured: list[LiveSignal] = []
+    _patched_signal_store(monkeypatch, captured)
+
+    signal = _exit_signal_full().model_copy(
+        update={"metadata": {**_exit_signal_full().metadata, "qty": 4.0, "explicit_qty": 4.0}}
+    )
+    broker_order_id = asyncio.run(adapter.submit_order(signal, qty=4.0))
+
+    assert broker_order_id
+    assert client.positions[0].qty == 6.0
+    oco = [order for order in client.submitted if _class_text(order) == "oco"]
+    assert len(oco) == 1
+    assert float(oco[0].qty) == 6.0
+
+
+def test_partial_exit_still_refuses_and_restores_when_the_cancel_never_lands(
+    monkeypatch,
+) -> None:
+    """The wait is bounded: a cancel that never settles still refuses the exit
+    and the cancelled protection is restored for the whole position."""
+    monkeypatch.setattr(alpaca_module, "_CANCEL_CONFIRM_INTERVAL_SECONDS", 0.001)
+    client = _FakeTradingClient(
+        orders=_filled_bracket(),
+        positions=[_FakePosition("AAPL", 10.0)],
+        cancel_settles=False,
+    )
+    adapter = _adapter(client)
+    captured: list[LiveSignal] = []
+    _patched_signal_store(monkeypatch, captured)
+
+    signal = _exit_signal_full().model_copy(
+        update={"metadata": {**_exit_signal_full().metadata, "qty": 4.0, "explicit_qty": 4.0}}
+    )
+    with pytest.raises(RuntimeError, match="still working after cancel"):
+        asyncio.run(adapter.submit_order(signal, qty=4.0))
+
+    # The exit order never went out; the position is untouched and its
+    # protection was re-placed for the full 10 shares.
+    assert not [
+        order for order in client.submitted if _type_text(order) == "market"
+    ]
+    restored = [
+        order for order in client.submitted if _class_text(order) in {"oco", "simple"}
+    ]
+    assert restored, "the cancelled protection was not restored"
 
 
 def test_unknown_exit_submit_outcome_is_logged_and_protection_restored(
@@ -3564,9 +3728,20 @@ def _filled_bracket_tranche(
         symbol=symbol,
         side="sell",
         order_type="stop",
+        order_class="bracket",
         qty=qty,
         stop_price=stop_price,
         status="held",
+    )
+    take_profit = _FakeOrder(
+        id=tp_id,
+        symbol=symbol,
+        side="sell",
+        order_type="limit",
+        order_class="bracket",
+        qty=qty,
+        limit_price=tp_price,
+        status="new",
     )
     parent = _FakeOrder(
         id=parent_id,
@@ -3576,16 +3751,7 @@ def _filled_bracket_tranche(
         order_class="bracket",
         qty=qty,
         status="filled",
-        legs=[stop_leg],
-    )
-    take_profit = _FakeOrder(
-        id=tp_id,
-        symbol=symbol,
-        side="sell",
-        order_type="limit",
-        qty=qty,
-        limit_price=tp_price,
-        status="new",
+        legs=[take_profit, stop_leg],
     )
     return [parent, take_profit]
 
@@ -3818,7 +3984,7 @@ def test_list_orders_status_all_pages_until_plus_one_microsecond() -> None:
     collected = asyncio.run(adapter._list_orders_status_all(client))
 
     assert len(collected) == 501
-    assert len({getattr(order, "id") for order in collected}) == 501
+    assert len({order.id for order in collected}) == 501
     assert len(filters) == 2
     page1_oldest = orders[499].submitted_at
     assert filters[1].until == page1_oldest + timedelta(microseconds=1)
@@ -4564,7 +4730,9 @@ def test_cancel_orders_never_lists_nested_bracket_legs() -> None:
     """A bracket leg's id in the refs must not reach it: legs are position
     protection, listed only under their parent - never by the open-orders
     read this sweep uses."""
-    leg = _FakeOrder("leg-1", "AAPL", "sell", order_type="stop")
+    leg = _FakeOrder(
+        "leg-1", "AAPL", "sell", order_type="stop", order_class="bracket"
+    )
     parent = _FakeOrder(
         "parent-1", "AAPL", "buy", order_class="bracket", legs=[leg]
     )

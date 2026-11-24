@@ -5,7 +5,7 @@ import inspect
 import math
 import os
 import re
-from collections.abc import Collection, Iterable, Iterator, Mapping
+from collections.abc import Collection, Iterable, Iterator, Mapping, Sequence
 from datetime import datetime, timedelta, timezone
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal, InvalidOperation
 from typing import Any, NamedTuple
@@ -396,7 +396,7 @@ def _exit_protection_kind(candidate: Mapping[str, Any]) -> str | None:
     return None
 
 
-def _covered_exit_protection_qty(candidates: list[Mapping[str, Any]]) -> float:
+def _covered_exit_protection_qty(candidates: Sequence[Mapping[str, Any]]) -> float:
     """Shares ``candidates`` protect, counting each broker order once.
 
     An OCO parent and its stop leg are two candidates for the same shares;
@@ -436,7 +436,7 @@ def _covered_exit_protection_qty(candidates: list[Mapping[str, Any]]) -> float:
         for other in unit[1:]:
             union(key, other)
     covered: dict[str, float] = {}
-    for candidate, key in zip(candidates, keys):
+    for candidate, key in zip(candidates, keys, strict=True):
         if not key:
             continue
         root = find(key)
@@ -1262,6 +1262,11 @@ def _alpaca_quote_asset(symbol: str) -> str:
         if len(symbol) > len(quote) + 1 and symbol.endswith(quote):
             return quote
     return "USD"
+
+
+#: Bounded wait for an asynchronous Alpaca cancel to leave the working book.
+_CANCEL_CONFIRM_ATTEMPTS = 20
+_CANCEL_CONFIRM_INTERVAL_SECONDS = 0.5
 
 
 class AlpacaLiveAdapter(BaseLiveAdapter):
@@ -2769,7 +2774,13 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         """
         order_class = _order_class_text(order)
         legs = _order_legs(order)
-        if order_class not in _ENTRY_ORDER_CLASSES:
+        # Alpaca stamps a bracket's LEGS with the parent's class too
+        # (order_class='bracket' on the take-profit limit and the stop), so
+        # the class alone cannot tell an entry parent from its leg: a leg is
+        # reached through a parent (``ancestors``) or, in the open listing of
+        # a filled bracket, appears top-level without legs of its own.
+        is_leg = bool(ancestors) or not legs
+        if order_class not in _ENTRY_ORDER_CLASSES or is_leg:
             self._add_exit_protection_candidate(
                 order,
                 symbol=symbol,
@@ -3333,7 +3344,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         # Greedy quantity pairing: each stop claims the unused take-profit
         # closest to its own tranche size, so equal-size pyramided tranches
         # rebuild as the OCO pairs they were.
-        pairs: list[tuple[Mapping[str, Any], Mapping[str, Any]]] = []
+        pairs: list[tuple[dict[str, Any], dict[str, Any]]] = []
         lone_tps: list[Mapping[str, Any]] = []
         for stop in stops:
             best_index = None
@@ -3556,10 +3567,22 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                         # the re-read below - not this error - decides whether
                         # anything still reserves the quantity.
                         cancel_errors.append(f"{order_id}:{exc}")
+                # Alpaca acknowledges a cancel asynchronously: the order sits
+                # in pending_cancel (still "working") for a moment, so one
+                # immediate re-read refuses a cancel that is about to land.
+                # Re-read with a short bounded wait before giving up.
                 still_working = sorted(
                     set(plan["order_ids"])
                     & await self._working_ids_for_symbol(client, symbol)
                 )
+                for _ in range(_CANCEL_CONFIRM_ATTEMPTS):
+                    if not still_working:
+                        break
+                    await asyncio.sleep(_CANCEL_CONFIRM_INTERVAL_SECONDS)
+                    still_working = sorted(
+                        set(plan["order_ids"])
+                        & await self._working_ids_for_symbol(client, symbol)
+                    )
                 if still_working:
                     raise RuntimeError(
                         f"Alpaca exit for {symbol}: protection orders still "
@@ -3571,7 +3594,8 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                     (current_qty > 0) == (plan["side"] == "sell")
                 )
                 if (
-                    not same_side
+                    current_qty is None
+                    or not same_side
                     or abs(abs(current_qty) - plan["position_qty"])
                     > self.position_qty_tolerance(symbol)
                 ):
@@ -3773,7 +3797,8 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             # working kind counts however its price moved (trailing), and a
             # partially present book is alerted, never guessed at.
             needed = {
-                item.get("kind") for item in recorded
+                str(item.get("kind"))
+                for item in recorded
                 if item.get("kind") in {"stop", "tp"}
             }
             if not needed:
@@ -4078,9 +4103,9 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             symbol = str(row.get("symbol") or "").strip().upper()
             if symbol:
                 by_symbol.setdefault(symbol, row)
-        for symbol, row in by_symbol.items():
+        for symbol, marker in by_symbol.items():
             try:
-                await self._recover_exit_reprotection(row)
+                await self._recover_exit_reprotection(marker)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -5752,8 +5777,12 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         # are open now, and every entry was signalled first. The bound keeps a
         # long-lived account from walking its whole order history on every
         # exit; the page cap remains the fail-closed backstop (#350 review).
-        after = await asyncio.to_thread(
-            earliest_live_signal_timestamp, self.account_id, symbols
+        after = (
+            await asyncio.to_thread(
+                earliest_live_signal_timestamp, self.account_id, symbols
+            )
+            if symbols is not None
+            else None
         )
         if after is not None:
             # Margin for clock skew and the signal-to-submit delay: the bound
