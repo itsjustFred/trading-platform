@@ -1,0 +1,23 @@
+shared/indicators/__init__.py
+  s_72b81e13fd197a::t_30d5a82559438d 6-9
+strategies/custom_swings_supertrend/README.md
+  s_72b81e13fd197a::t_2ad41d99388a4f 29-30,83-84
+tests/test_viewer_indicator_points.py
+  s_72b81e13fd197a::t_a4f28f69c63626 202
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "27660e5e561a4b48ab1b421da16c7c80020f2099",
+  "prompts": {},
+  "sessions": {
+    "s_72b81e13fd197a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b26fdc3a-6176-466d-9ab1-1ac4055c946c",
+        "model": "unknown"
+      },
+      "human_author": "itsjustFred <justfred.business@gmail.com>"
+    }
+  }
+}
