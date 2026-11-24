@@ -1,0 +1,21 @@
+tests/test_ctrader_adapter.py
+  s_390deb3211bc65::t_4d35b734da3f43 129-130,215-221,227-238,244,266-277,280-287,328-330,363-368,374-530,532-534,542,549,708,925,1470,1653,1777
+live_runner/ctrader_adapter.py
+  s_390deb3211bc65::t_4c3ec44ec7c354 18,1276-1277,1279-1282,1284,1751-1758,1760-1764,1766-1795,1798,1806-1810,1812-1815,1825-1845,1848-1868
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "d84619b1baceccc054fcb870d3861abc809f0440",
+  "prompts": {},
+  "sessions": {
+    "s_390deb3211bc65": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ee59811c-5453-4f5c-b767-6e44e25e1ae5",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "itsjustFred <justfred.business@gmail.com>"
+    }
+  }
+}
