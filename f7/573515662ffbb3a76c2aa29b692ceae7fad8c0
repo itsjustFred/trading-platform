@@ -1,0 +1,29 @@
+tests/test_ctrader_adapter.py
+  s_c4a064984fe2ba::t_f558e2952ee674 104,108-111,114,118-121,123-261,263-337,339-348,507,724,1269,1452,1576
+live_runner/ctrader_adapter.py
+  s_e03188dfa44974::t_38e0e981e93d2b 896-910,1098-1109,1275-1280,1630-1637,1716-1764,1768-1784,2483-2496,2502
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "f7573515662ffbb3a76c2aa29b692ceae7fad8c0",
+  "prompts": {},
+  "sessions": {
+    "s_c4a064984fe2ba": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "831f2153-9354-465e-bec0-91b1881a39f9",
+        "model": "unknown"
+      },
+      "human_author": "itsjustFred <justfred.business@gmail.com>"
+    },
+    "s_e03188dfa44974": {
+      "agent_id": {
+        "tool": "devin",
+        "id": "s_e03188dfa44974",
+        "model": "unknown"
+      },
+      "human_author": "itsjustFred <justfred.business@gmail.com>"
+    }
+  }
+}
