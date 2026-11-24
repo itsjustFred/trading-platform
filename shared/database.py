@@ -123,6 +123,9 @@ def _is_sqlite_url(url: str) -> bool:
 #: spelling that turns a ``file:`` database name into a SQLite URI filename.
 _SQLITE_URI_TRUE_VALUES = frozenset({"true", "yes", "on", "y", "t", "1"})
 
+#: The SQLite write-lock pragma every read-modify-write critical section opens with.
+_SQLITE_BEGIN_IMMEDIATE = "BEGIN IMMEDIATE"
+
 
 def _sqlite_uri_file_path(body: str) -> str:
     """The path inside a ``file:`` URI body, after ``uri=true`` was established.
@@ -1222,7 +1225,7 @@ def set_live_adapter_state(
     init_db()
     state_id = _adapter_state_id(normalized_account_id, normalized_key)
     with get_session() as session:
-        session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        session.connection().exec_driver_sql(_SQLITE_BEGIN_IMMEDIATE)
         record = session.get(LiveAdapterStateModel, state_id)
         if record is None:
             record = LiveAdapterStateModel(
@@ -2024,7 +2027,7 @@ def _schema_migration_connection() -> Iterator[Connection]:
             # Python's sqlite3 legacy transaction mode does not necessarily emit
             # BEGIN for DDL. Start the transaction explicitly so ALTER/DROP INDEX
             # statements roll back together with data backfills on any failure.
-            connection.exec_driver_sql("BEGIN IMMEDIATE")
+            connection.exec_driver_sql(_SQLITE_BEGIN_IMMEDIATE)
             try:
                 yield connection
                 violations = connection.execute(text("PRAGMA foreign_key_check")).fetchall()
@@ -3200,7 +3203,7 @@ def _reconcile_existing_live_signal(
     # committed, so take the write lock and re-read before deciding. Without it two redeliveries
     # with different ids on an empty tracked id would both backfill from a stale empty copy and
     # the loser's id would land nowhere: a live broker order the ledger never tracks.
-    session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+    session.connection().exec_driver_sql(_SQLITE_BEGIN_IMMEDIATE)
     session.refresh(existing)
     existing_broker_id = (existing.broker_order_id or "").strip()
     if not existing_broker_id:
@@ -3572,7 +3575,7 @@ def save_live_execution(execution: LiveExecution) -> bool:
     """Persist a fill. Returns False when a duplicate (same dedupe_key) was skipped."""
     init_db()
     with get_session() as session:
-        session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        session.connection().exec_driver_sql(_SQLITE_BEGIN_IMMEDIATE)
         try:
             record = LiveExecutionModel.from_live_execution(execution)
             if not record.dedupe_key:
@@ -3633,7 +3636,7 @@ def save_live_execution_up_to_cumulative(
 
     init_db()
     with get_session() as session:
-        session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        session.connection().exec_driver_sql(_SQLITE_BEGIN_IMMEDIATE)
         try:
             record = LiveExecutionModel.from_live_execution(execution)
             if not record.dedupe_key:
@@ -3948,7 +3951,7 @@ def apply_live_execution_commissions(account_id: str, commissions: Mapping[str, 
         return 0
     init_db()
     with get_session() as session:
-        session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        session.connection().exec_driver_sql(_SQLITE_BEGIN_IMMEDIATE)
         try:
             rows = session.exec(
                 _account_execution_rows_query(normalized_account_id)
@@ -4210,7 +4213,7 @@ def record_live_broker_side_close_fill(
 
     init_db()
     with get_session() as session:
-        session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        session.connection().exec_driver_sql(_SQLITE_BEGIN_IMMEDIATE)
         try:
             parent = session.get(LiveSignalModel, normalized_parent)
             if parent is None:
@@ -5306,6 +5309,72 @@ def earliest_live_signal_timestamp(
     return earliest
 
 
+def _open_lot_earliest_entry_for_deployment(
+    session: Any,
+    deployment_id: str,
+    normalized_symbols: set[str],
+) -> datetime | None:
+    """Earliest open-lot entry timestamp for one deployment's ``symbols``.
+
+    Same lot attribution as :func:`list_live_deployment_open_position_lots`;
+    see :func:`earliest_live_open_lot_entry_timestamp` for the contract.
+    """
+    signal_rows = session.exec(
+        select(
+            LiveSignalModel.id,
+            LiveSignalModel.symbol,
+            LiveSignalModel.timestamp,
+            LiveSignalModel.action,
+            LiveSignalModel.broker_order_id,
+            LiveSignalModel.source,
+            LiveSignalModel.metadata_json,
+        )
+        .where(LiveSignalModel.deployment_id == deployment_id)
+        .where(
+            func.upper(func.trim(LiveSignalModel.symbol)).in_(normalized_symbols)
+        )
+    ).all()
+    if not signal_rows:
+        return None
+    fill_rows = session.exec(
+        select(
+            LiveExecutionModel.signal_id,
+            func.coalesce(func.sum(LiveExecutionModel.filled_qty), 0.0),
+        )
+        .join(
+            LiveSignalModel,
+            LiveExecutionModel.signal_id == LiveSignalModel.id,
+        )
+        .where(LiveSignalModel.deployment_id == deployment_id)
+        .where(
+            func.upper(func.trim(LiveSignalModel.symbol)).in_(normalized_symbols)
+        )
+        .group_by(LiveExecutionModel.signal_id)
+    ).all()
+    filled_by_signal = {
+        str(signal_id): float(filled or 0.0)
+        for signal_id, filled in fill_rows
+    }
+    by_symbol: dict[str, list[tuple[Any, ...]]] = {}
+    for row in signal_rows:
+        symbol_key = str(row[1] or "").strip().upper()
+        if symbol_key in normalized_symbols:
+            by_symbol.setdefault(symbol_key, []).append(row)
+    earliest: datetime | None = None
+    for symbol_rows in by_symbol.values():
+        for entry in _position_lot_entries(symbol_rows, filled_by_signal):
+            if entry["residual_qty"] <= _EXIT_FILL_TOLERANCE:
+                continue
+            timestamp = entry["timestamp"]
+            if timestamp is None:
+                continue
+            if timestamp.tzinfo is None:
+                timestamp = timestamp.replace(tzinfo=timezone.utc)
+            if earliest is None or timestamp < earliest:
+                earliest = timestamp
+    return earliest
+
+
 def earliest_live_open_lot_entry_timestamp(
     account_id: str, symbols: set[str] | list[str] | tuple[str, ...]
 ) -> datetime | None:
@@ -5341,62 +5410,11 @@ def earliest_live_open_lot_entry_timestamp(
             ).all()
         ]
         for deployment_id in deployment_ids:
-            signal_rows = session.exec(
-                select(
-                    LiveSignalModel.id,
-                    LiveSignalModel.symbol,
-                    LiveSignalModel.timestamp,
-                    LiveSignalModel.action,
-                    LiveSignalModel.broker_order_id,
-                    LiveSignalModel.source,
-                    LiveSignalModel.metadata_json,
-                )
-                .where(LiveSignalModel.deployment_id == deployment_id)
-                .where(
-                    func.upper(func.trim(LiveSignalModel.symbol)).in_(
-                        normalized_symbols
-                    )
-                )
-            ).all()
-            if not signal_rows:
-                continue
-            fill_rows = session.exec(
-                select(
-                    LiveExecutionModel.signal_id,
-                    func.coalesce(func.sum(LiveExecutionModel.filled_qty), 0.0),
-                )
-                .join(
-                    LiveSignalModel,
-                    LiveExecutionModel.signal_id == LiveSignalModel.id,
-                )
-                .where(LiveSignalModel.deployment_id == deployment_id)
-                .where(
-                    func.upper(func.trim(LiveSignalModel.symbol)).in_(
-                        normalized_symbols
-                    )
-                )
-                .group_by(LiveExecutionModel.signal_id)
-            ).all()
-            filled_by_signal = {
-                str(signal_id): float(filled or 0.0)
-                for signal_id, filled in fill_rows
-            }
-            by_symbol: dict[str, list[tuple[Any, ...]]] = {}
-            for row in signal_rows:
-                symbol_key = str(row[1] or "").strip().upper()
-                if symbol_key in normalized_symbols:
-                    by_symbol.setdefault(symbol_key, []).append(row)
-            for symbol_rows in by_symbol.values():
-                for entry in _position_lot_entries(symbol_rows, filled_by_signal):
-                    if entry["residual_qty"] <= _EXIT_FILL_TOLERANCE:
-                        continue
-                    timestamp = entry["timestamp"]
-                    if timestamp is None:
-                        continue
-                    if timestamp.tzinfo is None:
-                        timestamp = timestamp.replace(tzinfo=timezone.utc)
-                    if earliest is None or timestamp < earliest:
-                        earliest = timestamp
+            candidate = _open_lot_earliest_entry_for_deployment(
+                session, deployment_id, normalized_symbols
+            )
+            if candidate is not None and (earliest is None or candidate < earliest):
+                earliest = candidate
     return earliest
 
 
@@ -5408,7 +5426,7 @@ def clear_live_signal_metadata_key(signal_id: str, key: str) -> bool:
         return False
     init_db()
     with get_session() as session:
-        session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        session.connection().exec_driver_sql(_SQLITE_BEGIN_IMMEDIATE)
         record = session.get(LiveSignalModel, normalized_signal_id)
         if record is None:
             return False
@@ -5445,7 +5463,7 @@ def set_live_signal_broker_order_id(
     ack_utc = _lift_optional_datetime(acknowledged_at) if acknowledged_at is not None else None
     init_db()
     with get_session() as session:
-        session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        session.connection().exec_driver_sql(_SQLITE_BEGIN_IMMEDIATE)
         record = session.get(LiveSignalModel, normalized_signal_id)
         if record is None:
             return False
@@ -5497,7 +5515,7 @@ def merge_live_signal_metadata(signal_id: str, updates: Mapping[str, Any]) -> bo
         return False
     init_db()
     with get_session() as session:
-        session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        session.connection().exec_driver_sql(_SQLITE_BEGIN_IMMEDIATE)
         record = session.get(LiveSignalModel, normalized_signal_id)
         if record is None:
             return False
@@ -5701,7 +5719,7 @@ def resolve_live_signal_broker_order_conflicts(signal_id: str) -> list[str]:
         # and this write would be clobbered by a stale copy of the metadata: the operator
         # would be told the conflict was resolved and the recording that replaced it
         # would have vanished with no record anywhere.
-        session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        session.connection().exec_driver_sql(_SQLITE_BEGIN_IMMEDIATE)
         record = session.get(LiveSignalModel, normalized)
         if record is None:
             return []
@@ -6740,7 +6758,7 @@ def set_live_kill_switch(
         # and the last commit silently steps the halt down. BEGIN IMMEDIATE
         # serialises the check against every other writer, the same way the
         # submission-claim and re-point paths do.
-        session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        session.connection().exec_driver_sql(_SQLITE_BEGIN_IMMEDIATE)
         try:
             record = session.get(LiveKillSwitchModel, normalized_scope)
             now = _utcnow_naive()
@@ -6805,7 +6823,7 @@ def clear_live_kill_switch(
     with get_session() as session:
         # Same write lock as set_live_kill_switch: a resume racing a halt must
         # serialise, not interleave a stale read into a lost update.
-        session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        session.connection().exec_driver_sql(_SQLITE_BEGIN_IMMEDIATE)
         try:
             record = session.get(LiveKillSwitchModel, normalized_scope)
             if record is None or record.cleared_at is not None:
@@ -7125,7 +7143,7 @@ def update_live_deployment_account(
         # submission already on its way to the *old* account, which is the exact
         # thing the check exists to prevent. BEGIN IMMEDIATE serialises the check
         # against claim insertion, the same way save_live_execution does.
-        session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        session.connection().exec_driver_sql(_SQLITE_BEGIN_IMMEDIATE)
         try:
             record = session.get(LiveDeploymentModel, normalized_deployment)
             if record is None:
@@ -7305,7 +7323,7 @@ def delete_live_deployment(deployment_id: str) -> bool:
         return False
     init_db()
     with get_session() as session:
-        session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        session.connection().exec_driver_sql(_SQLITE_BEGIN_IMMEDIATE)
         try:
             record = session.get(LiveDeploymentModel, normalized_id)
             if record is None:

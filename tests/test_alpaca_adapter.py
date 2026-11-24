@@ -2440,7 +2440,8 @@ def test_partial_exit_reprotects_remainder_at_original_levels(
     # already proven terminal and fully filled when the re-place returns, so
     # the watchdog marker is spent immediately rather than left for the next
     # connect or stream update (#350 review).
-    assert captured and "exit_reprotection" in (captured[0].metadata or {})
+    assert captured
+    assert "exit_reprotection" in (captured[0].metadata or {})
     assert len(cleared) == 1
 
 
@@ -2547,8 +2548,9 @@ def test_partial_exit_refuses_ambiguous_protection_levels(monkeypatch) -> None:
     signal = _exit_signal_full().model_copy(
         update={"metadata": {**_exit_signal_full().metadata, "qty": 4.0, "explicit_qty": 4.0}}
     )
+    submission = adapter.submit_order(signal, qty=4.0)
     with pytest.raises(ValueError, match="ambiguous") as raised:
-        asyncio.run(adapter.submit_order(signal, qty=4.0))
+        asyncio.run(submission)
 
     # Refused before any broker write: nothing cancelled, nothing submitted,
     # and the failure is marked so the caller may release its submission lease.
@@ -2575,8 +2577,9 @@ def test_failed_exit_submit_restores_protection(monkeypatch) -> None:
 
     client.submit_order = _fail_exit  # type: ignore[method-assign]
 
+    submission = adapter.submit_order(_exit_signal_full(), qty=10.0)
     with pytest.raises(RuntimeError, match="broker rejected the exit"):
-        asyncio.run(adapter.submit_order(_exit_signal_full(), qty=10.0))
+        asyncio.run(submission)
 
     # The protection the strategy had is back on the still-open position
     # (SL+TP go back as one OCO pair, so the stop lives on its leg).
@@ -3066,8 +3069,9 @@ def test_partial_exit_refuses_when_flooring_leaves_less_than_one_share(
     captured: list[LiveSignal] = []
     _patched_signal_store(monkeypatch, captured)
 
+    submission = adapter.submit_order(_partial_signal(0.5), qty=0.5)
     with pytest.raises(ValueError, match="floors"):
-        asyncio.run(adapter.submit_order(_partial_signal(0.5), qty=0.5))
+        asyncio.run(submission)
 
     assert client.cancelled == []
     assert client.submitted == []
@@ -3084,8 +3088,9 @@ def test_partial_exit_refuses_a_fractional_broker_position(monkeypatch) -> None:
     captured: list[LiveSignal] = []
     _patched_signal_store(monkeypatch, captured)
 
+    submission = adapter.submit_order(_partial_signal(1.0), qty=1.0)
     with pytest.raises(ValueError, match="fractional"):
-        asyncio.run(adapter.submit_order(_partial_signal(1.0), qty=1.0))
+        asyncio.run(submission)
 
     assert client.cancelled == []
     assert client.submitted == []
@@ -3110,8 +3115,9 @@ def test_position_change_during_release_refuses_and_restores(monkeypatch) -> Non
 
     monkeypatch.setattr(adapter, "_symbol_position_qty", _qty)
 
+    submission = adapter.submit_order(_exit_signal_full(), qty=10.0)
     with pytest.raises(RuntimeError, match="position changed"):
-        asyncio.run(adapter.submit_order(_exit_signal_full(), qty=10.0))
+        asyncio.run(submission)
 
     # The exit never went out; the restore re-protected the 9 that remain.
     assert not [
@@ -3143,8 +3149,9 @@ def test_still_working_protection_after_cancel_refuses_the_exit(
     _patched_signal_store(monkeypatch, captured)
 
     with caplog.at_level("CRITICAL"):
+        submission = adapter.submit_order(_exit_signal_full(), qty=10.0)
         with pytest.raises(RuntimeError, match="still"):
-            asyncio.run(adapter.submit_order(_exit_signal_full(), qty=10.0))
+            asyncio.run(submission)
 
     # The exit never went out and NOTHING was re-placed: the pending-cancel
     # orders still reserve the shares.
@@ -3176,8 +3183,9 @@ def test_exit_order_rejected_on_submission_restores_protection(monkeypatch) -> N
 
     client.submit_order = _reject_exit  # type: ignore[method-assign]
 
+    submission = adapter.submit_order(_exit_signal_full(), qty=10.0)
     with pytest.raises(RuntimeError, match="rejected on submission"):
-        asyncio.run(adapter.submit_order(_exit_signal_full(), qty=10.0))
+        asyncio.run(submission)
 
     oco = [order for order in client.submitted if _class_text(order) == "oco"]
     assert len(oco) == 1
@@ -3211,8 +3219,9 @@ def test_changed_protection_between_plan_and_release_refuses_before_cancel(
 
     monkeypatch.setattr(adapter, "_exit_protection_candidates", _candidates)
 
+    submission = adapter.submit_order(_exit_signal_full(), qty=10.0)
     with pytest.raises(RuntimeError, match="changed"):
-        asyncio.run(adapter.submit_order(_exit_signal_full(), qty=10.0))
+        asyncio.run(submission)
 
     assert client.cancelled == []
     assert client.submitted == []
@@ -3361,8 +3370,9 @@ def test_partial_exit_still_refuses_and_does_not_restore_when_the_cancel_never_l
         update={"metadata": {**_exit_signal_full().metadata, "qty": 4.0, "explicit_qty": 4.0}}
     )
     with caplog.at_level("CRITICAL"):
+        submission = adapter.submit_order(signal, qty=4.0)
         with pytest.raises(RuntimeError, match="still working after cancel"):
-            asyncio.run(adapter.submit_order(signal, qty=4.0))
+            asyncio.run(submission)
 
     # The exit order never went out and no protection was re-placed: the
     # still-working orders already reserve the whole position.
@@ -3394,8 +3404,9 @@ def test_unknown_exit_submit_outcome_is_logged_and_protection_restored(
     client.submit_order = _timeout  # type: ignore[method-assign]
 
     with caplog.at_level("WARNING"):
+        submission = adapter.submit_order(_exit_signal_full(), qty=10.0)
         with pytest.raises(TimeoutError):
-            asyncio.run(adapter.submit_order(_exit_signal_full(), qty=10.0))
+            asyncio.run(submission)
 
     assert any("outcome is unknown" in record.message for record in caplog.records)
     oco = [order for order in client.submitted if _class_text(order) == "oco"]
@@ -3426,8 +3437,9 @@ def test_definite_broker_rejection_does_not_claim_unknown_outcome(
     client.submit_order = _reject  # type: ignore[method-assign]
 
     with caplog.at_level("WARNING"):
+        submission = adapter.submit_order(_exit_signal_full(), qty=10.0)
         with pytest.raises(APIError):
-            asyncio.run(adapter.submit_order(_exit_signal_full(), qty=10.0))
+            asyncio.run(submission)
 
     assert not any(
         "outcome is unknown" in record.message for record in caplog.records
@@ -3799,8 +3811,9 @@ def test_a_full_exit_over_ambiguous_levels_restores_each_recorded_candidate(
 
     client.submit_order = _fail_exit  # type: ignore[method-assign]
 
+    submission = adapter.submit_order(_exit_signal_full(), qty=10.0)
     with pytest.raises(RuntimeError, match="broker rejected the exit"):
-        asyncio.run(adapter.submit_order(_exit_signal_full(), qty=10.0))
+        asyncio.run(submission)
 
     # The marker recorded every candidate, not just the ambiguous Nones.
     marker = captured[0].metadata["exit_reprotection"]
@@ -5138,7 +5151,8 @@ def test_flatten_fill_is_classified_not_flagged_unattributed(
     with caplog.at_level("WARNING"):
         asyncio.run(adapter._on_trade_update(update))
 
-    assert flagged and flagged[0]["cause"] == "alpaca_flatten_fill"
+    assert flagged
+    assert flagged[0]["cause"] == "alpaca_flatten_fill"
     assert flagged[0]["symbol"] == "AAPL"
     assert any(
         record.levelname == "WARNING" and "flatten fill" in record.message
@@ -5183,7 +5197,8 @@ def test_an_unknown_order_fill_still_flags_unattributed(monkeypatch, caplog) -> 
     with caplog.at_level("ERROR"):
         asyncio.run(adapter._on_trade_update(update))
 
-    assert flagged and flagged[0]["cause"] == "alpaca_unattributed_order_fill"
+    assert flagged
+    assert flagged[0]["cause"] == "alpaca_unattributed_order_fill"
     assert any(
         record.levelname == "ERROR" and "could not be attributed" in record.message
         for record in caplog.records
@@ -5248,7 +5263,8 @@ def test_connect_inside_both_locks_does_not_deadlock(monkeypatch) -> None:
                 # connect returned while holding both locks: no deadlock,
                 # and the replay is queued, not running inline.
                 task = adapter._exit_reprotection_recovery_task
-                assert task is not None and not task.done()
+                assert task is not None
+                assert not task.done()
                 adapter._trading_client = client
         await task
 

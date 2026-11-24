@@ -364,6 +364,31 @@ def _order_submitted_at_utc(order: Any) -> Any:
     return submitted
 
 
+def _scan_orders_page(
+    result: Any, seen: set[str], collected: list[Any]
+) -> tuple[Any, int]:
+    """Append a ``status=all`` page's unseen orders; return (oldest, new count).
+
+    ``seen`` dedupes ids across pages because ``until`` is inclusive and a
+    page boundary can repeat orders. The oldest normalised ``submitted_at``
+    is what the next page's ``until`` bound steps past.
+    """
+    new_on_page = 0
+    oldest: Any = None
+    for order in result:
+        order_id = _control_order_id(_order_attr(order, "id"))
+        if order_id is not None:
+            if order_id in seen:
+                continue
+            seen.add(order_id)
+        new_on_page += 1
+        collected.append(order)
+        submitted = _order_submitted_at_utc(order)
+        if submitted is not None and (oldest is None or submitted < oldest):
+            oldest = submitted
+    return oldest, new_on_page
+
+
 def _order_class_text(order: Any) -> str:
     """The order's class (``bracket``, ``oco``, ...), from an enum or a string."""
     return _enum_text(_order_attr(order, "order_class", ""))
@@ -412,6 +437,51 @@ def _exit_protection_kind(candidate: Mapping[str, Any]) -> str | None:
     return None
 
 
+class _IdUnionFind:
+    """Tiny union-find over string ids, for coverage-unit grouping."""
+
+    def __init__(self) -> None:
+        self._parent: dict[str, str] = {}
+
+    def find(self, node: str) -> str:
+        parent = self._parent
+        parent.setdefault(node, node)
+        root = node
+        while parent[root] != root:
+            root = parent[root]
+        while parent[node] != root:
+            parent[node], node = root, parent[node]
+        return root
+
+    def union(self, a: str, b: str) -> None:
+        root_a, root_b = self.find(a), self.find(b)
+        if root_a != root_b:
+            self._parent[root_b] = root_a
+
+
+def _coverage_unit_ids(candidate: Mapping[str, Any]) -> list[str]:
+    """The order ids tying ``candidate`` to the orders covering its shares.
+
+    ``coverage_ids`` links legs that share a (possibly terminal) parent -
+    e.g. a filled bracket's TP leg listed top-level and its held SL leg
+    reached through ``status=all``. ``cancel_ids`` cannot do this: it
+    deliberately skips terminal ancestors, and a top-level leg carries no
+    ancestors at all (#350 review: the two legs of one filled bracket used
+    to count as 2N covered shares). Candidates built without
+    ``coverage_ids`` fall back to the cancel chain plus the order id.
+    """
+    coverage_ids = candidate.get("coverage_ids")
+    fallback_ids = [
+        *(candidate.get("cancel_ids") or ()),
+        candidate.get("order_id"),
+    ]
+    return [
+        str(item)
+        for item in (coverage_ids if coverage_ids is not None else fallback_ids)
+        if str(item or "")
+    ]
+
+
 def _covered_exit_protection_qty(candidates: Sequence[Mapping[str, Any]]) -> float:
     """Shares ``candidates`` protect, counting each broker order once.
 
@@ -422,57 +492,25 @@ def _covered_exit_protection_qty(candidates: Sequence[Mapping[str, Any]]) -> flo
     separate orders) sum. Used to tell "protected, maybe at a moved price"
     apart from "the exit under-filled and shares are naked" (#350 review).
     """
-    parent: dict[str, str] = {}
-
-    def find(node: str) -> str:
-        parent.setdefault(node, node)
-        root = node
-        while parent[root] != root:
-            root = parent[root]
-        while parent[node] != root:
-            parent[node], node = root, parent[node]
-        return root
-
-    def union(a: str, b: str) -> None:
-        ra, rb = find(a), find(b)
-        if ra != rb:
-            parent[rb] = ra
-
+    units = _IdUnionFind()
     keys: list[str] = []
     for candidate in candidates:
-        # ``coverage_ids`` links legs that share a (possibly terminal) parent
-        # - e.g. a filled bracket's TP leg listed top-level and its held SL
-        # leg reached through ``status=all`` - so they count as ONE unit for
-        # coverage. ``cancel_ids`` cannot do this: it deliberately skips
-        # terminal ancestors, and a top-level leg carries no ancestors at all
-        # (#350 review: the two legs of one filled bracket used to count as
-        # 2N covered shares). Candidates built without ``coverage_ids`` fall
-        # back to the cancel chain plus the order id.
-        coverage_ids = candidate.get("coverage_ids")
-        fallback_ids = [
-            *(candidate.get("cancel_ids") or ()),
-            candidate.get("order_id"),
-        ]
-        ids = [
-            str(item)
-            for item in (coverage_ids if coverage_ids is not None else fallback_ids)
-            if str(item or "")
-        ]
+        ids = _coverage_unit_ids(candidate)
         key = ids[0] if ids else ""
         keys.append(key)
         for other in ids[1:]:
-            union(key, other)
+            units.union(key, other)
     covered: dict[str, float] = {}
     for candidate, key in zip(candidates, keys, strict=True):
         if not key:
             continue
-        root = find(key)
         qty = candidate.get("qty")
         value = (
             float(qty)
             if isinstance(qty, (int, float)) and math.isfinite(qty)
             else 0.0
         )
+        root = units.find(key)
         covered[root] = max(covered.get(root, 0.0), value)
     return sum(covered.values())
 
@@ -494,6 +532,32 @@ def _exit_protection_signature(
         _single_level([c["limit_price"] for c in stops if c["limit_price"] is not None]),
         _single_level([c["limit_price"] for c in take_profits]),
     )
+
+
+def _ancestor_order_ids(
+    order_id: str, ancestors: tuple[Any, ...], *, include_terminal: bool
+) -> set[str]:
+    """``order_id`` plus its ancestors' ids; terminal ones only if asked."""
+    ids = {order_id}
+    for ancestor in ancestors:
+        if not include_terminal and _order_status(ancestor) in _TERMINAL_ORDER_STATUSES:
+            continue
+        ancestor_id = _control_order_id(_order_attr(ancestor, "id"))
+        if ancestor_id is not None:
+            ids.add(ancestor_id)
+    return ids
+
+
+def _ancestor_ids_including_terminal(
+    order_id: str, ancestors: tuple[Any, ...]
+) -> set[str]:
+    return _ancestor_order_ids(order_id, ancestors, include_terminal=True)
+
+
+def _ancestor_ids_excluding_terminal(
+    order_id: str, ancestors: tuple[Any, ...]
+) -> set[str]:
+    return _ancestor_order_ids(order_id, ancestors, include_terminal=False)
 
 
 class _ExitProtectionCancelPendingError(RuntimeError):
@@ -1486,13 +1550,12 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         handled inside ``_recover_exit_reprotections``.
         """
         try:
-            async with self.order_placement_lock():
-                async with self._order_book_lock():
-                    await self._recover_exit_reprotections()
+            async with self.order_placement_lock(), self._order_book_lock():
+                await self._recover_exit_reprotections()
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # except-kind: money-decision
-            logger.error(
+            logger.exception(
                 "Alpaca exit re-protection recovery failed before/while "
                 "replaying markers; markers stay pending for the next connect",
                 extra={"data": {"account_id": self.account_id, "error": repr(exc)}},
@@ -1508,7 +1571,12 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         try:
             await task
         except asyncio.CancelledError:
-            pass
+            # ``await task`` also raises CancelledError when THIS coroutine
+            # is cancelled while waiting; only the inner task's own cancel
+            # may be swallowed here.
+            current = asyncio.current_task()
+            if current is not None and current.cancelling():
+                raise
         except Exception as exc:  # except-kind: money-decision
             logger.warning(
                 "Alpaca exit re-protection recovery task ended with an error "
@@ -2967,11 +3035,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         # that links its TP leg (seen top-level) to its held SL leg (seen
         # through ``status=all``). ``cancel_ids`` keeps its own semantics -
         # only still-working ancestors are cancelled.
-        coverage_ids = {order_id}
-        for ancestor in ancestors:
-            ancestor_id = _control_order_id(_order_attr(ancestor, "id"))
-            if ancestor_id is not None:
-                coverage_ids.add(ancestor_id)
+        coverage_ids = _ancestor_ids_including_terminal(order_id, ancestors)
         if order_id in found:
             # The same order reached twice (top-level AND nested under its
             # filled parent): keep the FIRST record's levels but merge the
@@ -2983,13 +3047,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         # A leg is cancelled through its own id; a still-working ancestor (the
         # OCO container an exit re-places, #145) goes too, while a terminal one
         # (a filled bracket parent) cannot be cancelled and is skipped.
-        cancel_ids = {order_id}
-        for ancestor in ancestors:
-            if _order_status(ancestor) in _TERMINAL_ORDER_STATUSES:
-                continue
-            ancestor_id = _control_order_id(_order_attr(ancestor, "id"))
-            if ancestor_id is not None:
-                cancel_ids.add(ancestor_id)
+        cancel_ids = _ancestor_ids_excluding_terminal(order_id, ancestors)
         qty = _to_float(_order_attr(order, "qty", None), default=0.0)
         found[order_id] = {
             "order_id": order_id,
@@ -3363,7 +3421,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                     },
                 )
             else:
-                logger.error(
+                logger.exception(
                     "Alpaca exit re-protection failed for %s; the remaining "
                     "position keeps no take-profit leg (%s)",
                     plan["symbol"],
@@ -4327,34 +4385,47 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             # "pending" marker still needs its superseded siblings kept as
             # history, and an "unverified" clear (unusable record, side
             # mismatch, unplaceable levels) proved nothing about coverage.
-            if verdict != "resolved":
-                continue
-            signal_id = str(marker_row.get("signal_id") or "")
-            try:
-                metadata = await asyncio.to_thread(
-                    get_live_signal_metadata, signal_id
+            if verdict == "resolved":
+                await self._clear_superseded_markers_after_resolution(
+                    symbol, marker_row
                 )
-            except Exception:  # except-kind: money-decision
-                metadata = None
-            if (
-                signal_id
-                and isinstance(metadata, dict)
-                and EXIT_REPROTECTION_METADATA_KEY not in metadata
-            ):
-                try:
-                    await asyncio.to_thread(
-                        clear_superseded_exit_reprotection_markers,
-                        self.account_id,
-                        symbol,
-                        keep_signal_id=signal_id,
-                    )
-                except Exception as exc:  # except-kind: money-decision
-                    logger.debug(
-                        "Alpaca superseded exit re-protection markers for %s "
-                        "could not be cleared: %r",
-                        symbol,
-                        exc,
-                    )
+
+    async def _clear_superseded_markers_after_resolution(
+        self, symbol: str, marker_row: Mapping[str, Any]
+    ) -> None:
+        """Spend a resolved marker's superseded siblings, when it is gone.
+
+        The newest marker must already be cleared from the signal's metadata
+        (the recovery path clears it on success); if it is still recorded the
+        symbol's markers are left alone entirely.
+        """
+        signal_id = str(marker_row.get("signal_id") or "")
+        try:
+            metadata = await asyncio.to_thread(
+                get_live_signal_metadata, signal_id
+            )
+        except Exception:  # except-kind: money-decision
+            metadata = None
+        if not (
+            signal_id
+            and isinstance(metadata, dict)
+            and EXIT_REPROTECTION_METADATA_KEY not in metadata
+        ):
+            return
+        try:
+            await asyncio.to_thread(
+                clear_superseded_exit_reprotection_markers,
+                self.account_id,
+                symbol,
+                keep_signal_id=signal_id,
+            )
+        except Exception as exc:  # except-kind: money-decision
+            logger.debug(
+                "Alpaca superseded exit re-protection markers for %s "
+                "could not be cleared: %r",
+                symbol,
+                exc,
+            )
 
     async def submit_order(self, signal: LiveSignal, *, qty: float | None = None) -> str:
         # Everything up to and including the request build is provably before
@@ -6087,21 +6158,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                     f"Alpaca order list has an unrecognised shape ({type(result).__name__}); "
                     "refusing to treat it as complete"
                 )
-            new_on_page = 0
-            oldest: Any = None
-            for order in result:
-                order_id = _control_order_id(_order_attr(order, "id"))
-                if order_id is not None:
-                    if order_id in seen:
-                        continue
-                    seen.add(order_id)
-                new_on_page += 1
-                collected.append(order)
-                submitted = _order_submitted_at_utc(order)
-                if submitted is not None and (
-                    oldest is None or submitted < oldest
-                ):
-                    oldest = submitted
+            oldest, new_on_page = _scan_orders_page(result, seen, collected)
             if len(result) < _ALPACA_HELD_LEG_LOOKUP_LIMIT:
                 return collected
             if (
@@ -6678,7 +6735,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             },
         )
 
-    async def _record_flatten_fill(
+    def _record_flatten_fill(
         self,
         order: Any,
         *,
@@ -6755,7 +6812,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             # client_order_id names no signal and must not reach the
             # unattributed-fill ERROR (#350 review).
             if broker_order_id in self._flatten_order_ids:
-                await self._record_flatten_fill(
+                self._record_flatten_fill(
                     order,
                     broker_order_id=broker_order_id,
                     client_order_id=client_order_id,
