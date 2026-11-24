@@ -555,3 +555,23 @@ def test_adapter_state_roundtrip(isolated_db_sandbox) -> None:
         "after": "2026-02-01T00:00:00+00:00"
     }
     assert database.get_live_adapter_state("acct-2", "wm") is None
+
+
+def test_adapter_state_rejects_pipe_in_key_parts(isolated_db_sandbox) -> None:
+    """``|`` is the row-id separator: a part containing it would alias rows.
+
+    ``("a|b", "c")`` and ``("a", "b|c")`` concatenate to the same ``id``, so
+    the accessors refuse the separator outright rather than let two logical
+    keys share one row (#350 review; #415 adopts this definition).
+    """
+    database, _, _ = isolated_db_sandbox
+    database.init_db()
+
+    with pytest.raises(ValueError, match="must not contain"):
+        database.set_live_adapter_state("a|b", "c", {"x": 1})
+    with pytest.raises(ValueError, match="must not contain"):
+        database.set_live_adapter_state("a", "b|c", {"x": 1})
+    with pytest.raises(ValueError, match="must not contain"):
+        database.get_live_adapter_state("a|b", "c")
+    with pytest.raises(ValueError, match="must not contain"):
+        database.get_live_adapter_state("a", "b|c")

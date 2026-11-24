@@ -5,6 +5,7 @@ import inspect
 import math
 import os
 import re
+import time
 from collections.abc import Collection, Iterable, Iterator, Mapping, Sequence
 from datetime import datetime, timedelta, timezone
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal, InvalidOperation
@@ -15,6 +16,7 @@ import pandas as pd
 from alpaca.trading.enums import OrderClass
 from alpaca.trading.requests import ReplaceOrderRequest, StopLossRequest, TakeProfitRequest
 
+from live_runner.account_order_lock import AccountOrderLockTimeoutError
 from live_runner.alpaca_fees import (
     ACTIVITY_WINDOW_OVERLAP,
     CFEE_LOOKBACK_MARGIN,
@@ -118,6 +120,15 @@ _REPROTECT_RECONCILE_STATE_KEY = "alpaca_reprotect_reconcile_after"
 #: Bound on remembered ``close_position`` order ids used to classify flatten
 #: fills (#350 review); flattens are rare events, so this only guards leaks.
 _FLATTEN_ORDER_ID_LIMIT = 500
+#: How long a ``close_position`` submit counts as "in flight" for fill
+#: attribution: the stream can deliver the fill before the HTTP response
+#: hands back the broker order id to remember (#350 review).
+_FLATTEN_IN_FLIGHT_TTL_SECONDS = 120.0
+#: Connect-time marker replay attempts when the account order-placement lock
+#: stays busy past its bound, and the pause between them. After the last
+#: attempt the markers wait for the next connect (#350 review).
+_RECOVERY_LOCK_ATTEMPTS = 3
+_RECOVERY_LOCK_RETRY_SECONDS = 30.0
 
 #: States in which a bracket leg still rests at the broker: ``held`` is the OCO-inactive
 #: leg of a filled parent, ``pending_cancel`` one whose cancel has not settled yet and may
@@ -1452,6 +1463,16 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         # so their fills are classified as flatten fills instead of raising the
         # unattributed-fill ERROR (#350 review). Insertion-ordered for a bound.
         self._flatten_order_ids: dict[str, None] = {}
+        # ``close_position`` submits still inside their fill-attribution
+        # window: symbol -> (monotonic mark, reducing side or None). The
+        # stream runs on its own loop and can process the fill BEFORE the
+        # main loop remembers the order id, so the unattributed-fill path
+        # consults this marker first (#350 review). Written/read across
+        # threads; dict ops are atomic under the GIL.
+        self._flatten_in_flight: dict[str, tuple[float, str | None]] = {}
+        # Broker order ids of flatten fills already flagged
+        # ``ledger_reconciliation_required`` this process (dedupe).
+        self._flatten_fills_flagged: set[str] = set()
         # The earliest crypto fill is fixed history once found: the FILL-history scan behind
         # ``backfill_commissions`` runs once and later passes answer from this cache
         # instead of re-paging up to ``MAX_ACTIVITY_PAGES`` requests every pass. Only a found
@@ -1545,27 +1566,66 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         ``connect`` is called from inside both (the daemon's submit section,
         ``cancel_orders``' book lock), which is why the replay runs as this
         separate task rather than inline - the account lock is not
-        re-entrant and the book lock has no timeout. Failures leave every
-        marker pending for the next connect; per-symbol errors are already
-        handled inside ``_recover_exit_reprotections``.
+        re-entrant and the book lock has no timeout. A lock wait that times
+        out is retried a bounded number of times; every other failure leaves
+        all markers pending for the next connect, and per-symbol errors are
+        already handled inside ``_recover_exit_reprotections``.
         """
-        try:
-            async with self.order_placement_lock(), self._order_book_lock():
-                await self._recover_exit_reprotections()
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:  # except-kind: money-decision
-            logger.exception(
-                "Alpaca exit re-protection recovery failed before/while "
-                "replaying markers; markers stay pending for the next connect",
-                extra={"data": {"account_id": self.account_id, "error": repr(exc)}},
-            )
+        for attempt in range(1, _RECOVERY_LOCK_ATTEMPTS + 1):
+            try:
+                async with self.order_placement_lock(), self._order_book_lock():
+                    await self._recover_exit_reprotections()
+                return
+            except asyncio.CancelledError:
+                raise
+            except AccountOrderLockTimeoutError as exc:
+                if attempt == _RECOVERY_LOCK_ATTEMPTS:
+                    logger.error(
+                        "ALERT: Alpaca exit re-protection recovery could not "
+                        "take the account order-placement lock after %d "
+                        "attempts; markers stay pending until the next "
+                        "connect - restart or reconnect to replay them",
+                        _RECOVERY_LOCK_ATTEMPTS,
+                        extra={
+                            "data": {
+                                "account_id": self.account_id,
+                                "alert": "exit_reprotection_recovery_lock_timeout",
+                                "error": repr(exc),
+                            }
+                        },
+                    )
+                    return
+                logger.warning(
+                    "Alpaca exit re-protection recovery waited out the "
+                    "account order-placement lock; retrying in %.0fs "
+                    "(attempt %d of %d)",
+                    _RECOVERY_LOCK_RETRY_SECONDS,
+                    attempt,
+                    _RECOVERY_LOCK_ATTEMPTS,
+                    extra={
+                        "data": {
+                            "account_id": self.account_id,
+                            "error": repr(exc),
+                        }
+                    },
+                )
+                await asyncio.sleep(_RECOVERY_LOCK_RETRY_SECONDS)
+            except Exception as exc:  # except-kind: money-decision
+                logger.exception(
+                    "Alpaca exit re-protection recovery failed before/while "
+                    "replaying markers; markers stay pending for the next connect",
+                    extra={"data": {"account_id": self.account_id, "error": repr(exc)}},
+                )
+                return
 
     async def _cancel_exit_reprotection_recovery(self) -> None:
         """Cancel a queued/running marker replay on disconnect."""
         task = self._exit_reprotection_recovery_task
         self._exit_reprotection_recovery_task = None
-        if task is None or task.done():
+        # ``connect`` may fail while the recovery task itself is inside it
+        # (via ``get_positions`` on a dropped connection): ``disconnect`` then
+        # runs ON the recovery task, and awaiting it would be a self-await.
+        if task is None or task.done() or task is asyncio.current_task():
             return
         task.cancel()
         try:
@@ -3737,7 +3797,10 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         """Cancel the protection, submit the exit, re-protect the remainder.
 
         Runs under ``_order_book_lock`` so a flatten or orphan sweep cannot
-        interleave with the release. Every failure before the exit submit
+        interleave with the release. The account order-placement lock is NOT
+        taken here: it is not re-entrant, so every caller must already hold
+        it (the daemon's submit section, kill-switch and STOPPED flattens)
+        before calling ``submit_order``. Every failure before the exit submit
         restores the protection for the current position and re-raises (the
         exit is then refused, never half-done); a failure to re-place after a
         successful submit alerts CRITICAL and leaves the persisted marker for
@@ -3928,8 +3991,8 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         Only a *proven* outcome clears: the exit order re-read by id must be
         terminal and its ``filled_qty`` must cover the requested exit
         quantity. A still-working order, a short fill, an unknown status or a
-        failed re-read all keep the marker - the connect replay and the
-        stream watchdog remain the backstops (#350 review).
+        failed re-read all keep the marker - the connect replay is the
+        backstop; the stream only alerts (#350 review).
         """
         order_id = _control_order_id(_order_attr(order, "id"))
         get_order = getattr(client, "get_order_by_id", None)
@@ -4353,10 +4416,10 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             )
             return
         by_symbol: dict[str, Mapping[str, Any]] = {}
-        for row in rows:
-            symbol = str(row.get("symbol") or "").strip().upper()
+        for listed in rows:
+            symbol = str(listed.get("symbol") or "").strip().upper()
             if symbol:
-                by_symbol.setdefault(symbol, row)
+                by_symbol.setdefault(symbol, listed)
         for symbol, marker_row in by_symbol.items():
             try:
                 verdict = await self._recover_exit_reprotection(marker_row)
@@ -5695,12 +5758,18 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 return f"{reason};NO-STOP-RESTORED"
         return reason
 
-    async def _flatten_symbol(self, client: Any, symbol: str) -> str | None:
+    async def _flatten_symbol(
+        self, client: Any, symbol: str, *, position_qty: float | None = None
+    ) -> str | None:
         """Flatten one symbol; see :meth:`_flatten_symbol_locked`."""
         async with self._order_book_lock():
-            return await self._flatten_symbol_locked(client, symbol)
+            return await self._flatten_symbol_locked(
+                client, symbol, position_qty=position_qty
+            )
 
-    async def _flatten_symbol_locked(self, client: Any, symbol: str) -> str | None:
+    async def _flatten_symbol_locked(
+        self, client: Any, symbol: str, *, position_qty: float | None = None
+    ) -> str | None:
         """Cancel this symbol's working orders, then close its position.
 
         Returns ``None`` on success, or a short reason for the failure.
@@ -5779,6 +5848,16 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 removed_protection=cancelled_any,
             )
 
+        # Mark the flatten in flight BEFORE the submit: the stream runs on
+        # its own loop and can deliver this order's fill before the HTTP
+        # response hands back the broker order id ``_remember_flatten_order``
+        # needs, and the unattributed-fill path consults this marker (#350
+        # review). The reducing side is recorded so an unrelated same-symbol
+        # fill cannot borrow the attribution.
+        reducing_side = None
+        if position_qty is not None and not _is_flat(position_qty):
+            reducing_side = "sell" if position_qty > 0 else "buy"
+        self._flatten_in_flight[symbol] = (time.monotonic(), reducing_side)
         try:
             close_order = await asyncio.to_thread(client.close_position, symbol)
         except Exception as exc:  # except-kind: money-decision
@@ -5841,7 +5920,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             qty = _position_qty(position)
             if not symbol or _is_flat(qty):
                 continue
-            problem = await self._flatten_symbol(client, symbol)
+            problem = await self._flatten_symbol(client, symbol, position_qty=qty)
             if problem is not None:
                 failed.append(f"{symbol}:{problem}")
 
@@ -6074,16 +6153,39 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         # positions that are open now. The open-lot bound ADVANCES as rounds
         # close (an account-wide all-signals bound never did - #350 review),
         # and the all-signals bound remains the fail-closed fallback when no
-        # open lot can be named. The page cap remains the backstop either way.
+        # open lot can be named. The bound is computed PER SYMBOL and the
+        # scan takes the minimum: a symbol whose ledger shows no open lot -
+        # an entry fill not yet booked, or ledger/broker drift - keeps its
+        # own all-signals fallback window instead of inheriting a sibling's
+        # newer open-lot bound and losing its older held legs (#350 review).
+        # A symbol with neither bound leaves the scan unbounded, and the page
+        # cap remains the backstop either way.
         after = None
         if symbols is not None:
-            after = await asyncio.to_thread(
-                earliest_live_open_lot_entry_timestamp, self.account_id, symbols
-            )
-            if after is None:
-                after = await asyncio.to_thread(
-                    earliest_live_signal_timestamp, self.account_id, symbols
+            scoped = {
+                str(symbol or "").strip().upper() for symbol in symbols
+            }
+            scoped.discard("")
+            bounds: list[datetime] = []
+            unbounded = not scoped
+            for symbol in sorted(scoped):
+                bound = await asyncio.to_thread(
+                    earliest_live_open_lot_entry_timestamp,
+                    self.account_id,
+                    {symbol},
                 )
+                if bound is None:
+                    bound = await asyncio.to_thread(
+                        earliest_live_signal_timestamp,
+                        self.account_id,
+                        {symbol},
+                    )
+                if bound is None:
+                    unbounded = True
+                    break
+                bounds.append(bound)
+            if not unbounded:
+                after = min(bounds)
         if after is not None:
             # Margin for clock skew and the signal-to-submit delay: the bound
             # must stay at or before the entry order's own ``submitted_at``.
@@ -6735,6 +6837,32 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             },
         )
 
+    def _flatten_in_flight_match(self, order: Any) -> bool:
+        """Whether ``order``'s fill can only be an in-flight flatten's.
+
+        ``close_position`` accepts no client order id, so its fill arrives
+        with a broker UUID that names no signal; the broker order id is only
+        remembered after the HTTP response, and the stream - on its own loop -
+        can process the fill first. A market order on the recorded reducing
+        side of a symbol whose flatten is still inside the attribution
+        window is that flatten's fill (#350 review). Anything else - a
+        resting order type, the wrong side, a stale marker - falls through
+        to the normal attribution paths.
+        """
+        symbol = _order_symbol(order)
+        entry = self._flatten_in_flight.get(symbol)
+        if entry is None:
+            return False
+        marked_at, reducing_side = entry
+        if time.monotonic() - marked_at > _FLATTEN_IN_FLIGHT_TTL_SECONDS:
+            self._flatten_in_flight.pop(symbol, None)
+            return False
+        if _order_type(order) != "market":
+            return False
+        if reducing_side is not None and _order_side(order) != reducing_side:
+            return False
+        return True
+
     def _record_flatten_fill(
         self,
         order: Any,
@@ -6749,14 +6877,21 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         ``client_order_id`` that names no signal, so without this path every
         routine kill-switch / STOPPED flatten fill raised the ERROR
         unattributed-fill alert. The broker order id was remembered under
-        ``_order_book_lock`` when the flatten ran, so the fill is attributed
+        ``_order_book_lock`` when the flatten ran - or the fill matched the
+        in-flight marker when it arrived first - so the fill is attributed
         to the flatten: the ``ledger_reconciliation_required`` audit row is
         still written - a flatten IS a reconciliation event (#144) - once
         per broker order id at WARNING, never the ERROR unattributed
         alert. In-memory only: a flatten fill delivered after a restart
         still alerts (fail-closed).
         """
-        if broker_order_id in self._flagged_reprotect_order_ids:
+        # Once per broker order id across BOTH flag sets: an order already
+        # flagged unattributed must not be re-flagged as a flatten (and vice
+        # versa) on a redelivery.
+        if (
+            broker_order_id in self._flatten_fills_flagged
+            or broker_order_id in self._flagged_reprotect_order_ids
+        ):
             return
         symbol = _order_symbol(order)
         flag_live_ledger_reconciliation(
@@ -6770,6 +6905,9 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 "event": event,
             },
         )
+        self._flatten_fills_flagged.add(broker_order_id)
+        # Also mark the shared unattributed-flag set: a redelivery that can
+        # no longer match the flatten id must not escalate to the ERROR.
         self._flagged_reprotect_order_ids.add(broker_order_id)
         logger.warning(
             "Alpaca flatten fill for %s (order %s) classified for ledger "
@@ -6864,6 +7002,18 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 get_live_signal_metadata, str(signal_uuid)
             )
             if not isinstance(signal_metadata, dict):
+                # A flatten fill can reach here before its broker order id
+                # was remembered (the stream runs on its own loop): the
+                # in-flight marker classifies it instead of the unattributed
+                # ERROR (#350 review - the decision is "never ERROR").
+                if self._flatten_in_flight_match(order):
+                    self._record_flatten_fill(
+                        order,
+                        broker_order_id=broker_order_id,
+                        client_order_id=client_order_id,
+                        event=event,
+                    )
+                    return
                 self._flag_reprotect_fill_unattributed(
                     order,
                     client_order_id,

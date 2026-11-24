@@ -1180,7 +1180,16 @@ class LiveAdapterStateModel(SQLModel, table=True):
     Adapters need a durable place for pass-to-pass bookkeeping that is not a
     signal, an execution or an account attribute - e.g. the Alpaca
     re-protect reconciliation watermark (#350 review). ``id`` is
-    ``"{account_id}|{key}"`` so one account can hold several keys.
+    ``"{account_id}|{key}"`` so one account can hold several keys; neither
+    part may contain ``|`` (rejected by the accessors), which keeps the
+    concatenation unambiguous - ``("a|b", "c")`` and ``("a", "b|c")`` can
+    never alias one row. ``account_id`` is the same id the account
+    order-placement lock uses (``order_placement_account_id`` /
+    ``live_accounts.id`` for Alpaca), so two spellings of one account cannot
+    split its state across rows. #415 (cTrader) adopts this definition
+    verbatim: keep the id format and the account-id convention stable once
+    rows exist - there is no migration framework, the table comes from
+    ``create_all``.
     """
 
     __tablename__ = "live_adapter_state"
@@ -1195,16 +1204,41 @@ class LiveAdapterStateModel(SQLModel, table=True):
     updated_at: datetime = Field(default_factory=_utcnow_naive)
 
 
+def _adapter_state_part(value: Any, field_name: str) -> str:
+    """One ``live_adapter_state`` key part, or a refusal.
+
+    ``|`` is the id separator, so a part containing it would make
+    ``("a|b", "c")`` and ``("a", "b|c")`` the same row; empty parts can
+    never name a row either.
+    """
+    normalized = str(value or "").strip()
+    if not normalized:
+        raise ValueError(f"adapter state {field_name} is required")
+    if "|" in normalized:
+        raise ValueError(
+            f"adapter state {field_name} must not contain '|': it is the "
+            "row-id separator"
+        )
+    return normalized
+
+
 def _adapter_state_id(account_id: str, key: str) -> str:
     return f"{account_id}|{key}"
 
 
 def get_live_adapter_state(account_id: str, key: str) -> dict[str, Any] | None:
-    """The persisted value for ``(account_id, key)``, or ``None`` when unset."""
+    """The persisted value for ``(account_id, key)``, or ``None`` when unset.
+
+    ``account_id`` is the id the account order-placement lock uses
+    (``order_placement_account_id``); ``key`` is a free-form namespaced key
+    (this repo uses the ``alpaca_`` prefix convention).
+    """
     normalized_account_id = str(account_id or "").strip()
     normalized_key = str(key or "").strip()
     if not normalized_account_id or not normalized_key:
         return None
+    _adapter_state_part(normalized_account_id, "account_id")
+    _adapter_state_part(normalized_key, "key")
     init_db()
     state_id = _adapter_state_id(normalized_account_id, normalized_key)
     with get_session() as session:
@@ -1218,10 +1252,8 @@ def set_live_adapter_state(
     account_id: str, key: str, value: Mapping[str, Any]
 ) -> None:
     """Persist ``value`` for ``(account_id, key)``, replacing any earlier one."""
-    normalized_account_id = str(account_id or "").strip()
-    normalized_key = str(key or "").strip()
-    if not normalized_account_id or not normalized_key:
-        raise ValueError("adapter state requires an account id and a key")
+    normalized_account_id = _adapter_state_part(account_id, "account_id")
+    normalized_key = _adapter_state_part(key, "key")
     init_db()
     state_id = _adapter_state_id(normalized_account_id, normalized_key)
     with get_session() as session:
