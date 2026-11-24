@@ -32,51 +32,8 @@ STRATEGY_META = {
 import numpy as np
 import pandas as pd
 
+from shared.indicators import presets
 from shared.strategy_markers import entry_exit_markers
-
-
-def _calc_supertrend(df: pd.DataFrame, period: int, multiplier: float):
-    close = df["close"].values
-    high = df["high"].values
-    low = df["low"].values
-
-    tr = np.zeros(len(close))
-    for i in range(1, len(close)):
-        tr[i] = max(high[i] - low[i], abs(high[i] - close[i - 1]), abs(low[i] - close[i - 1]))
-    atr = pd.Series(tr, index=df.index).rolling(period).mean().values
-
-    src = (high + low) / 2
-    upper_band = np.zeros(len(close))
-    lower_band = np.zeros(len(close))
-    trend = np.ones(len(close))
-
-    for i in range(period, len(close)):
-        up = src[i] - multiplier * atr[i]
-        dn = src[i] + multiplier * atr[i]
-        if i > 0:
-            lower_band[i] = max(up, lower_band[i - 1]) if close[i - 1] > upper_band[i - 1] else up
-            upper_band[i] = min(dn, upper_band[i - 1]) if close[i - 1] < lower_band[i - 1] else dn
-            if trend[i - 1] == -1 and close[i] > upper_band[i - 1]:
-                trend[i] = 1
-            elif trend[i - 1] == 1 and close[i] < lower_band[i - 1]:
-                trend[i] = -1
-            else:
-                trend[i] = trend[i - 1]
-        else:
-            lower_band[i] = up
-            upper_band[i] = dn
-
-    return (
-        pd.Series(trend, index=df.index),
-        pd.Series(lower_band, index=df.index),
-        pd.Series(upper_band, index=df.index),
-    )
-
-
-def _calc_dema(series: pd.Series, length: int) -> pd.Series:
-    ema1 = series.ewm(span=length, adjust=False).mean()
-    ema2 = ema1.ewm(span=length, adjust=False).mean()
-    return 2 * ema1 - ema2
 
 
 def generate_signals(df: pd.DataFrame, params: dict):
@@ -85,8 +42,11 @@ def generate_signals(df: pd.DataFrame, params: dict):
     dema_length = params.get("dema_length", 9)
 
     close = df["close"]
-    trend, lower_band, upper_band = _calc_supertrend(df, atr_period, atr_mult)
-    dema = _calc_dema(close, dema_length)
+    st = presets.supertrend_pine_dema(df["high"], df["low"], df["close"], atr_period, atr_mult)
+    trend = st.trend
+    lower_band = st.lower_band
+    upper_band = st.upper_band
+    dema = presets.dema_pine_ta(close, dema_length)
 
     trend_flip_up = (trend == 1) & (trend.shift(1) == -1)
     trend_flip_down = (trend == -1) & (trend.shift(1) == 1)

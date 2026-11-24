@@ -323,6 +323,39 @@ def test_market_data_failure_is_contained(tmp_path: Path) -> None:
     assert sent == []
 
 
+def test_market_data_failure_log_carries_the_exception_and_traceback(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The once-per-symbol report must keep the exception type and traceback:
+    ``error=str(exc)`` alone hid the real cause of the cTrader soak failure
+    (``'int' object is not iterable``) behind a bare message."""
+    import logging
+
+    path = _strategy_file(tmp_path, META)
+    sent, submit = _collect()
+    runner = _runner(submit, path=path, module=_module_with(_entry_strategy))
+
+    with caplog.at_level(logging.ERROR):
+        asyncio.run(
+            runner.run_once(
+                [_deployment()],
+                {"acct-1": NoBarsAdapter()},
+                now=BASE + timedelta(seconds=70),
+            )
+        )
+
+    assert sent == []
+    record = next(
+        r
+        for r in caplog.records
+        if "market data fetch failed" in r.getMessage()
+    )
+    assert record.exc_info is not None
+    assert record.exc_info[0] is RuntimeError
+    assert record.exc_info[1] is not None
+    assert "feed down" in str(record.exc_info[1])
+
+
 def test_inactive_and_discord_deployments_are_skipped(tmp_path: Path) -> None:
     path = _strategy_file(tmp_path, META)
     sent, submit = _collect()

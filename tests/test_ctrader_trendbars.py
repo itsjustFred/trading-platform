@@ -126,6 +126,37 @@ def test_decode_trendbars_response_sorts_oldest_first() -> None:
     assert [row["timestamp"] for row in rows] == [t0, t1]
 
 
+def test_decode_trendbars_response_ignores_scalar_deprecated_timestamp() -> None:
+    """``ProtoOAGetTrendbarsRes.timestamp`` is a singular deprecated int64 -
+    cTrader's docs say "simply don't use this field" - not the parallel
+    per-bar array the decoder assumed. A nonzero value must not be iterated:
+    the soak run failed every cTrader fetch with
+    ``'int' object is not iterable`` (#soak 2026-11-24)."""
+    from ctrader_open_api.messages.OpenApiMessages_pb2 import ProtoOAGetTrendbarsRes
+
+    open_time = datetime(2026, 11, 20, 12, 0, tzinfo=timezone.utc)
+    res = ProtoOAGetTrendbarsRes()
+    res.timestamp = int(open_time.timestamp() * 1000) + 300_000
+    res.trendbar.append(
+        _trendbar(low=100_000, delta_high=10, delta_close=5, utc_minutes=_minutes(open_time))
+    )
+    rows = decode_trendbars_response(res, symbol="EURUSD", price_digits=5)
+    assert [row["timestamp"] for row in rows] == [open_time]
+    assert rows[0]["close"] == pytest.approx(1.00005)
+
+
+def test_get_market_data_survives_scalar_deprecated_timestamp() -> None:
+    """End-to-end through ``get_market_data``: the broker sets the deprecated
+    scalar on real responses, so the whole fetch must still decode."""
+    now = datetime.now(timezone.utc)
+    closed_open = now - timedelta(minutes=10)
+    response = _bars_response([(closed_open, 1.1)])
+    response.timestamp = int(now.timestamp() * 1000)
+    adapter, _ = _adapter_with_fakes(response=response)
+    frame = asyncio.run(adapter.get_market_data("EURUSD", timeframe="5m", limit=10))
+    assert len(frame) == 1
+
+
 def _adapter_with_fakes(*, response=None, send_error=None):
     adapter = CTraderLiveAdapter(
         app_id="app",

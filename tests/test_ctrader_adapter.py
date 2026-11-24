@@ -49,6 +49,103 @@ def test_is_terminal_auth_error_ignores_transient_timeout() -> None:
     assert not _is_terminal_auth_error("TIMEOUT", "Connection timeout")
 
 
+def test_connection_scoped_tcp_protocol_gives_each_connection_its_own_send_queue() -> None:
+    """Regression for the shared ``TcpProtocol._send_queue`` class attribute.
+
+    ctrader-open-api 0.9.2 keeps ``_send_queue``/``_send_task``/
+    ``_lastSendMessageTime`` on the CLASS, so every protocol instance in the
+    process drains one deque: with one adapter per account an AccountAuth
+    request queued by one client can be written on another account's socket,
+    the response then resolves on the wrong ``Client`` and the real request
+    times out - the flap that left exactly one cTrader account authenticated
+    per daemon start.
+    """
+    from ctrader_open_api import TcpProtocol
+
+    from live_runner.ctrader_adapter import _connection_scoped_tcp_protocol
+
+    raw_first, raw_second = TcpProtocol(), TcpProtocol()
+    assert raw_first._send_queue is raw_second._send_queue
+
+    protocol_cls = _connection_scoped_tcp_protocol()
+    assert issubclass(protocol_cls, TcpProtocol)
+
+    first, second = protocol_cls(), protocol_cls()
+    assert "_send_queue" in first.__dict__
+    assert "_send_queue" in second.__dict__
+    assert first._send_queue is not second._send_queue
+
+    first.send(b"alpha")
+    second.send(b"beta")
+
+    assert [entry[1] for entry in first._send_queue] == [b"alpha"]
+    assert [entry[1] for entry in second._send_queue] == [b"beta"]
+
+
+def test_connection_scoped_tcp_protocol_drains_only_its_own_queue() -> None:
+    """``_sendStrings`` must write queued bytes on the owning connection only."""
+    from live_runner.ctrader_adapter import _connection_scoped_tcp_protocol
+
+    class _Transport:
+        def __init__(self) -> None:
+            self.written = b""
+
+        def write(self, data: bytes) -> None:
+            self.written += data
+
+    first, second = _connection_scoped_tcp_protocol()(), _connection_scoped_tcp_protocol()()
+    for protocol in (first, second):
+        protocol.factory = SimpleNamespace(numberOfMessagesToSendPerSecond=5)
+        protocol.transport = _Transport()
+
+    first.send(b"alpha")
+    second.send(b"beta")
+    first._sendStrings()
+
+    assert first.transport.written.endswith(b"alpha")
+    assert b"beta" not in first.transport.written
+    assert second.transport.written == b""
+    assert len(second._send_queue) == 1
+
+
+def test_load_openapi_types_installs_connection_scoped_protocol() -> None:
+    """The loader must hand Twisted the per-connection protocol, not the
+    upstream class carrying the process-wide shared send queue.
+
+    Runs in a subprocess: ``_load_openapi_types`` installs the asyncio
+    Twisted reactor, which must not leak into this pytest session.
+    """
+    import subprocess
+    import sys
+    import textwrap
+
+    code = textwrap.dedent(
+        """
+        import asyncio
+        from live_runner.ctrader_adapter import CTraderLiveAdapter
+        adapter = CTraderLiveAdapter.__new__(CTraderLiveAdapter)
+        adapter._client_class = None
+        adapter._loop = asyncio.new_event_loop()
+        adapter._load_openapi_types()
+        from ctrader_open_api import TcpProtocol
+        assert issubclass(adapter._TcpProtocol, TcpProtocol)
+        assert adapter._TcpProtocol is not TcpProtocol
+        first, second = adapter._TcpProtocol(), adapter._TcpProtocol()
+        assert first._send_queue is not second._send_queue
+        print("ok")
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        cwd=str(Path(__file__).resolve().parents[1]),
+    )
+    assert result.returncode == 0, result.stderr
+    assert "ok" in result.stdout
+
+
 def test_adapter_uses_strict_canonical_demo_switch(monkeypatch) -> None:
     monkeypatch.setenv("CTRADER_DEMO", "false")
 

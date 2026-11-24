@@ -1181,7 +1181,6 @@
  },
  "ema_crossoiver_conversion_test": {
   "entries": [
-   1,
    131,
    251,
    372,
@@ -1200,14 +1199,6 @@
    791
   ],
   "drawings": [
-   {
-    "type": "marker",
-    "time": "2022-01-02T00:00:00+00:00",
-    "position": "belowBar",
-    "shape": "arrowUp",
-    "color": "#22c55e",
-    "text": "Entry"
-   },
    {
     "type": "marker",
     "time": "2022-05-12T00:00:00+00:00",
@@ -1677,11 +1668,14 @@
  "pine_superosc_vumanchu": {
   "entries": [
    93,
-   234
+   234,
+   741,
+   799
   ],
   "exits": [
    96,
-   242
+   242,
+   747
   ],
   "drawings": [
    {
@@ -1702,6 +1696,22 @@
    },
    {
     "type": "marker",
+    "time": "2026-01-11T00:00:00+00:00",
+    "position": "belowBar",
+    "shape": "arrowUp",
+    "color": "#22c55e",
+    "text": "Entry"
+   },
+   {
+    "type": "marker",
+    "time": "2026-03-10T00:00:00+00:00",
+    "position": "belowBar",
+    "shape": "arrowUp",
+    "color": "#22c55e",
+    "text": "Entry"
+   },
+   {
+    "type": "marker",
     "time": "2024-04-06T00:00:00+00:00",
     "position": "aboveBar",
     "shape": "arrowDown",
@@ -1715,16 +1725,26 @@
     "shape": "arrowDown",
     "color": "#ef4444",
     "text": "Exit"
+   },
+   {
+    "type": "marker",
+    "time": "2026-01-17T00:00:00+00:00",
+    "position": "aboveBar",
+    "shape": "arrowDown",
+    "color": "#ef4444",
+    "text": "Exit"
    }
   ],
   "n_rows": 800
  },
  "pine_supertrend_dema": {
   "entries": [
-   151
+   151,
+   223
   ],
   "exits": [
-   220
+   220,
+   421
   ],
   "drawings": [
    {
@@ -1737,7 +1757,23 @@
    },
    {
     "type": "marker",
+    "time": "2024-08-11T00:00:00+00:00",
+    "position": "belowBar",
+    "shape": "arrowUp",
+    "color": "#22c55e",
+    "text": "Entry"
+   },
+   {
+    "type": "marker",
     "time": "2024-08-08T00:00:00+00:00",
+    "position": "aboveBar",
+    "shape": "arrowDown",
+    "color": "#ef4444",
+    "text": "Exit"
+   },
+   {
+    "type": "marker",
+    "time": "2025-02-25T00:00:00+00:00",
     "position": "aboveBar",
     "shape": "arrowDown",
     "color": "#ef4444",

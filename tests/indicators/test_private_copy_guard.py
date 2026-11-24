@@ -24,8 +24,9 @@ records two kinds of signal per file:
 ``_ALLOWED`` pins the exact per-file signal counts of the copies that still
 exist on purpose: the ``strategies/`` entries are pre-P3 private
 implementations awaiting their one-strategy-per-PR parity migration (the
-``pine_*`` ones are being removed by the P3 draft), the ``ref_*``/agent
-strategies and parity/audit scripts are self-contained reference oracles,
+``pine_*`` ones were removed by the P3 migration in PR #375), the
+``ref_*``/agent strategies and parity/audit scripts are self-contained
+reference oracles,
 and the two non-strategy entries are reviewed non-computations kept for
 name/shape reasons. Files under ``strategies/`` carrying generated-code
 provenance (a ``.generated.json`` marker or a
@@ -270,11 +271,12 @@ _ALLOWED: dict[str, dict[str, int]] = {
         "rolling@init": 2,
     },
     # Pre-P3 private implementations awaiting their one-strategy-per-PR
-    # parity migration (#317). PR #375 (P3 draft) touches four of these —
+    # parity migration (#317). PR #375 (P3) migrated
     # custom_swings_supertrend, ema_crossoiver_conversion_test,
-    # pine_superosc_vumanchu, pine_supertrend_dema — plus adds
-    # scripts/bench_indicators_numba.py {"def:_supertrend_ta_nb": 1}; when
-    # it lands, apply those five roster changes here.
+    # pine_superosc_vumanchu and pine_supertrend_dema onto
+    # ``shared.indicators`` presets, so their entries are gone; the shared
+    # kernels are benchmarked by ``scripts/bench_indicator_kernels.py``,
+    # which carries no private copy.
     "strategies/channel_breakout/channel_breakout.py": {
         "ewm@generate_signals": 1,
         "rolling@generate_signals": 3,
@@ -282,16 +284,7 @@ _ALLOWED: dict[str, dict[str, int]] = {
     "strategies/cross_asset_momentum/cross_asset_momentum.py": {
         "rolling@generate_signals": 2,
     },
-    "strategies/custom_swings_supertrend/custom_swings_supertrend.py": {
-        "def:_calc_atr": 1,
-        "def:_calc_supertrend": 1,
-        "ewm@generate_signals": 2,
-    },
     "strategies/demo_agent/demo_agent.py": {"rolling@generate_signals": 2},
-    "strategies/ema_crossoiver_conversion_test/ema_crossoiver_conversion_test.py": {
-        "ewm@generate_signals": 2,
-        "rolling@generate_signals": 1,
-    },
     "strategies/example_sma/example_sma.py": {"ewm@generate_signals": 2},
     "strategies/gold_momentum/gold_momentum.py": {"rolling@generate_signals": 2},
     "strategies/intraday_volatility_breakout/intraday_volatility_breakout.py": {
@@ -304,20 +297,6 @@ _ALLOWED: dict[str, dict[str, int]] = {
     "strategies/long_agent/long_agent.py": {"rolling@generate_signals": 2},
     "strategies/mean_reversion_rsi_bb/mean_reversion_rsi_bb.py": {
         "rolling@generate_signals": 1,
-    },
-    "strategies/pine_superosc_vumanchu/pine_superosc_vumanchu.py": {
-        "def:_calc_supertrend_osc": 1,
-        "def:_calc_wavetrend": 1,
-        "ewm@_calc_wavetrend": 3,
-        "rolling@_calc_supertrend_osc": 1,
-        "rolling@_calc_wavetrend": 1,
-        "rolling@generate_signals": 1,
-    },
-    "strategies/pine_supertrend_dema/pine_supertrend_dema.py": {
-        "def:_calc_dema": 1,
-        "def:_calc_supertrend": 1,
-        "ewm@_calc_dema": 2,
-        "rolling@_calc_supertrend": 1,
     },
     "strategies/post_vix_dip_buy/post_vix_dip_buy.py": {
         "def:_wilder_rsi": 1,

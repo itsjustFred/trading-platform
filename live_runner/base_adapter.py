@@ -621,6 +621,22 @@ class BaseLiveAdapter(ABC):
         """
         raise NotImplementedError(f"{type(self).__name__} cannot amend protective stops")
 
+    async def amend_position_take_profit(
+        self, position_id: int, take_profit: float | None
+    ) -> float | None:
+        """Set (``take_profit`` price) or clear (``None``) a position's broker-side
+        take profit while preserving its stop loss exactly.
+
+        Exists for the live ``supertrend_flip`` fallback TP (#168): placed when
+        the workflow halts or gives up so the position keeps an upside exit,
+        amended away again before the workflow resumes. The confirmed TP is
+        returned (``None`` when cleared); an unconfirmed outcome must raise
+        with the previous broker state still in force.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} cannot amend position take profits"
+        )
+
     @property
     def supports_cancel_orders(self) -> bool:
         """Whether :meth:`cancel_open_orders` is implemented for this broker."""
