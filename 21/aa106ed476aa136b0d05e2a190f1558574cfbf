@@ -1,0 +1,21 @@
+tests/test_ctrader_stop_amendment.py
+  s_cf18a1388ebe38::t_ac1e52f8a8a264 413-509
+docs/live-deploy-runbook.md
+  s_cf18a1388ebe38::t_3cbc358ce0be83 120-133
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "21aa106ed476aa136b0d05e2a190f1558574cfbf",
+  "prompts": {},
+  "sessions": {
+    "s_cf18a1388ebe38": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "89a0ca19-4b09-4edb-8bd9-cc391f1b137d",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "itsjustFred <justfred.business@gmail.com>"
+    }
+  }
+}
