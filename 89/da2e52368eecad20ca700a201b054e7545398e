@@ -1,0 +1,21 @@
+live_runner/ctrader_adapter.py
+  s_b93b61760146c9::t_fb19e25fa5ff01 6859-6860,7024-7039,7050,7137,7140-7146,7148-7149
+tests/test_live_ctrader_broker_close_fills.py
+  s_b93b61760146c9::t_82464c9edce72b 1897-1988
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "89da2e52368eecad20ca700a201b054e7545398e",
+  "prompts": {},
+  "sessions": {
+    "s_b93b61760146c9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e957873e-219b-4227-bc63-6a8101e160de",
+        "model": "unknown"
+      },
+      "human_author": "itsjustFred <justfred.business@gmail.com>"
+    }
+  }
+}
