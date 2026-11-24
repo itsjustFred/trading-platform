@@ -42,7 +42,7 @@ _guard.ensure_own_checkout("bench_indicator_kernels")
 import numpy as np
 
 import shared  # noqa: F401
-from shared.indicators import core, presets
+from shared.indicators import core
 
 
 def _bench(fn, *args, reps: int) -> tuple[float, float]:
@@ -80,34 +80,16 @@ def main() -> int:
 
     cases = [
         (
-            "supertrend pine (same)",
+            "supertrend pine",
             core._supertrend_pine_kernel_py,
             core._supertrend_pine_kernel_nb,
-            (src, close, atr, 3.0, 0, 1),
-        ),
-        (
-            "supertrend pine (cross)",
-            core._supertrend_pine_kernel_py,
-            core._supertrend_pine_kernel_nb,
-            (src, close, atr, 3.0, 1, 14),
+            (src, close, atr, 3.0),
         ),
         (
             "supertrend ta",
             core._supertrend_ta_kernel_py,
             core._supertrend_ta_kernel_nb,
             (src, close, atr, 3.0),
-        ),
-        (
-            "custom_swings tr",
-            presets._custom_swings_tr_kernel_py,
-            presets._custom_swings_tr_kernel_nb,
-            (high, low, close),
-        ),
-        (
-            "custom_swings atr",
-            presets._custom_swings_atr_kernel_py,
-            presets._custom_swings_atr_kernel_nb,
-            (atr, 12, 1.0),
         ),
     ]
 
