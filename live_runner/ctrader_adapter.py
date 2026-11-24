@@ -1138,6 +1138,43 @@ def _ensure_asyncio_twisted_reactor(loop: asyncio.AbstractEventLoop) -> None:
         reactor.startRunning(installSignalHandlers=False)
 
 
+_CONNECTION_SCOPED_TCP_PROTOCOL: Any = None
+
+
+def _connection_scoped_tcp_protocol() -> Any:
+    """``TcpProtocol`` whose send state is private to each connection.
+
+    ctrader-open-api 0.9.2 declares ``_send_queue``, ``_send_task`` and
+    ``_lastSendMessageTime`` as CLASS attributes on ``TcpProtocol``, so every
+    protocol instance in the process drains ONE shared deque: whichever
+    connection's ``LoopingCall`` pops an entry writes those bytes on ITS
+    socket. The daemon runs one ``CTraderLiveAdapter`` per cTrader account -
+    each with its own ``Client``/TCP connection but the same app credentials -
+    so an ``ProtoOAAccountAuthReq`` queued by one adapter can be sent on
+    another adapter's session. The broker then authorises the wrong account on
+    each connection, the response resolves on the wrong ``Client``
+    (``clientMsgId`` is only unique per client, so it is dropped), the real
+    request times out, and exactly one account ends up authenticated per
+    daemon start with the winner decided by queue ordering. Instantiating the
+    three attributes per protocol gives each Twisted connection (one protocol
+    instance per TCP connection) its own queue, send task and heartbeat clock.
+    """
+    global _CONNECTION_SCOPED_TCP_PROTOCOL
+    if _CONNECTION_SCOPED_TCP_PROTOCOL is not None:
+        return _CONNECTION_SCOPED_TCP_PROTOCOL
+    from ctrader_open_api import TcpProtocol
+
+    class _ConnectionScopedTcpProtocol(TcpProtocol):
+        def __init__(self) -> None:
+            super().__init__()
+            self._send_queue: deque[Any] = deque()
+            self._send_task = None
+            self._lastSendMessageTime = None
+
+    _CONNECTION_SCOPED_TCP_PROTOCOL = _ConnectionScopedTcpProtocol
+    return _CONNECTION_SCOPED_TCP_PROTOCOL
+
+
 class CTraderLiveAdapter(BaseLiveAdapter):
     """cTrader live adapter backed by OpenApiPy."""
 
@@ -1349,7 +1386,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         assert self._loop is not None
         _ensure_asyncio_twisted_reactor(self._loop)
         try:
-            from ctrader_open_api import Client, EndPoints, Protobuf, TcpProtocol
+            from ctrader_open_api import Client, EndPoints, Protobuf
             from ctrader_open_api.messages.OpenApiCommonMessages_pb2 import ProtoHeartbeatEvent
             from ctrader_open_api.messages.OpenApiMessages_pb2 import (
                 ProtoOAAccountAuthReq,
@@ -1405,7 +1442,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             ) from exc
 
         self._client_class = Client
-        self._TcpProtocol = TcpProtocol
+        self._TcpProtocol = _connection_scoped_tcp_protocol()
         self._EndPoints = EndPoints
         self._Protobuf = Protobuf
         self._ProtoHeartbeatEvent = ProtoHeartbeatEvent
