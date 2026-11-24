@@ -1,0 +1,16 @@
+scripts/bench_indicators_numba.py
+  h_f251b30ae7fbf6 3-8,34,84,89,94,97-105,110
+tests/indicators/test_private_copy_guard.py
+  h_f251b30ae7fbf6 277-279
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "81532a7a41b3bc173d869aeba9444cff5ea5df78",
+  "prompts": {},
+  "humans": {
+    "h_f251b30ae7fbf6": {
+      "author": "itsjustFred <justfred.business@gmail.com>"
+    }
+  }
+}
