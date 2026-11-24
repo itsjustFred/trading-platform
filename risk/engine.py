@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass
+from typing import Any
 
 from risk.config import RiskConfig
 from risk.models import RiskDecision, SizedOrder, TradeSignal
@@ -30,11 +31,11 @@ class RiskEngine:
         if atr is not None:
             try:
                 atr_value = float(atr)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError) as exc:
                 raise ValueError(
                     f"ATR value {atr!r} is not a number; refusing to size "
                     "on an uninterpretable stop distance."
-                )
+                ) from exc
             if not math.isfinite(atr_value) or atr_value <= 0:
                 raise ValueError(
                     f"ATR value {atr!r} is not finite and positive; refusing "
@@ -142,7 +143,7 @@ class RiskEngine:
         )
 
     @staticmethod
-    def _finite_number(value: object, field_name: str) -> float:
+    def _finite_number(value: Any, field_name: str) -> float:
         if isinstance(value, bool):
             raise ValueError(f"{field_name} must be numeric")
         try:
@@ -152,6 +153,57 @@ class RiskEngine:
         if not math.isfinite(parsed):
             raise ValueError(f"{field_name} must be finite")
         return parsed
+
+    @staticmethod
+    def _caller_fraction_limit(value: Any, field_name: str) -> float:
+        """Caller ceiling as a fraction of balance; ``math.inf`` = uncapped.
+
+        ``inf`` is not JSON-safe, so decision metadata records it as
+        ``"uncapped"``.
+        """
+        if isinstance(value, bool):
+            raise ValueError(f"{field_name} must be numeric")
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"{field_name} must be numeric") from exc
+        if math.isnan(parsed) or parsed == float("-inf") or parsed <= 0:
+            raise ValueError(f"{field_name} must be > 0")
+        return parsed
+
+    @staticmethod
+    def _caller_notional_limit(value: Any) -> float:
+        """Caller-specific notional ceiling (fraction of balance).
+
+        ``math.inf`` is the documented "uncapped" value: engines that apply
+        their own post-size caps (the native engine's free-margin leverage
+        clamp, #347) pass it so no engine-level ceiling binds.
+        """
+        return RiskEngine._caller_fraction_limit(
+            value, "max_notional_per_trade"
+        )
+
+    @staticmethod
+    def _caller_position_limit(value: Any) -> int | None:
+        """Caller-specific concurrent-position ceiling.
+
+        ``math.inf`` is the documented "uncapped" value (returned as
+        ``None``): protocols whose reference implementation applies no
+        position cap pass it. Finite values must be positive integers.
+        """
+        if isinstance(value, bool):
+            raise ValueError("max_positions must be an integer")
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("max_positions must be an integer") from exc
+        if math.isnan(numeric) or numeric == float("-inf") or numeric <= 0:
+            raise ValueError("max_positions must be > 0")
+        if math.isinf(numeric):
+            return None
+        if not numeric.is_integer():
+            raise ValueError("max_positions must be an integer")
+        return int(numeric)
 
     def calculate_position_size(
         self,
@@ -163,6 +215,10 @@ class RiskEngine:
         allow_fallback_stop: bool | None = None,
         reject_missing_stop: bool | None = None,
         max_notional_per_trade: float | None = None,
+        risk_amount_override: float | None = None,
+        stop_distance_override: float | None = None,
+        max_positions: int | float | None = None,
+        max_total_exposure: float | None = None,
     ) -> SizedOrder:
         """Size one signal against the configured risk limits.
 
@@ -171,13 +227,39 @@ class RiskEngine:
         - ``config.max_total_exposure``: aggregate open-risk ceiling, fraction.
         - ``config.max_risk_per_trade``: maximum loss on this trade, fraction.
         - ``config.max_notional_per_trade``: default notional ceiling for the
-          resulting position, as a fraction of balance. The position's notional
-          is ``position_size * entry_price * pip_value`` in account currency.
+          resulting position, as a fraction of balance; values above 1 are
+          leverage and callers bound them by the broker maximum (#240 —
+          ``risk.config.effective_max_notional_per_trade``). The position's
+          notional is ``position_size * entry_price * pip_value`` in account
+          currency.
         - ``pip_value``: account-currency P&L of one ``position_size`` unit per
           1.0 price move (1.0 for shares in the account currency; cTrader
           EURUSD on a USD account: 1000 per 0.01 lot).
         - ``max_notional_per_trade``: optional caller-specific ceiling, used by
           engines whose leverage policy is independent of the risk config.
+          ``math.inf`` means explicitly uncapped (recorded as ``"uncapped"``
+          in the decision metadata).
+        - ``risk_amount_override``: optional absolute per-trade risk in
+          account currency (e.g. the native engine's ``fixed_risk_amount``
+          MT5-alignment protocol, #279). It replaces the
+          ``balance * max_risk_per_trade`` target — the declared amount IS
+          the per-trade risk, so ``max_risk_per_trade`` does not apply — but
+          the aggregate ``max_total_exposure`` ceiling still binds: the
+          override is clamped to the remaining exposure budget, exactly like
+          the pct path clamps ``risk_percent``.
+        - ``stop_distance_override``: optional explicit risk distance per
+          unit (the strategy's stop distance, e.g. ATR-based) used instead of
+          ``|entry_price - stop_loss|``. ``max_positions``,
+          ``max_total_exposure`` rejection and every input validation apply
+          identically on both paths.
+        - ``max_positions``: optional caller-specific concurrent-position
+          ceiling (``None`` → ``config.max_positions``). ``math.inf`` means
+          explicitly uncapped — for protocols whose reference implementation
+          applies no position cap (the MT5-parity fixed-risk path, #279).
+        - ``max_total_exposure``: optional caller-specific aggregate open-risk
+          ceiling as a fraction of balance (``None`` →
+          ``config.max_total_exposure``). ``math.inf`` means explicitly
+          uncapped, same contract as ``max_notional_per_trade``.
 
         The returned ``SizedOrder.position_size`` is in account-currency units
         of the traded symbol (shares/lots); it is the only quantity in that
@@ -194,10 +276,32 @@ class RiskEngine:
         notional_limit = (
             self.config.max_notional_per_trade
             if max_notional_per_trade is None
-            else self._finite_number(max_notional_per_trade, "max_notional_per_trade")
+            else self._caller_notional_limit(max_notional_per_trade)
         )
-        if notional_limit <= 0:
-            raise ValueError("max_notional_per_trade must be > 0")
+        # Caller-specific cap overrides (#279): ``None`` keeps the config
+        # limit; ``math.inf`` is the documented uncapped value so a protocol
+        # whose reference applies no such cap (MT5-parity fixed-risk) can
+        # route through the engine without the cap binding.
+        position_limit = (
+            self.config.max_positions
+            if max_positions is None
+            else self._caller_position_limit(max_positions)
+        )
+        exposure_limit = (
+            self.config.max_total_exposure
+            if max_total_exposure is None
+            else self._caller_fraction_limit(
+                max_total_exposure, "max_total_exposure"
+            )
+        )
+        limit_metadata: dict[str, object] = {
+            "max_positions": (
+                "uncapped" if position_limit is None else position_limit
+            ),
+            "max_total_exposure": (
+                "uncapped" if math.isinf(exposure_limit) else exposure_limit
+            ),
+        }
         exposure = self._finite_number(current_exposure, "current_exposure")
         if exposure < 0:
             raise ValueError("current_exposure must be >= 0")
@@ -224,7 +328,7 @@ class RiskEngine:
         else:
             reject_missing_stop = RiskConfig._bool(reject_missing_stop, "reject_missing_stop")
 
-        if current_positions >= self.config.max_positions:
+        if position_limit is not None and current_positions >= position_limit:
             return self._sized_order(
                 signal=signal,
                 position_size=0.0,
@@ -241,12 +345,38 @@ class RiskEngine:
                     risk_distance=None,
                     stop_price_used=signal.stop_loss,
                     rejection_reason="max_positions",
-                    metadata={"current_positions": current_positions},
+                    metadata={
+                        **limit_metadata,
+                        "current_positions": current_positions,
+                    },
                 ),
             )
 
-        remaining_exposure = max(0.0, self.config.max_total_exposure - exposure)
-        risk_percent = min(self.config.max_risk_per_trade, remaining_exposure)
+        remaining_exposure = max(0.0, exposure_limit - exposure)
+        override_amount: float | None = None
+        if risk_amount_override is None:
+            risk_percent = min(self.config.max_risk_per_trade, remaining_exposure)
+        else:
+            override_amount = self._finite_number(
+                risk_amount_override, "risk_amount_override"
+            )
+            if override_amount <= 0:
+                raise ValueError("risk_amount_override must be > 0")
+            # The override is the declared absolute per-trade risk;
+            # ``max_risk_per_trade`` deliberately does not apply — the
+            # override IS the per-trade risk declaration. The aggregate
+            # exposure ceiling still binds: the amount is clamped to the
+            # remaining exposure budget, exactly like the pct path clamps
+            # ``risk_percent`` to ``remaining_exposure``.
+            # ``risk_percent`` is a fraction of balance and the order model
+            # caps it at 1.0; a declared amount above the balance is a
+            # legitimate state (only equity <= 0 raises — the
+            # margin/leverage clamp applies after sizing), so the reported
+            # fraction saturates at 1.0 while ``risk_amount`` below keeps
+            # the declared dollars exact.
+            risk_percent = min(
+                override_amount / balance, remaining_exposure, 1.0
+            )
         if risk_percent <= 0:
             return self._sized_order(
                 signal=signal,
@@ -264,7 +394,7 @@ class RiskEngine:
                     risk_distance=None,
                     stop_price_used=signal.stop_loss,
                     rejection_reason="max_total_exposure",
-                    metadata={"current_exposure": exposure},
+                    metadata={**limit_metadata, "current_exposure": exposure},
                 ),
             )
 
@@ -297,6 +427,7 @@ class RiskEngine:
                     stop_price_used=None,
                     rejection_reason="missing_stop",
                     metadata={
+                        **limit_metadata,
                         "current_exposure": exposure,
                         "stop_source": "missing",
                         "fallback_stop_allowed": False,
@@ -321,9 +452,10 @@ class RiskEngine:
             signal.metadata["resolved_stop_loss"] = stop_loss
         enforce_stop_direction = bool(signal.metadata.get("enforce_stop_direction", False))
         if enforce_stop_direction and not self._stop_matches_direction(signal, stop_loss):
-            risk_distance: float | None = abs(signal.entry_price - stop_loss)
-            if risk_distance <= 0 or not math.isfinite(risk_distance):
-                risk_distance = None
+            distance = abs(signal.entry_price - stop_loss)
+            risk_distance: float | None = (
+                distance if distance > 0 and math.isfinite(distance) else None
+            )
             return self._sized_order(
                 signal=signal,
                 position_size=0.0,
@@ -341,6 +473,7 @@ class RiskEngine:
                     stop_price_used=stop_loss,
                     rejection_reason="bad_stop_direction",
                     metadata={
+                        **limit_metadata,
                         "current_exposure": exposure,
                         "enforce_stop_direction": enforce_stop_direction,
                         "stop_source": stop_source,
@@ -348,11 +481,26 @@ class RiskEngine:
                 ),
             )
 
-        risk_distance = abs(signal.entry_price - stop_loss)
+        if stop_distance_override is not None:
+            override_distance = self._finite_number(
+                stop_distance_override, "stop_distance_override"
+            )
+            if override_distance <= 0:
+                raise ValueError("stop_distance_override must be > 0")
+            risk_distance = override_distance
+        else:
+            risk_distance = abs(signal.entry_price - stop_loss)
         if risk_distance <= 0 or not math.isfinite(risk_distance):
             raise ValueError("entry_price and stop_loss must differ for risk sizing")
 
-        risk_amount = balance * risk_percent
+        # For the override path keep the declared dollars exact — routing
+        # through ``balance * (override / balance)`` would add float dust to
+        # quantities the MT5-parity protocol pins exactly.
+        risk_amount = (
+            min(override_amount, remaining_exposure * balance)
+            if override_amount is not None
+            else balance * risk_percent
+        )
         raw_size = risk_amount / (risk_distance * pip)
         position_size = max(0.0, raw_size)
         max_notional = balance * notional_limit
@@ -390,12 +538,15 @@ class RiskEngine:
                 risk_distance=risk_distance,
                 stop_price_used=stop_loss,
                 metadata={
+                    **limit_metadata,
                     "current_exposure": exposure,
                     "pip_value": pip,
                     "stop_source": stop_source,
                     "fallback_stop_allowed": fallback_allowed and not reject_missing_stop,
                     "stop_price_provenance": stop_source,
-                    "max_notional_per_trade": notional_limit,
+                    "max_notional_per_trade": (
+                        "uncapped" if math.isinf(notional_limit) else notional_limit
+                    ),
                     "capped_by_notional": capped_by_notional,
                     **(
                         {"realized_risk_amount": realized_risk_amount}

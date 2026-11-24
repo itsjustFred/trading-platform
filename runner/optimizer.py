@@ -17,7 +17,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from data_tools.auto_download import ensure_backtest_data, has_sufficient_segment_coverage
 from runner.cli import _detect_date_range
-from runner.engines.base import BacktestConfig
+from runner.engines.base import BacktestConfig, warn_if_engine_frozen
 from runner.engines.vectorbt_adapter import VectorbtAdapter
 from runner.optimization_diagnostics import (
     ThreeWaySplit,
@@ -28,8 +28,12 @@ from runner.optimization_diagnostics import (
     train_validation_degradation,
     walk_forward_train_validation_folds,
 )
+from runner.portfolio_optimizer import (
+    MIN_OOS_DAILY_OBSERVATIONS,
+    daily_observation_count,
+)
 from runner.risk_parity_optimizer import select_best_risk_parity_universe
-from runner.stats import compute_stats_for_result, daily_returns_moments
+from runner.stats import compute_stats_for_result, daily_returns_moments_for_result
 from runner.universe_provenance import (
     UNIVERSE_PROVENANCE_KEY,
     observe_symbol_coverage,
@@ -39,7 +43,7 @@ from runner.universe_provenance import (
 )
 from shared.atomic_io import write_text_atomically
 from shared.constants import DATA_DIR, OPTIMIZATIONS_DIR, normalize_timeframe
-from shared.models import BacktestResult, resolve_defined_stat
+from shared.models import BacktestResult, LEGACY_SIGNAL_EXIT_FILL, resolve_defined_stat
 from shared.strategy_registry import find_strategy_entry
 
 logger = logging.getLogger(__name__)
@@ -106,6 +110,27 @@ RAW_MAXIMIZE_METRICS = frozenset(
 )
 
 
+def _resolved_max_drawdown(stats: Mapping[str, Any]) -> float | None:
+    """``max_drawdown_pct`` resolved to a finite fraction, or None.
+
+    ``None`` covers every unmeasurable case the drawdown consumers share:
+    an absent key, an explicit ``None``, a name in ``undefined_metrics``
+    (#250), a value that does not parse as a float, and a non-finite one
+    (#320). Percent-scale values (> 1.0) still resolve - the scale guard in
+    ``_risk_adjusted_metric_value`` fails loud on them instead of letting
+    the penalty path absorb them.
+    """
+    resolved = stats if isinstance(stats, dict) else dict(stats)
+    raw = resolve_defined_stat(resolved, "max_drawdown_pct", None)
+    if raw is None:
+        return None
+    try:
+        value = abs(float(raw))
+    except (TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) else None
+
+
 def _risk_adjusted_metric_value(
     value: float,
     stats: dict[str, Any],
@@ -125,6 +150,19 @@ def _risk_adjusted_metric_value(
     haircut would compress them toward zero and let losers outrank small
     winners). Non-raw metrics (sharpe/sortino/calmar/psr/cagr) and minimize
     studies pass through untouched.
+
+    ``max_drawdown_pct`` is resolved through ``resolve_defined_stat``: a run
+    whose equity is unreadable stores it as ``None`` and names it in
+    ``undefined_metrics`` (#250). An unmeasurable drawdown takes the
+    worst-case haircut (``drawdown_factor`` 0) - reading it as 0.0 would
+    hand such a run full drawdown credit (#286). "Unmeasurable" is broader
+    than corrupt artifacts: it also covers a stats dict with no
+    ``max_drawdown_pct`` key at all and any run whose equity curve has fewer
+    than two points (``runner/stats.py`` declares the metric undefined then).
+    Under ``risk_adjust_objective`` the objective goes further and treats
+    such a trial as unrankable (#320): the 0.0 this function would return
+    still outranks every measured losing trial, so the trial is penalized
+    instead, and validation marks it unselectable.
     """
     terms = {"sparsity_factor": 1.0, "drawdown_factor": 1.0}
     if direction != "maximize" or metric_key not in RAW_MAXIMIZE_METRICS:
@@ -135,16 +173,11 @@ def _risk_adjusted_metric_value(
         trade_count = int(stats.get("total_trades", 0) or 0)
     except (TypeError, ValueError):
         trade_count = 0
-    try:
-        max_dd = abs(float(stats.get("max_drawdown_pct", 0.0) or 0.0))
-    except (TypeError, ValueError):
-        max_dd = 0.0
-    if not math.isfinite(max_dd):
-        max_dd = 0.0
+    max_dd = _resolved_max_drawdown(stats)
     # Pre-mortem T3: stats publish drawdown as a FRACTION (e.g. 0.05, not
     # 5.0). Percent-scale input would silently zero every trial via the
     # min(max_dd, 1.0) clamp — fail loud instead.
-    if max_dd > 1.0:
+    if max_dd is not None and max_dd > 1.0:
         raise ValueError(
             f"max_drawdown_pct {max_dd} looks percent-scaled; expected a fraction <= 1.0."
         )
@@ -152,9 +185,27 @@ def _risk_adjusted_metric_value(
         0.0,
         min(1.0, trade_count / max(int(min_trades_for_full_credit), 1)),
     )
-    drawdown_factor = max(0.0, 1.0 - min(max_dd, 1.0) * max(drawdown_penalty_weight, 0.0))
+    drawdown_factor = (
+        0.0
+        if max_dd is None
+        else max(0.0, 1.0 - min(max_dd, 1.0) * max(drawdown_penalty_weight, 0.0))
+    )
     terms = {"sparsity_factor": sparsity, "drawdown_factor": drawdown_factor}
     return value * sparsity * drawdown_factor, terms
+
+
+def _drawdown_unmeasurable(stats: Mapping[str, Any]) -> bool:
+    """True when ``max_drawdown_pct`` cannot be resolved to a finite number.
+
+    Covers every case ``_risk_adjusted_metric_value`` would haircut with
+    ``drawdown_factor`` 0: an absent key, an explicit ``None``, a name in
+    ``undefined_metrics`` (#250), a value that does not parse as a float,
+    and a non-finite one (#320). A percent-scaled value (> 1.0) counts as
+    measurable here so the scale guard in ``_risk_adjusted_metric_value``
+    still fails loud instead of being absorbed into the penalty path.
+    """
+    return _resolved_max_drawdown(stats) is None
+
 
 #: Marker value recorded on no-trade trials. Purely informational (the trial
 #: objective returns the dynamic penalty from :func:`_no_trade_penalty_value`);
@@ -316,6 +367,11 @@ class OptimizationConfig(BaseModel):
     # This is an overfitting / selection-luck hint, not a judgement of
     # strategy quality: a low Sharpe can still be a useful portfolio component.
     min_deflated_sharpe: float = Field(default=0.90, gt=0.0, le=1.0)
+    # Minimum distinct DAILY observations in the OOS holdout before its
+    # statistics are trusted (#133). Intraday bars on the same day count once.
+    min_oos_daily_observations: int = Field(
+        default=MIN_OOS_DAILY_OBSERVATIONS, ge=1
+    )
 
     @field_validator("base_backtest_id", "target_metric")
     @classmethod
@@ -692,6 +748,19 @@ def run_optimization(
         # runs cannot beat robust ones. Terms are recorded for transparency.
         metric_direction = _study_direction(config.target_metric)
         if config.risk_adjust_objective:
+            if (
+                metric_direction == "maximize"
+                and metric_key in RAW_MAXIMIZE_METRICS
+                and _drawdown_unmeasurable(train_stats)
+            ):
+                # #320: a raw maximize target is risk-adjusted by the
+                # drawdown haircut, so an unmeasurable drawdown makes the
+                # trial unrankable - the same #132 rule as an undefined
+                # objective. The worst-case haircut alone would score the
+                # run 0.0, which beats every measured losing trial.
+                return _penalize_trial(
+                    trial, metric_key, completed_trading_values, config.target_metric
+                )
             metric_value, penalty_terms = _risk_adjusted_metric_value(
                 metric_value,
                 train_stats,
@@ -876,13 +945,27 @@ def run_optimization(
         )
     final_test_stats = dict(winner_test_row["test_stats"])
     validation_stats = dict(winner_row["validation_stats"])
+    oos_daily_observations = int(winner_test_row.get("test_daily_observations") or 0)
+    oos_status = (
+        "available"
+        if oos_daily_observations >= config.min_oos_daily_observations
+        else "insufficient_oos_bars"
+    )
+    if oos_status != "available":
+        # #133: risk-adjusted ratios computed on too few daily observations are
+        # noise, not evidence — withhold them from the headline holdout while
+        # keeping factual fields (trade counts, pnl) for diagnostics.
+        final_test_stats = _withhold_oos_risk_metrics(final_test_stats)
     # Flags the winner's overfitting risk; it never changes the selection or
-    # drops the result.
+    # drops the result. An OOS holdout below the daily-observation minimum is
+    # itself an overfitting/insufficient-evidence failure.
     overfitting = _overfitting_payload(
         winner_row=winner_row,
         train_stats=best_train_stats,
         selectable_rows=selectable_rows,
         config=config,
+        oos_daily_observations=oos_daily_observations,
+        min_oos_daily_observations=config.min_oos_daily_observations,
     )
 
     now = datetime.now(timezone.utc)
@@ -940,7 +1023,9 @@ def run_optimization(
         "validation_stats": _json_safe(validation_stats),
         "final_test_period": test_period,
         "final_test_stats": _json_safe(final_test_stats),
-        "oos_status": "available",
+        "oos_status": oos_status,
+        "oos_daily_observations": oos_daily_observations,
+        "min_oos_daily_observations": config.min_oos_daily_observations,
         "three_way": {
             "segments": split.as_dict(),
             "winner": {
@@ -949,6 +1034,7 @@ def run_optimization(
                 "validation_metrics": _json_safe(validation_stats),
                 "test_metrics": _json_safe(final_test_stats),
             },
+            "oos_metrics_withheld": oos_status != "available",
             "selection": _selection_payload(
                 selection=selection,
                 validation_rows=validation_rows,
@@ -1227,7 +1313,11 @@ def _trial_selection_score(
 
 
 def _validation_unselectable_reason(
-    result: BacktestResult, stats: Mapping[str, Any], metric_key: str
+    result: BacktestResult,
+    stats: Mapping[str, Any],
+    metric_key: str,
+    *,
+    require_measurable_drawdown: bool = False,
 ) -> str | None:
     """Why a validation result cannot be selected, or None when it can."""
     if not result.trades:
@@ -1236,6 +1326,10 @@ def _validation_unselectable_reason(
         return "validation: ruined"
     if resolve_defined_stat(dict(stats), metric_key, None) is None:
         return f"validation: target metric {metric_key!r} is undefined"
+    if require_measurable_drawdown and _drawdown_unmeasurable(stats):
+        # #320: mirrors the train-side penalty - a raw maximize target whose
+        # drawdown cannot be measured is unrankable, not a 0.0-score trial.
+        return "validation: max_drawdown_pct undefined"
     return None
 
 
@@ -1302,7 +1396,7 @@ def _evaluate_trials_on_validation(
             )
             stats = _canonical_stats(result)
             score, raw_metric = _trial_selection_score(stats, config)
-            moments = daily_returns_moments(result.equity_curve)
+            moments = daily_returns_moments_for_result(result)
         except (ValueError, RuntimeError, KeyError) as exc:
             reason = f"validation run failed: {type(exc).__name__}: {exc}"
             trial.set_user_attr(VALIDATION_FAILURE_ATTR, reason)
@@ -1315,8 +1409,16 @@ def _evaluate_trials_on_validation(
         # metric out of sample must never win on validation, mirroring the
         # train-side guard in the objective (#132, 16-D1). The metric may even
         # carry a 0.0 placeholder, which `resolve_defined_stat` rejects.
+        validation_metric_key = _metric_key(config.target_metric, stats)
         validation_reason = _validation_unselectable_reason(
-            result, stats, _metric_key(config.target_metric, stats)
+            result,
+            stats,
+            validation_metric_key,
+            require_measurable_drawdown=(
+                config.risk_adjust_objective
+                and _study_direction(config.target_metric) == "maximize"
+                and validation_metric_key in RAW_MAXIMIZE_METRICS
+            ),
         )
         if validation_reason is not None:
             trial.set_user_attr(VALIDATION_FAILURE_ATTR, validation_reason)
@@ -1384,6 +1486,7 @@ def _evaluate_top_set_on_test(
             "test_metric_value": None,
             "test_stats": {},
             "test_failure_reason": None,
+            "test_daily_observations": 0,
         }
         # Same isolation as the validation pass: one candidate whose holdout
         # run fails is recorded, and the rest of the top set still reports.
@@ -1400,6 +1503,9 @@ def _evaluate_top_set_on_test(
             )
             stats = _canonical_stats(result)
             metric_value = _metric_value(stats, config.target_metric)
+            row["test_daily_observations"] = daily_observation_count(
+                point.time for point in result.equity_curve
+            )
         except (ValueError, RuntimeError, KeyError) as exc:
             row["test_failure_reason"] = f"{type(exc).__name__}: {exc}"
             rows.append(row)
@@ -1550,12 +1656,43 @@ def _selection_payload(
     }
 
 
+#: Risk-adjusted performance ratios that are meaningless on an undersized
+#: out-of-sample holdout (#133). Factual fields (trade counts, pnl, returns
+#: in currency) stay: they describe what happened, not whether it is
+#: statistically meaningful.
+_OOS_RISK_METRIC_KEYS = frozenset(
+    {
+        "sharpe_ratio",
+        "sharpe",
+        "sortino_ratio",
+        "sortino",
+        "calmar_ratio",
+        "calmar",
+        "max_drawdown_pct",
+        "max_drawdown",
+        "psr",
+        "deflated_sharpe_ratio",
+    }
+)
+
+
+def _withhold_oos_risk_metrics(stats: Mapping[str, Any]) -> dict[str, Any]:
+    """Drop risk-adjusted ratios from OOS stats below the daily minimum."""
+    return {
+        key: value
+        for key, value in dict(stats).items()
+        if key not in _OOS_RISK_METRIC_KEYS
+    }
+
+
 def _overfitting_payload(
     *,
     winner_row: Mapping[str, Any],
     train_stats: Mapping[str, Any],
     selectable_rows: Sequence[Mapping[str, Any]],
     config: OptimizationConfig,
+    oos_daily_observations: int | None = None,
+    min_oos_daily_observations: int = MIN_OOS_DAILY_OBSERVATIONS,
 ) -> dict[str, Any]:
     """The winner's train->validation degradation and deflated Sharpe (#164).
 
@@ -1605,8 +1742,32 @@ def _overfitting_payload(
         max_degradation=config.max_train_validation_degradation,
         min_deflated_sharpe=config.min_deflated_sharpe,
     )
+    checks = dict(verdict.get("checks") or {})
+    reasons = list(verdict.get("reasons") or [])
+    passed = bool(verdict.get("passed"))
+    if (
+        oos_daily_observations is not None
+        and oos_daily_observations < min_oos_daily_observations
+    ):
+        # #133: too few distinct daily OOS observations means the holdout
+        # cannot support a promotion decision; the verdict must say so rather
+        # than leaving oos_status as a label the gate never reads.
+        checks["oos_daily_observations"] = {
+            "value": int(oos_daily_observations),
+            "threshold": int(min_oos_daily_observations),
+            "passed": False,
+            "computable": True,
+        }
+        reasons.append(
+            f"out-of-sample holdout has {int(oos_daily_observations)} daily "
+            f"observations, below the required {int(min_oos_daily_observations)}"
+        )
+        passed = False
     return {
         **verdict,
+        "passed": passed,
+        "checks": checks,
+        "reasons": reasons,
         "degradation": _safe_float_or_none(degradation),
         "deflated_sharpe": _safe_float_or_none(deflated),
         "metric": TARGET_METRIC_ALIASES.get(config.target_metric, config.target_metric),
@@ -2013,7 +2174,10 @@ def _runtime_config_from_base_result(result: BacktestResult) -> dict[str, Any]:
         "max_position_exposure_pct": value("max_position_exposure_pct"),
         "max_leverage": value("max_leverage"),
         "modeling_resolution": value("modeling_resolution", "open_close"),
-        "signal_exit_fill": value("signal_exit_fill", "close"),
+        # A base result that records no exit model is a legacy artifact made
+        # under the old same-bar close fill; re-optimising it under next_open
+        # would compare trials against base stats from a different model.
+        "signal_exit_fill": value("signal_exit_fill", LEGACY_SIGNAL_EXIT_FILL),
         "allow_fallback_stop": value("allow_fallback_stop", True),
         "reject_missing_stop": value("reject_missing_stop", False),
         "require_explicit_column_roles": value("require_explicit_column_roles", False),
@@ -2030,6 +2194,7 @@ def _run_vectorbt_backtest(config: BacktestConfig, strategy_path: Path) -> Backt
         modeling_resolution=config.modeling_resolution,
         log_callback=lambda message: None,
     )
+    warn_if_engine_frozen("vectorbt", stacklevel=2)
     result = VectorbtAdapter().run(config, str(strategy_path))
     result.stats = {**result.stats, **compute_stats_for_result(result)}
     return result
@@ -2152,6 +2317,14 @@ def _run_risk_parity_covariance_optimization(
         strategy_path,
     )
     test_stats = _canonical_stats(test_result)
+    test_daily_observations = daily_observation_count(
+        point.time for point in test_result.equity_curve
+    )
+    oos_status = (
+        "available"
+        if test_daily_observations >= config.min_oos_daily_observations
+        else "insufficient_oos_bars"
+    )
 
     now = datetime.now(timezone.utc)
     optimization_id = (
@@ -2194,8 +2367,17 @@ def _run_risk_parity_covariance_optimization(
             "diversification_ratio": selection["best_diversification_ratio"],
             "avg_abs_correlation": selection["best_avg_abs_correlation"],
         },
-        "test_stats": _json_safe(test_stats),
-        "oos_status": "available",
+        # This path has no overfitting verdict to carry the failure, so an
+        # undersized OOS holdout withholds its risk-adjusted ratios rather
+        # than leaving them readable as if they were evidence.
+        "test_stats": _json_safe(
+            test_stats
+            if oos_status == "available"
+            else _withhold_oos_risk_metrics(test_stats)
+        ),
+        "oos_status": oos_status,
+        "oos_daily_observations": test_daily_observations,
+        "min_oos_daily_observations": config.min_oos_daily_observations,
         "risk_parity": _json_safe(selection),
         "top_trials": [],
     }
@@ -2336,36 +2518,36 @@ def _top_trials_payload(
         reverse=(direction != "minimize"),
     )
     payload: list[dict[str, Any]] = []
-    for trial in ordered_trials[:limit]:
-        payload.append(
-            {
-                "number": trial.number,
-                "state": trial.state.name,
-                "value": _safe_float_or_none(trial.value),
-                "params": _json_safe(dict(trial.params)),
-                "effective_parameters": _json_safe(
-                    dict(trial.user_attrs.get("effective_parameters") or {})
-                ),
-                "symbols": _json_safe(list(trial.user_attrs.get("symbols") or [])),
-                "trade_count": int(trial.user_attrs.get("trade_count", 0) or 0),
-                "penalty_applied": bool(trial.user_attrs.get("penalty_applied", False)),
-                "raw_metric_value": _safe_float_or_none(
-                    trial.user_attrs.get("raw_metric_value")
-                ),
-                "train_stats": _json_safe(dict(trial.user_attrs.get("train_stats") or {})),
-                # #164: the trial's out-of-search result, recorded when it was
-                # validated. None for trials the validation pass could not score.
-                "validation_score": _safe_float_or_none(
-                    trial.user_attrs.get(VALIDATION_SCORE_ATTR)
-                ),
-                "validation_metric_value": _safe_float_or_none(
-                    trial.user_attrs.get(VALIDATION_METRIC_ATTR)
-                ),
-                "validation_stats": _json_safe(
-                    dict(trial.user_attrs.get(VALIDATION_STATS_ATTR) or {})
-                ),
-            }
-        )
+    payload.extend(
+        {
+            "number": trial.number,
+            "state": trial.state.name,
+            "value": _safe_float_or_none(trial.value),
+            "params": _json_safe(dict(trial.params)),
+            "effective_parameters": _json_safe(
+                dict(trial.user_attrs.get("effective_parameters") or {})
+            ),
+            "symbols": _json_safe(list(trial.user_attrs.get("symbols") or [])),
+            "trade_count": int(trial.user_attrs.get("trade_count", 0) or 0),
+            "penalty_applied": bool(trial.user_attrs.get("penalty_applied", False)),
+            "raw_metric_value": _safe_float_or_none(
+                trial.user_attrs.get("raw_metric_value")
+            ),
+            "train_stats": _json_safe(dict(trial.user_attrs.get("train_stats") or {})),
+            # #164: the trial's out-of-search result, recorded when it was
+            # validated. None for trials the validation pass could not score.
+            "validation_score": _safe_float_or_none(
+                trial.user_attrs.get(VALIDATION_SCORE_ATTR)
+            ),
+            "validation_metric_value": _safe_float_or_none(
+                trial.user_attrs.get(VALIDATION_METRIC_ATTR)
+            ),
+            "validation_stats": _json_safe(
+                dict(trial.user_attrs.get(VALIDATION_STATS_ATTR) or {})
+            ),
+        }
+        for trial in ordered_trials[:limit]
+    )
     return payload
 
 

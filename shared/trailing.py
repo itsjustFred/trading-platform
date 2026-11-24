@@ -17,18 +17,22 @@ per-broker table lives here (``LIVE_SUPPORTED_TRAILING_MODES_BY_BROKER``);
 the live runner additionally requires the adapter instance to declare the
 ``supports_stop_amendment`` capability at signal time.
 
-``supertrend_flip`` (#168) is executed by the replay backtest only. Its
-parameters are validated by ``parse_supertrend_flip_plan`` (fail closed, no
-invented defaults). The live path keeps rejecting it: the Alpaca entry is a
-full-quantity bracket whose take-profit leg would close the whole position at
-TP1, so a TP1 *partial* exit needs a different entry order structure first
-(see ``docs/live-deploy-runbook.md``).
+``supertrend_flip`` (#168) runs live on cTrader demo/paper deployments that
+carry the explicit ``live_supertrend_flip`` settings opt-in (see
+``deployment_supertrend_flip_enabled``); every other live broker and every
+non-opted-in deployment still rejects it. Its parameters are validated by
+``parse_supertrend_flip_plan`` (fail closed, no invented defaults). The live
+workflow lives in ``live_runner/supertrend_flip.py``.
 """
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:  # pragma: no cover - import cycle guard, annotations only
+    from shared.models import LiveDeploymentConfig
 
 #: Metadata key a signal processor uses to request trailing-stop behaviour.
 TRAILING_SL_CONFIG_METADATA_KEY = "trailing_sl_config"
@@ -65,13 +69,15 @@ LIVE_BASELINE_TRAILING_MODES: frozenset[str] = frozenset({TRAILING_MODE_NONE})
 #: Modes the live path executes, per broker (``LiveAccountConfig.broker``).
 #: - ``alpaca``: ``percent`` is trailed by `live_runner/trailing_stops.py`,
 #:   which replaces the protective stop order in place (#167).
-#: - ``ctrader``: the daemon has no cTrader market data to trail on and the
-#:   adapter declares no stop-amendment capability, so only ``none``.
-#: ``supertrend_flip`` is on no broker: its TP1 partial exit cannot coexist
-#: with the full-quantity entry bracket (module docstring, #168).
+#: - ``ctrader``: ``supertrend_flip`` is executable by
+#:   `live_runner/supertrend_flip.py`, but ONLY for deployments that carry the
+#:   ``live_supertrend_flip`` settings opt-in on a provably demo/paper account
+#:   — the deployment-validation and signal-time gates below enforce both
+#:   halves; this table only says the broker *can* execute the mode. ``percent``
+#:   stays unsupported: cTrader declares no ``supports_stop_amendment``.
 LIVE_SUPPORTED_TRAILING_MODES_BY_BROKER: dict[str, frozenset[str]] = {
     "alpaca": frozenset({TRAILING_MODE_NONE, TRAILING_MODE_PERCENT}),
-    "ctrader": LIVE_BASELINE_TRAILING_MODES,
+    "ctrader": frozenset({TRAILING_MODE_NONE, TRAILING_MODE_SUPERTREND_FLIP}),
 }
 
 #: Signal timeframes a live broker can trail on, per broker. Trailing is replayed
@@ -84,6 +90,12 @@ LIVE_SUPPORTED_TRAILING_MODES_BY_BROKER: dict[str, frozenset[str]] = {
 #: trails on no timeframe.
 LIVE_TRAILING_TIMEFRAMES_BY_BROKER: dict[str, frozenset[str]] = {
     "alpaca": frozenset({"1m", "5m", "15m", "30m", "1h"}),
+    # cTrader ``supertrend_flip`` (#168): sub-day bars only. ``4h``/``1d``/``1w``
+    # are excluded because the broker anchors them to its server day, which is
+    # not provably the UTC alignment the replay's bar boundaries use; the flip
+    # workflow's dead-bar and TP1-bar rules are only replay-faithful on bars
+    # both sides agree on.
+    "ctrader": frozenset({"1m", "5m", "15m", "30m", "1h"}),
 }
 
 #: Modes at least one live broker executes. This is NOT a gate for trading a
@@ -106,6 +118,43 @@ RISK_ENGINE_SUPPORTED_TRAILING_MODES: frozenset[str] = frozenset(
 def normalize_trailing_mode(value: Any) -> str:
     """Normalize a configured trailing mode value (strip + lowercase)."""
     return str(value or "").strip().lower()
+
+
+# ── supertrend_flip deployment opt-in (#168) ──────────────────────────────────
+#
+# The live ``supertrend_flip`` workflow is deliberately opt-in per deployment:
+# the mode alone never enables it. A deployment must ALSO carry the explicit
+# ``live_supertrend_flip`` settings flag, and the account's adapter must be a
+# provably demo/paper cTrader (``supports_supertrend_flip`` +
+# ``_adapter_is_demo`` at the daemon's signal gates). Absent or
+# unrecognized values fail closed: the workflow simply does not run.
+
+#: ``LiveDeploymentConfig.settings`` key opting a deployment into the live
+#: ``supertrend_flip`` workflow (#168).
+FLIP_DEPLOYMENT_OPT_IN_KEY = "live_supertrend_flip"
+
+_TRUE_OPT_IN_TOKENS = frozenset({"1", "true", "yes", "on"})
+
+
+def supertrend_flip_opted_in(settings: Any) -> bool:
+    """Whether deployment ``settings`` carry the live flip opt-in.
+
+    Only an explicit truthy value enables it; every other value - absent,
+    false, blank, or an unrecognized token - is off, so a typo fails closed.
+    """
+    if not isinstance(settings, Mapping):
+        return False
+    value = settings.get(FLIP_DEPLOYMENT_OPT_IN_KEY)
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() in _TRUE_OPT_IN_TOKENS
+
+
+def deployment_supertrend_flip_enabled(deployment: Any) -> bool:
+    """Whether this deployment opted into the live flip workflow."""
+    return supertrend_flip_opted_in(getattr(deployment, "settings", None))
 
 
 def validate_trailing_mode(
@@ -226,12 +275,68 @@ class _AnyBroker:
 ANY_BROKER: Any = _AnyBroker()
 
 
+def _validate_trailing_mode_for_stage(
+    value: Any,
+    *,
+    broker: Any,
+    timeframe: Any,
+    context: str,
+    flip_opted_in: bool = False,
+) -> None:
+    """Validate one trailing mode against a broker, and a timeframe when known.
+
+    The two stages of the deployment contract, in one place so every gate that
+    reads a deployment's mode decides identically:
+
+    - ``ANY_BROKER`` (model validation, where only the account id is known —
+      and the daemon's load path, which must not refuse more than the
+      signal-time gates do): the mode must be one that at least one live broker
+      executes. The timeframe is unknown there, so it is not gated.
+    - a concrete broker (deployment creation, account re-point, YAML parse —
+      wherever the account is resolved): the mode must be supported by that
+      broker (``None``/unknown brokers fail closed to ``none`` only) and, when
+      a timeframe is given, trailable on it.
+
+    ``supertrend_flip`` additionally requires the deployment's explicit
+    ``live_supertrend_flip`` opt-in (``flip_opted_in``): the broker table says
+    cTrader *can* execute the mode, but only an opted-in deployment may ask
+    for it. Demo/paper enforcement happens later, at the signal gates where
+    the adapter instance is known.
+    """
+    if broker is ANY_BROKER:
+        mode = validate_trailing_mode(
+            value,
+            supported=LIVE_ANY_BROKER_TRAILING_MODES,
+            context=context,
+        )
+    else:
+        mode = validate_trailing_mode(
+            value,
+            supported=live_supported_trailing_modes(broker),
+            context=context,
+        )
+    if mode == TRAILING_MODE_SUPERTREND_FLIP and not flip_opted_in:
+        raise ValueError(
+            f"Trailing stop mode 'supertrend_flip' in {context} requires the "
+            f"deployment '{FLIP_DEPLOYMENT_OPT_IN_KEY}' settings opt-in; "
+            "refusing to run the live flip workflow without it."
+        )
+    if broker is not ANY_BROKER and timeframe is not None:
+        validate_live_trailing_timeframe(
+            mode,
+            timeframe,
+            supported_timeframes=live_trailing_timeframes(broker),
+            context=f"{context} on broker {str(broker or '').strip().lower() or 'unknown'!r}",
+        )
+
+
 def validate_live_deployment_trailing_override(
     signal_config: Any,
     *,
     context: str,
     broker: Any = ANY_BROKER,
     timeframe: Any = None,
+    flip_opted_in: bool = False,
 ) -> None:
     """Validate a live deployment's trailing-mode override, if it sets one.
 
@@ -255,30 +360,98 @@ def validate_live_deployment_trailing_override(
     processor_config = signal_config.get("signal_processor_config")
     if not isinstance(processor_config, dict) or "trailing_mode" not in processor_config:
         return
-    if broker is ANY_BROKER:
-        supported = LIVE_ANY_BROKER_TRAILING_MODES
-        where = f"{context} signal_processor_config.trailing_mode (any live broker)"
-    else:
-        supported = live_supported_trailing_modes(broker)
-        broker_label = str(broker or "").strip().lower() or "unknown"
-        where = (
-            f"{context} signal_processor_config.trailing_mode "
-            f"on broker {broker_label!r}"
-        )
-    mode = validate_trailing_mode(
+    where = f"{context} signal_processor_config.trailing_mode"
+    _validate_trailing_mode_for_stage(
         processor_config.get("trailing_mode"),
-        supported=supported,
+        broker=broker,
+        timeframe=timeframe,
         context=where,
+        flip_opted_in=flip_opted_in,
     )
-    # With a broker AND a timeframe (the stages that know both) the mode must
-    # also be trailable on that timeframe.
-    if broker is not ANY_BROKER and timeframe is not None:
-        validate_live_trailing_timeframe(
-            mode,
-            timeframe,
-            supported_timeframes=live_trailing_timeframes(broker),
-            context=f"{context} on broker {str(broker or '').strip().lower() or 'unknown'!r}",
-        )
+
+
+def validate_live_deployment_trailing_mode(
+    deployment: "LiveDeploymentConfig",
+    *,
+    context: str,
+    broker: Any = ANY_BROKER,
+    timeframe: Any = None,
+) -> None:
+    """Validate the trailing mode a live deployment would run, fail closed.
+
+    #150, the deployment-validation stage: a mode that is unknown, or that the
+    live path cannot execute on this broker and timeframe, is rejected with a
+    ``ValueError`` before the deployment exists — it is never created and then
+    refused signal by signal. Callers that only validate a stored deployment
+    (the daemon's load path) catch the error and log it.
+
+    The mode reaches a deployment through one of two places and both are
+    checked here:
+
+    - an explicit ``signal_processor_config.trailing_mode`` override
+      (:func:`validate_live_deployment_trailing_override`), and
+    - the signal processor's own default, read from the processor the
+      deployment actually runs — the bot config merged with the deployment's
+      overrides, exactly as the daemon builds it. The mode is a setting of the
+      *bot* (``signal_bots/<bot>/config.yaml``) and the processor emits it with
+      every signal, which is where the issue's defect came from: a bot default
+      that live cannot execute used to be invisible until the first signal was
+      refused at runtime.
+
+    A deployment without a signal processor, and a processor that declares no
+    trailing mode at all (e.g. RocketFuel), pass untouched.
+
+    ``supertrend_flip`` additionally requires the deployment's explicit
+    ``live_supertrend_flip`` settings opt-in (#168); the flag is read from the
+    deployment itself, so every caller gets the same answer.
+    """
+    flip_opted_in = deployment_supertrend_flip_enabled(deployment)
+    validate_live_deployment_trailing_override(
+        deployment.signal_config,
+        context=context,
+        broker=broker,
+        timeframe=timeframe,
+        flip_opted_in=flip_opted_in,
+    )
+    processor_name = deployment.signal_processor_name
+    if not processor_name:
+        return
+    processor_config = deployment.signal_config.get("signal_processor_config")
+    if isinstance(processor_config, Mapping) and "trailing_mode" in processor_config:
+        # The override check above already owns this deployment's mode; building
+        # its processor for it would only repeat the work.
+        return
+    if not isinstance(processor_config, Mapping):
+        processor_config = {}
+    # Imported here, not at module level: the signal processors import
+    # ``shared.trailing``, so a module-level import of the registry would be a
+    # cycle (shared.trailing -> signal_bots.registry -> shared.trailing).
+    from signal_bots.registry import get_signal_processor
+
+    try:
+        processor = get_signal_processor(processor_name, dict(processor_config))
+    except Exception as exc:
+        # An unregistered id or a bot config that no longer loads is a client
+        # error (the API answers 400 with this detail), not a 500; at the
+        # daemon's load path it is a configuration error that must not cost the
+        # whole deployment list its sync tick.
+        raise ValueError(
+            f"{context}: its signal processor '{processor_name}' could not be "
+            f"built to check the trailing mode it would emit: {exc}"
+        ) from exc
+    mode = getattr(processor, "trailing_mode", None)
+    if mode is None:
+        return
+    _validate_trailing_mode_for_stage(
+        mode,
+        broker=broker,
+        timeframe=timeframe,
+        flip_opted_in=flip_opted_in,
+        context=(
+            f"{context}: its signal processor '{processor_name}' requests "
+            f"trailing mode {normalize_trailing_mode(mode)!r}"
+        ),
+    )
 
 
 def live_trailing_timeframes(broker: Any) -> frozenset[str]:

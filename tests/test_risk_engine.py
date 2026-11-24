@@ -15,12 +15,27 @@ from shared.models import LiveDeploymentConfig, LiveSignal
 
 @pytest.mark.parametrize(
     "field_name",
-    ["max_risk_per_trade", "max_total_exposure", "max_notional_per_trade"],
+    ["max_risk_per_trade", "max_total_exposure"],
 )
 @pytest.mark.parametrize("value", [0.0, -0.01, 1.01, math.nan, math.inf])
 def test_risk_config_rejects_exposure_outside_fraction_range(field_name, value):
     with pytest.raises(ValueError):
         RiskConfig(**{field_name: value})
+
+
+@pytest.mark.parametrize("value", [0.0, -0.01, math.nan, math.inf])
+def test_risk_config_rejects_non_positive_notional_cap(value):
+    with pytest.raises(ValueError):
+        RiskConfig(max_notional_per_trade=value)
+
+
+@pytest.mark.parametrize("value", [0.2, 1.0, 1.01, 50.0])
+def test_risk_config_accepts_notional_cap_above_one(value):
+    """#240: max_notional_per_trade may exceed 1x — leverage up to the broker
+    maximum. The broker bound is applied by each sizing path
+    (``effective_max_notional_per_trade``), not by this validation."""
+    config = RiskConfig(max_notional_per_trade=value)
+    assert config.max_notional_per_trade == value
 
 
 @pytest.mark.parametrize(
@@ -30,6 +45,28 @@ def test_risk_config_rejects_exposure_outside_fraction_range(field_name, value):
 def test_risk_config_accepts_upper_fraction_boundary(field_name):
     config = RiskConfig(**{field_name: 1.0})
     assert getattr(config, field_name) == 1.0
+
+
+@pytest.mark.parametrize(
+    ("configured", "broker_max", "expected"),
+    [
+        (5.0, 3.0, 3.0),    # broker maximum binds below the configured cap
+        (5.0, 50.0, 5.0),   # configured cap binds below the broker maximum
+        (0.2, 50.0, 0.2),   # sub-1x configs are unchanged by a high broker max
+        (5.0, None, 1.0),   # unknown broker maximum fails closed to 1x
+        (0.2, None, 0.2),
+        (5.0, math.nan, 1.0),
+        (5.0, 0.0, 1.0),
+        (5.0, -3.0, 1.0),
+        (5.0, math.inf, 1.0),
+        (5.0, "x", 1.0),
+        (5.0, True, 1.0),
+    ],
+)
+def test_effective_max_notional_per_trade(configured, broker_max, expected):
+    from risk.config import effective_max_notional_per_trade
+
+    assert effective_max_notional_per_trade(configured, broker_max) == pytest.approx(expected)
 
 
 def _risk_decision(risk_percent: float) -> RiskDecision:
@@ -117,6 +154,282 @@ def test_calculate_position_size_normal_case():
     assert sized.decision.take_profit_used == pytest.approx(104.0)
     assert sized.decision.rejection_reason is None
     assert sized.decision.metadata["stop_source"] == "signal"
+
+
+def _override_signal(**metadata) -> TradeSignal:
+    return TradeSignal(
+        action="buy",
+        symbol="EURUSD",
+        entry_price=100.0,
+        stop_loss=98.0,
+        take_profit=None,
+        timeframe="1h",
+        metadata=metadata,
+    )
+
+
+def test_calculate_position_size_risk_amount_override_sizes_absolute_dollars():
+    """#279: the override IS the per-trade risk — max_risk_per_trade does not
+    apply, and the quantity derives from the declared amount, not the pct."""
+    engine = RiskEngine(
+        RiskConfig(max_risk_per_trade=0.01, max_total_exposure=0.05, max_positions=5)
+    )
+    sized = engine.calculate_position_size(
+        signal=_override_signal(),
+        account_balance=100_000.0,
+        pip_value=1.0,
+        current_exposure=0.0,
+        max_notional_per_trade=math.inf,
+        risk_amount_override=500.0,
+    )
+
+    # 500 / |100 - 98| = 250 units; the 1% pct target would have been 50.
+    assert sized.position_size == pytest.approx(250.0)
+    assert sized.risk_amount == pytest.approx(500.0)
+    assert sized.risk_percent == pytest.approx(0.005)
+    assert sized.decision.accepted is True
+
+
+def test_calculate_position_size_risk_amount_override_clamps_to_exposure_budget():
+    """The aggregate ceiling still binds: the override is clamped to the
+    remaining exposure budget, like the pct path clamps risk_percent."""
+    engine = RiskEngine(
+        RiskConfig(max_risk_per_trade=0.01, max_total_exposure=0.05, max_positions=5)
+    )
+    sized = engine.calculate_position_size(
+        signal=_override_signal(),
+        account_balance=100_000.0,
+        pip_value=1.0,
+        # 4% already used → only 1% (1,000) of risk budget remains.
+        current_exposure=0.04,
+        max_notional_per_trade=math.inf,
+        risk_amount_override=5_000.0,
+    )
+
+    assert sized.risk_amount == pytest.approx(1_000.0)
+    assert sized.position_size == pytest.approx(500.0)
+
+
+def test_calculate_position_size_risk_amount_override_above_balance_saturates_percent():
+    """#279: a declared amount larger than the balance is legitimate — only
+    equity <= 0 raises (the margin/leverage clamp applies after sizing, and
+    main sizes it too). ``risk_percent`` is a fraction of balance and the
+    order model caps it at 1.0, so the reported figure saturates while
+    ``risk_amount`` keeps the declared dollars exact and the size is
+    unchanged."""
+    engine = RiskEngine(
+        RiskConfig(max_risk_per_trade=0.01, max_total_exposure=0.05, max_positions=5)
+    )
+    sized = engine.calculate_position_size(
+        signal=_override_signal(),
+        account_balance=2_000.0,
+        pip_value=1.0,
+        current_exposure=0.0,
+        max_notional_per_trade=math.inf,
+        risk_amount_override=3_000.0,
+        max_total_exposure=math.inf,
+    )
+
+    # |100 - 98| = 2 → 3,000 / 2 = 1,500 units; the 1% pct target would be 20.
+    assert sized.position_size == pytest.approx(1_500.0)
+    assert sized.risk_amount == pytest.approx(3_000.0)
+    assert sized.risk_percent == pytest.approx(1.0)
+    assert sized.decision is not None
+    assert sized.decision.risk_percent == pytest.approx(1.0)
+    assert sized.decision.accepted is True
+
+
+def test_calculate_position_size_risk_amount_override_rejects_at_exposure_limit():
+    engine = RiskEngine(
+        RiskConfig(max_risk_per_trade=0.01, max_total_exposure=0.05, max_positions=5)
+    )
+    sized = engine.calculate_position_size(
+        signal=_override_signal(),
+        account_balance=100_000.0,
+        pip_value=1.0,
+        current_exposure=0.05,
+        max_notional_per_trade=math.inf,
+        risk_amount_override=500.0,
+    )
+
+    assert sized.position_size == 0.0
+    assert sized.decision.accepted is False
+    assert sized.decision.rejection_reason == "max_total_exposure"
+
+
+def test_calculate_position_size_risk_amount_override_respects_max_positions():
+    engine = RiskEngine(
+        RiskConfig(max_risk_per_trade=0.01, max_total_exposure=0.05, max_positions=2)
+    )
+    sized = engine.calculate_position_size(
+        signal=_override_signal(current_positions=2),
+        account_balance=100_000.0,
+        pip_value=1.0,
+        current_exposure=0.0,
+        max_notional_per_trade=math.inf,
+        risk_amount_override=500.0,
+    )
+
+    assert sized.position_size == 0.0
+    assert sized.decision.rejection_reason == "max_positions"
+
+
+@pytest.mark.parametrize("value", [0.0, -1.0, math.nan, math.inf])
+def test_calculate_position_size_risk_amount_override_rejects_bad_values(value):
+    with pytest.raises(ValueError, match="risk_amount_override"):
+        RiskEngine().calculate_position_size(
+            signal=_override_signal(),
+            account_balance=10_000.0,
+            pip_value=1.0,
+            current_exposure=0.0,
+            risk_amount_override=value,
+        )
+
+
+def test_calculate_position_size_stop_distance_override_replaces_derived_distance():
+    """#279: the strategy's explicit stop distance (e.g. ATR-based) sizes the
+    position instead of |entry - stop_loss| — the MT5-parity protocol."""
+    engine = RiskEngine(
+        RiskConfig(max_risk_per_trade=0.01, max_total_exposure=0.05, max_positions=5)
+    )
+    sized = engine.calculate_position_size(
+        signal=_override_signal(),
+        account_balance=100_000.0,
+        pip_value=1.0,
+        current_exposure=0.0,
+        max_notional_per_trade=math.inf,
+        risk_amount_override=500.0,
+        stop_distance_override=5.0,
+    )
+
+    # |100 - 98| = 2 would give 250; the 5.0 override distance gives 100.
+    assert sized.position_size == pytest.approx(100.0)
+    assert sized.decision.risk_distance == pytest.approx(5.0)
+
+
+@pytest.mark.parametrize("value", [0.0, -1.0, math.nan, math.inf])
+def test_calculate_position_size_stop_distance_override_rejects_bad_values(value):
+    with pytest.raises(ValueError, match="stop_distance_override"):
+        RiskEngine().calculate_position_size(
+            signal=_override_signal(),
+            account_balance=10_000.0,
+            pip_value=1.0,
+            current_exposure=0.0,
+            risk_amount_override=500.0,
+            stop_distance_override=value,
+        )
+
+
+def test_calculate_position_size_max_positions_override_uncapped():
+    """``max_positions=math.inf`` is the documented uncapped value: a
+    protocol whose reference applies no position cap (the MT5-parity
+    fixed-risk path, #279) routes through the engine without the cap
+    binding, and the decision records ``"uncapped"``."""
+    engine = RiskEngine(
+        RiskConfig(max_risk_per_trade=0.01, max_total_exposure=0.05, max_positions=1)
+    )
+    sized = engine.calculate_position_size(
+        signal=_override_signal(current_positions=99),
+        account_balance=100_000.0,
+        pip_value=1.0,
+        current_exposure=0.0,
+        max_notional_per_trade=math.inf,
+        risk_amount_override=500.0,
+        max_positions=math.inf,
+    )
+
+    assert sized.position_size == pytest.approx(250.0)
+    assert sized.decision.accepted is True
+    assert sized.decision.metadata["max_positions"] == "uncapped"
+
+
+def test_calculate_position_size_max_positions_override_finite_binds():
+    """A finite caller cap replaces the config one — stricter OR looser —
+    and is what the rejection/metadata reports."""
+    engine = RiskEngine(
+        RiskConfig(max_risk_per_trade=0.01, max_total_exposure=0.05, max_positions=5)
+    )
+    sized = engine.calculate_position_size(
+        signal=_override_signal(current_positions=3),
+        account_balance=100_000.0,
+        pip_value=1.0,
+        current_exposure=0.0,
+        max_notional_per_trade=math.inf,
+        risk_amount_override=500.0,
+        max_positions=3,
+    )
+
+    assert sized.position_size == 0.0
+    assert sized.decision.rejection_reason == "max_positions"
+    assert sized.decision.metadata["max_positions"] == 3
+
+
+@pytest.mark.parametrize("value", [0, -1, 1.5, math.nan, math.inf * -1])
+def test_calculate_position_size_max_positions_override_rejects_bad_values(value):
+    with pytest.raises(ValueError, match="max_positions"):
+        RiskEngine().calculate_position_size(
+            signal=_override_signal(),
+            account_balance=10_000.0,
+            pip_value=1.0,
+            current_exposure=0.0,
+            max_positions=value,
+        )
+
+
+def test_calculate_position_size_max_total_exposure_override_uncapped():
+    """``max_total_exposure=math.inf`` lifts the aggregate ceiling for the
+    call — the override path then sizes the full declared amount however
+    much risk is already open."""
+    engine = RiskEngine(
+        RiskConfig(max_risk_per_trade=0.01, max_total_exposure=0.05, max_positions=5)
+    )
+    sized = engine.calculate_position_size(
+        signal=_override_signal(),
+        account_balance=100_000.0,
+        pip_value=1.0,
+        current_exposure=0.90,
+        max_notional_per_trade=math.inf,
+        risk_amount_override=500.0,
+        max_total_exposure=math.inf,
+    )
+
+    assert sized.risk_amount == pytest.approx(500.0)
+    assert sized.position_size == pytest.approx(250.0)
+    assert sized.decision.metadata["max_total_exposure"] == "uncapped"
+
+
+def test_calculate_position_size_max_total_exposure_override_finite_binds():
+    """A finite caller ceiling replaces the config one — here stricter than
+    the 5% config, it clamps the declared override to the remaining budget."""
+    engine = RiskEngine(
+        RiskConfig(max_risk_per_trade=0.01, max_total_exposure=0.05, max_positions=5)
+    )
+    sized = engine.calculate_position_size(
+        signal=_override_signal(),
+        account_balance=100_000.0,
+        pip_value=1.0,
+        current_exposure=0.01,
+        max_notional_per_trade=math.inf,
+        risk_amount_override=5_000.0,
+        max_total_exposure=0.02,
+    )
+
+    # Budget: 2% - 1% = 1% of 100k = $1,000 of the declared $5,000.
+    assert sized.risk_amount == pytest.approx(1_000.0)
+    assert sized.position_size == pytest.approx(500.0)
+    assert sized.decision.metadata["max_total_exposure"] == 0.02
+
+
+@pytest.mark.parametrize("value", [0.0, -0.5, math.nan, math.inf * -1])
+def test_calculate_position_size_max_total_exposure_override_rejects_bad_values(value):
+    with pytest.raises(ValueError, match="max_total_exposure"):
+        RiskEngine().calculate_position_size(
+            signal=_override_signal(),
+            account_balance=10_000.0,
+            pip_value=1.0,
+            current_exposure=0.0,
+            max_total_exposure=value,
+        )
 
 
 @pytest.mark.parametrize(
@@ -239,6 +552,40 @@ def test_calculate_position_size_notional_cap_edge_is_inclusive():
     assert sized.decision.metadata["capped_by_notional"] is False
 
 
+def test_calculate_position_size_math_inf_notional_is_documented_uncapped():
+    """#347: engines that apply their own post-size caps pass math.inf as the
+    caller ceiling — no engine-level cap binds and the decision metadata
+    records the JSON-safe "uncapped" sentinel, never 1.8e308."""
+    engine = RiskEngine(RiskConfig(max_risk_per_trade=0.01, max_total_exposure=0.05))
+    signal = TradeSignal(
+        action="buy", symbol="INF", entry_price=100.0, stop_loss=99.0,
+        take_profit=None, timeframe="1h", metadata={},
+    )
+
+    sized = engine.calculate_position_size(
+        signal=signal,
+        account_balance=10_000.0,
+        pip_value=1.0,
+        current_exposure=0.0,
+        max_notional_per_trade=math.inf,
+    )
+
+    # Risk sizing alone: 100 / 1 = 100 shares; nothing caps it.
+    assert sized.position_size == pytest.approx(100.0)
+    assert sized.decision.metadata["capped_by_notional"] is False
+    assert sized.decision.metadata["max_notional_per_trade"] == "uncapped"
+
+    for bad in (math.nan, math.inf * -1, 0.0, -1.0, True, False):
+        with pytest.raises(ValueError, match="max_notional_per_trade"):
+            engine.calculate_position_size(
+                signal=signal,
+                account_balance=10_000.0,
+                pip_value=1.0,
+                current_exposure=0.0,
+                max_notional_per_trade=bad,
+            )
+
+
 def test_calculate_position_size_exposure_limit_hit():
     engine = RiskEngine(
         RiskConfig(
@@ -332,6 +679,83 @@ def test_calculate_position_size_zero_distance_wrong_side_returns_rejection():
     assert sized.decision.accepted is False
     assert sized.decision.rejection_reason == "bad_stop_direction"
     assert sized.decision.risk_distance is None
+
+
+def test_wrong_side_stop_reports_the_absolute_risk_distance():
+    """A rejected wrong-side stop still reports the distance, as an absolute.
+
+    The rejection is sized from ``abs(entry - stop)``: a buy at 100 with a stop
+    at 105 is 5.0 away, not -105.0, so the diagnostic a reviewer reads against a
+    rejected order names the real separation rather than a signed difference.
+    """
+    signal = TradeSignal(
+        action="buy",
+        symbol="AAPL",
+        entry_price=100.0,
+        stop_loss=105.0,
+        take_profit=110.0,
+        timeframe="1h",
+        metadata={"current_positions": 0, "enforce_stop_direction": True},
+    )
+
+    sized = RiskEngine().calculate_position_size(
+        signal=signal,
+        account_balance=10_000.0,
+        pip_value=1.0,
+        current_exposure=0.0,
+    )
+
+    assert sized.position_size == 0.0
+    assert sized.decision is not None
+    assert sized.decision.accepted is False
+    assert sized.decision.rejection_reason == "bad_stop_direction"
+    assert sized.decision.risk_distance == pytest.approx(5.0)
+
+
+def test_a_non_finite_entry_price_is_refused_at_the_model():
+    """The signal model refuses a non-finite entry at construction.
+
+    Together with the engine's stop re-validation below, this is what makes the
+    wrong-side branch's ``math.isfinite`` guard defence in depth: neither price
+    can be non-finite once sizing starts, so no reachable outcome depends on it.
+    """
+    with pytest.raises(ValueError, match="entry_price must be finite"):
+        TradeSignal(
+            action="buy",
+            symbol="AAPL",
+            entry_price=math.inf,
+            stop_loss=105.0,
+            take_profit=110.0,
+            timeframe="1h",
+            metadata={"current_positions": 0, "enforce_stop_direction": True},
+        )
+
+
+def test_a_non_finite_stop_is_refused_before_the_distance_is_computed():
+    """A stop the fallback path rewrote to a non-finite value never gets sized.
+
+    The engine assigns ``signal.stop_loss`` itself when resolving a fallback, so
+    pin that it re-validates the price before the wrong-side distance maths
+    rather than reporting an ``inf`` risk distance.
+    """
+    signal = TradeSignal(
+        action="buy",
+        symbol="AAPL",
+        entry_price=100.0,
+        stop_loss=105.0,
+        take_profit=110.0,
+        timeframe="1h",
+        metadata={"current_positions": 0, "enforce_stop_direction": True},
+    )
+    signal.stop_loss = math.inf
+
+    with pytest.raises(ValueError, match="stop_loss must be finite"):
+        RiskEngine().calculate_position_size(
+            signal=signal,
+            account_balance=10_000.0,
+            pip_value=1.0,
+            current_exposure=0.0,
+        )
 
 
 def test_calculate_position_size_missing_stop_loss_uses_fallback():
@@ -515,6 +939,9 @@ class _DummyAdapter(BaseLiveAdapter):
     async def get_balance(self) -> tuple[float, float]:
         return 100_000.0, 100_000.0
 
+    async def get_used_margin(self) -> float | None:
+        return 0.0
+
     async def get_pip_value(self, symbol):
         # #146: a USD-quoted share in a USD account moves 1.0 per 1.0.
         from live_runner.base_adapter import LivePipValue
@@ -585,7 +1012,7 @@ class TestIssueC1FallbackGuards:
 
     @pytest.mark.parametrize("bad_atr", [float("nan"), float("inf"), -1.5, 0.0, "nonsense"])
     def test_non_finite_atr_rejected(self, bad_atr) -> None:
-        with pytest.raises(ValueError, match="[Aa][Tt][Rr]"):
+        with pytest.raises(ValueError, match=r"[Aa][Tt][Rr]"):
             self._engine().calculate_position_size(
                 signal=self._signal(atr=bad_atr),
                 account_balance=10000.0,

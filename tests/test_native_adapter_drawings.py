@@ -113,7 +113,7 @@ def test_native_adapter_output_is_json_serializable(tmp_path, monkeypatch):
         # Sizing and costs must be explicit: the engine refuses the full-equity
         # default and a silently cost-free run.
         risk_per_trade_pct=0.01,
-        parameters={"fees": "zero"},
+        parameters={"fees": "zero", "slippage": "none"},
     )
     result = native_adapter.NativeAdapter().run(config, str(strategy))
 

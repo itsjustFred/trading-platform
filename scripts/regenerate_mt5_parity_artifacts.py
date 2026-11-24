@@ -42,6 +42,7 @@ _guard.ensure_own_checkout("regenerate_mt5_parity_artifacts")
 import shared  # noqa: F401
 from runner.daily_equity import attach_daily_equity
 from runner.engines.base import resolve_strategy_parameters
+from runner.engines.mtm_equity import BASIS_REALIZED_EXIT_TIMED, EQUITY_CURVE_BASIS_KEY
 from runner.stats import compute_stats_for_result
 from shared.constants import DATA_DIR, normalize_timeframe
 from shared.models import BacktestMeta, BacktestResult, EquityPoint, Trade, TradeExit
@@ -323,7 +324,31 @@ def _opposite_side_series(frame: pd.DataFrame, side: str, field: str) -> pd.Seri
 
 
 def _round_mt5_lots(symbol: str, lots: float) -> float:
-    """MT5-Lot-Rundung + Broker-Clamp (.mq5 Z.391-393: floor, max(min), min(max))."""
+    """MT5-Lot-Rundung + Broker-Clamp (.mq5 Z.391-393: floor, max(min), min(max)).
+
+    The floor keeps MT5's ABSOLUTE epsilon -- `+ 1e-12` added to the QUOTIENT
+    (`lots / step`), not a relative tolerance -- because this generator is the
+    reference the engine is parity-checked against: it reproduces the EA, it
+    does not improve on it. The engine's lot floor is the shared decimal floor
+    `shared.lot_grid.floor_qty_to_step` (#278, reached through
+    `runner.engine_pkg.trading_engine._floor_to_lot_grid`): exact `repr`
+    decimals with a noise band of 1e-6 OF A STEP added to the quotient, so
+    the engine snaps a size UP to the next step whenever `lots / step` lands
+    within 1e-6 below an integer. MT5's band is the absolute `+ 1e-12` on
+    the same quotient, so the two rules disagree on EVERY size inside that
+    1e-6-of-a-step window -- not only the `k * lot_step` ulp case from step
+    counts of a few thousand and up (`25602 * 0.01`, float quotient
+    `25601.999999999996`, ~4e-12 off an integer, comes out `256.01` here and
+    `256.02` in the engine), but also real fractions like
+    `0.029999995 / 0.01` (quotient 2.9999995): `0.02` here, `0.03` in the
+    engine. The divergence is pinned, not incidental: no committed strategy
+    configures the engine's lot metadata (`lot_step`/`min_lot`/`max_lot`) --
+    asserted by `test_no_committed_strategy_configures_lot_metadata` -- so
+    the committed goldens do not shift, and the boundary itself is pinned by
+    `test_mt5_and_engine_lot_floors_diverge_above_the_absolute_epsilon`. The
+    first config that wires a `lot_step` must decide which of the two rules
+    its goldens pin (or stay on the absolute-epsilon side of the reference).
+    """
     step = MT5_LOT_STEPS.get(symbol, 0.0)
     if step <= 0:
         floored = max(lots, 0.0)
@@ -412,7 +437,12 @@ def _build_trades(
             stop_distance_from_signal = abs(signal_close - float(signal_stop_loss))
             stop_loss = entry_price - stop_distance_from_signal if side == "LONG" else entry_price + stop_distance_from_signal
 
-        exit_index = int(exit_indices[exit_cursor])
+        # A signal exit fills at the open of the bar AFTER the signal bar, like the native
+        # engine's default (signal_exit_fill="next_open"). The strategy raises its MT5
+        # time-exit signal on the bar before the exit time, so that open IS MT5's first
+        # tick at/after Exit_Time. A signal on the last bar has no next bar: it keeps
+        # filling at that bar's own open.
+        exit_index = min(int(exit_indices[exit_cursor]) + 1, len(df) - 1)
         exit_reason = "signal"
         exit_price = _opposite_side_price(df.iloc[exit_index], side, "open")
 
@@ -430,6 +460,14 @@ def _build_trades(
             if not hit.empty:
                 exit_index = int(hit.index[0])
                 exit_price = stop
+                # Owner decision 2026-11-13: a bar that OPENS beyond the stop
+                # (gap) fills at its open - the price a broker actually gives -
+                # not at the skipped stop level. Intrabar touches keep the level.
+                gap_open = _opposite_side_price(df.iloc[exit_index], side, "open")
+                if (side == "LONG" and gap_open <= stop) or (
+                    side != "LONG" and gap_open >= stop
+                ):
+                    exit_price = gap_open
                 exit_reason = "stop_loss"
 
         account_currency = str(case.get("account_currency", "USD"))
@@ -568,6 +606,12 @@ def regenerate_case(
                     else []
                 ),
                 "source": "ohlcv",
+                # These trades are priced with MT5 tick values and currency
+                # conversion, which cannot be re-derived from bar closes, so the
+                # curve here is the BALANCE curve (credited at exit). Its
+                # drawdown/Sharpe are balance-based - compare them with MT5's
+                # "balance drawdown", never with its (deeper) equity drawdown.
+                EQUITY_CURVE_BASIS_KEY: BASIS_REALIZED_EXIT_TIMED,
             },
             initial_capital=capital,
             parameters=params,

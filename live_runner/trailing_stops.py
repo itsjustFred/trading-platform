@@ -48,6 +48,7 @@ from typing import Any
 import pandas as pd
 
 from live_runner.base_adapter import BaseLiveAdapter, ProtectiveStop
+from live_runner.shutdown import BrokerMutationGate
 from live_runner.signal_sources.execution_timing import _timeframe_seconds
 from risk import RiskEngine, TradeSignal
 from shared.database import find_latest_filled_live_entry_signals
@@ -56,9 +57,11 @@ from shared.models import LiveDeploymentConfig
 from shared.sentry import capture_exception
 from shared.trailing import (
     TRAILING_MODE_NONE,
+    TRAILING_MODE_SUPERTREND_FLIP,
     TRAILING_SL_CONFIG_METADATA_KEY,
     live_supported_trailing_modes,
     live_trailing_timeframes,
+    normalize_trailing_mode,
     validate_live_trailing_timeframe,
     validate_trailing_sl_config,
 )
@@ -108,7 +111,7 @@ def adapter_live_trailing_modes(adapter: Any) -> frozenset[str]:
     try:
         broker = getattr(adapter, "broker_name", "")
         can_amend = getattr(adapter, "supports_stop_amendment", False) is True
-    except Exception:
+    except Exception:  # except-kind: money-decision
         return live_supported_trailing_modes(None, supports_stop_amendment=False)
     return live_supported_trailing_modes(broker, supports_stop_amendment=can_amend)
 
@@ -126,7 +129,7 @@ def adapter_live_trailing_timeframes(adapter: Any) -> frozenset[str]:
         serves = getattr(adapter, "supports_market_data_timeframe", None)
         if callable(serves):
             timeframes = frozenset(item for item in timeframes if serves(item))
-    except Exception:
+    except Exception:  # except-kind: money-decision
         return frozenset()
     return timeframes
 
@@ -203,8 +206,8 @@ def _normalize_symbol(value: object) -> str:
 
 
 def _signal_timeframe(deployment: LiveDeploymentConfig) -> str:
-    configured = (deployment.signal_config or {}).get("timeframe")
-    return str(configured or deployment.timeframe or "").strip()
+    """The deployment's own signal timeframe, resolved by the model."""
+    return deployment.signal_timeframe
 
 
 def _position_qty(position: Mapping[str, Any]) -> float:
@@ -237,9 +240,11 @@ class LiveTrailingStopManager:
         *,
         load_entry_signals: EntrySignalLoader = find_latest_filled_live_entry_signals,
         risk_engine: RiskEngine | None = None,
+        mutation_gate: BrokerMutationGate | None = None,
     ) -> None:
         self._load_entry_signals = load_entry_signals
         self._risk_engine = risk_engine or RiskEngine()
+        self._mutation_gate = mutation_gate
         self._trails: dict[tuple[str, str], _Trail] = {}
         self._schedules: dict[str, _AccountSchedule] = {}
 
@@ -293,7 +298,7 @@ class LiveTrailingStopManager:
                 )
             except asyncio.CancelledError:
                 raise
-            except Exception as exc:
+            except Exception as exc:  # except-kind: money-decision
                 self._surface(
                     "Live trailing-stop pass failed for account; broker-side stops are unchanged",
                     exc,
@@ -404,9 +409,27 @@ class LiveTrailingStopManager:
                 )
             except asyncio.CancelledError:
                 raise
-            except Exception as exc:
+            except Exception as exc:  # except-kind: money-decision
                 needs_retry |= self._record_failure(key, entry, exc, context, moment)
         return needs_retry
+
+    async def _amend_stop(
+        self, adapter: BaseLiveAdapter, current: ProtectiveStop, target: float
+    ) -> ProtectiveStop | None:
+        """Amend the broker-side stop under the shutdown drain guard.
+
+        ``None`` means the daemon refused to start this mutation because it is
+        shutting down; the caller then leaves the bars unprocessed. An amendment
+        that was allowed to start is registered on the shutdown ledger, so the
+        shutdown drain waits for it rather than cancelling a request whose
+        broker outcome is unknown.
+        """
+        if self._mutation_gate is None:
+            return await adapter.amend_protective_stop(current, target)
+        async with self._mutation_gate() as may_mutate:
+            if not may_mutate:
+                return None
+            return await adapter.amend_protective_stop(current, target)
 
     @staticmethod
     async def _read_positions(adapter: BaseLiveAdapter) -> dict[str, Mapping[str, Any]]:
@@ -454,7 +477,7 @@ class LiveTrailingStopManager:
             stops = list(await adapter.list_protective_stops())
         except asyncio.CancelledError:
             raise
-        except Exception as exc:
+        except Exception as exc:  # except-kind: money-decision
             return None, self._record_outage(outage, exc, account_context, moment)
         self._resume(outage, account_context)
         return stops, False
@@ -557,6 +580,12 @@ class LiveTrailingStopManager:
         if entry is None:
             return None
         trailing_cfg = (entry.get("metadata") or {}).get(TRAILING_SL_CONFIG_METADATA_KEY)
+        # ``supertrend_flip`` belongs to LiveSupertrendFlipManager (#168): the
+        # percent trail must never touch it, whatever the adapter supports.
+        if isinstance(trailing_cfg, Mapping) and normalize_trailing_mode(
+            trailing_cfg.get("mode")
+        ) == TRAILING_MODE_SUPERTREND_FLIP:
+            return None
         # A persisted signal whose mode this adapter cannot execute should
         # have been refused at submission; if one exists it is reported, never
         # silently skipped.
@@ -578,7 +607,10 @@ class LiveTrailingStopManager:
             )
         if (action == "buy") != (qty > 0):
             return None
-        return dict(trailing_cfg)
+        # ``validate_trailing_sl_config`` returns ``None`` for a ``None`` config
+        # and raises for anything that is not a mapping, so reaching here means
+        # ``trailing_cfg`` is a validated dict; mypy cannot follow that guard.
+        return dict(trailing_cfg)  # type: ignore[arg-type]
 
     # ── one position ─────────────────────────────────────────────────────
 
@@ -649,7 +681,22 @@ class LiveTrailingStopManager:
         )
         if improves:
             context["target_stop"] = target
-            amended = await adapter.amend_protective_stop(current, target)
+            amended = await self._amend_stop(adapter, current, target)
+            if amended is None:
+                # The daemon is shutting down and refused to start a broker
+                # mutation: leave these bars unprocessed so the next pass
+                # recomputes the same target instead of skipping it, and come
+                # back early rather than recording progress that did not
+                # happen. The broker-side stop stays at the previous level, so
+                # say so: an operator reading the shutdown log has to know the
+                # stop was not moved.
+                logger.warning(
+                    "Trailing-stop amendment refused during shutdown; the "
+                    "broker-side stop stays at its previous level and the bars "
+                    "are retried",
+                    extra={"data": dict(context)},
+                )
+                return True
             logger.info(
                 "Trailed live stop",
                 extra={
@@ -733,7 +780,7 @@ class LiveTrailingStopManager:
         if not math.isfinite(entry_price) or entry_price <= 0:
             entry_price = bars[0][1]
         signal = TradeSignal(
-            action=action,
+            action=action,  # type: ignore[arg-type]  # restricted to buy/sell by the guard above
             symbol=symbol,
             entry_price=entry_price,
             stop_loss=current.stop_price,
@@ -807,7 +854,10 @@ class LiveTrailingStopManager:
             raise _TrailingFailure("market data has no timestamp/close columns")
         bars: list[tuple[datetime, float]] = []
         ordered = frame.sort_values("timestamp")
-        for raw_time, raw_close in zip(ordered["timestamp"], ordered["close"]):
+        # Both are columns of the same sorted frame, so the two are the same
+        # length by construction: ``strict=True`` turns them getting out of step
+        # into an error instead of pairing a close with the wrong time.
+        for raw_time, raw_close in zip(ordered["timestamp"], ordered["close"], strict=True):
             opened = pd.Timestamp(raw_time)
             if opened.tzinfo is None:
                 opened = opened.tz_localize("UTC")
@@ -867,7 +917,7 @@ async def run_trailing_stops_loop(
             await manager.run_once(eligible_adapters(), current_deployments())
         except asyncio.CancelledError:
             raise
-        except Exception as exc:
+        except Exception as exc:  # except-kind: loop-survival
             LiveTrailingStopManager._surface(
                 "Live trailing-stop tick failed", exc, {"phase": "tick"}
             )

@@ -13,7 +13,7 @@ import sentry_sdk
 from sentry_sdk.integrations.logging import LoggingIntegration
 
 import shared.constants  # noqa: F401
-from shared.logging import _SENSITIVE_MARKERS, redact_text, redact_value
+from shared.logging import _SENSITIVE_MARKERS, get_logger, redact_text, redact_value
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
@@ -167,6 +167,38 @@ def capture_exception(
             scope.set_context("error_context", dict(context))
         event_id = sentry_sdk.capture_exception(exc)
     return str(event_id) if event_id is not None else None
+
+
+def flush_sentry(timeout: float) -> bool:
+    """Flush the Sentry queue, at most ``timeout`` seconds. False when idle.
+
+    The SDK flushes its queue through an ``atexit`` hook, so a caller that leaves
+    the process by any other means loses every event it emitted: the live daemon
+    shutdown path ends in ``os._exit`` (``live_runner/daemon.py``), which runs no
+    atexit hook at all. The ERROR events a shutdown emits - a drain timeout, an
+    exit path that gave up on a task - are exactly the ones an operator needs to
+    see outside the log file, so that path flushes explicitly.
+
+    Bounded, because the flush is a network wait and a shutdown has a budget: the
+    daemon counts this figure in the exit window its runbook and its systemd unit
+    publish. A flush that raises is reported and treated as nothing flushed
+    rather than propagated: the caller is on its way out, and losing the exit
+    code it is about to report costs more than losing the events.
+    """
+    if not _INITIALIZED:
+        return False
+    try:
+        sentry_sdk.flush(timeout=timeout)
+    except Exception:
+        # Resolved here rather than at import: a logger created by this module
+        # adds a log file to every process that imports it, and nothing else in
+        # here writes one.
+        get_logger("shared.sentry").warning(
+            "Flushing Sentry failed; the events it had queued are lost",
+            exc_info=True,
+        )
+        return False
+    return True
 
 
 def _before_send(event: dict[str, Any], hint: dict[str, Any]) -> dict[str, Any] | None:

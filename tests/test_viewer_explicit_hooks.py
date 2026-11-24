@@ -29,8 +29,9 @@ def test_legacy_hook_injection_is_explicit_not_import_time():
 
     source = _read("viewer/main.py")
     tree = ast.parse(source)
-    offenders = []
-    for node in tree.body:  # module level only
+    offenders = [
+        node.lineno
+        for node in tree.body  # module level only
         if (
             isinstance(node, ast.Assign)
             and isinstance(node.value, ast.Name)
@@ -47,8 +48,8 @@ def test_legacy_hook_injection_is_explicit_not_import_time():
                 "_mark_task_finished",
                 "_serialize_task",
             }
-        ):
-            offenders.append(node.lineno)
+        )
+    ]
     assert offenders == [], f"import-time legacy monkeypatching at {offenders}"
 
     # And installing the hooks wires the wrappers into the legacy module.

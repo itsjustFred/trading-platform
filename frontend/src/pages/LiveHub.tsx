@@ -20,10 +20,12 @@ import {
   updateLiveDeploymentStatus,
 } from "../api/client";
 import { liveWinRateToPoints } from "../api/metricScale";
+import { LiveKillSwitchPanel } from "../components/LiveKillSwitchPanel";
 import { Modal } from "../components/Modal";
 import { Sparkline } from "../components/Sparkline";
 import { SymbolInput } from "../components/SymbolInput";
 import { useLiveAccountsStream } from "../hooks/liveStreams";
+import { useLiveKillSwitch } from "../hooks/useLiveKillSwitch";
 import { useDebouncedCallback } from "../hooks/useDebouncedValue";
 import type {
   LiveAccount,
@@ -178,6 +180,13 @@ const LiveDeploymentCard = memo(function LiveDeploymentCard({
   // exposure at the broker. Rendering the raw status would report a stop that
   // only partly happened.
   const stopPending = card.status === "STOPPED" && Boolean(card.exposure_may_be_open);
+  const entriesHalted = Boolean(card.entries_halted);
+  const entriesHaltDetail = [
+    card.entries_halted_by ? `by ${card.entries_halted_by}` : "",
+    card.entries_halted_at ? `at ${card.entries_halted_at}` : "",
+  ]
+    .filter(Boolean)
+    .join(" · ");
   return (
     <div
       key={card.id}
@@ -199,15 +208,29 @@ const LiveDeploymentCard = memo(function LiveDeploymentCard({
       />
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
         <div style={{ fontWeight: 600, fontSize: "0.87rem" }}>{card.strategy_name}</div>
-        <div
-          style={stopPending ? stopPendingChipStyle : statusChipStyle(card.status)}
-          title={
-            stopPending
-              ? "The daemon has not confirmed a complete cancel-and-flatten yet, so positions may still be open at the broker."
-              : undefined
-          }
-        >
-          {stopPending ? "STOPPING" : card.status}
+        <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+          <div
+            style={stopPending ? stopPendingChipStyle : statusChipStyle(card.status)}
+            title={
+              stopPending
+                ? "The daemon has not confirmed a complete cancel-and-flatten yet, so positions may still be open at the broker."
+                : undefined
+            }
+          >
+            {stopPending ? "STOPPING" : card.status}
+          </div>
+          {entriesHalted && (
+            <div
+              style={entriesHaltChipStyle}
+              title={
+                entriesHaltDetail
+                  ? `Broker reconciliation halted new entries ${entriesHaltDetail}. Exits and in-flight orders continue.`
+                  : "Broker reconciliation halted new entries. Exits and in-flight orders continue."
+              }
+            >
+              ENTRIES HALTED
+            </div>
+          )}
         </div>
       </div>
       <div style={{ color: "var(--color-text-muted)", fontSize: "0.8rem", margin: "6px 0 8px" }}>
@@ -282,6 +305,17 @@ export function LiveHubPage() {
   const [cards, setCards] = useState<DeploymentCard[]>([]);
   const [statsByAccount, setStatsByAccount] = useState<Record<string, LiveHubAccountStats>>({});
   const [dashboard, setDashboard] = useState<LiveDashboardResponse | null>(null);
+  // The kill-switch state reads on its own mount effect and timer (see the
+  // hook): it must keep refreshing even when the accounts/deployments fetch
+  // below fails, and a halt written elsewhere still surfaces without waiting
+  // for account-stream traffic.
+  const {
+    state: killSwitch,
+    error: killSwitchError,
+    stale: killSwitchStale,
+    readAt: killSwitchReadAt,
+    onStateChange: handleKillSwitchStateChange,
+  } = useLiveKillSwitch();
   const [strategies, setStrategies] = useState<StrategyMeta[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
@@ -1277,6 +1311,15 @@ export function LiveHubPage() {
         </div>
       </div>
 
+      <LiveKillSwitchPanel
+        state={killSwitch}
+        loadError={killSwitchError}
+        stale={killSwitchStale}
+        staleSince={killSwitchReadAt}
+        accounts={accounts}
+        onStateChange={handleKillSwitchStateChange}
+      />
+
       {loading && (
         <div style={{ color: "var(--color-text-muted)", textAlign: "center", padding: "48px 0" }}>
           Loading live deployments...
@@ -1799,6 +1842,20 @@ const stopPendingChipStyle: React.CSSProperties = {
   background: "rgba(251, 146, 60, 0.16)",
   color: "#fdba74",
   letterSpacing: "0.03em",
+};
+
+const entriesHaltChipStyle: React.CSSProperties = {
+  marginBottom: "8px",
+  fontSize: "0.7rem",
+  display: "inline-flex",
+  alignItems: "center",
+  borderRadius: "999px",
+  padding: "3px 8px",
+  border: "1px solid rgba(248, 113, 113, 0.45)",
+  background: "rgba(248, 113, 113, 0.16)",
+  color: "#fecaca",
+  letterSpacing: "0.03em",
+  whiteSpace: "nowrap",
 };
 
 const addDeploymentBtnStyle: React.CSSProperties = {

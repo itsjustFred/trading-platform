@@ -26,6 +26,24 @@ test("live deployment controls sit above the card overlay link and offer resume"
   assert.match(liveHub, /Play/);
 });
 
+test("live hub surfaces a broker-reconciliation entry halt", async () => {
+  const types = stripComments(await read("../src/api/types.ts"));
+  const liveHub = await read("../src/pages/LiveHub.tsx");
+
+  for (const field of [
+    "entries_halted",
+    "entries_halted_at",
+    "entries_halted_by",
+  ]) {
+    assert.ok(
+      types.includes(field),
+      `LiveDeploymentConfig must type ${field} for the halt badge`,
+    );
+  }
+  assert.match(liveHub, /entries_halted/);
+  assert.match(liveHub, /ENTRIES HALTED/);
+});
+
 test("an application-level error boundary wraps the SPA", async () => {
   const app = await read("../src/App.tsx");
   const main = await read("../src/main.tsx");

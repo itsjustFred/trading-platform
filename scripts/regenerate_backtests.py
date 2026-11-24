@@ -67,6 +67,7 @@ _guard.ensure_own_checkout("regenerate_backtests")
 import shared  # noqa: F401
 from runner.cli import get_engine
 from runner.engines.base import BacktestConfig, resolve_strategy_parameters
+from runner.engines.contract import default_signal_exit_fill_for_engine
 from runner.stats import compute_stats_for_result
 from shared.database import (
     BacktestRecord,
@@ -192,7 +193,7 @@ def _select_symbol_timeframe(
         if not timeframe_map:
             continue
         for timeframe in TIMEFRAME_PRIORITY:
-            if timeframe in timeframe_map and timeframe_map[timeframe]:
+            if timeframe_map.get(timeframe):
                 return symbol, timeframe, timeframe_map[timeframe][0]
         first_timeframe = min(timeframe_map)
         return symbol, first_timeframe, timeframe_map[first_timeframe][0]
@@ -371,7 +372,7 @@ def _read_table_rows(source: sqlite3.Connection, tables: Iterable[str]) -> dict[
         try:
             cursor = source.execute(f'SELECT * FROM "{table}"')
             columns = [description[0] for description in cursor.description]
-            rows[table] = [dict(zip(columns, row)) for row in cursor.fetchall()]
+            rows[table] = [dict(zip(columns, row, strict=True)) for row in cursor.fetchall()]
         except sqlite3.OperationalError:
             rows[table] = []
     return rows
@@ -533,6 +534,9 @@ def _run_strategy(
             modeling_resolution="open_close",
             data_dir=str(data_dir),
             parameters=parameters,
+            # Frozen engines (pynecore/vectorbt here) refuse next_open; declare
+            # the legacy close fill they simulate so meta stays truthful.
+            signal_exit_fill=default_signal_exit_fill_for_engine(engine_name),
         )
     except ValidationError as exc:
         raise BacktestRunError(f"{strategy_name}: invalid config ({exc})") from exc

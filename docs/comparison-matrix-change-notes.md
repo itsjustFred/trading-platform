@@ -31,6 +31,50 @@ committed comparison cases, plus the remaining limitations.
   - Per-exit `fees` in the goldens are `null`, so per-exit cost attribution is
     not recorded; costs are carried on the trade.
 
+## #259 — risk-parity 2% rebalance gate marks through the previous close
+
+- Changed behavior, protected files:
+  - `scripts/run_risk_parity_backtest.py`: the drifted-weight trade gate, the
+    trade delta and the realized-PnL check now key off the holding weight
+    marked through the PREVIOUS return bar — the
+    `HoldingsValue`/`TotalPortfolioValue` snapshot QC reads at its 10:00
+    Rebalance — instead of the rebalance day's own close. The carried weight
+    book (`next_weights`) and the published portfolio value still mark through
+    the rebalance-day close, the MOC fill bar. The mark-to-market math is
+    shared via `_drift_weights`; only the end bar differs.
+  - `tests/strategies/test_risk_parity.py`: new parametrized test
+    `test_trade_gate_ignores_the_rebalance_day_close` — a same-day SPY jump
+    does not trade, the previous-session jump does.
+  - `strategy-comparisons/risk_parity/risk_parity_reference.json`:
+    regenerated on yfinance data (see below); the platform artifact in
+    `data/backtests/` is not committed.
+- Why: maintainer decision on #259 (2026-11-18): the rebalance day's close is
+  not known at the 10:00 decision, so gating on it is a one-day look-ahead.
+  The other #188 no-look-ahead guarantees (covariance window, hedge SMA,
+  start date) are unchanged.
+- Before/after matrix: reference stats before -> after (QC run "Sleepy Tan
+  Coyote" truth in parentheses): total return 0.9296 -> 0.9500 (0.9378);
+  CAGR 7.58% -> 7.70% (7.62%); max drawdown -17.85% -> -17.66% (-17.70%);
+  Sharpe (rf 2.5%) 0.351 -> 0.361 (0.372); annual vol 8.76% -> 8.76% (8.7%).
+  Regenerated 2026-11-21 on the same yfinance `auto_adjust=True` download
+  convention as the 2026-11-13 artifact (`download_prices`,
+  `lean_statistics=True`, `risk_free_rate=0.025`); the platform artifact in
+  `data/backtests/` is not committed. yfinance revised the adjusted series
+  between the two downloads, so the before/after numbers above mix the code
+  change with a data revision: re-running the PRE-change code on the
+  2026-11-21 download gives 0.9354 return / 0.3535 Sharpe / 265 trades, i.e.
+  the code change alone is 0.9354 -> 0.9500 and 0.3535 -> 0.3606 on identical
+  data. Order-leg parity vs the QC "Sleepy Tan Coyote" orders is 250/264
+  identical in (date, symbol, sign), up from 249/264 on 2026-11-13.
+- Remaining limitations:
+  - Order sizing (`position_size`) and the realized-PnL factor still mark
+    the portfolio through the rebalance-day close; QC's `SetHoldings` sizes
+    off the same 10:00 snapshot. The gate — the decision #259 scoped — is
+    previous-close; sizing parity remains a documented residual.
+  - No fee model, fractional shares, QC sizing MOC orders at the previous
+    close, and yfinance-vs-QC adjusted-price differences (median fill gap
+    0.1%).
+
 ## #203 — comparison matrix reads MT5 reports on the broker clock
 
 - Changed behavior, protected files:
@@ -92,7 +136,8 @@ committed comparison cases, plus the remaining limitations.
     close. Legs within one day's drift of the gate can therefore flip; the 15+16
     unmatched QC legs sit within ~0.3pp of it. Moving the gate to the previous
     bar needs a regenerated reference and re-pinned stats (local data is not in
-    the repo), so it is left as a follow-up decision.
+    the repo), so it is left as a follow-up decision — resolved by #259 (see
+    the #259 entry above).
   - No fee model, fractional shares, QC sizing MOC orders at the previous close,
     and yfinance-vs-QC adjusted-price differences (median fill gap 0.1%).
 

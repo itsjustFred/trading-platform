@@ -7,6 +7,7 @@ so the Runner CLI can invoke any of them uniformly.
 
 from __future__ import annotations
 
+import ast
 import math
 import warnings
 from abc import ABC, abstractmethod
@@ -17,7 +18,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from runner.engines import contract
 from shared.models import VALID_TIMEFRAMES, BacktestResult
-from shared.strategy_registry import load_strategy_meta
+from shared.strategy_registry import load_strategy_meta, read_strategy_source
 
 #: Deprecated alias of :attr:`BacktestConfig.max_position_exposure_pct`.
 #: Kept so old invocations keep working during the Cleanup 16-E migration.
@@ -68,6 +69,143 @@ VALID_RESOLUTIONS = (
 
 ProgressCallback = Callable[[float, str], None]
 
+#: Engines frozen by the engine-consolidation decision (#318,
+#: ``docs/adr/0001-native-single-strategy-engine.md``): bug fixes only, no new
+#: features, while phase M ports the still-needed behaviour into ``native``.
+#: ``lean`` covers the LEAN *run* path only — ``LeanAdapter.import_result``
+#: and the QC/LEAN importers stay supported as oracles.
+FROZEN_ENGINES: dict[str, str] = {
+    "vectorbt": (
+        "scheduled for removal in phase L once native covers its remaining "
+        "features; 'native' is the strategic engine going forward"
+    ),
+    "pynecore": "scheduled for deletion in phase L of the #318 consolidation",
+    "lean": (
+        "the LEAN run path is frozen; LEAN becomes import-only "
+        "(LeanAdapter.import_result stays supported)"
+    ),
+}
+
+
+def warn_if_engine_frozen(name: str, *, stacklevel: int = 2) -> None:
+    """Emit a ``DeprecationWarning`` when ``name`` selects a frozen engine.
+
+    No-op for ``native`` and for names outside :data:`FROZEN_ENGINES`.
+    """
+    reason = FROZEN_ENGINES.get(str(name or "").strip().lower())
+    if reason is None:
+        return
+    warnings.warn(
+        f"Backtest engine {name!r} is frozen: {reason}. Bug fixes only, no "
+        "new features (issue #318; docs/adr/0001-native-single-strategy-engine.md).",
+        DeprecationWarning,
+        stacklevel=stacklevel,
+    )
+
+
+NATIVE_TRAILING_SL_PARAM = "use_trailing_sl"
+_TRAILING_SL_TRUE_STRINGS = frozenset({"1", "true", "yes", "on"})
+_TRAILING_SL_FALSE_STRINGS = frozenset({"", "0", "false", "no", "off"})
+
+
+def _trailing_sl_request(value: Any) -> str:
+    """Classify a ``use_trailing_sl`` value as ``"true"``, ``"false"`` or ``"invalid"``.
+
+    Only unambiguous booleans, ``None``, numeric 0/non-zero and the known
+    true/false string tokens are accepted. Anything else — including strings
+    like ``"maybe"`` that Python's ``bool()`` would silently coerce — is
+    ``"invalid"`` so the caller can refuse it rather than guess.
+    """
+    if value is None or value is False:
+        return "false"
+    if value is True:
+        return "true"
+    if isinstance(value, str):
+        token = value.strip().lower()
+        if token in _TRAILING_SL_TRUE_STRINGS:
+            return "true"
+        if token in _TRAILING_SL_FALSE_STRINGS:
+            return "false"
+        return "invalid"
+    if isinstance(value, (int, float)):
+        if isinstance(value, float) and not math.isfinite(value):
+            return "invalid"
+        return "true" if value != 0 else "false"
+    return "invalid"
+
+
+def _literal_default(node: ast.AST | None) -> Any:
+    if node is None:
+        return None
+    try:
+        return ast.literal_eval(node)
+    except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError):
+        return None
+
+
+def _generate_signals_defaults(tree: ast.AST) -> dict[str, ast.AST]:
+    for node in tree.body:
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if node.name != "generate_signals":
+            continue
+        args = node.args
+        positional = list(args.posonlyargs) + list(args.args)
+        defaults: list[ast.AST | None] = [None] * (
+            len(positional) - len(args.defaults)
+        ) + list(args.defaults)
+        found: dict[str, ast.AST] = {}
+        for arg, default in zip(positional, defaults, strict=True):
+            if default is not None:
+                found[arg.arg] = default
+        for arg, default in zip(args.kwonlyargs, args.kw_defaults, strict=True):
+            if default is not None:
+                found[arg.arg] = default
+        return found
+    return {}
+
+
+def strategy_parameter_default(strategy_path: str | Path, name: str) -> Any:
+    """Return a literal ``generate_signals`` default without executing the file.
+
+    Returns ``None`` when the parameter has no literal default; the adapter's
+    imported-signature check remains the authority for non-literal defaults.
+    """
+    resolved = Path(strategy_path).resolve()
+    source = read_strategy_source(resolved, resolved.parent)
+    if source is None:
+        return None
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError, TypeError, MemoryError, RecursionError):
+        return None
+    return _literal_default(_generate_signals_defaults(tree).get(name))
+
+
+def native_parameter_errors(parameters: dict[str, Any] | None) -> list[str]:
+    """Return errors for strategy parameters the native engine cannot model.
+
+    Maintainer decision (2026-11-23): until the strategies are rebuilt, native
+    must refuse ``use_trailing_sl=true`` rather than compute a fixed stop and
+    call it a trailing stop. Values that are not an unambiguous boolean or a
+    known true/false token are refused as invalid — never silently coerced.
+    """
+    parameters = parameters or {}
+    state = _trailing_sl_request(parameters.get(NATIVE_TRAILING_SL_PARAM))
+    if state == "true":
+        return [
+            "parameters.use_trailing_sl=true requests a trailing stop, but "
+            "trailing stops are not modelled by the native engine; set "
+            "use_trailing_sl=false or choose a path that models trailing stops"
+        ]
+    if state == "invalid":
+        return [
+            f"parameters.use_trailing_sl={parameters.get(NATIVE_TRAILING_SL_PARAM)!r} "
+            "is not a recognised boolean or true/false token; use a boolean or "
+            "one of 'true'/'1'/'yes'/'on' or 'false'/'0'/'no'/'off'"
+        ]
+    return []
+
 
 class BacktestConfig(BaseModel):
     """Configuration passed to any engine adapter."""
@@ -90,19 +228,36 @@ class BacktestConfig(BaseModel):
     # exposure of a single position as a fraction of equity (0.05 = 5%).
     # Not an aggregate-portfolio limit and not a loss budget — those are
     # ``max_total_exposure`` (RiskConfig) and ``risk_per_trade_pct``.
-    max_position_exposure_pct: float | None = Field(None, gt=0.0, le=1.0)
+    # Values above 1 are leverage (#240): the broker maximum
+    # (``max_leverage``, 1x when unset) bounds the notional at sizing time —
+    # the native engine's MT5-style free-margin clamp (#347) — so the config
+    # itself carries no upper bound.
+    max_position_exposure_pct: float | None = Field(None, gt=0.0)
     max_leverage: float | None = Field(None, gt=0.0)
+    # Fixed-risk (``fixed_risk_amount``) sizing policy (#279). The fixed-risk
+    # protocol routes through RiskEngine like the pct path; these fields opt
+    # the aggregate open-risk ceiling and the concurrent-position limit back
+    # in for that protocol only. ``None`` means UNCAPPED — the settled
+    # parity-safe default: the MT5 EA the protocol mirrors applies neither
+    # cap (parity-first per #262). Set a field to reproduce a reference
+    # that does enforce it, or to tighten a fixed-risk run.
+    fixed_risk_max_total_exposure: float | None = Field(None, gt=0.0, le=1.0)
+    fixed_risk_max_positions: int | None = Field(None, ge=1)
     modeling_resolution: str = "main_timeframe"
-    # Fill convention for signal-driven
-    # exits in bar engines. D4 (A-M1): the unified convention is
-    # Fill-zum-Trigger-Close — "close" (default) fills at the signal bar's
-    # close in every engine (native _close_position and vectorbt
-    # _resolve_exit_price with an unshifted exit leg). "open" fills at the
-    # signal bar's open — closer to MT5, which exits at the first tick
-    # inside the exit minute (~bar open) — and stays available as an
-    # explicitly configured opt-in. Stop-loss fills are unaffected (always
-    # the stop level, SHORT legs on the ask when spread/ask_ohlc applies).
-    signal_exit_fill: str = "close"
+    # Fill convention for signal-driven exits in bar engines. Owner decision
+    # 2026-11-13 (supersedes D4 / A-M1 "Fill-zum-Trigger-Close"): a signal exit
+    # produced on bar N fills at bar N+1's OPEN, exactly like market entries
+    # ("next_open", default). A signal on the LAST bar has no next bar: the
+    # position is closed by the end-of-data forced close at that bar's close and
+    # the trade is flagged (meta["signal_exit_deferred_to_end_of_data"]).
+    # "close" remains an explicit legacy opt-in that fills on the SIGNAL
+    # bar itself (its close); the former "open" mode was removed (issue #153)
+    # because an exit computed from bar N cannot fill at bar N's open without
+    # lookahead — MT5 clock exits raise their signal one bar early instead.
+    # Stop/take-profit fills are independent of
+    # this switch: a level fills at the level, or at the bar's open when the
+    # bar gaps through it.
+    signal_exit_fill: str = "next_open"
     # Indicator warmup. When set (date
     # string), market data is loaded from this earlier date so indicators
     # needing history (e.g. daily ATR) are already warmed up at start_date.
@@ -143,6 +298,7 @@ class BacktestConfig(BaseModel):
         "risk_per_trade_pct",
         "max_position_exposure_pct",
         "max_leverage",
+        "fixed_risk_max_total_exposure",
         mode="before",
     )
     @classmethod
@@ -178,12 +334,9 @@ class BacktestConfig(BaseModel):
         # bar engines — a typo ("clos", "OPEN ") silently fell through to
         # close-fill everywhere (every reader tests `== "open"`). Normalize
         # case/whitespace so "Close"/"OPEN" keep working, reject the rest.
-        normalized = str(v or "").strip().lower()
-        if normalized not in {"close", "open"}:
-            raise ValueError(
-                f"Invalid signal_exit_fill {v!r}, must be 'close' or 'open'"
-            )
-        return normalized
+        # Issue #153: the lookahead-prone "open" mode is removed; the shared
+        # gate raises a migration message for it.
+        return contract.normalize_signal_exit_fill(v)
 
     @field_validator("timeframe")
     @classmethod
@@ -233,6 +386,25 @@ def resolve_strategy_parameters(
     merged = dict(defaults)
     merged.update(overrides or {})
     return merged
+
+
+def native_strategy_parameter_errors(
+    strategy_path: str | Path,
+    parameters: dict[str, Any] | None,
+) -> list[str]:
+    """Native parameter errors for a strategy path plus explicit parameters.
+
+    Merges ``STRATEGY_META.parameters`` defaults and a literal
+    ``generate_signals`` default so callers can fail before queueing work or
+    downloading market data. Non-literal signature defaults remain the native
+    adapter's imported-signature check.
+    """
+    effective = dict(resolve_strategy_parameters(strategy_path, parameters))
+    if NATIVE_TRAILING_SL_PARAM not in effective:
+        default = strategy_parameter_default(strategy_path, NATIVE_TRAILING_SL_PARAM)
+        if default is not None:
+            effective[NATIVE_TRAILING_SL_PARAM] = default
+    return native_parameter_errors(effective)
 
 
 class EngineAdapter(ABC):

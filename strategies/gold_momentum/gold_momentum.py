@@ -37,12 +37,14 @@ and regime multipliers; none of that is single-symbol-expressible:
 
 STRATEGY_META = {
     "name": "Gold Momentum",
-    "version": "1.1.0",
+    "version": "1.2.0",
     "source_url": "https://github.com/desenyon/quantconnect-strategies/blob/main/gold_momentum_strategy.py",
     "notes": (
         "Single-symbol proxy of desenyon's GoldMomentumStrategy. "
         "Source-exact: MACD 12/26/9, Wilder RSI14, Wilder ATR14, "
         "BB(20, 2), continuous momentum score with source weights. "
+        "1.2.0: the score-reversal exit is a market exit with no "
+        "exit_price=close (fills at the next open). "
         "Dropped (not single-symbol-expressible): TLT leg, "
         "volatility targeting, regime multipliers, 40 % position cap. "
         "ATR stop is opt-in only (default OFF)."
@@ -59,28 +61,8 @@ STRATEGY_META = {
 import numpy as np
 import pandas as pd
 
-
-def _wilder_rsi(close: pd.Series, period: int) -> pd.Series:
-    delta = close.diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    avg_gain = gain.ewm(alpha=1.0 / period, min_periods=period, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1.0 / period, min_periods=period, adjust=False).mean()
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-    return 100 - (100 / (1 + rs))
-
-
-def _wilder_atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int) -> pd.Series:
-    prev_close = close.shift(1)
-    tr = pd.concat(
-        [
-            high - low,
-            (high - prev_close).abs(),
-            (low - prev_close).abs(),
-        ],
-        axis=1,
-    ).max(axis=1)
-    return tr.ewm(alpha=1.0 / period, min_periods=period, adjust=False).mean()
+from shared.indicators import presets
+from shared.strategy_markers import entry_exit_markers
 
 
 def generate_signals(df: pd.DataFrame, params: dict):
@@ -103,14 +85,14 @@ def generate_signals(df: pd.DataFrame, params: dict):
     high = df["high"]
     low = df["low"]
 
-    ema_fast = close.ewm(span=macd_fast, adjust=False).mean()
-    ema_slow = close.ewm(span=macd_slow, adjust=False).mean()
+    ema_fast = presets.ema_first_seed(close, macd_fast)
+    ema_slow = presets.ema_first_seed(close, macd_slow)
     macd_line = ema_fast - ema_slow
-    signal_line = macd_line.ewm(span=macd_signal_period, adjust=False).mean()
+    signal_line = presets.ema_first_seed(macd_line, macd_signal_period)
     macd_hist = macd_line - signal_line
 
-    rsi = _wilder_rsi(close, rsi_period)
-    atr = _wilder_atr(high, low, close, atr_period)
+    rsi = presets.rsi_wilder(close, rsi_period)
+    atr = presets.atr_qc_wilder(high, low, close, atr_period)
 
     bb_mid = close.rolling(bb_period).mean()
     bb_std = close.rolling(bb_period).std()
@@ -175,11 +157,15 @@ def generate_signals(df: pd.DataFrame, params: dict):
             if stop_hit or score_exit_hit:
                 in_trade = False
                 exits.iloc[i] = True
+                # The ATR stop's level travels in sl_price (the protective
+                # stop fills it); the exit-bar exit_price is only honored as
+                # a level with exit_order_type="level", which is not emitted
+                # here. The score reversal is a close-triggered MARKET exit:
+                # no explicit exit_price, so it fills at the next bar's open.
                 if stop_hit:
                     exit_price.iloc[i] = active_stop
                     exit_reason.iloc[i] = "stop_loss"
                 else:
-                    exit_price.iloc[i] = float(close.iloc[i])
                     exit_reason.iloc[i] = "score_reversal"
                 active_stop = np.nan
 
@@ -203,35 +189,6 @@ def generate_signals(df: pd.DataFrame, params: dict):
         "exit_price": exit_price,
         "exit_reason": exit_reason,
     }
-    drawings: list[dict] = []
-    if "timestamp" in df.columns:
-        entry_times = pd.to_datetime(
-            df.loc[entries[entries].index, "timestamp"], utc=True, errors="coerce"
-        ).dropna()
-        exit_times = pd.to_datetime(
-            df.loc[exits[exits].index, "timestamp"], utc=True, errors="coerce"
-        ).dropna()
-        for ts in entry_times.iloc[:30]:
-            drawings.append(
-                {
-                    "type": "marker",
-                    "time": ts.isoformat(),
-                    "position": "belowBar",
-                    "shape": "arrowUp",
-                    "color": "#22c55e",
-                    "text": "Entry",
-                }
-            )
-        for ts in exit_times.iloc[:30]:
-            drawings.append(
-                {
-                    "type": "marker",
-                    "time": ts.isoformat(),
-                    "position": "aboveBar",
-                    "shape": "arrowDown",
-                    "color": "#ef4444",
-                    "text": "Exit",
-                }
-            )
+    drawings = entry_exit_markers(df, entries, exits)
 
     return entries, exits, indicators_dict, drawings

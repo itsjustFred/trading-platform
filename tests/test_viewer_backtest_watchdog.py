@@ -110,7 +110,8 @@ def test_timeout_error_message_reports_configured_budget(monkeypatch):
     from viewer import main as viewer_main
 
     monkeypatch.setattr(viewer_main, "BACKTEST_WATCHDOG_TIMEOUT_SECONDS", 60.0)
-    message = f"Backtest timed out after {viewer_main.BACKTEST_WATCHDOG_TIMEOUT_SECONDS:.0f} seconds"
+    timeout = viewer_main.BACKTEST_WATCHDOG_TIMEOUT_SECONDS
+    message = f"Backtest timed out after {timeout:.0f} seconds"
     assert "60" in message
     assert "300" not in message
 
@@ -237,7 +238,9 @@ def test_run_reports_timeout_reason_not_kill_exit_code(
     monkeypatch.setattr(viewer_app_module, "STRATEGIES_DIR", strategies_dir)
     monkeypatch.setattr(viewer_app_module.legacy_viewer, "STRATEGIES_DIR", strategies_dir)
     monkeypatch.setattr(viewer_app_module, "_dolthub_pull", lambda: None)
-    monkeypatch.setattr(viewer_app_module, "_ensure_backtest_data_availability", lambda **kwargs: [])
+    monkeypatch.setattr(
+        viewer_app_module, "_ensure_backtest_data_availability", lambda **kwargs: []
+    )
     monkeypatch.setattr(viewer_app_module, "BACKTEST_WATCHDOG_TIMEOUT_SECONDS", 0.5)
 
     # `viewer_app_module.subprocess` is the global subprocess module, so patch
@@ -245,18 +248,23 @@ def test_run_reports_timeout_reason_not_kill_exit_code(
     real_popen = subprocess.Popen
 
     def fake_popen(cmd, *args, **kwargs):
-        # A child that keeps streaming (and never exits) until the watchdog kills it.
-        return real_popen(
-            [
-                sys.executable,
-                "-c",
-                "import time\nwhile True:\n    print('tick', flush=True)\n    time.sleep(0.05)\n",
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-        )
+        # Only the backtest runner gets the never-ending child. Popen is global,
+        # so anything else (e.g. the task-evidence git probe) must stay real.
+        if list(cmd)[:4] == [sys.executable, "-u", "-m", "runner.cli"]:
+            # A child that keeps streaming (and never exits) until the watchdog kills it.
+            child_code = (
+                "import time\nwhile True:\n"
+                "    print('tick', flush=True)\n"
+                "    time.sleep(0.05)\n"
+            )
+            return real_popen(
+                [sys.executable, "-c", child_code],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+        return real_popen(cmd, *args, **kwargs)
 
     monkeypatch.setattr(viewer_app_module.subprocess, "Popen", fake_popen)
 
@@ -272,12 +280,11 @@ def test_run_reports_timeout_reason_not_kill_exit_code(
     assert response.status_code == 202
     task_id = response.json()["task_id"]
 
-    for _ in range(200):
-        task = viewer_app_module.DATA_TASKS[task_id]
-        if task["status"] in {"completed", "failed"}:
-            break
-        time.sleep(0.05)
-
+    task = viewer_app_module.DATA_TASKS[task_id]
+    thread = task.get("thread")
+    assert isinstance(thread, threading.Thread), f"task {task_id} has no worker thread"
+    thread.join(timeout=30)
+    assert not thread.is_alive(), "backtest worker did not reach a terminal state"
     task = viewer_app_module.DATA_TASKS[task_id]
     assert task["status"] == "failed"
     error_text = str(task.get("error") or "")

@@ -62,25 +62,31 @@ def test_support_sets_are_what_the_paths_can_execute() -> None:
     # Live support is per broker (#167): percent on Alpaca only.
     assert LIVE_SUPPORTED_TRAILING_MODES_BY_BROKER == {
         "alpaca": {"none", "percent"},
-        "ctrader": {"none"},
+        # #168: cTrader can execute supertrend_flip, but only for deployments
+        # carrying the live_supertrend_flip opt-in on a demo/paper account -
+        # enforced by the deployment-validation and signal-time gates.
+        "ctrader": {"none", "supertrend_flip"},
     }
     assert LIVE_BASELINE_TRAILING_MODES == {"none"}
-    assert LIVE_ANY_BROKER_TRAILING_MODES == {"none", "percent"}
+    assert LIVE_ANY_BROKER_TRAILING_MODES == {"none", "percent", "supertrend_flip"}
 
 
 def test_live_modes_are_resolved_per_broker_and_fail_closed() -> None:
     assert live_supported_trailing_modes("alpaca") == {"none", "percent"}
     assert live_supported_trailing_modes(" Alpaca ") == {"none", "percent"}
-    assert live_supported_trailing_modes("ctrader") == {"none"}
+    assert live_supported_trailing_modes("ctrader") == {"none", "supertrend_flip"}
     # Unknown or missing broker: baseline only.
     for broker in (None, "", "ibkr"):
         assert live_supported_trailing_modes(broker) == {"none"}
     # No stop-amendment capability: baseline only, whatever the broker.
     assert live_supported_trailing_modes("alpaca", supports_stop_amendment=False) == {"none"}
     assert live_supported_trailing_modes("alpaca", supports_stop_amendment="yes") == {"none"}  # type: ignore[arg-type]
-    # No live broker executes supertrend_flip (#168).
-    for modes in LIVE_SUPPORTED_TRAILING_MODES_BY_BROKER.values():
-        assert "supertrend_flip" not in modes
+    # supertrend_flip is cTrader-only (#168); every other broker stays
+    # without it, and the deployment opt-in + demo/paper gates apply
+    # downstream of this table.
+    for broker, modes in LIVE_SUPPORTED_TRAILING_MODES_BY_BROKER.items():
+        if broker != "ctrader":
+            assert "supertrend_flip" not in modes
 
 
 def test_mode_is_normalised() -> None:
@@ -184,7 +190,7 @@ def test_broker_aware_override_check_rejects_percent_without_broker_support(brok
 
 @pytest.mark.parametrize("mode", ["supertrend_flip", "bogus"])
 def test_broker_aware_override_check_rejects_unsupported_modes_on_alpaca(mode: str) -> None:
-    with pytest.raises(ValueError, match="[Tt]railing"):
+    with pytest.raises(ValueError, match=r"[Tt]railing"):
         validate_live_deployment_trailing_override(
             {"signal_processor_config": {"trailing_mode": mode}},
             context="test",
@@ -367,7 +373,7 @@ _ALPACA_WITHOUT_AMEND = SimpleNamespace(broker_name="alpaca", supports_stop_amen
     ],
 )
 def test_live_signal_with_unexecutable_trailing_is_refused(monkeypatch, trailing_cfg) -> None:
-    with pytest.raises(ValueError, match="[Tt]railing|trailing_sl_config"):
+    with pytest.raises(ValueError, match=r"[Tt]railing|trailing_sl_config"):
         _process(monkeypatch, trailing_cfg)
 
 
@@ -383,7 +389,7 @@ def test_live_percent_signal_is_refused_for_an_adapter_that_cannot_trail(
 def test_live_signal_with_a_mode_no_adapter_executes_is_refused(
     monkeypatch, trailing_cfg
 ) -> None:
-    with pytest.raises(ValueError, match="[Tt]railing"):
+    with pytest.raises(ValueError, match=r"[Tt]railing"):
         _process(monkeypatch, trailing_cfg, _ALPACA_LIKE)
 
 

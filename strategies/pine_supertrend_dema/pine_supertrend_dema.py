@@ -3,11 +3,23 @@ Strategy: Supertrend + DEMA (Pine Script Conversion)
 
 Combines Supertrend indicator with Double EMA (DEMA) filter.
 Long when Supertrend flips bullish AND price > DEMA.
+
+Exits: only the INITIAL Supertrend band is protective on native — ``sl_price``
+is written on the entry bar alone, so the engine's stop never trails. The
+trailed level travels in the exit bar's ``exit_price``/``trailing_stop_at_exit``,
+which native honors only with ``exit_order_type="level"`` (not emitted here).
+A trailed-stop hit (a low-touch, not close-triggered) or Supertrend flip-down
+is therefore a market exit that fills at the next bar's open under the default
+``signal_exit_fill="next_open"`` — any ``exit_price`` written on the stop-hit
+bar is informational and ignored without ``exit_order_type="level"``, so the
+trailed level itself is not enforced as a fill price. Native also refuses any
+resolved ``use_trailing_sl=true`` parameter on this strategy even though the
+parameter is not part of its signature (maintainer decision 2026-11-23).
 """
 
 STRATEGY_META = {
     "name": "Supertrend + DEMA",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "tags": {
         "type": ["trend-following"],
         "source": "indikatoren-repo",
@@ -19,6 +31,8 @@ STRATEGY_META = {
 
 import numpy as np
 import pandas as pd
+
+from shared.strategy_markers import entry_exit_markers
 
 
 def _calc_supertrend(df: pd.DataFrame, period: int, multiplier: float):
@@ -101,11 +115,18 @@ def generate_signals(df: pd.DataFrame, params: dict):
             if stop_hit or bool(exit_cond.iloc[i]):
                 exits.iloc[i] = True
                 trailing_stop_at_exit.iloc[i] = active_stop
+                # Only the INITIAL band is protective on native: sl_price is
+                # written on the entry bar alone, so the engine's stop never
+                # trails. The trailed level travels in exit_price /
+                # trailing_stop_at_exit, honored as a level only with
+                # exit_order_type="level" (not emitted here). A trailed-stop
+                # hit or flip is a MARKET exit -> next bar's open; on a stop
+                # hit exit_price is informational only (ignored without
+                # exit_order_type="level").
                 if stop_hit:
                     exit_price.iloc[i] = active_stop
                     exit_reason.iloc[i] = "trailing_stop"
                 else:
-                    exit_price.iloc[i] = float(close.iloc[i])
                     exit_reason.iloc[i] = "supertrend_flip_down"
                 in_trade = False
                 active_stop = np.nan
@@ -121,35 +142,6 @@ def generate_signals(df: pd.DataFrame, params: dict):
         "exit_price": exit_price,
         "exit_reason": exit_reason,
     }
-    drawings: list[dict] = []
-    if "timestamp" in df.columns:
-        entry_times = pd.to_datetime(
-            df.loc[entries[entries].index, "timestamp"], utc=True, errors="coerce"
-        ).dropna()
-        exit_times = pd.to_datetime(
-            df.loc[exits[exits].index, "timestamp"], utc=True, errors="coerce"
-        ).dropna()
-        for ts in entry_times.iloc[:30]:
-            drawings.append(
-                {
-                    "type": "marker",
-                    "time": ts.isoformat(),
-                    "position": "belowBar",
-                    "shape": "arrowUp",
-                    "color": "#22c55e",
-                    "text": "Entry",
-                }
-            )
-        for ts in exit_times.iloc[:30]:
-            drawings.append(
-                {
-                    "type": "marker",
-                    "time": ts.isoformat(),
-                    "position": "aboveBar",
-                    "shape": "arrowDown",
-                    "color": "#ef4444",
-                    "text": "Exit",
-                }
-            )
+    drawings = entry_exit_markers(df, entries, exits)
 
     return entries, exits, indicators_dict, drawings

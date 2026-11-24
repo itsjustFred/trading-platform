@@ -45,7 +45,11 @@ pro Bot.
   Definition: `shared/trailing.py`.
   - **Fail closed:** Ein unbekannter Modus oder einer, den der ausführende Pfad nicht kann, wird
     abgelehnt: bei der Deployment-Validierung und erneut zur Signalzeit. Das Signal wird dann
-    nicht gehandelt; ein angeforderter Trail wird nie stillschweigend weggelassen.
+    nicht gehandelt; ein angeforderter Trail wird nie stillschweigend weggelassen. Bei der
+    Deployment-Validierung wird der Modus sowohl aus einem expliziten Override
+    (`signal_config.signal_processor_config.trailing_mode`) als auch aus dem Default der eigenen
+    Bot-Config gelesen — der Prozessor des Deployments wird dafür genauso gebaut wie vom Daemon
+    (`shared/trailing.py: validate_live_deployment_trailing_mode`).
   - **Unterstützt:** Replay-Backtest `none`, `percent`, `supertrend_flip`. Live je Broker: Alpaca `none`, `percent`;
     cTrader nur `none` (der Daemon hat keine cTrader-Marktdaten zum Nachziehen). `percent` wird
     live pro geschlossener Kerze des Signal-Timeframes mit derselben Arithmetik wie im Replay
@@ -54,7 +58,8 @@ pro Bot.
     Broker ausgeführt und dort abgelehnt (Grund und Design-Vorschlag im Runbook).
   - **`supertrend_flip` im Replay (#168):**
     1. TP1: Teilausstieg von `tp1_exit_percent` (Bruchteil, 0.5 = halbe Position) zu `tp1_price`
-       — in ganzen Shares: `qty * Bruchteil` abgerundet, wie im Original-Bot
+       — öffnet die Kerze über `tp1_price`, füllt der Teilausstieg zum OPEN der Kerze
+       (Gap-Regel #287), sonst zum Level — in ganzen Shares: `qty * Bruchteil` abgerundet, wie im Original-Bot
        (`int(qty * tp1_exit_percent)`, `shared/trailing.tp1_partial_quantity`). Ergibt sich 0
        (z. B. 1 Share bei 0.5), wird der Teilausstieg übersprungen, genau wie im Original-Bot:
        kein Verkauf, kein Einstands-Stop, und der restliche Workflow (Aktivierung, Flip) startet
@@ -73,7 +78,16 @@ pro Bot.
     - Ein Signal ohne `stop_loss` wird abgelehnt: vor TP1 ist der Stop der einzige Schutz,
       der Workflow setzt keinen eigenen.
     - Stop und TP1 in derselben Kerze: Stop zuerst (Konvention des Adapters,
-      `resolve_same_bar_exit`); dann gibt es kein TP1.
+      `resolve_same_bar_exit`); dann gibt es kein TP1. Ausnahme Gap (#287):
+      öffnet die Kerze bereits jenseits eines Levels (über TP1 bzw. unter dem
+      Stop), zählt der OPEN als erstes Ereignis der Kerze — der durchbrochene
+      Level füllt zum OPEN (`resolve_protective_exit` prüft die Lücke vor der
+      Stop-zuerst-Regel), auch wenn die Kerze später den anderen Level berührt.
+      Ausnahme innerhalb der Flip-Logik: nach einem TP1-Gap bleibt der Rest der
+      Position mit seinem ursprünglichen Stop für den Rest derselben Kerze
+      geschützt — der OTO-Stop steht auf dem Ausgangslevel und die
+      Breakeven-Änderung greift erst ab der nächsten Kerze; ein späterer
+      Same-Bar-Trade durch den Stop schließt den Rest zum Stop-Preis.
     - Supertrend: dieselbe Implementierung wie der Processor (`calculate_supertrend`), mit
       `supertrend_period`/`supertrend_multiplier` aus `trailing_sl_config`, nur aus geschlossenen
       Kerzen.
@@ -119,6 +133,25 @@ pro Bot.
 - Tests:
   - `tests/test_signal_bot_health_check.py`
   - `tests/test_scheduler_signal_bot_health.py`
+
+### Betrieb (#158, Entscheidung 2026-11-21)
+
+Der Health-Check bleibt bewusst ein **Standalone-Skript plus Scheduler-Job** —
+kein `runner.cli`-Subcommand. So wird er ausgeführt und geplant:
+
+- **Manuell:** `python -m signal_bots.health_check` (keine Flags). Gibt das
+  JSON-Ergebnis auf stdout aus; Exit-Code `0` = alle Processor ok, `1` =
+  mindestens ein Fehler. Geprüft werden pro Processor: Import/Factory,
+  `process_signal`-Probe mit synthetischen Marktdaten und die Existenz der
+  Config-Datei aus der Registry.
+- **Geplant:** Viewer → **Services** → „+ Add Scheduled Job" mit Job Type
+  `signal_bot_health_check` und einem Cron-Ausdruck, oder direkt
+  `POST /api/services` mit `type: "scheduled_job"`, `status: "running"` und
+  `config: {"cron": "...", "job_type": "signal_bot_health_check"}`. Der Cron
+  wird in UTC interpretiert (`scheduler/scheduler.py`, `CronTrigger.from_crontab`).
+  Der `ServiceScheduler` läuft innerhalb von `live_runner.daemon`; der
+  Job-Handler schreibt das Ergebnis als Background-Task-Status in die DB
+  (Services/Tasks im Viewer). `PAUSED`/`STOPPED` des Service pausiert den Lauf.
 
 ## Risk-Engine Integration
 
@@ -245,7 +278,9 @@ Bedingung nennt, erzeugt eine neue Entry-Order.
   eine ganze Einheit → strikt 1e-9 + `WARNING`),
   oder übersteigt die eigene Menge die Broker-Position, wird der gedeckelte Exit
   **trotzdem abgeschickt** und ein Alert ausgelöst: `ERROR`-Log mit
-  `alert=exit_ledger_mismatch` (Sentry macht daraus ein Event), allen
+  `alert=exit_ledger_mismatch` (Sentry macht daraus ein Event; mit
+  `OPS_ALERT_WEBHOOK_URL` konfiguriert geht der Alert zusätzlich an den
+  Ops-Alert-Channel, siehe `docs/live-deploy-runbook.md`), allen
   Ledger-Mengen (`ledger_qty_by_deployment`, `ledger_qty_total`), `broker_qty`
   und `own_ledger_qty`. Grund der Abweichung sind meist Broker-seitige
   Schließungen (SL/TP-Legs, cTrader-SL/TP, Flatten, manuelles Schließen), die
@@ -306,11 +341,22 @@ Bedingung nennt, erzeugt eine neue Entry-Order.
   Unverändert: Seiten-Konflikt (eigene Seite ≠ Broker-Seite oder ≠ Nachricht)
   → abgelehnt; keine eigene Menge → ignoriert + `WARNING`; auf 0 gedeckelt bzw.
   abgerundet → ignoriert + `WARNING`.
-- **Bekannte Einschränkung: Exits auf `PAUSED`-Deployments (#126).** Ein Exit
-  wird wie jede Order nur für `ACTIVE`-Deployments zugestellt (Fan-out und
-  Re-Check vor dem Absenden). Auf einem `PAUSED`-Deployment wird „Exit AAPL"
-  verworfen (INFO-Log), die Position bleibt offen. Das Gate ist in #121
-  unverändert; Exits trotz `PAUSED` anzunehmen ist offen (#126).
+- **`PAUSED` nimmt Exits an, aber keine Entries (#126).** Die Status-Gates
+  (Fan-out, Re-Check vor dem Absenden und der atomare Submission-Claim) lassen
+  für einen Exit `ACTIVE` **oder** `PAUSED` zu, für einen Entry nur `ACTIVE`;
+  unterschieden wird je Deployment aus dem rohen Signal: der geparste Intent
+  (`live_runner.exit_signals.is_exit_order`) **oder** ein plain `SELL`/`SHORT` auf
+  einem Deployment, das nicht shorten darf - dieselbe Regel, die
+  `live_runner.daemon._trade_signal_to_live_signal` anwendet, nur vor den Gates
+  statt danach. `STOPPED` bleibt ausgeschlossen
+  (STOP macht seine Position über die Cancel/Flatten-Sweeps dicht). Das gilt für
+  jedes Pause, auch ein manuelles. Hintergrund: „stop opening new positions"
+  (die `PAUSED`-Zeile des "Operator safety controls"-Kommentars in
+  `live_runner/base_adapter.py`) darf eine Position, die das Ledger kennt, nicht
+  unbewacht bis zum Stop offen lassen - genau das wäre bei einem Pause durch
+  einen widersprüchlichen `broker_order_id` der Fall (Konflikt-Halt, siehe
+  `docs/live-deploy-runbook.md`). Trailing bleibt dabei unberührt: nur
+  `ACTIVE`-Deployments werden getrailt.
 - **Ein Exit nach dem anderen (pro Account und Symbol):** Ein früherer Exit
   **desselben Deployments** für dasselbe Symbol, der beim Broker noch arbeitet
   (nicht voll gefüllt und in den offenen Orders des Brokers, per Broker- oder
@@ -365,6 +411,15 @@ Bedingung nennt, erzeugt eine neue Entry-Order.
   der Cursor bleibt stehen, und kommt dauerhaft nur so eine Seite, nimmt der Kanal
   bis zu einem Neustart nichts auf (danach greift das Start-Verhalten unten). Snowflake-IDs
   sind nicht fortlaufend, daher wird keine Nachrichtenanzahl berechnet.
+- **Ein einzelnes kaputtes Message-Objekt verliert nicht die ganze Seite:** Die
+  geparste Nachricht wird pro Nachricht isoliert (`_emit_polled_message`). Wirft
+  das Parsen (z. B. ein strukturell kaputtes `author`-Feld oder ein von
+  `TradeSignal` abgelehnter Preis), wird die Nachricht auf `ERROR` geloggt
+  (`Discord message dropped: emission failed` mit `channel_id`, `message_id` und
+  `error_type`), ihre ID bleibt im Seen-Set (kein Endlos-Retry) und der Poll
+  arbeitet mit dem Rest der Seite weiter. `asyncio.CancelledError` wird nicht
+  verschluckt; Auth-/Channel-Forbidden-/Rate-Limit-Fehler entstehen beim Abruf
+  und behalten ihr bestehendes Verhalten.
   Grundlage ist die Semantik von `after`: Discord liefert mit `after=<id>&limit=N`
   die N Nachrichten direkt nach der ID, im Array neueste zuerst
   ([Get Channel Messages](https://docs.discord.com/developers/resources/message#get-channel-messages):
@@ -410,3 +465,109 @@ Account-(User-)Token unverändert. Eine falsche Kombination antwortet mit
   statt den Wait stillschweigend zu überspringen; der Daemon verwirft dann
   dieses Signal und führt den Listener weiter.
 
+
+### Raw-Signal-Archiv (#308)
+
+Jede Nachricht, die `DiscordSignalSource` zur Signalverarbeitung emittiert,
+wird append-only archiviert — ob sie nun in einen `TradeSignal` geparst
+wird oder vom Parser abgelehnt wurde. Auch Nachrichten von Autoren außerhalb
+der Trusted-Author-Allowlist werden archiviert (für die
+Impostor-Auditierbarkeit) und tragen `author_trusted: false`; Inhalte werden
+nicht redigiert. Die Startup-Cursor-Priming-Seite wird nur als gesehen
+gemarkiert und nicht archiviert — auch Nachrichten, die während eines
+Daemon-Stops eintrafen, können also fehlen. Ohne dieses Archiv existieren
+die Rohsignale nur im Log-Stream und nur ab dem Tag der Aufzeichnung —
+Backtests und Meta-Labeling der Bots (nitro, ramjet, rocketfuel) brauchen
+die historische Rohdatenmenge.
+
+**Speicherort und Format.** JSON Lines unter
+`DATA_DIR / "signal_log" / "discord_signals-<YYYY-MM-DD>.jsonl"` (eine Datei
+pro UTC-Tag). JSONL statt SQLite `backtests.db` aus drei Gründen: Das Archiv
+darf nie mit der Handelsdatenbank um Locks konkurrieren, es muss für die
+offline Label-Pipeline trivial exportierbar bleiben, und „append-only" ist
+wörtlich — eine Zeile wird nie umgeschrieben. File-basierte Stores liegen im
+Repo bereits neben der DB (`DATA_DIR / "backtests"`, `"grid_results"`,
+`"signals"`), das Format passt also in das bestehende Persistenz-Layout.
+Implementierung: `live_runner/signal_archive.py`.
+
+Jeder Record trägt `schema_version` (aktuell `1`). Die Offline-Pipeline muss
+Zeilen, die nicht parsen (z. B. eine durch einen Absturz abgeschnittene
+Zeile), überspringen und auf `discord_message_id` deduplizieren — ein
+Daemon-Neustart kann zuletzt emittierte Nachrichten erneut archivieren.
+
+**Record-Typen.**
+
+- `discord_signal_received` — einmal pro zur Signalverarbeitung emittierter
+  Nachricht: Roh-Content,
+  Autor (ID, Username, Bot-Flag, `author_trusted`), Channel, Message-ID,
+  `message_created_at`, Archivierzeit (`logged_at`), Bot-Name, Account,
+  Service, `parse_status` (`parsed`/`rejected`),
+  `refusal_reason`/`refusal_detail`
+  (z. B. `untrusted_author`, `non_entry_rejection`, `malformed_levels`),
+  die geparsten Felder (`signal`: action, symbol, entry, SL, TP, timeframe,
+  signal_type) und receipt-time `features` (Clock-Features: Stunde/Wochentag
+  UTC, Content-Länge, explizites SL/TP, Exit-Flag).
+- `discord_signal_decision` — einmal pro (Signal, Deployment): Outcome
+  `traded` / `refused` / `ignored` / `unknown`, `reason` (z. B.
+  `deployment_not_active`, `symbol_not_covered`, `author_not_allowed`,
+  `unmapped_channel`, `stale_signal`, `signal_gate_rejected`,
+  `invalid_deployment_config`, `submission_claim_failed`, `halt_refused`,
+  `loss_breaker_refused`,
+  `broker_refused_pre_request`, `broker_submit_outcome_unknown`,
+  `nothing_to_exit`, `exit_below_step`, `exit_in_flight`,
+  `unhandled_error`), `detail`,
+  `broker_order_id`, `signal_age_seconds`, Deployment-/Strategy-IDs und
+  `features`.
+
+**Signal-Pfad bleibt frei.** `record()` ist ein bounded `put_nowait` auf
+ einer Queue; Serialisierung und Disk-I/O laufen auf einem dedizierten
+Writer-Thread (`signal-archive-writer`). Eine volle Queue droppt den Record
+und zählt ihn (`dropped`), Schreibfehler zählen `write_errors`/`enqueue_errors`
+ und warnen — nichts davon blockiert, verzögert oder wirft in den
+Signalpfad. Abschalten mit `TP_SIGNAL_ARCHIVE=0`.
+
+**Market-Features — offline, nicht auf dem Signal-Pfad.** Produktiv
+tragen Discord-Signale heute keine OHLCV-Frame (`signal.metadata["market_data"]`
+wird von keinem Producer gesetzt); die Decision-Records erhalten deshalb
+keine Market-Features. Die Feature-Berechnung
+(`market_features_from_frame`) läuft netzwerkfrei über eine bereits
+vorhandene OHLCV-Frame — ATR(14) samt Perzentil-Rang im Frame, Abstände zu
+SMA20/SMA50 und VWAP (nur wenn `volume` vorhanden), Gap der letzten Bar,
+grobe Trend-Regime (`above_sma50`/`below_sma50`) — und ist damit auch für
+die spätere Offline-Berechnung aus historischen OHLCV-Daten per
+`message_created_at` nutzbar (außer Spread, der Quotes bräuchte).
+
+**Offline-Anreicherung.** `scripts/signal_archive_market_features.py`
+schließt diese Lücke: Es liest die `discord_signals-<tag>.jsonl`-Archive,
+joimet jeden parsbaren Signal-Record über Symbol und Timeframe mit dem
+lokalen OHLCV-Parquet-Store (`select_ohlcv_path`, gleiche
+Source-Priorität wie im Backtest) und schreibt pro Archiv-Tag eine
+Sidecar-Datei `signal_log/features/discord_signal_features-<tag>.jsonl`
+(abgeleitete Daten — pro Lauf komplett neu geschrieben, das
+Append-only-Archiv wird nie angefasst). Jeder Sidecar-Record trägt
+`discord_message_id`, `message_created_at`, Symbol, Timeframe,
+OHLCV-Pfad, `bars_used`, `features` und bei Ausfall einen `skip_reason`
+(`no_ohlcv`, `no_timeframe`, `unknown_timeframe`, `no_closed_bars`,
+`features_failed`, …),
+damit die Coverage gegen das Archiv prüfbar bleibt. Es werden nur
+**abgeschlossene** Balken verwendet (`bar_open + timeframe <=
+message_created_at`) — der noch laufende Balken zum Signalzeitpunkt
+fließt nie ein, und ATR-Perzentil-Rang sowie VWAP werden über ein festes
+Fenster (`--lookback-bars`, Default 250) berechnet, damit gleiche Signale
+unabhängig von der verfügbaren Historie dieselben Werte liefern. Aufruf:
+
+```bash
+python -m scripts.signal_archive_market_features [--since YYYY-MM-DD] [--until YYYY-MM-DD] [--lookback-bars N] [--data-source SRC]
+```
+
+Der Decision-Record schreibt außerdem
+Prozessor-Metadaten, wenn ein Processor läuft
+(Processor-ATR, Supertrend-Entry-State, Slippage, Trailing-Mode). Die
+Clock-/Parse-Features (Stunde/Wochentag UTC, Content-Länge, explizites
+SL/TP, Exit-Flag) stehen im `discord_signal_received`-Record. Bewusst
+**nicht** drin, weil sie extra Daten bräuchten (Follow-ups): Bid/Ask-Spread
+(braucht Quotes), session-ankererter VWAP, Multi-Window-Perzentile.
+
+**Nächste Schritte (Issue #308, separat).** Jeder Signal bekommt später ein
+Triple-Barrier-Label mit den SL/TP des Bots; daraus wird ein
+regularisierter Filter trainiert und walk-forward validiert.

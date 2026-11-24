@@ -9,29 +9,39 @@ import re
 import tempfile
 import time
 from collections import deque
-from collections.abc import Iterator, Mapping
+from collections.abc import Collection, Iterator, Mapping
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
+from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from pathlib import Path
 from typing import Any
 from uuid import UUID
 
+import pandas as pd
+
 from live_runner.base_adapter import (
     EXIT_ONLY_RISK_SIZING_MODE,
+    ORDER_STATE_FILLED,
+    ORDER_STATE_TERMINAL,
+    ORDER_STATE_WORKING,
     BaseLiveAdapter,
+    BrokerOrderView,
     ControlOutcome,
     LivePipValue,
     LiveQuote,
+    ProtectiveStop,
     coerce_positive_live_qty,
-    commission_cost,
+    commission_from_signed_cash_flow,
     is_unbounded_tp,
     money_digits_from_trader,
     money_scale,
     order_not_submitted,
     validate_live_quote_prices,
 )
-from live_runner.credential_env import resolve_env_value
-from live_runner.exit_signals import ExitBelowStepError, round_exit_qty_down
+from live_runner.credential_env import resolve_accounts_env_path, resolve_env_value
+from live_runner.exit_signals import ExitBelowStepError
+from shared import venue_calendar
+from shared.constants import DATA_DIR
 from shared.database import (
     BROKER_CLOSE_REASON_CTRADER_POSITION_CLOSE,
     broker_close_signal_id,
@@ -51,6 +61,7 @@ from shared.database import (
     set_live_signal_broker_order_id,
 )
 from shared.logging import get_logger
+from shared.lot_grid import floor_qty_to_step
 from shared.models import (
     PRICE_ABSENT,
     PRICE_OBSERVED,
@@ -58,6 +69,7 @@ from shared.models import (
     LiveExecution,
     LiveSignal,
 )
+from shared.money import parse_money, parse_optional
 
 logger = get_logger("live-runner")
 
@@ -186,6 +198,216 @@ MAX_CONVERSION_HOPS = 3
 CTRADER_RELATIVE_PRICE_UNIT_DIVISOR = 100_000
 EXECUTION_RETRY_LIMIT = 3
 UNRESOLVED_EXECUTION_EVENT_LIMIT = 1000
+#: Bounded broker-state confirmation for ProtoOAAmendPositionSLTPReq (#168):
+#: the request has no dedicated response, so the amended stop is confirmed by
+#: re-reading the position. The broker applies the amend asynchronously, so a
+#: few short-interval reads cover the apply window without stalling the trail.
+_AMEND_CONFIRM_ATTEMPTS = 8
+_AMEND_CONFIRM_INTERVAL_SECONDS = 0.4
+#: Sentinel queued on ``_execution_queue`` to wake ``listen_executions`` for a
+#: pending broker reconciliation instead of letting it sleep out the 30 s
+#: ``queue.get`` timeout. Never a real execution payload.
+_EXECUTION_RECONCILE_WAKE = object()
+
+# ── Trendbar market data (#168) ────────────────────────────────────────────────
+#
+# ProtoOATrendbar is delta-encoded against its own LOW, not the previous close:
+#   low    = absolute price in 1/100000 units (int64)
+#   open   = (low + deltaOpen) / 100000
+#   close  = (low + deltaClose) / 100000
+#   high   = (low + deltaHigh) / 100000
+#   utcTimestampInMinutes = unix minutes of the bar's nominal open
+# (cTrader Open API model-messages docs; verified against the installed
+# ctrader_open_api 0.9.2 descriptors.)
+
+#: Deployment/signal timeframe spelling -> ProtoOATrendbarPeriod member name.
+#: Only periods the enum actually defines are mapped (there is no H2/H3/H6).
+_TRENDBAR_PERIOD_BY_TIMEFRAME: dict[str, str] = {
+    "1m": "M1",
+    "1min": "M1",
+    "2m": "M2",
+    "3m": "M3",
+    "4m": "M4",
+    "5m": "M5",
+    "5min": "M5",
+    "10m": "M10",
+    "15m": "M15",
+    "15min": "M15",
+    "30m": "M30",
+    "30min": "M30",
+    "1h": "H1",
+    "60min": "H1",
+    "4h": "H4",
+    "12h": "H12",
+    "1d": "D1",
+    "1w": "W1",
+}
+
+#: Seconds per ProtoOATrendbarPeriod member (the enum has no H2/H3/H6/D2+).
+_TRENDBAR_PERIOD_SECONDS: dict[str, int] = {
+    "M1": 60,
+    "M2": 120,
+    "M3": 180,
+    "M4": 240,
+    "M5": 300,
+    "M10": 600,
+    "M15": 900,
+    "M30": 1800,
+    "H1": 3600,
+    "H4": 14400,
+    "H12": 43200,
+    "D1": 86400,
+    "W1": 604800,
+    "MN1": 2_592_000,
+}
+
+#: Canonical deployment timeframes the cTrader adapter can serve for the
+#: live ``supertrend_flip`` workflow (#168). Only sub-day bars: the broker
+#: anchors ``4h``/``1d``/``1w`` to its server day/week, which is not provably
+#: the UTC alignment replay uses, so the flip workflow refuses them. The
+#: per-broker live-trailing table in ``shared.trailing`` mirrors this set.
+CTRADER_MARKET_DATA_TIMEFRAMES: frozenset[str] = frozenset(
+    {"1m", "5m", "15m", "30m", "1h"}
+)
+
+
+def _trendbar_period_for_timeframe(timeframe: str) -> str | None:
+    """The ProtoOATrendbarPeriod member name for a deployment timeframe."""
+    normalized = str(timeframe or "").strip().lower()
+    return _TRENDBAR_PERIOD_BY_TIMEFRAME.get(normalized)
+
+
+def _decode_trendbar_price(raw_value: Any, *, price_digits: int) -> float:
+    """One 1/100000-unit price field -> a symbol-precision float, fail closed."""
+    try:
+        raw = float(raw_value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"cTrader trendbar price is not numeric: {raw_value!r}") from exc
+    if not math.isfinite(raw):
+        raise ValueError(f"cTrader trendbar price is not finite: {raw_value!r}")
+    price = raw / CTRADER_RELATIVE_PRICE_UNIT_DIVISOR
+    # Round to the symbol's own digits, exactly like the broker-doc recipe:
+    # the integer protocol value can carry sub-tick noise the symbol cannot.
+    return round(price, max(0, int(price_digits)))
+
+
+def _trendbar_present(bar: Any, has_field: Any, name: str) -> bool:
+    if has_field is None:
+        return getattr(bar, name, None) is not None
+    try:
+        return bool(has_field(name))
+    except (TypeError, ValueError):
+        return getattr(bar, name, None) is not None
+
+
+def _trendbar_field(bar: Any, name: str) -> float:
+    try:
+        return float(getattr(bar, name))
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise ValueError(f"cTrader trendbar field {name!r} is unreadable") from exc
+
+
+def _require_trendbar_fields(bar: Any, has_field: Any) -> None:
+    for name in ("low", "deltaOpen", "deltaClose", "deltaHigh"):
+        if not _trendbar_present(bar, has_field, name):
+            raise ValueError(f"cTrader trendbar is missing required field {name!r}")
+
+
+def _validate_trendbar_prices(prices: Mapping[str, float]) -> None:
+    if min(prices.values()) <= 0:
+        raise ValueError(
+            "cTrader trendbar decoded a non-positive price: "
+            f"O={prices['open']!r} H={prices['high']!r} "
+            f"L={prices['low']!r} C={prices['close']!r}"
+        )
+    if prices["high"] < max(prices["open"], prices["close"], prices["low"]) or (
+        prices["low"] > min(prices["open"], prices["close"])
+    ):
+        raise ValueError(
+            "cTrader trendbar OHLC is inconsistent: "
+            f"O={prices['open']!r} H={prices['high']!r} "
+            f"L={prices['low']!r} C={prices['close']!r}"
+        )
+
+
+def _trendbar_open_time(bar: Any, timestamp_ms_fallback: int | None) -> datetime:
+    open_minutes = _optional_int(getattr(bar, "utcTimestampInMinutes", None))
+    if open_minutes is not None and open_minutes > 0:
+        return datetime.fromtimestamp(open_minutes * 60, tz=timezone.utc)
+    if timestamp_ms_fallback is not None and timestamp_ms_fallback > 0:
+        return datetime.fromtimestamp(timestamp_ms_fallback / 1000.0, tz=timezone.utc)
+    raise ValueError("cTrader trendbar has no usable open timestamp")
+
+
+def decode_trendbar(
+    bar: Any,
+    *,
+    price_digits: int,
+    timestamp_ms_fallback: int | None = None,
+) -> dict[str, Any]:
+    """Decode one ``ProtoOATrendbar`` into an OHLCV row.
+
+    ``timestamp_ms_fallback`` is the deprecated parallel ``timestamp`` array
+    entry (unix ms), used only when the bar carries no
+    ``utcTimestampInMinutes``. Raises ``ValueError`` on any missing or
+    unusable field: a bar this decoder cannot read must not be guessed into
+    the series a workflow trades on.
+    """
+    has_field = getattr(bar, "HasField", None)
+    _require_trendbar_fields(bar, has_field)
+    low_raw = _trendbar_field(bar, "low")
+    prices = {
+        "open": _decode_trendbar_price(
+            low_raw + _trendbar_field(bar, "deltaOpen"), price_digits=price_digits
+        ),
+        "high": _decode_trendbar_price(
+            low_raw + _trendbar_field(bar, "deltaHigh"), price_digits=price_digits
+        ),
+        "low": _decode_trendbar_price(low_raw, price_digits=price_digits),
+        "close": _decode_trendbar_price(
+            low_raw + _trendbar_field(bar, "deltaClose"), price_digits=price_digits
+        ),
+    }
+    _validate_trendbar_prices(prices)
+    return {
+        "timestamp": _trendbar_open_time(bar, timestamp_ms_fallback),
+        "open": prices["open"],
+        "high": prices["high"],
+        "low": prices["low"],
+        "close": prices["close"],
+        "volume": float(getattr(bar, "volume", 0) or 0),
+    }
+
+
+def decode_trendbars_response(
+    response: Any, *, symbol: str, price_digits: int
+) -> list[dict[str, Any]]:
+    """Decode every bar of one ``ProtoOAGetTrendbarsRes``, oldest first.
+
+    The response's deprecated parallel ``timestamp`` array (unix ms) is used
+    only for bars that carry no ``utcTimestampInMinutes`` of their own.
+    """
+    bars = list(getattr(response, "trendbar", []) or [])
+    timestamps = [int(value) for value in (getattr(response, "timestamp", []) or [])]
+    rows: list[dict[str, Any]] = []
+    for index, bar in enumerate(bars):
+        fallback = timestamps[index] if index < len(timestamps) else None
+        try:
+            rows.append(
+                decode_trendbar(
+                    bar,
+                    price_digits=price_digits,
+                    timestamp_ms_fallback=fallback,
+                )
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"cTrader trendbar {index} for {symbol} is unusable: {exc}"
+            ) from exc
+    rows.sort(key=lambda row: row["timestamp"])
+    return rows
+
+
 #: How far back the deal-list pass looks for broker-side position closes the
 #: stream never saw (#144). Bounded on purpose: an older unattributed close is
 #: surfaced by the ledger-mismatch alert and periodic broker reconciliation,
@@ -473,9 +695,12 @@ def _qty_to_broker_volume(qty: float, volume_per_qty: float = QTY_VOLUME_SCALE) 
     if not math.isfinite(float(volume_per_qty)) or float(volume_per_qty) <= 0:
         raise ValueError("volume_per_qty must be finite and positive")
     # Floor, never round: rounding to nearest can size up by half a volume unit
-    # and put the loss at the stop above the risk budget. The relative nudge
-    # only absorbs binary float error (0.29 * 100 == 28.999999999999996).
-    volume = math.floor(qty_value * float(volume_per_qty) * (1.0 + 1e-12))
+    # and put the loss at the stop above the risk budget. The shared lot-grid
+    # floor's decimal noise band absorbs binary float error
+    # (0.29 * 100 == 28.999999999999996) and can return a value up to 1e-6 of
+    # a unit above a real fraction that close to the next unit -- below every
+    # broker's volume resolution -- #278.
+    volume = int(floor_qty_to_step(qty_value * float(volume_per_qty), 1.0))
     if volume <= 0:
         raise ValueError(
             f"qty {qty_value!r} is below one broker volume unit at "
@@ -492,6 +717,9 @@ def _floor_to_volume_step(volume: int, step_volume: int) -> int:
     ``stepVolume`` (``TRADING_BAD_VOLUME``). A risk-sized volume almost never
     lands on that grid, so it is rounded DOWN: rounding up would exceed the
     risk budget. A result below the broker minimum is refused by the caller.
+    Both operands are integers, so ``//`` is already the exact floor -- there
+    is no float dust for the shared lot-grid floor (#278) to absorb, and
+    routing ints through it could only add error.
     """
     step = int(step_volume)
     if step <= 1:
@@ -501,7 +729,14 @@ def _floor_to_volume_step(volume: int, step_volume: int) -> int:
 
 def _broker_volume_to_qty(volume: float, volume_per_qty: float = QTY_VOLUME_SCALE) -> float:
     """Convert broker volume units into qty units (risk-engine units)."""
-    return _to_float(volume, default=0.0) / float(volume_per_qty)
+    return parse_money(volume) / float(volume_per_qty)
+
+
+def _enum_name_or_none(name_fn: Any, value: int) -> str | None:
+    try:
+        return str(name_fn(value))
+    except Exception:  # except-kind: loop-survival
+        return None
 
 
 def _light_symbol_assets(symbol: Any) -> tuple[int, int] | None:
@@ -542,26 +777,54 @@ def _deal_id_or_none(deal: Any | None) -> int | None:
     return deal_id if deal_id > 0 else None
 
 
-def _deal_commission(deal: Any | None) -> float:
-    """A deal's commission in account currency, as a positive cost.
+def _deal_commission(
+    deal: Any | None, *, rebate_logged: set[int] | None = None
+) -> float | None:
+    """A deal's commission in account currency, as a positive cost — or ``None``.
 
     cTrader reports a charge as a NEGATIVE ``commission`` (a signed cash flow). It is stored as a
     positive cost, the ``live_executions.commission`` convention shared with Alpaca (see
-    ``base_adapter.commission_cost``).
+    ``base_adapter.commission_from_signed_cash_flow``).
 
     ``ProtoOADeal.commission`` is an ``int64`` in minor units: it is scaled by the deal's own
     ``moneyDigits`` exactly like ``ProtoOATrader.balance`` is by the trader's. Storing the raw
     integer records a 2-digit-account commission of 3.50 as 350. A deal that carries no
     commission (an unset int64 reads as ``0``) is ``0.0`` without consulting ``moneyDigits``, so
     only a real charge can trigger the "digits missing" fallback warning.
+
+    A positive broker cash flow is a REBATE: the converted cost is negative, which the
+    ``commission`` write guard refuses. Refusing the ``LiveExecution`` would drop the whole
+    fill — the stream caller retains the event for reconciliation forever and the row never
+    reaches ``live_executions``, the lost-fill the persist path exists to prevent — so the
+    rebate is stored as ``None`` ("fee unknown"; readers already treat it as net-PnL
+    incomplete) and logged at ERROR with the deal id and the raw value. How a rebate should
+    be represented is an open maintainer decision (#285); until then the fill is kept.
     """
     if deal is None:
         return 0.0
-    raw = _to_float(getattr(deal, "commission", 0))
+    raw = parse_money(getattr(deal, "commission", 0))
     # Truthiness, not float equality: an unset int64 (and a test double's 0.0) is falsy.
-    if not raw or not math.isfinite(raw):
+    if not raw:
         return 0.0
-    return commission_cost(raw / money_scale(money_digits_from_trader(deal)))
+    cost = commission_from_signed_cash_flow(raw / money_scale(money_digits_from_trader(deal)))
+    if cost < 0:
+        deal_id = _deal_id_or_none(deal)
+        # ERROR once per deal id per adapter: reconciliation re-reads the same deals on
+        # every pass, and each ERROR is a Sentry event — the anomaly is logged loudly
+        # once, not once per pass.
+        if rebate_logged is None or deal_id is None or deal_id not in rebate_logged:
+            logger.error(
+                "cTrader deal %s reported a rebate: commission=%r converts to cost=%r, which "
+                "the write guard refuses; storing commission=NULL so the fill is kept and "
+                "net PnL stays flagged incomplete (#285)",
+                deal_id,
+                raw,
+                cost,
+            )
+            if rebate_logged is not None and deal_id is not None:
+                rebate_logged.add(deal_id)
+        return None
+    return cost
 
 
 _NOT_AUTHORIZED_MARKER = "not authorized"
@@ -580,7 +843,7 @@ def _twisted_deferred_timeout_class() -> type[BaseException] | None:
     """
     try:
         from twisted.internet import defer
-    except Exception:  # pragma: no cover - Twisted is absent
+    except Exception:  # pragma: no cover - Twisted is absent  # except-kind: loop-survival
         return None
     return getattr(defer, "TimeoutError", None)
 
@@ -620,12 +883,23 @@ def _classify_deferred_response_timeout(
     return True, seconds
 _CTRADER_AUTH_FAILURE_FALLBACK = "cTrader account authorization failed"
 
+#: ``ProtoOAAccountType`` numbers -> lowercase names. Mirrored here so the
+#: account-type read does not depend on the proto enum object being bound
+#: (tests stub ``_fetch_trader`` without loading the openapi types).
+_CTRADER_ACCOUNT_TYPES = {0: "hedged", 1: "netted", 2: "spread_betting"}
+
+#: Seconds an unreadable ``account_type`` read is negatively cached. Every
+#: runner pass on an ``internal_max_open_per_symbol > 1`` cTrader deployment
+#: asks again; without the window an unreachable broker would cost a full
+#: request timeout on every pass while the refusal already fails closed.
+_ACCOUNT_TYPE_RETRY_SECONDS = 60.0
+
 
 def _reason_to_text(reason: Any) -> str:
     if hasattr(reason, "getErrorMessage"):
         try:
             return str(reason.getErrorMessage())
-        except Exception:
+        except Exception:  # except-kind: loop-survival
             return str(reason)
     return str(reason)
 
@@ -681,7 +955,12 @@ def _exclusive_file_lock(handle: Any) -> Iterator[None]:
         while True:
             handle.seek(0)
             try:
-                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                # `msvcrt` is a Windows-only stdlib module (typeshed gates it on
+                # `sys_platform == "win32"`), so mypy on the Linux CI runner cannot
+                # see its members at all: `attr-defined` is about the platform, not
+                # about a runtime value. The `os.name == "nt"` guard is what makes
+                # this branch reachable only where the module exists.
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)  # type: ignore[attr-defined]
                 break
             except OSError:
                 time.sleep(0.05)
@@ -689,7 +968,7 @@ def _exclusive_file_lock(handle: Any) -> Iterator[None]:
             yield
         finally:
             handle.seek(0)
-            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)  # type: ignore[attr-defined]  # Windows-only module, see the lock call above
         return
 
     import fcntl
@@ -762,7 +1041,18 @@ def _ensure_asyncio_twisted_reactor(loop: asyncio.AbstractEventLoop) -> None:
             pass
         _ASYNCIO_REACTOR_VALIDATED = True
 
-    from twisted.internet import reactor
+    from twisted.internet import reactor as _reactor
+
+    # `twisted.internet.reactor` is a *module* at import time and the installed
+    # reactor *instance* at run time: `installReactor()` rebinds
+    # sys.modules["twisted.internet.reactor"] to the instance, which is why
+    # `__class__.__module__` names the reactor class below. The static type is
+    # therefore the module, so `running`/`startRunning` are genuinely not on it.
+    # Take it as Any instead of two `# type: ignore[attr-defined]` comments:
+    # those are unused whenever Twisted's own (partial) types are absent, and
+    # `warn_unused_ignores` turns an unused ignore into a failure - so the same
+    # source would type-check in CI and fail in a dev-extra-only checkout.
+    reactor: Any = _reactor
 
     reactor_module = reactor.__class__.__module__
     if "asyncioreactor" not in reactor_module:
@@ -778,9 +1068,13 @@ class CTraderLiveAdapter(BaseLiveAdapter):
     """cTrader live adapter backed by OpenApiPy."""
 
     broker_name = "ctrader"
-    # No `supports_stop_amendment`: the daemon has no cTrader market data to
-    # trail on, so this adapter stays on trailing mode "none" (issue #167; see
-    # `shared.trailing.LIVE_SUPPORTED_TRAILING_MODES_BY_BROKER`).
+    # `supports_stop_amendment` (#168): a cTrader position's SL/TP is amended
+    # in place through ProtoOAAmendPositionSLTPReq - the broker replaces the
+    # protective levels atomically, so the previous stop keeps working until
+    # the new one is accepted and stays if the request is refused. The adapter
+    # confirms every amendment by re-reading the position from the broker
+    # before reporting success; an unconfirmed outcome raises instead of
+    # claiming the stop moved.
 
     def __init__(
         self,
@@ -802,8 +1096,8 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self.app_secret = app_secret or resolve_env_value(env_values, "CTRADER_APP_SECRET")
         self.access_token = access_token or resolve_env_value(env_values, "CTRADER_ACCESS_TOKEN")
         self.refresh_token = refresh_token or resolve_env_value(env_values, "CTRADER_REFRESH_TOKEN")
-        self.accounts_env_path = (
-            Path(accounts_env_path) if accounts_env_path else DEFAULT_ACCOUNTS_ENV
+        self.accounts_env_path = resolve_accounts_env_path(
+            accounts_env_path or None, default=DEFAULT_ACCOUNTS_ENV
         )
         raw_account_id = str(account_id or account_config_id).strip()
         self.ctid_trader_account_id = int(raw_account_id) if raw_account_id else 0
@@ -846,6 +1140,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._connected_event = asyncio.Event()
         self._execution_queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=5000)
         self._execution_retry_counts: dict[int, int] = {}
+        self._rebate_logged_deal_ids: set[int] = set()
         self._unresolved_execution_events: deque[Any] = deque()
         # Deal ids already flagged ledger_reconciliation_required this process.
         # The reconcile pass re-reads the same 7-day window on every connect and
@@ -872,10 +1167,35 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         # #146: (baseAssetId, quoteAssetId) per upper symbol name, from the
         # light symbol list, and the account's deposit asset. Session state.
         self._symbol_assets: dict[str, tuple[int, int]] = {}
+        # #240: ProtoOASymbol.leverageId per upper symbol name, captured with
+        # the symbol props; resolved to a leverage via GetDynamicLeverageByID.
+        self._symbol_leverage_ids: dict[str, int] = {}
         self._deposit_asset_id: int | None = None
         self._asset_names: dict[int, str] = {}
         self._asset_names_task: asyncio.Task[dict[int, str]] | None = None
         self._position_ids_by_symbol: dict[str, tuple[int, ...]] = {}
+        # Broker volume per open position id, refreshed by ``get_positions``
+        # alongside ``_position_ids_by_symbol``. The exit-target resolver's
+        # order cache uses it to prove its read is not stale: a cached order
+        # list may never be the proof that pins a lot to a position when the
+        # position's volume has moved since the fetch (#382 maintainer
+        # decision - a netted book's opener set only grows).
+        self._position_volumes: dict[int, int] = {}
+        # #382: position id -> (monotonic timestamp, order list, volume at
+        # fetch) for the exit-target resolver. A per-lot exit fan-out would
+        # otherwise spend one broker round trip per open position *per exit*
+        # inside the account lock; the TTL bounds staleness and the recorded
+        # volume invalidates the entry the moment the position's size moves,
+        # which is the only way a netted position's opener set can change.
+        self._position_orders_cache: dict[int, tuple[float, Any, int | None]] = {}
+        # ``ProtoOAAccountType`` name ("hedged"/"netted"/"spread_betting"),
+        # cached after the first successful ``_fetch_trader`` read. An
+        # unreadable read is negatively cached for
+        # ``_ACCOUNT_TYPE_RETRY_SECONDS`` (monotonic timestamp below) so a
+        # broker outage cannot stall every runner pass; "unknown" is never
+        # pinned permanently - the next read after the window retries.
+        self._account_type: str | None = None
+        self._account_type_unreadable_at: float | None = None
         self._order_id_to_signal_id: dict[int, str] = {}
         # #80: order id -> upper symbol name (for order-only fills whose
         # payload carries no symbolId).
@@ -926,6 +1246,15 @@ class CTraderLiveAdapter(BaseLiveAdapter):
 
         self._ProtoOASubscribeSpotsReq: Any = None
         self._ProtoOAUnsubscribeSpotsReq: Any = None
+        self._ProtoOAGetDynamicLeverageByIDReq: Any = None
+        self._ProtoOAGetDynamicLeverageByIDRes: Any = None
+        self._ProtoOAGetPositionUnrealizedPnLReq: Any = None
+        self._ProtoOAGetPositionUnrealizedPnLRes: Any = None
+
+        self._ProtoOAGetTrendbarsReq: Any = None
+        self._ProtoOAGetTrendbarsRes: Any = None
+        self._ProtoOATrendbarPeriod: Any = None
+        self._ProtoOAAmendPositionSLTPReq: Any = None
 
         self._heartbeat_payload_type: int | None = None
         self._spot_payload_type: int | None = None
@@ -944,6 +1273,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             from ctrader_open_api.messages.OpenApiMessages_pb2 import (
                 ProtoOAAccountAuthReq,
                 ProtoOAAccountAuthRes,
+                ProtoOAAmendPositionSLTPReq,
                 ProtoOAApplicationAuthReq,
                 ProtoOAApplicationAuthRes,
                 ProtoOACancelOrderReq,
@@ -952,6 +1282,12 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 ProtoOADealListRes,
                 ProtoOAErrorRes,
                 ProtoOAExecutionEvent,
+                ProtoOAGetDynamicLeverageByIDReq,
+                ProtoOAGetDynamicLeverageByIDRes,
+                ProtoOAGetPositionUnrealizedPnLReq,
+                ProtoOAGetPositionUnrealizedPnLRes,
+                ProtoOAGetTrendbarsReq,
+                ProtoOAGetTrendbarsRes,
                 ProtoOANewOrderReq,
                 ProtoOAOrderDetailsReq,
                 ProtoOAOrderDetailsRes,
@@ -980,6 +1316,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 ProtoOAPositionStatus,
                 ProtoOATimeInForce,
                 ProtoOATradeSide,
+                ProtoOATrendbarPeriod,
             )
         except ModuleNotFoundError as exc:
             raise RuntimeError(
@@ -1009,6 +1346,10 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._ProtoOAOrderDetailsRes = ProtoOAOrderDetailsRes
         self._ProtoOAOrderListReq = ProtoOAOrderListReq
         self._ProtoOAOrderListRes = ProtoOAOrderListRes
+        self._ProtoOAGetDynamicLeverageByIDReq = ProtoOAGetDynamicLeverageByIDReq
+        self._ProtoOAGetDynamicLeverageByIDRes = ProtoOAGetDynamicLeverageByIDRes
+        self._ProtoOAGetPositionUnrealizedPnLReq = ProtoOAGetPositionUnrealizedPnLReq
+        self._ProtoOAGetPositionUnrealizedPnLRes = ProtoOAGetPositionUnrealizedPnLRes
         self._ProtoOAOrderListByPositionIdReq = ProtoOAOrderListByPositionIdReq
         self._ProtoOAOrderListByPositionIdRes = ProtoOAOrderListByPositionIdRes
         self._ProtoOADealListReq = ProtoOADealListReq
@@ -1027,6 +1368,10 @@ class CTraderLiveAdapter(BaseLiveAdapter):
 
         self._ProtoOASubscribeSpotsReq = ProtoOASubscribeSpotsReq
         self._ProtoOAUnsubscribeSpotsReq = ProtoOAUnsubscribeSpotsReq
+        self._ProtoOAGetTrendbarsReq = ProtoOAGetTrendbarsReq
+        self._ProtoOAGetTrendbarsRes = ProtoOAGetTrendbarsRes
+        self._ProtoOAAmendPositionSLTPReq = ProtoOAAmendPositionSLTPReq
+        self._ProtoOATrendbarPeriod = ProtoOATrendbarPeriod
 
         self._heartbeat_payload_type = ProtoHeartbeatEvent().payloadType
         self._spot_payload_type = ProtoOASpotEvent().payloadType
@@ -1107,7 +1452,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                         "CTRADER_REFRESH_TOKEN": refresh_token,
                     },
                 )
-            except Exception as exc:
+            except Exception as exc:  # except-kind: money-decision
                 logger.warning(
                     "cTrader tokens refreshed but could not be persisted",
                     extra={
@@ -1198,7 +1543,12 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             return
         try:
             payload = self._Protobuf.extract(message)
-        except Exception as exc:
+        except Exception as exc:  # except-kind: money-decision
+            if payload_type == self._execution_payload_type:
+                self._reconciliation_required = True
+                self._reconciliation_retry_at = 0.0
+                with contextlib.suppress(asyncio.QueueFull):
+                    self._execution_queue.put_nowait(_EXECUTION_RECONCILE_WAKE)
             logger.warning("Could not decode cTrader payload", extra={"data": {"error": str(exc)}})
             return
 
@@ -1211,6 +1561,8 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 self._execution_queue.put_nowait(payload)
             except asyncio.QueueFull:
                 self._reconciliation_required = True
+                with contextlib.suppress(asyncio.QueueFull):
+                    self._execution_queue.put_nowait(_EXECUTION_RECONCILE_WAKE)
                 logger.warning(
                     "cTrader execution queue is full; broker reconciliation required"
                 )
@@ -1323,7 +1675,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                         raise RuntimeError(
                             "Unexpected account auth response after refresh: "
                             f"{type(account_auth_res).__name__}"
-                        )
+                        ) from exc
                     self._authenticated = True
                 return await self._send_request_with_refresh_retry(
                     request, timeout_seconds=timeout_seconds, _depth=_depth + 1
@@ -1432,6 +1784,74 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             )
         return position_ids[0]
 
+    async def resolve_exit_position_target(
+        self, symbol: str, entry_signal_id: str
+    ) -> int | None:
+        """The open position ``entry_signal_id``'s order opened (#382).
+
+        Each candidate position's orders are read and the opening order's
+        ``clientOrderId`` (the persisted signal id, account-validated by
+        :meth:`_signal_id_for_position_order`) decides the match. ``None``
+        means no open position resolves to that entry - the caller then
+        fails closed on a multi-position book. An unreadable order list or a
+        signal matching several positions raises: guessing which lot a close
+        belongs to is exactly what this method exists to prevent.
+        """
+        upper = str(symbol or "").strip().upper()
+        position_ids = self._position_ids_by_symbol.get(upper, ())
+        if not position_ids:
+            return None
+        wanted = str(entry_signal_id or "").strip()
+        if not wanted:
+            return None
+        matches = await self._entry_matching_position_ids(position_ids, wanted, upper)
+        if len(matches) > 1:
+            raise ValueError(
+                f"cTrader entry {wanted} matches several open positions on "
+                f"{upper} ({matches}); refusing to guess the exit target."
+            )
+        return matches[0] if matches else None
+
+    async def _entry_matching_position_ids(
+        self, position_ids: tuple[int, ...], wanted: str, upper: str
+    ) -> list[int]:
+        """The positions whose opening orders belong exclusively to ``wanted``.
+
+        A position resolves only when its distinct opening-order identities
+        are exactly ``{wanted}``: every non-closing order must resolve to that
+        one entry signal, and no other opener - a sibling lot's signal, a
+        manual order, an exit signal this build cannot attribute - may share
+        the position (#382 maintainer decision). On a netted book several
+        entries merge into one position; matching it for one lot would let a
+        broker-sized full exit close the siblings' quantity too, so a shared
+        position returns no match and the exit sizes off the lot residual
+        instead. On a hedging book each position has exactly one opening
+        order, so the rule is a no-op there.
+        """
+        matches: list[int] = []
+        for position_id in position_ids:
+            orders = await self._position_orders_for_exit_target(position_id)
+            if orders is None:
+                raise ValueError(
+                    f"cTrader position {position_id} order list is unreadable; "
+                    "cannot resolve the exit target for "
+                    f"{wanted} on {upper}."
+                )
+            openers: set[str] = set()
+            for index, order in enumerate(getattr(orders, "order", []) or []):
+                if bool(getattr(order, "closingOrder", False)):
+                    continue
+                signal_id = await self._signal_id_for_position_order(order)
+                if signal_id:
+                    openers.add(signal_id)
+                else:
+                    # An opener this build cannot attribute still counts: it
+                    # is proof the position is NOT exclusively ``wanted``'s.
+                    openers.add(f"__unresolved_opener__{index}")
+            if openers == {wanted}:
+                matches.append(position_id)
+        return matches
+
     def _requested_exit_position_id(self, metadata: Mapping[str, Any]) -> int | None:
         raw_position_id = metadata.get("position_id")
         raw_position_ids = metadata.get("position_ids")
@@ -1469,6 +1889,43 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             "refusing to scale its volume with a guessed symbol."
         )
 
+    def _order_type_name(self, order: Any) -> str | None:
+        """The order's type name as the broker stated it (#134), or ``None``.
+
+        ``orderType`` is the protobuf enum's int value; the adapter's
+        ``ProtoOAOrderType`` wrapper names it. ``None`` when the payload or
+        the enum wrapper does not state one - never a fabricated type.
+        """
+        if order is None:
+            return None
+        raw = getattr(order, "orderType", None)
+        if raw is None:
+            return None
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            return None
+        name_fn = getattr(self._ProtoOAOrderType, "Name", None)
+        if not callable(name_fn):
+            return None
+        return _enum_name_or_none(name_fn, value)
+
+    def _requested_order_qty(self, order: Any, symbol: str) -> float | None:
+        """The order's requested volume converted to qty units (#134).
+
+        ``ProtoOAOrder`` carries no root ``volume``: the requested volume lives
+        in ``order.tradeData.volume`` in broker volume units, converted with
+        the same symbol scale the fill uses. ``None`` when the order is absent
+        or states no positive volume - never an invented quantity.
+        """
+        if order is None:
+            return None
+        trade_data = getattr(order, "tradeData", None)
+        volume = _to_float(getattr(trade_data, "volume", 0), default=0.0)
+        if volume <= 0.0:
+            return None
+        return _broker_volume_to_qty(volume, self._scale_for(symbol).volume_per_qty)
+
     async def _load_symbols_into_cache(self) -> None:
         symbols_req = self._ProtoOASymbolsListReq()
         symbols_req.ctidTraderAccountId = self.ctid_trader_account_id
@@ -1488,8 +1945,9 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._symbol_name_to_id = symbol_name_to_id
         self._symbol_assets = symbol_assets
         # #80: broker-API symbol properties (digits/lotSize/minVolume) are the
-        # source of truth for per-symbol scales. Best-effort: the light list
-        # above stays authoritative for ids when the detail fetch fails.
+        # source of truth for per-symbol scales. Required: a failed or
+        # unexpected detail fetch aborts authentication rather than letting
+        # _scale_for fall back to static scales that can misstate size.
         await self._load_symbol_props_into_cache(symbol_name_to_id)
         self._authenticated = True
 
@@ -1503,9 +1961,11 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         """
         if not symbol_name_to_id:
             self._symbol_props.clear()
+            self._symbol_leverage_ids.clear()
             return
         for name in symbol_name_to_id:
             self._symbol_props.pop(name, None)
+            self._symbol_leverage_ids.pop(name, None)
         try:
             from ctrader_open_api.messages.OpenApiMessages_pb2 import (
                 ProtoOASymbolByIdReq,
@@ -1521,23 +1981,38 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             detail_res = await self._send_request_with_refresh_retry(
                 detail_req, timeout_seconds=15
             )
-        except Exception:
+        except Exception as exc:  # except-kind: money-decision
             logger.warning(
-                "cTrader symbol-props fetch failed; using fallback scales",
-                extra={"data": {"account_id": self.ctid_trader_account_id}},
+                "cTrader symbol-props fetch failed; refusing fallback scales",
+                extra={
+                    "data": {
+                        "account_id": self.ctid_trader_account_id,
+                        "error": str(exc),
+                    }
+                },
             )
-            return
+            raise
         if not isinstance(detail_res, ProtoOASymbolByIdRes):
-            return
+            raise RuntimeError(
+                f"Unexpected symbol-props response: {type(detail_res).__name__}; "
+                "refusing to authenticate with fallback scales."
+            )
         # Archived entries first so live properties always win on collision.
         for detail in list(getattr(detail_res, "archivedSymbol", [])) + list(detail_res.symbol):
             try:
                 sid = int(detail.symbolId)
             except (TypeError, ValueError):
                 continue
-            name = id_to_name.get(sid)
+            name = id_to_name.get(sid)  # type: ignore[assignment]  # name reused with a wider type across branches
             if name is None:
                 continue
+            # #240: the symbol's dynamic-leverage id rides on the same detail
+            # payload. Archived entries come first, so a live entry's id wins.
+            leverage_id = _optional_int(getattr(detail, "leverageId", None))
+            if leverage_id is not None and leverage_id > 0:
+                self._symbol_leverage_ids[name] = leverage_id
+            else:
+                self._symbol_leverage_ids.pop(name, None)
             fallback = _fallback_symbol_scale(name) if _fallback_scale_class(name) else None
             scale = _symbol_scale_from_broker_props(
                 digits=getattr(detail, "digits", None),
@@ -1548,6 +2023,42 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             )
             if scale is not None:
                 self._symbol_props[name] = scale
+            self._persist_symbol_venue_calendar(detail, name)
+
+    def _persist_symbol_venue_calendar(self, detail: Any, name: str) -> None:
+        """Cache ProtoOASymbol schedule/timezone/holidays as a venue calendar.
+
+        The same ProtoOASymbolById response already carries the broker's
+        session schedule; persisting it lets coverage gates and live checks
+        share one authoritative calendar (#133). Best-effort per symbol.
+        """
+        try:
+            schedule = list(getattr(detail, "schedule", []) or [])
+            holidays = list(getattr(detail, "holiday", []) or [])
+            if not schedule and not holidays:
+                return
+            timezone_name = str(getattr(detail, "scheduleTimeZone", "") or "")
+            if not timezone_name.strip():
+                # Schedule seconds are relative to the broker zone; caching
+                # them as UTC would misplace every session boundary, so an
+                # absent timezone means no cache — the venue stays unresolved
+                # and coverage fails closed.
+                return
+            payload = venue_calendar.ctrader_schedule_payload(
+                symbol=name,
+                schedule=schedule,
+                schedule_timezone=timezone_name,
+                holidays=holidays,
+            )
+            venue_calendar.save_cached_calendar(
+                data_dir=DATA_DIR, source="ctrader", symbol=name, payload=payload
+            )
+        except Exception:  # except-kind: loop-survival
+            logger.warning(
+                "cTrader venue-calendar cache write failed for %s",
+                name,
+                exc_info=True,
+            )
 
     def _extract_order_id_from_payload(self, payload: Any) -> int | None:
         if isinstance(payload, self._ProtoOAExecutionEvent):
@@ -1573,7 +2084,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         when less than one step remains.
         """
         step_qty = float(max(int(scale.step_volume), 1)) / float(scale.volume_per_qty)
-        floored_qty = round_exit_qty_down(qty, step_qty)
+        floored_qty = floor_qty_to_step(qty, step_qty)
         if floored_qty <= 0.0:
             raise ExitBelowStepError(
                 f"cTrader exit for {symbol} ignored: the requested qty {qty:g} is below "
@@ -1581,8 +2092,9 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 requested_qty=qty,
                 qty_step=step_qty,
             )
-        # A whole number of steps: round() only removes float noise here.
-        return int(round(floored_qty * float(scale.volume_per_qty)))
+        # A whole number of steps: round() on a float returns an int, and this
+        # only removes float noise.
+        return round(floored_qty * float(scale.volume_per_qty))
 
     def _resolve_order_volume(self, signal: LiveSignal) -> int:
         """Resolve broker volume from the binding risk-engine ``qty``."""
@@ -1695,7 +2207,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 except CTraderAuthTerminalError as exc:
                     self._handle_terminal_auth_failure(exc)
                     raise
-                except Exception as exc:
+                except Exception as exc:  # except-kind: money-decision
                     await self._retry_or_raise_connect_failure(
                         exc, attempt, max_attempts, base_delay
                     )
@@ -1721,7 +2233,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             await self.reconcile_executions()
         except CTraderAuthTerminalError:
             raise
-        except Exception as exc:
+        except Exception as exc:  # except-kind: money-decision
             self._reconciliation_required = True
             self._reconciliation_retry_at = 0.0
             logger.warning(
@@ -1804,7 +2316,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             await asyncio.sleep(delay)
             return
         self._log_connect_failure(exc, error_text, message)
-        raise
+        raise exc
 
     def _log_connect_failure(
         self, exc: Exception, error_text: str, message: str
@@ -1903,11 +2415,11 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 stop = getattr(client, "stopService", None)
                 if stop is not None:
                     stop()
-            except Exception:
+            except Exception:  # except-kind: loop-survival
                 pass
         try:
             self._connected_event.clear()
-        except Exception:
+        except Exception:  # except-kind: loop-survival
             pass
 
     async def _recover_broker_order_id(
@@ -2216,10 +2728,17 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             actual_price=self._resolve_execution_price(order=order, deal=deal),
             actual_price_observed=self._execution_price_presence(order=order, deal=deal),
             filled_qty=filled_qty,
-            commission=_deal_commission(deal),
+            commission=_deal_commission(
+                deal,
+                # ``getattr``: tests build partial adapters via ``__new__`` without
+                # ``__init__``; a missing set only means the ERROR is not deduped.
+                rebate_logged=getattr(self, "_rebate_logged_deal_ids", None),
+            ),
             timestamp=_to_datetime_from_ms(timestamp_ms),
             broker_order_id=broker_order_id,
             dedupe_key=f"ctrader:deal:{deal_id}",
+            order_type=self._order_type_name(order),
+            requested_qty=self._requested_order_qty(order, deal_symbol),
             # The deal id is positive here - this path returns early when `deal_id <= 0` - so the
             # stored value is the broker's real id, not a sentinel.
             broker_fill_id=_deal_id_or_none(deal),
@@ -2298,10 +2817,13 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._symbol_name_to_id.clear()
         self._order_id_to_signal_id.clear()
         self._position_ids_by_symbol.clear()
+        self._position_volumes.clear()
+        self._position_orders_cache.clear()
         # #80: props and order-symbol mappings are session state — a
         # reconnect must re-fetch broker props, never trade on stale scales,
         # and the order map must not grow unboundedly across sessions.
         self._symbol_props.clear()
+        self._symbol_leverage_ids.clear()
         self._symbol_assets.clear()
         self._deposit_asset_id = None
         self._asset_names.clear()
@@ -2445,12 +2967,10 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 )
                 self._resolve_order_volume(signal)
 
-            canonical_signal_id, created = await asyncio.to_thread(
-                save_live_signal, signal
-            )
-            if not created:
-                return await self._recover_duplicate_signal_order_id(canonical_signal_id)
-
+            # Build the broker request BEFORE persisting: a refusal here
+            # (unknown symbol, missing SL/TP) must not leave a live_signals
+            # row that reads as "an order may exist" and routes retries into
+            # the persisted-signal recovery path.
             symbol_id = await self._resolve_symbol_id(signal.symbol)
             if exit_only:
                 if position_id is None:
@@ -2461,7 +2981,17 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 )
             else:
                 request = self._build_new_order_request(signal, symbol_id=symbol_id)
+
+            canonical_signal_id, created = await asyncio.to_thread(
+                save_live_signal, signal
+            )
+            if not created:
+                return await self._recover_duplicate_signal_order_id(canonical_signal_id)
+        # #134: bracket the broker call with the order-timing stamps, persisted
+        # with the order id once the broker answers.
+        submitted_at = datetime.now(timezone.utc)
         response = await self._submit_new_order_request(request)
+        acknowledged_at = datetime.now(timezone.utc)
 
         order_id = self._extract_order_id_from_payload(response)
         if order_id is None:
@@ -2475,7 +3005,11 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             )
         broker_order_id = str(order_id)
         persisted = await asyncio.to_thread(
-            set_live_signal_broker_order_id, canonical_signal_id, broker_order_id
+            set_live_signal_broker_order_id,
+            canonical_signal_id,
+            broker_order_id,
+            submitted_at=submitted_at,
+            acknowledged_at=acknowledged_at,
         )
         if not persisted:
             raise RuntimeError("Failed to persist cTrader broker order id.")
@@ -2548,7 +3082,12 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             ),
         )
 
-    async def _resolve_symbol_id(self, symbol: str) -> int | None:
+    async def _resolve_symbol_id(self, symbol: str) -> int:
+        """Resolve a symbol to its broker id, raising when it is unknown.
+
+        The return is declared ``int``, never ``int | None``: both lookup
+        misses raise, so a ``None`` return would be unrepresentable.
+        """
         symbol_id = self._symbol_name_to_id.get(symbol.upper())
         if symbol_id is None:
             await self._authenticate()
@@ -2574,7 +3113,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         ):
             raise ValueError("cTrader close position id must be positive integer.")
         volume_value = coerce_positive_live_qty(volume, field_name="cTrader close volume")
-        broker_volume = int(round(volume_value))
+        broker_volume = round(volume_value)
         if broker_volume <= 0:
             raise ValueError("cTrader close volume must be a positive integer.")
         request = self._ProtoOAClosePositionReq()
@@ -2754,7 +3293,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         request.symbolId.append(int(symbol_id))
         try:
             await self._send_request_with_refresh_retry(request, timeout_seconds=10)
-        except Exception as exc:
+        except Exception as exc:  # except-kind: loop-survival
             logger.warning(
                 "cTrader spot unsubscribe failed",
                 extra={
@@ -2809,6 +3348,106 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             finally:
                 self._spot_waiters.pop(symbol_id, None)
                 await self._unsubscribe_spot(symbol_id)
+
+    def supports_market_data_timeframe(self, timeframe: str) -> bool:
+        """Whether :meth:`get_market_data` can serve ``timeframe`` (#168).
+
+        Only canonical deployment spellings count: the per-broker trailing
+        table and the deployment gates compare the raw timeframe string, so
+        an alias like ``60min`` must not pass here and then fail there (or
+        vice versa). ``get_market_data`` itself accepts the aliases.
+        """
+        normalized = str(timeframe or "").strip().lower()
+        return normalized in CTRADER_MARKET_DATA_TIMEFRAMES
+
+    async def get_market_data(
+        self,
+        symbol: str,
+        *,
+        timeframe: str,
+        limit: int = 200,
+    ) -> pd.DataFrame:
+        """Recent closed trendbars for ``symbol`` on ``timeframe`` (#168).
+
+        Fetches ``ProtoOAGetTrendbarsReq`` history and decodes the
+        delta-encoded ``ProtoOATrendbar`` rows into the same OHLCV frame
+        shape the Alpaca adapter returns (``timestamp`` tz-aware UTC,
+        ascending, ``tail(limit)``). The still-forming bar is excluded: a
+        bar counts only once ``open + period <= now``, so no consumer can
+        read a close that has not happened yet.
+
+        Raises ``ValueError`` on an unsupported timeframe, an unknown
+        symbol, an unusable bar or an empty result — a workflow that cannot
+        see its bars must not guess at them.
+        """
+        self._raise_if_terminal_auth_failed()
+        normalized = str(symbol or "").strip().upper()
+        if not normalized:
+            raise ValueError("symbol is required for cTrader market data")
+        period_name = _trendbar_period_for_timeframe(timeframe)
+        if period_name is None:
+            raise ValueError(
+                f"cTrader cannot serve {timeframe!r} market data "
+                f"(supported: {', '.join(sorted(CTRADER_MARKET_DATA_TIMEFRAMES))})"
+            )
+        period_seconds = _TRENDBAR_PERIOD_SECONDS[period_name]
+        if (
+            self._ProtoOAGetTrendbarsReq is None
+            or self._ProtoOAGetTrendbarsRes is None
+            or self._ProtoOATrendbarPeriod is None
+        ):
+            raise RuntimeError("cTrader trendbar message types are not loaded")
+        if not self._connected or not self._authenticated:
+            await self.connect()
+        self._raise_if_terminal_auth_failed()
+        symbol_id = await self._resolve_symbol_id(normalized)
+        scale = self._scale_for(normalized)
+        bounded_limit = max(1, min(int(limit), 1000))
+        now = _utc_now()
+        # The window is wider than count*period on purpose: weekends and
+        # session gaps mean `count` calendar periods hold fewer bars, and a
+        # too-narrow window would silently truncate the history the
+        # supertrend warm-up needs.
+        window_seconds = period_seconds * bounded_limit * 3
+        request = self._ProtoOAGetTrendbarsReq()
+        request.ctidTraderAccountId = self.ctid_trader_account_id
+        request.symbolId = int(symbol_id)
+        request.period = getattr(self._ProtoOATrendbarPeriod, period_name)
+        request.count = bounded_limit
+        request.fromTimestamp = int((now - timedelta(seconds=window_seconds)).timestamp() * 1000)
+        request.toTimestamp = int(now.timestamp() * 1000)
+        try:
+            response = await self._send_request_with_refresh_retry(
+                request, timeout_seconds=20
+            )
+        except CTraderApiError as exc:
+            self._raise_terminal_auth_from_api_error(exc)
+            raise
+        if not isinstance(response, self._ProtoOAGetTrendbarsRes):
+            raise RuntimeError(
+                f"Unexpected cTrader trendbars response: {type(response).__name__}"
+            )
+        rows = decode_trendbars_response(
+            response, symbol=normalized, price_digits=scale.price_digits
+        )
+        frame = pd.DataFrame(rows)
+        if frame.empty:
+            raise ValueError(
+                f"cTrader returned no {timeframe} trendbars for {normalized}"
+            )
+        frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True)
+        # Closed-bar detection: the bar whose period has not fully elapsed is
+        # still forming and must not reach a consumer as if it were closed.
+        closed = frame[
+            frame["timestamp"] + pd.to_timedelta(period_seconds, unit="s") <= now
+        ]
+        frame = closed.tail(bounded_limit).reset_index(drop=True)
+        if frame.empty:
+            raise ValueError(
+                f"cTrader returned only the still-forming {timeframe} bar for "
+                f"{normalized}; no closed bar is available yet"
+            )
+        return frame
 
     async def get_pip_value(self, symbol: str) -> LivePipValue:
         """Account-currency value of one qty unit per 1.0 price move (#146).
@@ -2920,7 +3559,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 self._asset_names = {
                     int(asset.assetId): str(asset.name) for asset in response.asset
                 }
-        except Exception as exc:
+        except Exception as exc:  # except-kind: loop-survival
             logger.warning(
                 "cTrader asset list unavailable; pip value record keeps asset ids",
                 extra={"data": {"account_id": self.ctid_trader_account_id, "error": str(exc)}},
@@ -2999,6 +3638,114 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             raise ValueError(f"cTrader conversion rate for {label} is not positive: {rate!r}")
         return rate, tuple(symbols), tuple(quotes)
 
+    async def get_max_leverage(self, symbol: str) -> float | None:
+        """The broker's maximum leverage for this account and ``symbol`` (#240).
+
+        Two broker-granted ceilings bound the answer and the tighter one wins:
+
+        * the symbol's dynamic-leverage tiers — ``ProtoOASymbol.leverageId``,
+          captured with the symbol props, resolves through
+          ``ProtoOAGetDynamicLeverageByIDReq`` into volume tiers sorted
+          ascending by volume. ``ProtoOADynamicLeverageTier.leverage`` is in
+          the cents convention (1:200 is ``20000``): Spotware's own Open API
+          example divides the field by 100 before display, so the plain ratio
+          is ``value / 100``. Leverage shrinks as position volume grows, so
+          the maximum sits in the first tier — an upper bound: a larger order
+          is margined at a lower tier, which the broker still enforces;
+        * the account's own leverage — ``ProtoOATrader.leverageInCents`` is
+          the leverage the account actually trades at. Spotware's example
+          computes the effective leverage as
+          ``min(trader.leverageInCents, tier.leverage) / 100``, so an account
+          set to 1:50 on a symbol offering 1:500 is capped at 50 — the tier
+          alone would overstate what the broker will margin.
+          ``ProtoOATrader.maxLeverage`` is deliberately *not* read: it is a
+          plain uint32 named without an "InCents" suffix (Spotware uses it to
+          validate leverage *changes*, not margining), the broker already
+          validates ``leverageInCents`` against it so it can never be the
+          tighter bound, and reading it in the wrong unit would silently
+          shrink every order.
+
+        The account leg degrades on its own (no readable trader record or an
+        unset/nonpositive field contributes nothing), while a failed tier
+        request fails the whole lookup closed — ``None``, never a partial
+        answer — so callers treat ``None`` as 1x.
+        """
+        try:
+            self._raise_if_terminal_auth_failed()
+            if not self._connected or not self._authenticated:
+                await self.connect()
+            self._raise_if_terminal_auth_failed()
+
+            account_cents = await self._account_leverage_cents()
+
+            tier_cents: float | None = None
+            if (
+                self._ProtoOAGetDynamicLeverageByIDReq is not None
+                and self._ProtoOAGetDynamicLeverageByIDRes is not None
+            ):
+                leverage_id = self._symbol_leverage_ids.get(
+                    str(symbol or "").strip().upper()
+                )
+                if leverage_id is not None:
+                    request = self._ProtoOAGetDynamicLeverageByIDReq()
+                    request.ctidTraderAccountId = self.ctid_trader_account_id
+                    request.leverageId = int(leverage_id)
+                    response = await self._send_request_with_refresh_retry(
+                        request, timeout_seconds=10
+                    )
+                    if isinstance(
+                        response, self._ProtoOAGetDynamicLeverageByIDRes
+                    ):
+                        leverage_msg = getattr(response, "leverage", None)
+                        tiers = (
+                            getattr(leverage_msg, "tiers", None)
+                            if leverage_msg is not None
+                            else None
+                        )
+                        values = [
+                            value
+                            for tier in tiers or []
+                            if (value := _optional_float(getattr(tier, "leverage", None)))
+                            is not None
+                            and math.isfinite(value)
+                            and value > 0
+                        ]
+                        if values:
+                            tier_cents = max(values)
+
+            candidates = [cents for cents in (tier_cents, account_cents) if cents is not None]
+            return min(candidates) / 100.0 if candidates else None
+        except Exception as exc:  # except-kind: money-decision
+            logger.warning(
+                "cTrader max leverage lookup failed; treating it as unknown (1x)",
+                extra={"data": {"symbol": symbol, "error": repr(exc)}},
+            )
+            return None
+
+    async def _account_leverage_cents(self) -> float | None:
+        """The account's own leverage in cents, or ``None``.
+
+        Reads ``ProtoOATrader.leverageInCents`` — the leverage the account
+        actually trades at — which is the account-side bound the symbol
+        tiers are clamped against. ``maxLeverage`` is not read: its unit is
+        unverified and it is only the broker's ceiling for *changing*
+        leverage, which ``leverageInCents`` is already validated against.
+        An unreadable trader record or an unset/nonpositive field degrades
+        to ``None`` — the tier leg may still answer on its own.
+        """
+        try:
+            trader = await self._fetch_trader()
+        except Exception as exc:  # except-kind: money-decision
+            logger.warning(
+                "cTrader trader leverage lookup failed; using the symbol tiers only",
+                extra={"data": {"error": repr(exc)}},
+            )
+            return None
+        value = _optional_float(getattr(trader, "leverageInCents", None))
+        if value is None or not math.isfinite(value) or value <= 0:
+            return None
+        return value
+
     async def _fetch_trader(self) -> Any:
         """The account's ``ProtoOATrader`` (balance, money digits, deposit asset)."""
         self._raise_if_terminal_auth_failed()
@@ -3020,15 +3767,177 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             raise RuntimeError(f"Unexpected trader response: {type(trader_res).__name__}")
         return trader_res.trader
 
+    async def account_type(self) -> str | None:
+        """The account's ``ProtoOAAccountType`` as ``hedged``/``netted``/``spread_betting``.
+
+        ``None`` when the trader record cannot be read or carries a type this
+        build does not know - callers must treat "not proven hedged" as the
+        unsafe case (#382: ``internal_max_open_per_symbol > 1`` is refused on
+        cTrader accounts that cannot prove they hedge positions). Only a
+        successful read is cached permanently; an unreadable read is
+        negatively cached for ``_ACCOUNT_TYPE_RETRY_SECONDS`` so a broker
+        outage does not cost a request timeout on every runner pass, and
+        never pins "unknown" past the window.
+        """
+        if self._account_type is not None:
+            return self._account_type
+        now = time.monotonic()
+        if (
+            self._account_type_unreadable_at is not None
+            and now - self._account_type_unreadable_at < _ACCOUNT_TYPE_RETRY_SECONDS
+        ):
+            return None
+        try:
+            trader = await self._fetch_trader()
+        except Exception:  # except-kind: money-decision
+            self._account_type_unreadable_at = now
+            return None
+        # ``accountType`` is a proto2 optional whose declared default is
+        # HEDGED: a trader record that does not carry the field reads as
+        # ``0`` -> "hedged", which would fail OPEN on exactly the guard this
+        # read exists for. ``HasField`` is the only proof the broker stated
+        # a type; stubs without it (SimpleNamespace) keep the getattr path.
+        if hasattr(trader, "HasField") and not trader.HasField("accountType"):
+            self._account_type_unreadable_at = time.monotonic()
+            return None
+        try:
+            raw_type = int(getattr(trader, "accountType", -1))
+        except (TypeError, ValueError):
+            self._account_type_unreadable_at = time.monotonic()
+            return None
+        name = _CTRADER_ACCOUNT_TYPES.get(raw_type)
+        if name is None:
+            self._account_type_unreadable_at = time.monotonic()
+            return None
+        self._account_type = name
+        return name
+
+    async def _fetch_position_unrealized_pnl(self, fallback_money_digits: int) -> float:
+        """Summed net unrealized P&L of all open positions, in account currency.
+
+        ``ProtoOAGetPositionUnrealizedPnLRes`` reports one entry per open
+        position with ``grossUnrealizedPnL``/``netUnrealizedPnL`` in money
+        digits; the net figure (after accrued swap/commission) is what the
+        account's equity actually carries. The response carries its own
+        ``moneyDigits``; the trader's digits are the fallback when it is unset.
+        Any failure raises - the caller treats unreadable equity as unreadable,
+        never as "no unrealized loss".
+        """
+        from ctrader_open_api.messages.OpenApiMessages_pb2 import (
+            ProtoOAGetPositionUnrealizedPnLReq,
+            ProtoOAGetPositionUnrealizedPnLRes,
+        )
+
+        self._raise_if_terminal_auth_failed()
+        if not self._connected or not self._authenticated:
+            await self.connect()
+
+        self._raise_if_terminal_auth_failed()
+        request = ProtoOAGetPositionUnrealizedPnLReq()
+        request.ctidTraderAccountId = self.ctid_trader_account_id
+        try:
+            response = await self._send_request_with_refresh_retry(
+                request, timeout_seconds=15
+            )
+        except CTraderApiError as exc:
+            self._raise_terminal_auth_from_api_error(exc)
+            raise
+        if not isinstance(response, ProtoOAGetPositionUnrealizedPnLRes):
+            raise RuntimeError(
+                f"Unexpected unrealized PnL response: {type(response).__name__}"
+            )
+        digits = int(getattr(response, "moneyDigits", 0) or 0)
+        if digits <= 0:
+            digits = int(fallback_money_digits or 0)
+        scale = money_scale(digits)
+        total = 0.0
+        for position_pnl in response.positionUnrealizedPnL:
+            # Fail closed per entry (#302): an unreadable or non-finite
+            # netUnrealizedPnL read as 0.0 would understate a losing position
+            # and overstate equity - the unsafe direction for both the loss
+            # breaker and the pre-submit caps' free-margin ceiling.
+            # ``parse_money`` raises ``MoneyParseError`` on a missing or
+            # garbage field, so the whole equity read fails closed.
+            total += parse_money(getattr(position_pnl, "netUnrealizedPnL", None)) / scale
+        return total
+
     async def get_balance(self) -> tuple[float, float]:
         trader = await self._fetch_trader()
         money_digits = money_digits_from_trader(trader)
         scale = money_scale(money_digits)
-        balance = _to_float(getattr(trader, "balance", 0)) / scale
+        balance = parse_money(getattr(trader, "balance", 0)) / scale
         equity = balance
         if hasattr(trader, "equity"):
-            equity = _to_float(getattr(trader, "equity", balance)) / scale
+            raw_equity = parse_optional(getattr(trader, "equity", None))
+            if raw_equity is not None:
+                equity = raw_equity / scale
         return balance, equity
+
+    async def get_used_margin(self) -> float | None:
+        """Margin held against open positions, summed in account currency (#359).
+
+        Sums the broker-reported ``ProtoOAPosition.usedMargin`` of every OPEN
+        position — cTrader has already applied each position's own leverage
+        (account leverage clamped by the symbol's volume tier), so no leverage
+        lookup is needed here. ``None`` when the reconcile or any open
+        position's margin figure is unreadable: a partial sum would understate
+        used margin and overstate the free margin the pre-submit caps judge
+        the order against.
+        """
+        try:
+            self._raise_if_terminal_auth_failed()
+            if not self._connected or not self._authenticated:
+                await self.connect()
+            reconcile_res = await self._reconcile_state()
+            total = 0.0
+            for position in getattr(reconcile_res, "position", []) or []:
+                status = int(getattr(position, "positionStatus", 0) or 0)
+                if status != self._ProtoOAPositionStatus.POSITION_STATUS_OPEN:
+                    continue
+                used = _optional_float(getattr(position, "usedMargin", None))
+                digits = getattr(position, "moneyDigits", None)
+                if used is None or used < 0 or digits is None:
+                    return None
+                try:
+                    digits_int = int(digits)
+                except (TypeError, ValueError, OverflowError):
+                    return None
+                if digits_int < 0:
+                    return None
+                total += used / money_scale(digits_int)
+            return total
+        except Exception as exc:  # except-kind: money-decision
+            logger.warning(
+                "cTrader used-margin lookup failed; treating it as unknown",
+                extra={"data": {"error": repr(exc)}},
+            )
+            return None
+
+    async def get_equity(self) -> float:
+        """Account equity including unrealized P&L, for the loss breaker (#301).
+
+        Deliberately a separate path from :meth:`get_balance`: the #267
+        maintainer decision keeps position sizing on realized balance, so
+        ``get_balance`` must not start carrying unrealized P&L. The loss
+        breaker (#301) and the pre-submit caps' free-margin ceiling (#302,
+        #359) read this. ``ProtoOATrader`` has no equity field, so equity
+        is balance plus the summed net unrealized P&L of open positions -
+        reporting balance here would hide an open losing position until it
+        closes. Any failure raises: unreadable equity is never "no loss".
+        """
+        trader = await self._fetch_trader()
+        money_digits = money_digits_from_trader(trader)
+        scale = money_scale(money_digits)
+        balance = parse_money(getattr(trader, "balance", None)) / scale
+        if hasattr(trader, "equity"):
+            # A trader payload that carries its own equity field is trusted to
+            # include unrealized P&L already (ProtoOATrader does not). An
+            # absent field falls back to balance plus unrealized P&L; a
+            # present-but-unreadable one raises via parse_optional.
+            raw_equity = parse_optional(getattr(trader, "equity", None))
+            if raw_equity is not None:
+                return raw_equity / scale
+        return balance + await self._fetch_position_unrealized_pnl(money_digits)
 
     @property
     def supports_cancel_orders(self) -> bool:
@@ -3255,6 +4164,181 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 ids.add(client_order_id)
         return ids
 
+    async def list_reconciliation_orders(self) -> list[BrokerOrderView]:
+        """Working orders with client ids and position-protection marks (#303)."""
+        reconcile_res = await self._reconcile_state()
+        trade_side_enum = getattr(self, "_ProtoOATradeSide", None)
+        if trade_side_enum is None:
+            raise ValueError("cTrader trade-side enum is unavailable")
+        try:
+            buy_side = int(trade_side_enum.BUY)
+            sell_side = int(trade_side_enum.SELL)
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise ValueError("cTrader trade-side enum is unreadable") from exc
+
+        def _trade_int(value: Any, field: str, order_key: str) -> int:
+            if isinstance(value, bool):
+                raise ValueError(
+                    f"cTrader working order {order_key} has unreadable tradeData.{field}"
+                )
+            try:
+                number = int(value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"cTrader working order {order_key} has unreadable tradeData.{field}"
+                ) from exc
+            if isinstance(value, float) and not value.is_integer():
+                raise ValueError(
+                    f"cTrader working order {order_key} has unreadable tradeData.{field}"
+                )
+            return number
+
+        views: list[BrokerOrderView] = []
+        for order in getattr(reconcile_res, "order", []) or []:
+            if not self._is_working_order(order):
+                continue
+            try:
+                order_type = int(getattr(order, "orderType", 0) or 0)
+            except (TypeError, ValueError):
+                order_type = 0
+            order_id = self._positive_int(getattr(order, "orderId", 0))
+            client_order_id = str(getattr(order, "clientOrderId", "") or "").strip()
+            key = str(order_id) if order_id is not None else client_order_id
+            if not key:
+                continue
+
+            # ProtoOAOrder carries symbol, volume and side under tradeData,
+            # not at the message root. A missing or malformed tradeData makes
+            # the whole broker read unreadable: emitting a blank/zero view
+            # would let reconciliation treat an unpriced order as accounted
+            # for instead of failing closed.
+            trade_data = getattr(order, "tradeData", None)
+            if trade_data is None:
+                raise ValueError(f"cTrader working order {key} has no tradeData")
+            symbol_id = _trade_int(
+                getattr(trade_data, "symbolId", 0), "symbolId", key
+            )
+            if symbol_id <= 0:
+                raise ValueError(
+                    f"cTrader working order {key} has no tradeData.symbolId"
+                )
+            symbol = self._symbol_name_for_id(symbol_id)
+
+            volume_raw = getattr(trade_data, "volume", 0)
+            if isinstance(volume_raw, bool):
+                raise ValueError(
+                    f"cTrader working order {key} has unreadable tradeData.volume"
+                )
+            try:
+                volume = float(volume_raw)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"cTrader working order {key} has unreadable tradeData.volume"
+                ) from exc
+            if not math.isfinite(volume) or volume <= 0:
+                raise ValueError(
+                    f"cTrader working order {key} has non-positive tradeData.volume"
+                )
+
+            trade_side = _trade_int(
+                getattr(trade_data, "tradeSide", 0), "tradeSide", key
+            )
+            if trade_side == buy_side:
+                side = "buy"
+            elif trade_side == sell_side:
+                side = "sell"
+            else:
+                raise ValueError(
+                    f"cTrader working order {key} has unknown tradeData.tradeSide"
+                )
+
+            scale = self._scale_for(symbol)
+            qty = _broker_volume_to_qty(volume, scale.volume_per_qty)
+            if not math.isfinite(qty) or qty <= 0:
+                raise ValueError(
+                    f"cTrader working order {key} has unreadable tradeData volume"
+                )
+
+            protection = order_type == int(self._ProtoOAOrderType.STOP_LOSS_TAKE_PROFIT)
+            views.append(
+                BrokerOrderView(
+                    order_id=key,
+                    client_order_id=client_order_id,
+                    symbol=symbol,
+                    side=side,
+                    qty=qty,
+                    order_type=str(order_type),
+                    protection=protection,
+                )
+            )
+        return views
+
+    async def get_order_state(self, order_id: str, *, client_order_id: str = "") -> str | None:
+        """Working/terminal state of one order for reconciliation (#303).
+
+        ``ProtoOAOrderDetailsReq`` answers for a specific order id, including
+        orders no longer working. ``None`` - a transport error, an unknown
+        order, a missing status or a status this client cannot name - always
+        fails closed: the reconciler keeps its finding.
+        """
+        order_id_int = self._coerce_broker_order_id(order_id)
+        if order_id_int is None:
+            return None
+        self._raise_if_terminal_auth_failed()
+        if not self._connected or not self._authenticated:
+            await self.connect()
+        self._raise_if_terminal_auth_failed()
+        if (
+            self._ProtoOAOrderDetailsReq is None
+            or self._ProtoOAOrderDetailsRes is None
+            or self._ProtoOAOrderStatus is None
+        ):
+            return None
+        details_req = self._ProtoOAOrderDetailsReq()
+        details_req.ctidTraderAccountId = self.ctid_trader_account_id
+        details_req.orderId = order_id_int
+        try:
+            details_res = await self._send_request_with_refresh_retry(
+                details_req, timeout_seconds=15
+            )
+        except CTraderApiError:
+            return None
+        if not isinstance(details_res, self._ProtoOAOrderDetailsRes):
+            return None
+        order = getattr(details_res, "order", None)
+        if order is None:
+            return None
+        # ``orderStatus`` defaults to ACCEPTED on an unset order, so a broker
+        # response without a real order id must read as unknown, not working.
+        if not getattr(order, "orderId", 0):
+            return None
+        raw_status = getattr(order, "orderStatus", None)
+        if raw_status is None:
+            raw_status = getattr(order, "status", None)
+        if raw_status is None:
+            return None
+        try:
+            status = int(raw_status)
+        except (TypeError, ValueError):
+            return None
+        status_enum = self._ProtoOAOrderStatus
+        if status == int(status_enum.ORDER_STATUS_ACCEPTED):
+            return ORDER_STATE_WORKING
+        if status == int(status_enum.ORDER_STATUS_FILLED):
+            return ORDER_STATE_FILLED
+        terminal = {
+            int(getattr(status_enum, name))
+            for name in (
+                "ORDER_STATUS_REJECTED",
+                "ORDER_STATUS_EXPIRED",
+                "ORDER_STATUS_CANCELLED",
+            )
+            if getattr(status_enum, name, None) is not None
+        }
+        if status in terminal:
+            return ORDER_STATE_TERMINAL
+        return None
+
     def position_qty_tolerance(self, symbol: str) -> float:
         """Half of one broker volume unit, in qty units, for ``symbol``.
 
@@ -3316,6 +4400,95 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 logger.warning(
                     "cTrader refused to cancel order %s: %s. Continuing the sweep - the "
                     "remaining orders still need cancelling.",
+                    order_id,
+                    exc,
+                )
+                continue
+            cancelled += 1
+        return ControlOutcome(
+            completed=cancelled,
+            unidentified=tuple(unidentified),
+            failed=tuple(failed),
+        )
+
+    async def cancel_orders(
+        self, order_refs: Collection[str], *, symbol: str
+    ) -> ControlOutcome:
+        """Cancel the working orders ``order_refs`` names on ``symbol`` (#382).
+
+        Matches a working order on its broker ``orderId`` or its
+        ``clientOrderId`` (the persisted signal id) and only when the order's
+        symbol is ``symbol``. The same type gate as
+        :meth:`cancel_open_orders` applies, so attached position protections
+        (``STOP_LOSS_TAKE_PROFIT``) can never be caught by a ref that
+        happens to collide: they are not in the cancellable set at all.
+        """
+        wanted_symbol = str(symbol or "").strip().upper()
+        refs = {str(ref).strip() for ref in order_refs if str(ref or "").strip()}
+        if not refs or not wanted_symbol:
+            return ControlOutcome()
+        reconcile_res = await self._reconcile_state()
+        cancellable = {
+            int(self._ProtoOAOrderType.LIMIT),
+            int(self._ProtoOAOrderType.STOP),
+            int(self._ProtoOAOrderType.STOP_LIMIT),
+        }
+        cancelled = 0
+        unidentified: list[str] = []
+        failed: list[str] = []
+        for order in getattr(reconcile_res, "order", []) or []:
+            try:
+                order_type = int(getattr(order, "orderType", 0) or 0)
+            except (TypeError, ValueError):
+                order_type = 0
+            if order_type not in cancellable:
+                continue
+            if not self._is_working_order(order):
+                continue
+            order_id = self._positive_int(getattr(order, "orderId", 0))
+            client_order_id = str(getattr(order, "clientOrderId", "") or "").strip()
+            matched = (
+                (order_id is not None and str(order_id) in refs)
+                or (client_order_id and client_order_id in refs)
+            )
+            if not matched:
+                continue
+            trade_data = getattr(order, "tradeData", None)
+            symbol_id = (
+                self._positive_int(getattr(trade_data, "symbolId", 0))
+                if trade_data is not None
+                else None
+            )
+            try:
+                order_symbol = (
+                    self._symbol_name_for_id(symbol_id).strip().upper()
+                    if symbol_id is not None
+                    else ""
+                )
+            except ValueError:
+                order_symbol = ""
+            if not order_symbol:
+                # A matched ref whose symbol cannot be resolved can be
+                # neither proven ours-for-this-symbol nor safely cancelled:
+                # report it rather than skip it silently.
+                unidentified.append(
+                    f"order:{order_id if order_id is not None else client_order_id}"
+                )
+                continue
+            if order_symbol != wanted_symbol:
+                continue
+            if order_id is None:
+                unidentified.append(
+                    f"order:{client_order_id or getattr(order, 'orderId', None)!r}"
+                )
+                continue
+            try:
+                await self._cancel_order_id(order_id)
+            except CTraderApiError as exc:
+                self._raise_terminal_auth_from_api_error(exc)
+                failed.append(str(order_id))
+                logger.warning(
+                    "cTrader refused to cancel named order %s: %s.",
                     order_id,
                     exc,
                 )
@@ -3400,9 +4573,17 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 unidentified.append(f"position:{getattr(position, 'positionId', None)!r}")
                 continue
             trade_data = getattr(position, "tradeData", None)
-            volume = self._positive_int(
-                _to_float(getattr(trade_data, "volume", 0)) if trade_data is not None else 0
-            )
+            try:
+                raw_volume = (
+                    parse_optional(getattr(trade_data, "volume", None))
+                    if trade_data is not None
+                    else None
+                )
+            except ValueError:
+                # An unreadable volume is unidentified, not a zero: reporting it
+                # keeps the flatten honest instead of closing nothing silently.
+                raw_volume = None
+            volume = self._positive_int(raw_volume)
             if volume is None:
                 unidentified.append(f"position:{position_id}:volume")
                 continue
@@ -3448,7 +4629,9 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         }
         payload: list[dict[str, Any]] = []
         observed_position_ids: dict[str, list[int]] = {}
+        observed_volumes: dict[int, int] = {}
         self._position_ids_by_symbol = {}
+        self._position_volumes = observed_volumes
         for position in open_positions:
             trade_data = getattr(position, "tradeData", None)
             if trade_data is None:
@@ -3461,7 +4644,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                     f"cTrader symbol id {symbol_id!r} is not in the symbols "
                     "cache; refusing to scale its position with a guess."
                 )
-            volume = _to_float(getattr(trade_data, "volume", 0))
+            volume = parse_money(getattr(trade_data, "volume", 0))
             qty = _broker_volume_to_qty(
                 volume, self._scale_for(symbol).volume_per_qty
             )
@@ -3471,7 +4654,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             row: dict[str, Any] = {
                 "symbol": normalized_symbol,
                 "qty": qty,
-                "entry_price": _to_float(getattr(position, "price", 0)),
+                "entry_price": parse_money(getattr(position, "price", 0)),
                 "current_price": 0.0,
                 "unrealized_pnl": 0.0,
             }
@@ -3479,12 +4662,311 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             if position_id > 0:
                 row["position_id"] = position_id
                 observed_position_ids.setdefault(normalized_symbol, []).append(position_id)
+                observed_volumes[position_id] = int(volume)
             payload.append(row)
         self._position_ids_by_symbol = {
             symbol: tuple(position_ids)
             for symbol, position_ids in observed_position_ids.items()
         }
         return payload
+
+    # ── Protective stops / in-place SL-TP amendment (#168) ──────────────────────
+    #
+    # cTrader has no standalone protective-stop order: a position's stopLoss /
+    # takeProfit live on the position itself and are amended atomically through
+    # ProtoOAAmendPositionSLTPReq. The previous levels keep working until the
+    # broker accepts the new ones, and a refused request changes nothing.
+    # These primitives exist ONLY for the opt-in live ``supertrend_flip``
+    # workflow on demo/paper accounts: the adapter deliberately does NOT
+    # declare ``supports_stop_amendment``, so the percent-trailing path and
+    # the broker reconciler treat every cTrader account exactly as on main.
+    # ``supports_supertrend_flip`` is the single capability the flip manager
+    # and the daemon's signal gates check, and it is demo-only.
+
+    @property
+    def supports_supertrend_flip(self) -> bool:
+        """Live flip workflow requires a provably demo/paper account."""
+        return self.demo is True
+
+    async def list_protective_stops(self) -> list[ProtectiveStop]:
+        """One amendable protective stop per open position that has one.
+
+        Synthesized from ``ProtoOAPosition.stopLoss``: ``order_id`` is the
+        broker ``positionId`` (there is no separate stop order to name), and
+        ``side`` is the order side that would reduce the position - ``sell``
+        for a long, ``buy`` for a short. Read from the broker on every call,
+        so a restart continues from broker state.
+
+        A position with no stop is simply not listed - the caller reports the
+        missing protection. A position whose broker-native trailing stop is
+        active is also not listed: that mechanism is not an absolute-price
+        amend, so offering it would let a trail overwrite a level the broker
+        manages itself. Anything structurally unreadable (no trade data, an
+        unknown symbol or side) raises: a stop that cannot be named cannot be
+        safely amended, and the whole listing failing is the loud answer.
+        """
+        open_positions = await self._fetch_open_positions()
+        stops: list[ProtectiveStop] = []
+        for position in open_positions:
+            stop = self._position_protective_stop(position)
+            if stop is not None:
+                stops.append(stop)
+        return stops
+
+    def _position_protective_stop(self, position: Any) -> ProtectiveStop | None:
+        """The amendable protective stop of one open position, or ``None``.
+
+        ``None`` covers the two skip cases - a broker-native trailing stop
+        (not an absolute-price amend) and a position carrying no stopLoss at
+        all. Anything structurally unreadable raises instead: a stop that
+        cannot be named cannot be safely amended.
+        """
+        position_id = self._positive_int(getattr(position, "positionId", 0))
+        trade_data = getattr(position, "tradeData", None)
+        if position_id is None or trade_data is None:
+            raise ValueError(
+                "cTrader open position is missing positionId or tradeData; "
+                "refusing to report protective stops for an unattributable position"
+            )
+        if bool(getattr(position, "trailingStopLoss", False)):
+            return None
+        if not self._has_proto_field(position, "stopLoss"):
+            return None
+        stop_price = parse_optional(getattr(position, "stopLoss", None))
+        if stop_price is None or stop_price <= 0:
+            raise ValueError(
+                f"cTrader position {position_id} carries an unreadable stopLoss "
+                f"({getattr(position, 'stopLoss', None)!r}); refusing to guess it"
+            )
+        symbol_id = self._positive_int(getattr(trade_data, "symbolId", 0))
+        if symbol_id is None:
+            raise ValueError(
+                f"cTrader position {position_id} has no readable symbolId; "
+                "refusing to report its protective stop"
+            )
+        symbol = self._symbol_name_for_id(symbol_id).strip().upper()
+        stop_side = self._stop_side_for_position(position_id, trade_data)
+        qty: float | None = None
+        try:
+            volume = parse_money(getattr(trade_data, "volume", 0))
+            qty = _broker_volume_to_qty(
+                volume, self._scale_for(symbol).volume_per_qty
+            )
+        except (TypeError, ValueError):
+            qty = None
+        return ProtectiveStop(
+            order_id=str(position_id),
+            symbol=symbol,
+            side=stop_side,
+            stop_price=stop_price,
+            qty=qty,
+        )
+
+    def _stop_side_for_position(self, position_id: int, trade_data: Any) -> str:
+        """The order side that reduces this position - ``sell`` long, ``buy`` short."""
+        trade_side = self._positive_int(getattr(trade_data, "tradeSide", 0))
+        if trade_side == int(self._ProtoOATradeSide.BUY):
+            return "sell"
+        if trade_side == int(self._ProtoOATradeSide.SELL):
+            return "buy"
+        raise ValueError(
+            f"cTrader position {position_id} has unreadable tradeSide "
+            f"({getattr(trade_data, 'tradeSide', None)!r}); cannot tell "
+            "which side its stop protects"
+        )
+
+    def round_stop_price(self, stop: ProtectiveStop, price: float) -> float:
+        """Round a computed stop onto the symbol's price grid, away from market.
+
+        Same convention as the Alpaca adapter: floor for a ``sell`` stop,
+        ceiling for a ``buy`` stop, so the rounded stop is never tighter than
+        the computed one.
+        """
+        value = float(price)
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError(
+                f"Invalid stop price for {stop.symbol}: {price!r}; refusing to amend."
+            )
+        digits = self._scale_for(stop.symbol).price_digits
+        tick = Decimal(1).scaleb(-max(0, int(digits)))
+        # Float noise is removed first (101.96999999999998 is 101.97): flooring
+        # the raw float would otherwise give away a whole tick to a rounding
+        # artefact of the stop arithmetic.
+        rounding = ROUND_FLOOR if stop.side == "sell" else ROUND_CEILING
+        rounded = float(Decimal(repr(round(value, 8))).quantize(tick, rounding=rounding))
+        if rounded <= 0:
+            raise ValueError(
+                f"Stop price for {stop.symbol} rounds to {rounded!r}; refusing to amend."
+            )
+        return rounded
+
+    async def _fetch_open_position(self, position_id: int) -> Any | None:
+        """The open ``ProtoOAPosition`` with this id, or ``None`` when closed."""
+        for position in await self._fetch_open_positions():
+            if self._positive_int(getattr(position, "positionId", 0)) == position_id:
+                return position
+        return None
+
+    async def _confirm_position_stop(
+        self, position_id: int, expected_price: float, *, digits: int
+    ) -> float | None:
+        """The broker-reported stop once it matches ``expected_price``.
+
+        ``None`` while the broker has not yet shown the amended stop; the
+        caller bounds the wait. A position that is gone returns a separate
+        sentinel through the caller's own read - this only answers "does the
+        open position carry the new stop".
+        """
+        position = await self._fetch_open_position(position_id)
+        if position is None:
+            return None
+        if not self._has_proto_field(position, "stopLoss"):
+            return None
+        broker_price = parse_optional(getattr(position, "stopLoss", None))
+        if broker_price is None or broker_price <= 0:
+            return None
+        tolerance = float(Decimal(1).scaleb(-max(0, int(digits)))) * 0.5 + 1e-12
+        if math.isclose(broker_price, expected_price, rel_tol=0.0, abs_tol=tolerance):
+            return broker_price
+        return None
+
+    async def amend_protective_stop(
+        self, stop: ProtectiveStop, new_stop_price: float
+    ) -> ProtectiveStop:
+        """Move a position's stop loss to ``new_stop_price``, TP preserved.
+
+        Sends ``ProtoOAAmendPositionSLTPReq`` with the new absolute stop and
+        the position's current take profit echoed back unchanged (unset when
+        the position has none, which the broker reads as "no TP" either way).
+        The request has no dedicated response message, so the outcome is
+        confirmed by re-reading the position: only a broker-reported stop at
+        the requested price counts as amended. Any send failure that is not a
+        definite broker refusal (timeout, dropped connection, malformed
+        response) is verified the same way - if the state shows the new stop
+        the amendment did land; if it cannot be confirmed this raises and the
+        caller keeps treating the previous broker state as the truth.
+        """
+        position_id = self._positive_int(getattr(stop, "order_id", None))
+        if position_id is None:
+            raise ValueError(
+                f"cTrader protective stop for {stop.symbol} has no usable "
+                f"position id ({stop.order_id!r}); refusing to amend."
+            )
+        if self._ProtoOAAmendPositionSLTPReq is None:
+            raise RuntimeError("cTrader amend-position-SLTP request type is not loaded")
+        # Read the position first: it connects/authenticates (so the symbol
+        # scale is broker-sourced), proves the position is still open, and
+        # supplies the TP and protection flags to echo back unchanged.
+        position = await self._fetch_open_position(position_id)
+        if position is None:
+            raise RuntimeError(
+                f"cTrader position {position_id} ({stop.symbol}) is no longer open; "
+                "there is no stop to amend."
+            )
+        digits = self._scale_for(stop.symbol).price_digits
+        price = self.round_stop_price(stop, new_stop_price)
+
+        request = self._build_amend_position_request(position_id, price, position)
+        send_error = await self._send_amend_position_request(request)
+        return await self._confirmed_amendment(
+            position_id=position_id,
+            price=price,
+            digits=digits,
+            stop=stop,
+            send_error=send_error,
+        )
+
+    def _build_amend_position_request(
+        self, position_id: int, price: float, position: Any
+    ) -> Any:
+        """The SLTP amendment: new absolute stop, TP and flags echoed back."""
+        request = self._ProtoOAAmendPositionSLTPReq()
+        request.ctidTraderAccountId = self.ctid_trader_account_id
+        request.positionId = position_id
+        request.stopLoss = float(price)
+        if self._has_proto_field(position, "takeProfit"):
+            current_tp = parse_optional(getattr(position, "takeProfit", None))
+            if current_tp is not None and current_tp > 0:
+                request.takeProfit = float(current_tp)
+        for field_name in (
+            "guaranteedStopLoss",
+            "trailingStopLoss",
+            "stopLossTriggerMethod",
+        ):
+            if self._has_proto_field(position, field_name):
+                setattr(request, field_name, getattr(position, field_name))
+        return request
+
+    async def _send_amend_position_request(self, request: Any) -> BaseException | None:
+        """Send the amendment; the send error when the outcome is ambiguous.
+
+        ``None`` means the broker answered without an order-error event. A
+        definite ``CTraderApiError`` refusal propagates (the broker changed
+        nothing); anything else - timeout, transport failure, malformed
+        response - comes back as the exception for the caller to resolve
+        against broker state.
+        """
+        try:
+            response = await self._send_request_with_refresh_retry(
+                request, timeout_seconds=10
+            )
+            self._raise_if_order_error_event(response)
+        except CTraderApiError as exc:
+            # A definite refusal: the broker changed nothing, the previous
+            # stop is still in force.
+            self._raise_terminal_auth_from_api_error(exc)
+            raise
+        except Exception as exc:  # except-kind: money-decision
+            # Timeout, transport failure or an unparseable response: the
+            # request may or may not have landed. Broker state decides below.
+            return exc
+        return None
+
+    async def _confirmed_amendment(
+        self,
+        *,
+        position_id: int,
+        price: float,
+        digits: int,
+        stop: ProtectiveStop,
+        send_error: BaseException | None,
+    ) -> ProtectiveStop:
+        """Poll broker state until the new stop shows, or fail closed."""
+        confirmed_price: float | None = None
+        for attempt in range(_AMEND_CONFIRM_ATTEMPTS):
+            try:
+                confirmed_price = await self._confirm_position_stop(
+                    position_id, price, digits=digits
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # except-kind: money-decision
+                confirmed_price = None
+            if confirmed_price is not None:
+                break
+            if attempt + 1 < _AMEND_CONFIRM_ATTEMPTS:
+                await asyncio.sleep(_AMEND_CONFIRM_INTERVAL_SECONDS)
+        if confirmed_price is None:
+            position_now = await self._fetch_open_position(position_id)
+            if position_now is None:
+                raise RuntimeError(
+                    f"cTrader position {position_id} ({stop.symbol}) closed while its "
+                    "stop was being amended; the amendment outcome is moot but the "
+                    "close itself must be reconciled."
+                )
+            detail = f" send error: {send_error!r}" if send_error is not None else ""
+            raise RuntimeError(
+                f"cTrader did not confirm the stop amendment for position "
+                f"{position_id} ({stop.symbol}): broker still reports stopLoss "
+                f"{getattr(position_now, 'stopLoss', None)!r}, requested {price!r}.{detail}"
+            )
+        return ProtectiveStop(
+            order_id=str(position_id),
+            symbol=stop.symbol,
+            side=stop.side,
+            stop_price=confirmed_price,
+            qty=stop.qty,
+        )
 
     async def _persist_execution_event(self, event: Any) -> None:
         execution_type = int(event.executionType)
@@ -3501,7 +4983,12 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         if not client_order_id and order_id is not None:
             client_order_id = (
                 await asyncio.to_thread(
-                    find_live_signal_id_by_broker_order_id,
+                    # mypy's `to_thread` signature demands a callable returning
+                    # non-Optional (`Callable[[str, str], str]`) and rejects this
+                    # one's `str | None` result; the lookup genuinely returns
+                    # None for an unknown order and the `or ""` below handles
+                    # it. The arguments themselves are both str.
+                    find_live_signal_id_by_broker_order_id,  # type: ignore[arg-type]
                     self.account_config_id,
                     str(order_id),
                 )
@@ -3568,7 +5055,10 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             # `actual_price` treats a non-answer as a price.
             actual_price_observed=self._execution_price_presence(order=order, deal=deal),
             filled_qty=filled_qty,
-            commission=_deal_commission(deal),
+            commission=_deal_commission(
+                deal,
+                rebate_logged=getattr(self, "_rebate_logged_deal_ids", None),
+            ),
             timestamp=_to_datetime_from_ms(timestamp_ms),
             broker_order_id=str(order_id or ""),
             dedupe_key=self._build_dedupe_key(
@@ -3584,6 +5074,8 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             # `_deal_id_or_none` keeps the protobuf `0` sentinel out of the column, so "the broker
             # told us nothing" stays distinguishable from "the broker said zero".
             broker_fill_id=_deal_id_or_none(deal),
+            order_type=self._order_type_name(order),
+            requested_qty=self._requested_order_qty(order, fill_symbol),
         )
         if cumulative_qty > 0:
             # P1's amendment semantics, not a second insert: the same key with a *larger*
@@ -3668,6 +5160,49 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             if position_id is not None:
                 return position_id
         return None
+
+    #: How long a position's order list may be reused by the exit-target
+    #: resolver. The TTL alone cannot prove a netted position's opener set is
+    #: unchanged - a second opening order can appear at any time - so a cache
+    #: hit is only honoured while the position's broker volume still equals
+    #: the volume recorded at fetch time (``_position_volumes``, refreshed by
+    #: ``get_positions``). Any fill moves the volume and forces a refetch;
+    #: a cached list may therefore never be the stale proof that pins a lot
+    #: to a shared position (#382 maintainer decision).
+    _POSITION_ORDERS_CACHE_TTL_SECONDS = 300.0
+    _POSITION_ORDERS_CACHE_MAX = 512
+
+    async def _position_orders_for_exit_target(self, position_id: int) -> Any | None:
+        """``_fetch_position_orders`` with a bounded, volume-checked cache (#382).
+
+        Only successful reads are cached; an unreadable list stays a fresh
+        failure every call so a transient broker error cannot pin a stale
+        answer. The cache is keyed on the broker position id, which is never
+        reused for a different position, and an entry is only reused while
+        both the TTL holds and the position's volume - as last reported by
+        ``get_positions`` - still matches the volume seen at fetch time.
+        """
+        key = int(position_id)
+        cached = self._position_orders_cache.get(key)
+        if cached is not None:
+            fetched_at, orders, volume_at_fetch = cached
+            if (
+                time.monotonic() - fetched_at
+                < self._POSITION_ORDERS_CACHE_TTL_SECONDS
+                and self._position_volumes.get(key) == volume_at_fetch
+            ):
+                return orders
+            del self._position_orders_cache[key]
+        orders = await self._fetch_position_orders(position_id)
+        if orders is not None:
+            if len(self._position_orders_cache) >= self._POSITION_ORDERS_CACHE_MAX:
+                self._position_orders_cache.clear()
+            self._position_orders_cache[key] = (
+                time.monotonic(),
+                orders,
+                self._position_volumes.get(key),
+            )
+        return orders
 
     async def _fetch_position_orders(self, position_id: int) -> Any | None:
         """Every order the broker ties to one position, opening and closing."""
@@ -3777,6 +5312,27 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         if not candidates:
             return None, "no_opening_order"
         return None, "ambiguous_parent"
+
+    async def opening_signal_id_for_position(self, position_id: int) -> str | None:
+        """Public provenance read for the flip manager's first-sight bind (#168).
+
+        Reuses the broker-close attribution path: exactly one persisted
+        opening signal may claim the position. ``None`` means proven
+        foreign/ambiguous - the broker read the position's orders and none
+        (or several) resolve to a persisted signal. An UNREADABLE order list
+        raises ``CTraderApiError`` instead: the caller retries a transient
+        read failure rather than treating it as proven foreign ownership.
+        """
+        signal_id, cause = await self._resolve_position_parent_signal(
+            int(position_id)
+        )
+        if cause == "position_orders_unreadable":
+            raise CTraderApiError(
+                "ORDER_LIST_UNREADABLE",
+                f"cTrader position orders for position {position_id} are "
+                "unreadable; provenance cannot be proven this pass",
+            )
+        return signal_id
 
     @staticmethod
     def _broker_close_dedupe_key(deal: Any | None) -> str | None:
@@ -4255,7 +5811,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 )
             except CTraderApiError:
                 raise
-            except Exception as exc:
+            except Exception as exc:  # except-kind: money-decision
                 logger.warning(
                     "cTrader broker-close reconcile skipped an unreadable deal",
                     extra={
@@ -4512,6 +6068,8 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 await self._run_pending_reconciliation(backoff_seconds)
 
                 event = await asyncio.wait_for(self._execution_queue.get(), timeout=30)
+                if event is _EXECUTION_RECONCILE_WAKE:
+                    continue
                 await self._persist_execution_event(event)
                 self._ack_execution_event(event)
                 backoff_seconds = 2
@@ -4528,7 +6086,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                     ) from exc
                 self._log_listener_terminal_auth_failure(exc)
                 return
-            except Exception as exc:
+            except Exception as exc:  # except-kind: money-decision
                 if event is not None and not self._requeue_execution_event(event):
                     raise RuntimeError(
                         "cTrader execution event exhausted its retry budget; "
@@ -4558,7 +6116,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             await self.reconcile_executions()
         except CTraderAuthTerminalError:
             raise
-        except Exception as exc:
+        except Exception as exc:  # except-kind: money-decision
             self._reconciliation_retry_at = time.monotonic() + backoff_seconds
             logger.warning(
                 "cTrader overflow reconciliation failed; queue processing continues",

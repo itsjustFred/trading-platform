@@ -39,9 +39,12 @@ from runner.engines.contract import (
     EngineStatsKeys,
     apply_date_filter,
     flag_missing_intrabar,
+    level_fill_price,
+    level_gapped_at_open,
     normalize_ohlcv_frame,
     parse_date_bound,
     resolve_intrabar_timeframe,
+    resolve_protective_exit,
     resolve_same_bar_exit,
 )
 from runner.engines.native_adapter import NativeAdapter
@@ -88,17 +91,15 @@ def _deterministic_ohlcv(
     # up, flat, down, flat, ... (periods / 80 cycles). Flat phases sit strictly
     # between the trend legs so SMA(5)/SMA(20) fully re-converges and the next
     # trend leg produces a fresh crossover.
-    for cycle in range(max(1, periods // 80)):
+    for _ in range(max(1, periods // 80)):
         for _ in range(30):
             price += 0.5
             closes.append(price)
-        for _ in range(20):
-            closes.append(price)
+        closes.extend(price for _ in range(20))
         for _ in range(30):
             price -= 0.5
             closes.append(price)
-        for _ in range(20):
-            closes.append(price)
+        closes.extend(price for _ in range(20))
     closes = closes[:periods]
     timestamps = pd.date_range(start, periods=periods, freq=freq, tz="UTC")
     return pd.DataFrame(
@@ -138,6 +139,13 @@ def _config(data_dir: Path, **overrides) -> BacktestConfig:
     }
     payload.update(overrides)
     return BacktestConfig(**with_zero_fees(payload))
+
+
+def _frozen(cfg: BacktestConfig) -> BacktestConfig:
+    """Frozen engines (vectorbt/pynecore) refuse ``next_open``; pin the legacy
+    ``close`` signal-bar fill they actually simulate so the persisted meta
+    stays truthful."""
+    return cfg.model_copy(update={"signal_exit_fill": "close"})
 
 
 @pytest.fixture(scope="module")
@@ -222,7 +230,7 @@ class TestDateFilterConvention:
         cfg = _config(data_dir, end_date="2024-01-09", parameters={})
 
         native = NativeAdapter().run(cfg, STRATEGY_PATH)
-        vectorbt = VectorbtAdapter().run(cfg, STRATEGY_PATH)
+        vectorbt = VectorbtAdapter().run(_frozen(cfg), STRATEGY_PATH)
 
         # Bars from 2024-01-01 00:00 through 2024-01-09 23:00 inclusive.
         for result in (native, vectorbt):
@@ -480,7 +488,7 @@ def test_vectorbt_engine_stops_first_without_intrabar_data(tmp_path: Path):
         end_date="2024-01-01",
         parameters={},
     )
-    result = VectorbtAdapter().run(cfg, str(strategy))
+    result = VectorbtAdapter().run(_frozen(cfg), str(strategy))
 
     assert len(result.trades) == 1
     trade = result.trades[0]
@@ -543,7 +551,7 @@ def test_vectorbt_engine_uses_chronological_intrabar_event_when_available(tmp_pa
         modeling_resolution="5m",
         parameters={},
     )
-    result = VectorbtAdapter().run(cfg, str(strategy))
+    result = VectorbtAdapter().run(_frozen(cfg), str(strategy))
 
     assert len(result.trades) == 1
     trade = result.trades[0]
@@ -667,7 +675,7 @@ def test_native_engine_resolves_one_lower_like_vectorbt(tmp_path: Path):
     flag = native_trade.meta.get("same_bar_priority")
     assert flag is None, "with the intrabar frame available no fallback flag may be recorded"
 
-    vectorbt = VectorbtAdapter().run(cfg, str(strategy))
+    vectorbt = VectorbtAdapter().run(_frozen(cfg), str(strategy))
     assert len(vectorbt.trades) == 1
     assert vectorbt.trades[0].exits[-1].reason == "take_profit", (
         "vectorbt already resolves '1-lower' chronologically; native must agree"
@@ -723,7 +731,7 @@ def test_native_and_vectorbt_resolve_the_same_intrabar_spellings(tmp_path: Path)
     ]
     for resolution in resolutions:
         for base in ("1h", "1d"):
-            cfg = BacktestConfig(risk_per_trade_pct=0.01, parameters={"fees": "zero"},
+            cfg = BacktestConfig(risk_per_trade_pct=0.01, parameters={"fees": "zero", "slippage": "none"},
                 strategy_name="parity",
                 symbols=["X"],
                 timeframe=base,
@@ -778,7 +786,7 @@ def test_spellings_pinned_against_one_shared_table():
     assert vbt_module._resolve_intrabar_timeframe("1h", "m1") == contract.resolve_intrabar_timeframe("1h", "m1")
     # The config validator canonicalizes alias spellings before any adapter
     # sees them, so per-adapter divergence is structurally impossible.
-    cfg = BacktestConfig(risk_per_trade_pct=0.01, parameters={"fees": "zero"},
+    cfg = BacktestConfig(risk_per_trade_pct=0.01, parameters={"fees": "zero", "slippage": "none"},
         strategy_name="pin",
         symbols=["X"],
         timeframe="1h",
@@ -809,7 +817,7 @@ class TestSizingContract:
             end_date="2024-01-02",
             initial_capital=100_000.0,
             risk_per_trade_pct=0.01,
-            parameters={"fees": "zero"},
+            parameters={"fees": "zero", "slippage": "none"},
         )
         from runner.engine import TradeEngine
 
@@ -836,7 +844,7 @@ class TestSizingContract:
             risk_per_trade_pct=0.01,
             parameters={},
         )
-        result = VectorbtAdapter().run(cfg, str(strategy))
+        result = VectorbtAdapter().run(_frozen(cfg), str(strategy))
 
         assert len(result.trades) == 1
         trade = result.trades[0]
@@ -866,7 +874,7 @@ class TestSizingContract:
             max_position_pct=1.0,
             parameters={},
         )
-        result = VectorbtAdapter().run(cfg, str(strategy))
+        result = VectorbtAdapter().run(_frozen(cfg), str(strategy))
 
         assert len(result.trades) == 1
         trade = result.trades[0]
@@ -950,7 +958,7 @@ class TestStatsKeysContract:
                 "entry_price": 108.0,
             },
         ]
-        result = SignalReplayAdapter(fee_params={"fees": "zero"}, ).run(
+        result = SignalReplayAdapter(fee_params={"fees": "zero"}, slippage_params={"slippage": "none"}, ).run(
             signals=[ReplaySignal.from_payload(signal) for signal in signals],
             ohlcv_by_symbol={"PARITY": frame},
             timeframe="1h",
@@ -976,7 +984,7 @@ class TestStatsKeysContract:
         self, contract_data_dir: Path
     ):
         result = VectorbtAdapter().run(
-            _config(tmp_contract_dir(contract_data_dir)), STRATEGY_PATH
+            _frozen(_config(tmp_contract_dir(contract_data_dir))), STRATEGY_PATH
         )
         assert len(result.trades) > 0
 
@@ -1069,7 +1077,7 @@ class TestTotalBarsContract:
     def test_vectorbt_engine_reports_loaded_bar_count(self, contract_data_dir: Path):
         data_dir = tmp_contract_dir(contract_data_dir)
         frame = _read_parquet(data_dir, "PARITY", "1h")
-        result = VectorbtAdapter().run(_config(data_dir), STRATEGY_PATH)
+        result = VectorbtAdapter().run(_frozen(_config(data_dir)), STRATEGY_PATH)
         assert len(result.trades) > 0, "Fixture must trade for the assertion to bite"
         assert result.meta.total_bars == len(frame), (
             "total_bars must be the loaded bar count, not the trade count (F6)"
@@ -1093,7 +1101,10 @@ class TestTotalBarsContract:
     def test_total_bars_is_not_the_trade_count(self, contract_data_dir: Path):
         data_dir = tmp_contract_dir(contract_data_dir)
         for adapter in (NativeAdapter(), VectorbtAdapter()):
-            result = adapter.run(_config(data_dir), STRATEGY_PATH)
+            run_cfg = _config(data_dir)
+            if adapter.name == "vectorbt":
+                run_cfg = _frozen(run_cfg)
+            result = adapter.run(run_cfg, STRATEGY_PATH)
             assert result.meta.total_bars > len(result.trades), (
                 f"{result.meta.engine}: total_bars ({result.meta.total_bars}) must not "
                 f"degenerate into the trade count ({len(result.trades)})"
@@ -1135,7 +1146,7 @@ def _run_pyne_with_stubbed_cli(cfg, strategy_path, *, trade_csv_text, stats_csv_
         stack.enter_context(
             patch("runner.engines.pynecore_adapter.subprocess.run", side_effect=fake_run)
         )
-        return PyneCoreAdapter().run(cfg, strategy_path)
+        return PyneCoreAdapter().run(_frozen(cfg), strategy_path)
 
 
 PYNE_EMPTY_TRADE_CSV = (
@@ -1252,7 +1263,7 @@ def main(
             "runner.engines.pynecore_adapter.subprocess.run",
             side_effect=_stub_pyne_cli(captured, stats_csv_text="Metric,All USD\n"),
         ):
-            PyneCoreAdapter().run(cfg, str(strategy_path))
+            PyneCoreAdapter().run(_frozen(cfg), str(strategy_path))
         return strategy_path, captured
 
     @staticmethod
@@ -1327,7 +1338,7 @@ def main(
         CLI then cuts at midnight, the pyne backtest window is a strict subset
         of the native/vectorbt window for the same configuration.
         """
-        strategy_path, captured = self._run_pyne_dispatch(tmp_path)
+        _strategy_path, captured = self._run_pyne_dispatch(tmp_path)
 
         cmd = captured["cmd"]
         end_bound = cmd[cmd.index("--to") + 1]
@@ -1348,7 +1359,7 @@ def main(
         must pass an aware UTC start-of-day instant (both bounds aware = host
         TZ irrelevant).
         """
-        strategy_path, captured = self._run_pyne_dispatch(tmp_path)
+        _strategy_path, captured = self._run_pyne_dispatch(tmp_path)
 
         cmd = captured["cmd"]
         start_bound = cmd[cmd.index("--from") + 1]
@@ -1472,7 +1483,7 @@ class TestFillContract:
             end_date="2024-01-02",
             initial_capital=100_000,
             modeling_resolution="main_timeframe",
-            parameters={"fees": "zero"},
+            parameters={"fees": "zero", "slippage": "none"},
         )
         result = TradeEngine(cfg, symbol="PARITY").run(data, strategy_fn)
 
@@ -1486,7 +1497,7 @@ class TestFillContract:
         _write_ohlcv(tmp_path, "PARITY", "1h", data)
 
         cfg = _config(tmp_path, parameters={"fast_length": 5, "slow_length": 20})
-        result = VectorbtAdapter().run(cfg, STRATEGY_PATH)
+        result = VectorbtAdapter().run(_frozen(cfg), STRATEGY_PATH)
 
         assert len(result.trades) >= 1
         for trade in result.trades:
@@ -1503,10 +1514,12 @@ class TestFillContract:
         cfg = _config(data_dir)
 
         native = NativeAdapter().run(cfg, STRATEGY_PATH)
-        vectorbt = VectorbtAdapter().run(cfg, STRATEGY_PATH)
+        vectorbt = VectorbtAdapter().run(_frozen(cfg), STRATEGY_PATH)
 
         assert len(native.trades) == len(vectorbt.trades)
-        for native_trade, vectorbt_trade in zip(native.trades, vectorbt.trades):
+        # `len(...) == len(...)` is asserted on the line above, so the strict zip
+        # is the loop's own restatement of that same invariant.
+        for native_trade, vectorbt_trade in zip(native.trades, vectorbt.trades, strict=True):
             assert pd.Timestamp(native_trade.entry_time) == pd.Timestamp(vectorbt_trade.entry_time)
             assert native_trade.entry_price == pytest.approx(vectorbt_trade.entry_price, rel=1e-9)
 
@@ -1521,7 +1534,7 @@ class TestFillContract:
                 "entry_price": float(frame.iloc[5]["close"]),
             }
         )
-        result = SignalReplayAdapter(fee_params={"fees": "zero"}, ).run(
+        result = SignalReplayAdapter(fee_params={"fees": "zero"}, slippage_params={"slippage": "none"}, ).run(
             signals=[signal],
             ohlcv_by_symbol={"PARITY": frame},
             timeframe="1h",
@@ -1674,3 +1687,100 @@ def test_intrabar_resolution_equal_to_base_resolves_to_none():
     assert resolve_intrabar_timeframe("1d", "1d") is None
     assert resolve_intrabar_timeframe("1h", "1m") == "1m"
     assert resolve_intrabar_timeframe("1h", "4h") is None
+
+
+# ─── Protective-exit gap helpers (#287) ──────────────────────────────────────
+
+
+class TestProtectiveExitGapHelpers:
+    """``level_gapped_at_open`` / ``level_fill_price`` / ``resolve_protective_exit``.
+
+    The replay flip workflow (#364) routes its stop/TP1 checks through these;
+    #208 ports the same helpers to the native engine, so they are pinned here
+    directly — including the SHORT mirror the flip tests cannot reach
+    (``test_flip_workflow_is_long_only``).
+    """
+
+    def test_long_stop_gap_and_tp_gap_at_the_open(self):
+        assert level_gapped_at_open(direction="LONG", kind="stop", level=95.0, bar_open=94.0)
+        assert level_gapped_at_open(direction="LONG", kind="tp", level=110.0, bar_open=111.0)
+        assert not level_gapped_at_open(direction="LONG", kind="stop", level=95.0, bar_open=96.0)
+        assert not level_gapped_at_open(direction="LONG", kind="tp", level=110.0, bar_open=109.0)
+
+    def test_short_mirrors_long(self):
+        # SHORT stop sits ABOVE the market, TP BELOW it.
+        assert level_gapped_at_open(direction="SHORT", kind="stop", level=105.0, bar_open=106.0)
+        assert level_gapped_at_open(direction="SHORT", kind="tp", level=90.0, bar_open=89.0)
+        assert not level_gapped_at_open(direction="SHORT", kind="stop", level=105.0, bar_open=104.0)
+        assert not level_gapped_at_open(direction="SHORT", kind="tp", level=90.0, bar_open=91.0)
+
+    def test_open_exactly_at_the_level_counts_as_a_gap(self):
+        assert level_gapped_at_open(direction="LONG", kind="stop", level=95.0, bar_open=95.0)
+        assert level_fill_price(direction="LONG", kind="stop", level=95.0, bar_open=95.0) == 95.0
+
+    def test_level_fill_price_is_the_open_on_a_gap_else_the_level(self):
+        assert level_fill_price(direction="LONG", kind="stop", level=95.0, bar_open=94.0) == 94.0
+        assert level_fill_price(direction="LONG", kind="stop", level=95.0, bar_open=96.0) == 95.0
+        assert level_fill_price(direction="LONG", kind="tp", level=110.0, bar_open=111.0) == 111.0
+
+    def test_unknown_direction_and_kind_raise(self):
+        with pytest.raises(ValueError, match="direction"):
+            level_gapped_at_open(direction="long", kind="stop", level=95.0, bar_open=94.0)
+        with pytest.raises(ValueError, match="kind"):
+            level_gapped_at_open(direction="LONG", kind="trail", level=95.0, bar_open=94.0)
+        with pytest.raises(ValueError, match="direction"):
+            resolve_protective_exit(
+                direction="SIDEWAYS",
+                bar_open=100.0,
+                high=101.0,
+                low=99.0,
+                stop_price=95.0,
+                take_profit_price=110.0,
+            )
+
+    def test_gap_is_checked_before_the_same_bar_range(self):
+        # Opens above TP1 and later trades through the stop: the TP gap wins.
+        kind, gapped = resolve_protective_exit(
+            direction="LONG",
+            bar_open=111.0,
+            high=112.0,
+            low=94.0,
+            stop_price=95.0,
+            take_profit_price=110.0,
+        )
+        assert (kind, gapped) == ("tp", True)
+
+    def test_allow_gap_false_disables_the_open_check(self):
+        # Same bar as the entry: the open cannot have gapped through a level.
+        kind, gapped = resolve_protective_exit(
+            direction="LONG",
+            bar_open=94.0,
+            high=96.0,
+            low=93.0,
+            stop_price=95.0,
+            take_profit_price=110.0,
+            allow_gap=False,
+        )
+        assert (kind, gapped) == ("stop", False)
+
+    def test_no_gap_falls_back_to_the_range_classification(self):
+        kind, gapped = resolve_protective_exit(
+            direction="LONG",
+            bar_open=100.0,
+            high=112.0,
+            low=94.0,
+            stop_price=95.0,
+            take_profit_price=110.0,
+        )
+        assert (kind, gapped) == ("stop", False)
+
+    def test_nan_open_is_not_a_gap(self):
+        kind, gapped = resolve_protective_exit(
+            direction="LONG",
+            bar_open=float("nan"),
+            high=112.0,
+            low=94.0,
+            stop_price=95.0,
+            take_profit_price=110.0,
+        )
+        assert (kind, gapped) == ("stop", False)
