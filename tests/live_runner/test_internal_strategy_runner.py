@@ -15,7 +15,10 @@ from typing import Any
 import pandas as pd
 import pytest
 
-from live_runner.internal_strategy_runner import InternalStrategyRunner
+from live_runner.internal_strategy_runner import (
+    InternalStrategyRunner,
+    internal_runner_untradeable_reason,
+)
 from risk.models import TradeSignal
 from shared.models import LiveDeploymentConfig
 
@@ -831,6 +834,54 @@ def test_deployment_without_opt_in_is_inert(tmp_path: Path) -> None:
     assert sent == []
     assert adapter.calls == []
     assert (str(deployment.id), "opt_in") in runner._reported
+
+
+def test_untradeable_reason_is_none_for_an_opted_in_resolvable_deployment() -> None:
+    deployment = _deployment()
+
+    assert (
+        internal_runner_untradeable_reason(
+            deployment, load_target=lambda name: object()
+        )
+        is None
+    )
+
+
+def test_untradeable_reason_names_the_missing_opt_in() -> None:
+    deployment = _deployment(opted_in=False)
+
+    reason = internal_runner_untradeable_reason(
+        deployment, load_target=lambda name: object()
+    )
+
+    assert reason is not None
+    assert "internal_runner_enabled" in reason
+
+
+def test_untradeable_reason_names_an_unresolvable_strategy() -> None:
+    deployment = _deployment()
+
+    def _missing(name: str) -> Any:
+        raise ValueError(f"no strategy file for '{name}'")
+
+    reason = internal_runner_untradeable_reason(deployment, load_target=_missing)
+
+    assert reason is not None
+    assert "fake_strategy" in reason
+    assert "cannot be resolved" in reason
+
+
+def test_untradeable_reason_names_a_source_type_the_runner_ignores() -> None:
+    """signal_source 'internal' paired with a non-internal source_type is inert:
+    the Discord listener routes on signal_source and the runner on the pair."""
+    deployment = _deployment(source_type="discord")
+
+    reason = internal_runner_untradeable_reason(
+        deployment, load_target=lambda name: object()
+    )
+
+    assert reason is not None
+    assert "signal_source_type" in reason
 
 
 def test_daily_crypto_timeframe_is_allowed(tmp_path: Path) -> None:
