@@ -586,7 +586,11 @@ permanent, leave the flag - or `PAUSED`/`STOPPED` the deployment.
 
 Only signals younger than 7 days and belonging to ACTIVE/PAUSED deployments
 count as orders the ledger still expects to be working: both live order paths
-expire fast (Alpaca `DAY`, cTrader `IMMEDIATE_OR_CANCEL`), so an older
+expire fast (cTrader `IMMEDIATE_OR_CANCEL`, and Alpaca entries are market
+orders - they fill at the open or are rejected, never rest unfilled; the
+adapter submits them `GTC` since 2026-11-25 only so the bracket/OTO SL/TP
+legs survive the session close, and Alpaca's aged-order policy cancels any
+GTC order after 90 days regardless), so an older
 unfilled row is a cancelled/expired/rejected historical order, not a working
 one. A younger order missing from the broker's working list is not trusted on
 the age bound alone: the reconciler asks the adapter for that order's state

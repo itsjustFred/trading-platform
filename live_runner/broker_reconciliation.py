@@ -9,7 +9,7 @@ positions and working orders are account-level), the two views on a schedule:
   working orders (position-protection legs are marked by the adapter and are
   not treated as untracked entries/exits). An expected order missing from the
   working list is confirmed against the broker's own order state first: a
-  terminal order (expired DAY limit, cancelled IOC remainder, operator
+  terminal order (expired DAY/GTC leg, cancelled IOC remainder, operator
   cancel) is not a mismatch, while working or unknown stays fail closed;
 * protective stops vs open broker positions, for adapters that can list them.
 
@@ -73,7 +73,10 @@ RECONCILIATION_REPORT_FILENAME = "broker_reconciliation_report.json"
 BROKER_READ_TIMEOUT_SECONDS = 60.0
 #: How far back an unfilled signal may still count as an order the ledger
 #: expects to be working. Both live order paths are short-lived - Alpaca
-#: submits DAY orders and cTrader submits IMMEDIATE_OR_CANCEL - so anything
+#: entries are market orders that fill at the open or are rejected (submitted
+#: GTC only so the protective legs outlive the session; Alpaca's aged-order
+#: policy cancels any GTC order after 90 days) and cTrader submits
+#: IMMEDIATE_OR_CANCEL - so anything
 #: older than this is a cancelled/expired/rejected historical order, not a
 #: working one, and must not become a permanent ``missing_working_order``.
 #: Inside the window a missing expected order is confirmed against the

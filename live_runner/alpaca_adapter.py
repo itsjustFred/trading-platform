@@ -16,7 +16,10 @@ import pandas as pd
 from alpaca.trading.enums import OrderClass
 from alpaca.trading.requests import ReplaceOrderRequest, StopLossRequest, TakeProfitRequest
 
-from live_runner.account_order_lock import AccountOrderLockTimeoutError
+from live_runner.account_order_lock import (
+    AccountOrderLockTimeoutError,
+    account_order_placement,
+)
 from live_runner.alpaca_fees import (
     ACTIVITY_WINDOW_OVERLAP,
     CFEE_LOOKBACK_MARGIN,
@@ -68,6 +71,7 @@ from shared.database import (
     earliest_live_signal_timestamp,
     find_latest_filled_live_entry_signals,
     flag_live_ledger_reconciliation,
+    get_account_net_filled_qty_by_deployment,
     get_live_adapter_state,
     get_live_signal_broker_order_id,
     get_live_signal_filled_qty,
@@ -79,6 +83,7 @@ from shared.database import (
     list_live_signal_ids_for_reconciliation,
     list_pending_exit_reprotections,
     record_live_broker_side_close_fill,
+    record_live_control_audit,
     save_live_execution,
     save_live_execution_up_to_cumulative,
     save_live_signal,
@@ -139,6 +144,17 @@ _RECOVERY_LOCK_RETRY_SECONDS = 30.0
 #: holds the account order lock, so the wait stays well under ~1.5 s.
 _EXIT_MARKER_REREAD_ATTEMPTS = 3
 _EXIT_MARKER_REREAD_INTERVAL_SECONDS = 0.5
+#: Minimum seconds between expired-entry-stop heal scans on the periodic
+#: ``list_protective_stops`` path; the connect-time recovery always scans.
+#: The scan is a paged ``status=all`` history read, so it is throttled rather
+#: than run on every trailing tick.
+_EXPIRED_STOP_HEAL_INTERVAL_SECONDS = 300.0
+#: Bound on the account order-placement lock wait for the periodic heal: a
+#: busy account skips the pass (the next one retries) rather than stalling
+#: the protective-stop listing the trailing loop depends on.
+_EXPIRED_STOP_HEAL_LOCK_TIMEOUT_SECONDS = 30.0
+#: Audit action for the expired entry stop-leg self-heal.
+_EXPIRED_STOP_HEAL_AUDIT_ACTION = "alpaca_expired_entry_stop_heal"
 
 #: States in which a bracket leg still rests at the broker: ``held`` is the OCO-inactive
 #: leg of a filled parent, ``pending_cancel`` one whose cancel has not settled yet and may
@@ -1507,6 +1523,13 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         # ``None`` ("no crypto fill up to the scan's ``until``") is not, because fills posted
         # after the scan can still predate ``fill_start`` on a later pass.
         self._earliest_crypto_fill_at: Any = _CRYPTO_FILL_SCAN_PENDING
+        # Expired entry stop-leg self-heal (2026-11-25 paper soak: a DAY
+        # bracket/OTO stop leg expires at the close and leaves the filled
+        # position naked). ``_expired_stop_heal_last_run`` throttles the
+        # periodic scan inside ``list_protective_stops``;
+        # ``_expired_stop_heal_alerted`` dedupes its alerts per process.
+        self._expired_stop_heal_last_run = 0.0
+        self._expired_stop_heal_alerted: set[str] = set()
 
         if not self.api_key or not self.secret_key:
             raise ValueError(
@@ -1602,6 +1625,28 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             try:
                 async with self.order_placement_lock(), self._order_book_lock():
                     await self._recover_exit_reprotections()
+                    # Same locks, same pass: positions whose entry stop leg
+                    # expired at a session close (the pre-GTC DAY entries)
+                    # are re-protected here at connect, not only on the
+                    # throttled periodic scan.
+                    client = self._trading_client
+                    if client is not None:
+                        try:
+                            await self._heal_expired_entry_stops(client)
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as exc:  # except-kind: money-decision
+                            logger.error(
+                                "ALERT: Alpaca expired entry stop heal failed "
+                                "at connect",
+                                extra={
+                                    "data": {
+                                        "alert": "expired_entry_stop_heal_failed",
+                                        "account_id": self.account_id,
+                                        "error": repr(exc),
+                                    }
+                                },
+                            )
                 return
             except asyncio.CancelledError:
                 raise
@@ -2883,8 +2928,21 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             take_profit_leg = (
                 None if exit_only else TakeProfitRequest(limit_price=take_profit_price)
             )
+        # Entries ride GTC so the SL/TP legs survive the session close: a DAY
+        # bracket/OTO's stop leg expires at 4pm ET and leaves the filled
+        # position naked overnight (paper soak 2026-11-25). Alpaca accepts
+        # ``gtc`` on bracket/OTO parents, market parent included (its order
+        # docs restrict advanced-order TIF to day/gtc and allow gtc on market
+        # orders); ``extended_hours`` stays False. A bare exit-only market
+        # order keeps DAY: it carries no resting leg to protect, it is meant
+        # to fill in the session it was submitted, and a DAY expiry surfaces
+        # an unfilled exit through the terminal-order reconciliation rather
+        # than silently carrying a stale exit into a later session.
+        entry_time_in_force = (
+            time_in_force.DAY if exit_only else time_in_force.GTC
+        )
         return market_request_cls(
-            time_in_force=time_in_force.DAY,
+            time_in_force=entry_time_in_force,
             extended_hours=False,
             order_class=order_class,
             take_profit=take_profit_leg,
@@ -5751,7 +5809,9 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 side=order_side.SELL
                 if live.stop_side == "sell"
                 else order_side.BUY,
-                time_in_force=time_in_force.DAY,
+                # GTC: a DAY stop expires at the close and the refused close
+                # would leave the position naked overnight (2026-11-25 soak).
+                time_in_force=time_in_force.GTC,
                 stop_price=stop_price,
             )
             await asyncio.to_thread(client.submit_order, order_data=request)
@@ -6136,6 +6196,423 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             return False
         return True
 
+    # ── Expired entry stop-leg self-heal ──────────────────────────────────────
+    #
+    # A DAY bracket/OTO entry's stop leg expired at the session close and left
+    # the filled position naked overnight (paper soak 2026-11-25). Entries now
+    # submit GTC, but positions opened before the fix - and any leg Alpaca
+    # expires for another reason - still need the same protection back. The
+    # scan runs at connect-time recovery and, throttled, inside
+    # ``list_protective_stops`` (the periodic path the reconciler and the
+    # trailing loop already call); it never runs in the trade-update stream.
+
+    @staticmethod
+    def _expired_entry_stop_candidates(
+        orders: list[Any], book: Mapping[str, tuple[float, str]]
+    ) -> dict[str, list[tuple[Any, Any]]]:
+        """Expired stop legs under filled entry parents, grouped by symbol.
+
+        ``book`` maps each open symbol to ``(signed qty, reducing side)``. A
+        leg is a candidate only when it is provably an entry's protection:
+        its parent is ``filled``, the leg itself reads ``expired`` (never
+        ``canceled`` - that is a deliberate release, or ``filled``), carries
+        a stop order type on the position's reducing side, reports nothing
+        filled, and has a usable stop price. Anything less certain is left
+        for the caller's ambiguity handling rather than collected here.
+        """
+        candidates: dict[str, list[tuple[Any, Any]]] = {}
+        for parent in orders:
+            if _order_status(parent) != "filled":
+                continue
+            parent_symbol = _order_symbol(parent)
+            for leg in _order_legs(parent):
+                if _order_status(leg) != "expired":
+                    continue
+                if "stop" not in _order_type(leg):
+                    continue
+                symbol = _order_symbol(leg) or parent_symbol
+                position = book.get(symbol)
+                if position is None or _order_side(leg) != position[1]:
+                    continue
+                try:
+                    leg_filled = parse_optional(
+                        _order_attr(leg, "filled_qty", None)
+                    )
+                except MoneyParseError:
+                    # A quantity nobody can read cannot prove "not filled".
+                    continue
+                if leg_filled is not None and leg_filled > 0:
+                    continue
+                if _usable_stop_price(leg) is None:
+                    continue
+                candidates.setdefault(symbol, []).append((parent, leg))
+        return candidates
+
+    def _expired_stop_heal_alert(
+        self, symbol: str, reason: str, detail: Mapping[str, Any]
+    ) -> None:
+        """One deduped ERROR alert plus an audit row for a heal decision.
+
+        The expired leg stays in the broker's history forever, so without
+        dedupe every periodic pass would re-alert the same finding. The key
+        carries the reason and the leg ids: a NEW expired leg on the same
+        symbol alerts again.
+        """
+        leg_ids = detail.get("leg_order_ids") or ()
+        key = f"{symbol}:{reason}:{','.join(str(item) for item in leg_ids)}"
+        if key in self._expired_stop_heal_alerted:
+            return
+        if len(self._expired_stop_heal_alerted) > 500:
+            self._expired_stop_heal_alerted.clear()
+        self._expired_stop_heal_alerted.add(key)
+        record_live_control_audit(
+            action=_EXPIRED_STOP_HEAL_AUDIT_ACTION,
+            target_type="account_symbol",
+            target_id=f"{self.account_id}:{symbol}",
+            actor="live-runner",
+            succeeded=False,
+            detail={
+                "account_id": self.account_id,
+                "symbol": symbol,
+                "reason": reason,
+                **dict(detail),
+            },
+        )
+        logger.error(
+            "ALERT: Alpaca expired entry stop leg on %s needs attention "
+            "(%s); no protective order was placed by the heal",
+            symbol,
+            reason,
+            extra={
+                "data": {
+                    "alert": "expired_entry_stop_heal",
+                    "account_id": self.account_id,
+                    "symbol": symbol,
+                    "reason": reason,
+                    **dict(detail),
+                }
+            },
+        )
+
+    async def _heal_expired_entry_stop(
+        self,
+        client: Any,
+        symbol: str,
+        position: tuple[float, str],
+        found: list[tuple[Any, Any]],
+    ) -> None:
+        """Re-place one symbol's expired entry stop, or alert and place nothing.
+
+        Every ambiguity fails closed to an alert: more than one candidate
+        leg, a leg that cannot be attributed to a verified entry signal, a
+        ledger that does not match the broker position, a stop already
+        working, or a leg type the heal cannot reproduce. Only a single,
+        provably ours, unprotected, ledger-matching expired stop gets a GTC
+        replacement at its recorded price, booked against the entry through
+        the ``-reprotect`` client-order-id convention so a later fill lands
+        on the entry's ledger.
+        """
+        qty, side = position
+        leg_ids = sorted(
+            {
+                str(
+                    _control_order_id(_order_attr(leg, "id"))
+                    or _control_order_id(_order_attr(leg, "client_order_id"))
+                    or "?"
+                )
+                for _parent, leg in found
+            }
+        )
+        if len(found) != 1:
+            self._expired_stop_heal_alert(
+                symbol,
+                "ambiguous_expired_stop_legs",
+                {"leg_order_ids": leg_ids, "candidate_count": len(found)},
+            )
+            return
+        parent, leg = found[0]
+        # Nothing protective may already work: re-placing beside a working
+        # stop would leave two stops on one position, and the second becomes
+        # an orphan the moment the first fills.
+        try:
+            working = await self._working_book_on_symbol(client, symbol)
+        except Exception as exc:  # except-kind: money-decision
+            self._expired_stop_heal_alert(
+                symbol,
+                "working_book_unreadable",
+                {"leg_order_ids": leg_ids, "error": repr(exc)},
+            )
+            return
+        if self._has_working_stop(working, symbol, side):
+            self._expired_stop_heal_alert(
+                symbol,
+                "expired_leg_but_stop_working",
+                {"leg_order_ids": leg_ids},
+            )
+            return
+        coid = str(_order_attr(parent, "client_order_id", "") or "")
+        entry_signal_id = await self._verified_reprotect_entry(
+            _reprotect_entry_candidate(coid)
+        )
+        if entry_signal_id is None:
+            self._expired_stop_heal_alert(
+                symbol,
+                "expired_leg_unattributed",
+                {"leg_order_ids": leg_ids, "parent_client_order_id": coid},
+            )
+            return
+        try:
+            ledgers = await asyncio.to_thread(
+                get_account_net_filled_qty_by_deployment, self.account_id, symbol
+            )
+        except Exception as exc:  # except-kind: money-decision
+            self._expired_stop_heal_alert(
+                symbol,
+                "ledger_unreadable",
+                {"leg_order_ids": leg_ids, "error": repr(exc)},
+            )
+            return
+        ledger_net = sum(float(value) for value in ledgers.values())
+        if abs(ledger_net - qty) > self.position_qty_tolerance(symbol):
+            self._expired_stop_heal_alert(
+                symbol,
+                "ledger_mismatch",
+                {
+                    "leg_order_ids": leg_ids,
+                    "broker_qty": qty,
+                    "ledger_qty": ledger_net,
+                },
+            )
+            return
+        stop_price = _usable_stop_price(leg)
+        order_type = _order_type(leg)
+        leg_key = (
+            _control_order_id(_order_attr(leg, "id"))
+            or _control_order_id(_order_attr(leg, "client_order_id"))
+            or "unknown"
+        )
+        # ``{entry}-reprotect-{leg}``: the leading UUID is the verified entry
+        # (``_reprotect_entry_candidate`` stops at the first marker), and the
+        # leg id keeps the client order id unique across repeated heals.
+        client_order_id = f"{entry_signal_id}-reprotect-{leg_key}"[:128]
+        (
+            order_side,
+            time_in_force,
+            _limit_request_cls,
+            stop_request_cls,
+            stop_limit_request_cls,
+        ) = self._load_exit_order_types()
+        request_side = order_side.SELL if side == "sell" else order_side.BUY
+        request_qty = abs(qty)
+        if order_type == "stop_limit":
+            try:
+                limit_price = parse_optional(_order_attr(leg, "limit_price", None))
+            except MoneyParseError:
+                limit_price = None
+            if stop_price is None or limit_price is None:
+                self._expired_stop_heal_alert(
+                    symbol,
+                    "unusable_stop_level",
+                    {"leg_order_ids": leg_ids, "order_type": order_type},
+                )
+                return
+            request = stop_limit_request_cls(
+                symbol=symbol,
+                qty=request_qty,
+                side=request_side,
+                time_in_force=time_in_force.GTC,
+                stop_price=stop_price,
+                limit_price=limit_price,
+                client_order_id=client_order_id,
+            )
+        elif order_type == "stop":
+            if stop_price is None:
+                self._expired_stop_heal_alert(
+                    symbol,
+                    "unusable_stop_level",
+                    {"leg_order_ids": leg_ids, "order_type": order_type},
+                )
+                return
+            request = stop_request_cls(
+                symbol=symbol,
+                qty=request_qty,
+                side=request_side,
+                time_in_force=time_in_force.GTC,
+                stop_price=stop_price,
+                client_order_id=client_order_id,
+            )
+        else:
+            self._expired_stop_heal_alert(
+                symbol,
+                "unhandled_leg_type",
+                {"leg_order_ids": leg_ids, "order_type": order_type},
+            )
+            return
+        try:
+            order = await asyncio.to_thread(client.submit_order, order_data=request)
+        except Exception as exc:  # except-kind: money-decision
+            self._expired_stop_heal_alert(
+                symbol,
+                "place_failed",
+                {
+                    "leg_order_ids": leg_ids,
+                    "entry_signal_id": entry_signal_id,
+                    "stop_price": stop_price,
+                    "error": repr(exc),
+                },
+            )
+            return
+        await self._register_reprotect_attribution(
+            client,
+            {"entry_signal_id": entry_signal_id, "symbol": symbol, "side": side},
+            order,
+            nested_lookup=False,
+        )
+        record_live_control_audit(
+            action=_EXPIRED_STOP_HEAL_AUDIT_ACTION,
+            target_type="account_symbol",
+            target_id=f"{self.account_id}:{symbol}",
+            actor="live-runner",
+            succeeded=True,
+            detail={
+                "account_id": self.account_id,
+                "symbol": symbol,
+                "outcome": "stop_replaced",
+                "entry_signal_id": entry_signal_id,
+                "expired_leg_order_ids": leg_ids,
+                "broker_order_id": _control_order_id(_order_attr(order, "id")),
+                "qty": request_qty,
+                "side": side,
+                "stop_price": stop_price,
+            },
+        )
+        logger.error(
+            "ALERT: Alpaca position %s was naked - its entry stop leg %s had "
+            "expired; re-placed a GTC stop at %s for %s shares",
+            symbol,
+            leg_ids,
+            stop_price,
+            request_qty,
+            extra={
+                "data": {
+                    "alert": "expired_entry_stop_reprotect",
+                    "account_id": self.account_id,
+                    "symbol": symbol,
+                    "entry_signal_id": entry_signal_id,
+                    "expired_leg_order_ids": leg_ids,
+                    "broker_order_id": _control_order_id(_order_attr(order, "id")),
+                    "qty": request_qty,
+                    "side": side,
+                    "stop_price": stop_price,
+                }
+            },
+        )
+
+    async def _heal_expired_entry_stops(self, client: Any) -> None:
+        """Scan open positions for expired entry stop legs and re-protect.
+
+        A position is healed only when the ledger's net filled quantity for
+        the symbol matches the broker's (the position is provably the
+        platform's) and exactly one expired stop leg on the reducing side is
+        found under a filled, attributable entry parent. Per-symbol failures
+        alert and never abort the scan; a failure to list the order history
+        propagates so the caller reports the pass as failed rather than
+        reading an incomplete book as clean.
+        """
+        positions = await self.get_positions()
+        book: dict[str, tuple[float, str]] = {}
+        for position in positions:
+            symbol = str(position.get("symbol") or "").strip().upper()
+            if not symbol or position.get("qty_unparseable"):
+                continue
+            try:
+                qty = _position_qty(position)
+            except ValueError:
+                # A quantity nobody can read cannot be proven ours; the
+                # symbol is skipped rather than aborting the whole scan.
+                continue
+            if _is_flat(qty):
+                continue
+            book[symbol] = (qty, "sell" if qty > 0 else "buy")
+        if not book:
+            return
+        symbols = set(book)
+        orders = await self._list_orders_status_all(
+            client,
+            symbols=symbols,
+            after=await self._held_leg_scan_after(symbols),
+        )
+        candidates = self._expired_entry_stop_candidates(orders, book)
+        for symbol, found in candidates.items():
+            try:
+                await self._heal_expired_entry_stop(
+                    client, symbol, book[symbol], found
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # except-kind: money-decision
+                self._expired_stop_heal_alert(
+                    symbol,
+                    "heal_error",
+                    {
+                        "leg_order_ids": sorted(
+                            {
+                                str(
+                                    _control_order_id(_order_attr(leg, "id"))
+                                    or _control_order_id(
+                                        _order_attr(leg, "client_order_id")
+                                    )
+                                    or "?"
+                                )
+                                for _parent, leg in found
+                            }
+                        ),
+                        "error": repr(exc),
+                    },
+                )
+
+    async def _maybe_heal_expired_entry_stops(self, client: Any) -> None:
+        """Throttled heal for the periodic ``list_protective_stops`` path.
+
+        The account order-placement lock is taken with a bounded wait: the
+        listing must not stall behind a busy submit section, and a skipped
+        pass is retried on the next interval (and always at connect).
+        """
+        now = time.monotonic()
+        if now - self._expired_stop_heal_last_run < _EXPIRED_STOP_HEAL_INTERVAL_SECONDS:
+            return
+        self._expired_stop_heal_last_run = now
+        try:
+            async with account_order_placement(
+                self.order_placement_account_id,
+                timeout=_EXPIRED_STOP_HEAL_LOCK_TIMEOUT_SECONDS,
+            ), self._order_book_lock():
+                await self._heal_expired_entry_stops(client)
+        except AccountOrderLockTimeoutError as exc:
+            logger.warning(
+                "Alpaca expired entry stop heal skipped: the account "
+                "order-placement lock stayed busy",
+                extra={
+                    "data": {
+                        "account_id": self.account_id,
+                        "error": repr(exc),
+                    }
+                },
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # except-kind: money-decision
+            logger.error(
+                "ALERT: Alpaca expired entry stop heal pass failed",
+                extra={
+                    "data": {
+                        "alert": "expired_entry_stop_heal_failed",
+                        "account_id": self.account_id,
+                        "error": repr(exc),
+                    }
+                },
+            )
+
     async def list_protective_stops(self) -> list[ProtectiveStop]:
         """Working plain stop orders on the reducing side of each open position.
 
@@ -6161,9 +6638,15 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         # A symbol with an unreadable stop candidate is ambiguous: listing its
         # readable stops would let trailing amend one while the malformed one
         # stays put. Zero listed stops is the fail-closed answer.
-        return [
+        result = [
             stop for stop in stops.values() if stop.symbol not in unreadable_symbols
         ]
+        # This listing is the periodic path the reconciler and the trailing
+        # loop already run; the throttled expired-leg heal rides it so a
+        # position whose DAY stop leg expired at the close is re-protected
+        # without waiting for a restart.
+        await self._maybe_heal_expired_entry_stops(client)
+        return result
 
     async def _list_filled_parents_with_held_legs(
         self, client: Any, symbols: set[str] | None
