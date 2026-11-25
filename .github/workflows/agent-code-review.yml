@@ -7,6 +7,7 @@ name: Agent Code Review
 #
 # opencode's free Zen models (and Kilo's, see Configuration) need no login and
 # no API key, so this workflow holds no secret besides the default GITHUB_TOKEN
+# (and, only for an `nvidia/...` model, ACTIONS_NVIDIA_API_KEY - see Configuration)
 # of the posting job. Those
 # models do cap usage, and an exhausted cap must not read as a review result:
 # the `quota-probe` job pings the same model before the agent job installs
@@ -64,6 +65,15 @@ name: Agent Code Review
 # quota path like a Zen cap. Kilo's free models may train on prompts - this
 # repository is public. Variants are per model and not always the ones Kilo lists:
 # opencode 2.2.7 refused Ling 3.2 Flash's `thinking` and took `high`.
+#
+# A `nvidia/<model>` value (e.g. nvidia/stepfun-ai/step-5-preview) runs the stage on
+# NVIDIA's API with the ACTIONS_NVIDIA_API_KEY repository secret. Only the probe step
+# and the agent step receive it, and only for an `nvidia/...` model; every other model
+# runs with no secret, as before. The agent has a shell, so the key is reachable from
+# the agent's environment: accepted for a free-tier key on same-repo PRs (forks are
+# skipped and get no secrets). NVIDIA's free tier limits per key, not per IP, and the
+# key is shared with local use. A 429 ("Too Many Requests") takes the quota path
+# like a Zen cap - grey when the probe sees it, "not run: quota" when it hits mid-run.
 
 on:
   pull_request:
@@ -160,14 +170,27 @@ jobs:
           conf="$HOME/.config/opencode"
           mkdir -p "$conf/agents"
           # A `kilo/...` model runs on Kilo's anonymous gateway (ai-gateway.kilo.ai, no key,
-          # like the Zen free models); every other model gets the config it always had.
+          # like the Zen free models) and an `nvidia/...` model on NVIDIA's API (below);
+          # every other model gets the config it always had.
           # The gateway URL and the model itself are declared, not left to opencode's
           # catalog: with only `"kilo": {}` opencode 2.2.7 resolved the model in some fresh
           # homes and in others silently ran its default model instead (run 45239957263
           # pinged `nex-agi/nex-n2.6`, "You need to sign in"). Declared, 5 of 5 fresh homes
           # reached the configured model.
+          # MODEL is provider/model; a bare or empty model id would only reach
+          # opencode as a model it cannot resolve, so it stops here with its name.
+          if [ "${MODEL%%/*}" = "$MODEL" ] || [ -z "${MODEL#*/}" ]; then
+            echo "::error::MODEL '${MODEL}' is not provider/model (e.g. nvidia/stepfun-ai/step-5-preview)."
+            exit 1
+          fi
           if [ "${MODEL%%/*}" = "kilo" ]; then
             jq -cn --arg model "${MODEL#kilo/}" '{"$schema": "https://opencode.ai/config.json", update: "disable", providers: {kilo: {settings: {baseURL: "https://ai-gateway.kilo.ai/api/v1"}, models: {($model): {}}}}}' > "$conf/opencode.json"
+          elif [ "${MODEL%%/*}" = "nvidia" ]; then
+            # An `nvidia/...` model runs on NVIDIA's API with the key from the
+            # ACTIONS_NVIDIA_API_KEY secret, which only the probe and agent steps
+            # receive (as NVIDIA_API_KEY, the variable opencode's built-in provider
+            # reads). The model is declared for the same reason as Kilo's.
+            jq -cn --arg model "${MODEL#nvidia/}" '{"$schema": "https://opencode.ai/config.json", update: "disable", providers: {nvidia: {models: {($model): {}}}}}' > "$conf/opencode.json"
           else
             printf '{"$schema":"https://opencode.ai/config.json","update":"disable"}\n' > "$conf/opencode.json"
           fi
@@ -190,8 +213,14 @@ jobs:
         id: probe
         env:
           OPENCODE_DISABLE_PROJECT_CONFIG: "1"
+          NVIDIA_API_KEY: ${{ startsWith(env.MODEL, 'nvidia/') && secrets.ACTIONS_NVIDIA_API_KEY || '' }}
         run: |
           set -euo pipefail
+          # Without the secret an `nvidia/...` model can only fail with a 401; say why.
+          if [ -n "${MODEL:-}" ] && [ "${MODEL%%/*}" = "nvidia" ] && [ -z "${NVIDIA_API_KEY:-}" ]; then
+            echo "::error::MODEL is ${MODEL}, but the ACTIONS_NVIDIA_API_KEY secret is not set (Settings -> Secrets and variables -> Actions)."
+            exit 1
+          fi
           probe_dir="$RUNNER_TEMP/quota-probe"
           mkdir -p "$probe_dir"
           # Over Kilo's OpenAI-compatible gateway a 429 reaches opencode only as the bare
@@ -207,6 +236,25 @@ jobs:
               echo 'rate limit: opencode gave up retrying a retryable provider error' >> "$1"
             fi
           }
+          # opencode repeats the provider's error on every retry line ("retrying
+          # (attempt N): ... Too Many Requests"), also when a later retry succeeds.
+          # A cap only counts once all retries are through, so the quota classifier
+          # reads stderr without those lines (<file>.final); the final error line
+          # stays, and so does note_exhausted_retries' synthetic line, which must
+          # therefore never contain "retrying (attempt".
+          drop_retry_lines() {
+            grep -v 'retrying (attempt' "$1" > "$1.final" || true
+          }
+          # A failed probe whose last stderr line is a retry line was cut off mid-retry:
+          # that line is why it failed, so it goes back into the classifier's view (only
+          # for a failed probe - after a retry that cleared it must not count).
+          keep_last_retry_line() {
+            local final_line
+            final_line=$(grep -v '^[[:space:]]*$' "$1" | tail -n 1) || true
+            case "$final_line" in
+              *'retrying (attempt'*) printf '%s\n' "$final_line" >> "$1.final" ;;
+            esac
+          }
           # opencode has been seen exiting 0 on the cap for this tiny prompt,
           # so the exit status alone cannot clear the model: the quota
           # signature is grepped over BOTH streams whatever the status, and
@@ -219,6 +267,8 @@ jobs:
             "Reply with the single word: OK" 2> "$probe_dir/stderr") || status=$?
           printf '%s\n' "$raw" > "$probe_dir/stdout"
           note_exhausted_retries "$probe_dir/stderr"
+          drop_retry_lines "$probe_dir/stderr"
+          [ "$status" -eq 0 ] || keep_last_retry_line "$probe_dir/stderr"
           cat "$probe_dir/stdout" "$probe_dir/stderr" > "$probe_dir/combined"
           # Always logged, bounded like the agent step's echo: run 44962236033
           # passed this probe and hit "Free usage limit reached" 26 s later,
@@ -233,7 +283,7 @@ jobs:
           # an exhausted quota or a region refusal - and deliberately not the
           # misconfiguration class (a model or variant that cannot be resolved
           # at all): that is a genuine failure, and the agent job reports it.
-          if grep -qiE 'usage limit|rate.?limit|quota|insufficient credits|limit reached|not available in your country|service unavailable|overloaded|sign up for free to continue' "$probe_dir/stdout" "$probe_dir/stderr"; then
+          if grep -qiE 'usage limit|rate.?limit|quota|insufficient credits|limit reached|not available in your country|service unavailable|overloaded|sign up for free to continue|too many requests' "$probe_dir/stdout" "$probe_dir/stderr.final"; then
             echo "available=false" >> "$GITHUB_OUTPUT"
             echo "::warning::The free model is capped, rate-limited, region-refused or unavailable; the agent job is skipped - not run: quota. Re-run the workflow after the quota resets."
           elif [ "$status" -eq 0 ] && grep -qw 'OK' "$probe_dir/stdout"; then
@@ -330,14 +380,27 @@ jobs:
           conf="$HOME/.config/opencode"
           mkdir -p "$conf/agents"
           # A `kilo/...` model runs on Kilo's anonymous gateway (ai-gateway.kilo.ai, no key,
-          # like the Zen free models); every other model gets the config it always had.
+          # like the Zen free models) and an `nvidia/...` model on NVIDIA's API (below);
+          # every other model gets the config it always had.
           # The gateway URL and the model itself are declared, not left to opencode's
           # catalog: with only `"kilo": {}` opencode 2.2.7 resolved the model in some fresh
           # homes and in others silently ran its default model instead (run 45239957263
           # pinged `nex-agi/nex-n2.6`, "You need to sign in"). Declared, 5 of 5 fresh homes
           # reached the configured model.
+          # MODEL is provider/model; a bare or empty model id would only reach
+          # opencode as a model it cannot resolve, so it stops here with its name.
+          if [ "${MODEL%%/*}" = "$MODEL" ] || [ -z "${MODEL#*/}" ]; then
+            echo "::error::MODEL '${MODEL}' is not provider/model (e.g. nvidia/stepfun-ai/step-5-preview)."
+            exit 1
+          fi
           if [ "${MODEL%%/*}" = "kilo" ]; then
             jq -cn --arg model "${MODEL#kilo/}" '{"$schema": "https://opencode.ai/config.json", update: "disable", providers: {kilo: {settings: {baseURL: "https://ai-gateway.kilo.ai/api/v1"}, models: {($model): {}}}}}' > "$conf/opencode.json"
+          elif [ "${MODEL%%/*}" = "nvidia" ]; then
+            # An `nvidia/...` model runs on NVIDIA's API with the key from the
+            # ACTIONS_NVIDIA_API_KEY secret, which only the probe and agent steps
+            # receive (as NVIDIA_API_KEY, the variable opencode's built-in provider
+            # reads). The model is declared for the same reason as Kilo's.
+            jq -cn --arg model "${MODEL#nvidia/}" '{"$schema": "https://opencode.ai/config.json", update: "disable", providers: {nvidia: {models: {($model): {}}}}}' > "$conf/opencode.json"
           else
             printf '{"$schema":"https://opencode.ai/config.json","update":"disable"}\n' > "$conf/opencode.json"
           fi
@@ -377,8 +440,14 @@ jobs:
       - name: Run review agent
         env:
           OPENCODE_DISABLE_PROJECT_CONFIG: "1"
+          NVIDIA_API_KEY: ${{ startsWith(env.MODEL, 'nvidia/') && secrets.ACTIONS_NVIDIA_API_KEY || '' }}
         run: |
           set -euo pipefail
+          # Without the secret an `nvidia/...` model can only fail with a 401; say why.
+          if [ -n "${MODEL:-}" ] && [ "${MODEL%%/*}" = "nvidia" ] && [ -z "${NVIDIA_API_KEY:-}" ]; then
+            echo "::error::MODEL is ${MODEL}, but the ACTIONS_NVIDIA_API_KEY secret is not set (Settings -> Secrets and variables -> Actions)."
+            exit 1
+          fi
           out="$RUNNER_TEMP/review/comment.md"
           # Whose rules ran is the one thing the report itself cannot show, and it is the
           # fallback's whole point: while the base branch has no skill, the PR's own copy
@@ -405,6 +474,40 @@ jobs:
               echo 'rate limit: opencode gave up retrying a retryable provider error' >> "$1"
             fi
           }
+          # opencode repeats the provider's error on every retry line ("retrying
+          # (attempt N): ... Too Many Requests"), also when a later retry succeeds.
+          # A cap only counts once all retries are through, so the quota classifier
+          # reads stderr without those lines (<file>.final); the final error line
+          # stays, and so does note_exhausted_retries' synthetic line, which must
+          # therefore never contain "retrying (attempt".
+          drop_retry_lines() {
+            grep -v 'retrying (attempt' "$1" > "$1.final" || true
+          }
+          # The agent has a shell and its stdout becomes a public PR comment (and, for the
+          # pre-mortem, an artifact). An `nvidia/...` run holds the key in this step's env,
+          # so before anything is kept the captured streams are checked for it: a stream
+          # that carries the key fails the step, which uploads and posts nothing (the later
+          # steps only run on success), and the files are removed besides. Actions masks
+          # the secret in the log on its own.
+          refuse_leaked_key() {
+            if [ -n "${NVIDIA_API_KEY:-}" ] \
+              && grep -qF -- "$NVIDIA_API_KEY" "$out.raw" "$out.stderr" 2>/dev/null; then
+              rm -f "$out" "$out.raw" "$out.stderr" "$out.stderr.final"
+              echo "::error::The agent output contains the NVIDIA API key; nothing is posted or uploaded. Rotate ACTIONS_NVIDIA_API_KEY."
+              exit 1
+            fi
+          }
+          # A failed run's retries are over, so if its last stderr line is a retry line
+          # (opencode cut off mid-retry) that line is the final word on why it failed and
+          # goes back into the classifier's view. Only for a failed run: after a retry that
+          # cleared, the last stderr line can be that retry too, and it must not count.
+          keep_last_retry_line() {
+            local final_line
+            final_line=$(grep -v '^[[:space:]]*$' "$1" | tail -n 1) || true
+            case "$final_line" in
+              *'retrying (attempt'*) printf '%s\n' "$final_line" >> "$1.final" ;;
+            esac
+          }
           report_quota_skip() {
             echo "::warning::The review agent could not run - the free model was capped, rate-limited, refused or unavailable (see the group above for the exact reason). That is a transient infra failure, not a review result: not run: quota. Re-run this job after the quota resets."
             {
@@ -424,8 +527,11 @@ jobs:
             "Review PR #${PR_NUMBER}. Base ${BASE_SHA}, head ${HEAD_SHA}. PR metadata: $RUNNER_TEMP/review/meta.json. Review rules loaded from: ${SKILL_SOURCE}." \
             2> "$out.stderr"); then
             note_exhausted_retries "$out.stderr"
+            drop_retry_lines "$out.stderr"
+            keep_last_retry_line "$out.stderr"
             printf '%s\n' "$raw" > "$out.raw"
             cat "$out.stderr" >> "$out.raw"
+            refuse_leaked_key
             # The reason the agent failed is only in stderr, and a file no one
             # reads is not a diagnosis: echo the captured output, bounded so a
             # runaway agent cannot flood the log, before the classification.
@@ -442,7 +548,7 @@ jobs:
             # until the repository variable changes. Only the first class takes
             # the quota path; anything else fails with its own message and the
             # captured stderr above it.
-            if grep -qiE 'usage limit|rate.?limit|quota|insufficient credits|limit reached|not available in your country|service unavailable|overloaded|sign up for free to continue' "$out.stderr"; then
+            if grep -qiE 'usage limit|rate.?limit|quota|insufficient credits|limit reached|not available in your country|service unavailable|overloaded|sign up for free to continue|too many requests' "$out.stderr.final"; then
               report_quota_skip
             elif grep -qiE 'model (is )?(not (found|available|supported))|no provider|invalid model|unknown variant' "$out.stderr"; then
               echo "::error::The review agent could not resolve its model - REVIEW_MODEL / REVIEW_VARIANT name a model, variant or provider that does not exist or is not authorised (see the group above for the exact reason). That is a configuration error, not a transient one: re-running this job cannot succeed until the repository variable changes."
@@ -452,6 +558,8 @@ jobs:
             exit 1
           fi
           printf '%s\n' "$raw" > "$out.raw"
+          drop_retry_lines "$out.stderr"
+          refuse_leaked_key
           # stderr went to a file for the failure classifier; on success it
           # would otherwise never reach the log, so it is echoed bounded too.
           if [ -s "$out.stderr" ]; then
@@ -469,7 +577,7 @@ jobs:
             # classified before it fails. The grep covers the raw stream and
             # stderr both, and runs only here - a real report's own text may
             # mention "quota", so a produced report is never re-classified.
-            if grep -qiE 'usage limit|rate.?limit|quota|insufficient credits|limit reached|not available in your country|service unavailable|overloaded|sign up for free to continue' "$out.raw" "$out.stderr"; then
+            if grep -qiE 'usage limit|rate.?limit|quota|insufficient credits|limit reached|not available in your country|service unavailable|overloaded|sign up for free to continue|too many requests' "$out.raw" "$out.stderr.final"; then
               echo "::group::Agent output (last 4000 bytes)"
               tail -c 4000 "$out.raw"
               echo "::endgroup::"
@@ -485,7 +593,7 @@ jobs:
           if ! grep -v '^[[:space:]]*$' "$out" | tail -n 1 | grep -q '^\*\*Verdict:'; then
             # Same zero-exit cap as above: a report that starts but never reaches
             # a verdict line can still be the quota signature, on either stream.
-            if grep -qiE 'usage limit|rate.?limit|quota|insufficient credits|limit reached|not available in your country|service unavailable|overloaded|sign up for free to continue' "$out.raw" "$out.stderr"; then
+            if grep -qiE 'usage limit|rate.?limit|quota|insufficient credits|limit reached|not available in your country|service unavailable|overloaded|sign up for free to continue|too many requests' "$out.raw" "$out.stderr.final"; then
               echo "::group::Agent output (last 4000 bytes)"
               tail -c 4000 "$out.raw"
               echo "::endgroup::"
