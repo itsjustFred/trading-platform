@@ -6049,3 +6049,445 @@ def test_held_leg_scan_after_is_unbounded_when_a_symbol_has_no_bound(
         adapter._list_filled_parents_with_held_legs(client, {"AAA", "BBB"})
     )
     assert client.last_order_filter.after is None
+
+
+# ─── #350 bundle-84 review: money-path refusal guards pinned (B1) ────────────
+#
+# Each test below fails when its guard is removed: the guards are the only
+# thing stopping a wrong-level or naked re-protection on a live account, so a
+# silent deletion must turn a test red.
+
+
+def test_partial_exit_refuses_ambiguous_tp_levels(monkeypatch) -> None:
+    """Two working take-profit prices: which tranche the exit hits is
+    unknowable, so the partial exit refuses before any broker write (#350 M2).
+    """
+    orders = _filled_bracket()
+    orders.append(
+        _FakeOrder(
+            id="tp-2",
+            symbol="AAPL",
+            side="sell",
+            order_type="limit",
+            qty=5.0,
+            limit_price=215.0,
+            status="new",
+        )
+    )
+    client = _FakeTradingClient(
+        orders=orders,
+        positions=[_FakePosition("AAPL", 10.0)],
+    )
+    adapter = _adapter(client)
+    _patched_signal_store(monkeypatch, [])
+
+    submission = adapter.submit_order(_partial_signal(4.0), qty=4.0)
+    with pytest.raises(ValueError, match="ambiguous take_profit") as raised:
+        asyncio.run(submission)
+
+    assert "ambiguous take_profit levels" in str(raised.value)
+    assert client.cancelled == []
+    assert client.submitted == []
+    assert is_order_not_submitted(raised.value) is True
+
+
+def test_partial_exit_refuses_unreadable_levels(monkeypatch) -> None:
+    """A protection leg whose price cannot be read refuses the exit (#350 M3).
+
+    Re-placing at a ``None`` level would submit a protection order with no
+    price at all; the refusal fires before any cancel or submit.
+    """
+    orders = _filled_bracket()
+    orders.append(
+        _FakeOrder(
+            id="sl-2",
+            symbol="AAPL",
+            side="sell",
+            order_type="stop",
+            qty=5.0,
+            stop_price=None,
+            status="new",
+        )
+    )
+    client = _FakeTradingClient(
+        orders=orders,
+        positions=[_FakePosition("AAPL", 10.0)],
+    )
+    adapter = _adapter(client)
+    _patched_signal_store(monkeypatch, [])
+
+    submission = adapter.submit_order(_partial_signal(4.0), qty=4.0)
+    with pytest.raises(ValueError, match="unreadable") as raised:
+        asyncio.run(submission)
+
+    assert "stop_loss level unreadable" in str(raised.value)
+    assert client.cancelled == []
+    assert client.submitted == []
+    assert is_order_not_submitted(raised.value) is True
+
+
+def _underfilled_exit_client() -> _FakeTradingClient:
+    """Position 10, OCO protecting 6, terminal exit order ``exit-1``: 4 naked."""
+    return _FakeTradingClient(
+        orders=[
+            _working_oco(qty=6.0),
+            _FakeOrder(
+                id="exit-1",
+                symbol="AAPL",
+                side="sell",
+                order_type="market",
+                qty=4.0,
+                status="expired",
+            ),
+        ],
+        positions=[_FakePosition("AAPL", 10.0)],
+    )
+
+
+def test_recovery_tops_up_refuses_per_candidate_recorded_levels(
+    monkeypatch, caplog
+) -> None:
+    """Under-filled exit + marker that recorded protection per candidate.
+
+    The top-up cannot pick which recorded tranche to re-place, so it alerts
+    and keeps the marker pending rather than guessing a level (#350 M11).
+    """
+    client = _underfilled_exit_client()
+    adapter = _adapter(client)
+    row = _reprotect_row(
+        {
+            "side": "sell",
+            "protection": [
+                {
+                    "kind": "stop",
+                    "order_type": "stop",
+                    "stop_price": 190.0,
+                    "limit_price": None,
+                    "qty": 6.0,
+                },
+                {
+                    "kind": "tp",
+                    "order_type": "limit",
+                    "stop_price": None,
+                    "limit_price": 210.0,
+                    "qty": 6.0,
+                },
+            ],
+        },
+        broker_order_id="exit-1",
+    )
+    cleared = _patch_marker_clears(monkeypatch)
+
+    with caplog.at_level("ERROR"):
+        verdict = asyncio.run(adapter._recover_exit_reprotection(row))
+
+    assert verdict == "pending"
+    assert client.submitted == []
+    assert client.cancelled == []
+    assert cleared == []
+    assert any(
+        "per-candidate" in record.message for record in caplog.records
+    )
+
+
+def test_recovery_tops_up_clears_a_marker_that_recorded_no_levels(
+    monkeypatch, caplog
+) -> None:
+    """Under-filled exit + marker with no recorded levels at all.
+
+    There is nothing the top-up could place, so it alerts and spends the
+    marker as ``unverified`` instead of leaving it to pile up (#350 M12).
+    """
+    client = _underfilled_exit_client()
+    adapter = _adapter(client)
+    row = _reprotect_row({"side": "sell"}, broker_order_id="exit-1")
+    cleared = _patch_marker_clears(monkeypatch)
+
+    with caplog.at_level("ERROR"):
+        verdict = asyncio.run(adapter._recover_exit_reprotection(row))
+
+    assert verdict == "unverified"
+    assert client.submitted == []
+    assert client.cancelled == []
+    assert cleared == ["sig-1"]
+    assert any(
+        "recorded no levels" in record.message for record in caplog.records
+    )
+
+
+def test_recovery_clears_an_unusable_marker(monkeypatch, caplog) -> None:
+    """A marker with an empty symbol or an unknown side can never be replayed.
+
+    Both halves of the guard end ``unverified``: the empty symbol would
+    otherwise read as "position flat" (``resolved``) and spend superseded
+    markers on a record that proved nothing, and the bad side must alert as
+    unusable rather than as a side mismatch (#350 M14).
+    """
+    client = _FakeTradingClient(positions=[_FakePosition("AAPL", 6.0)])
+    adapter = _adapter(client)
+    cleared = _patch_marker_clears(monkeypatch)
+
+    verdict = asyncio.run(
+        adapter._recover_exit_reprotection(_reprotect_row({"side": "sell"}, symbol=""))
+    )
+    assert verdict == "unverified"
+
+    with caplog.at_level("ERROR"):
+        verdict = asyncio.run(
+            adapter._recover_exit_reprotection(
+                _reprotect_row({"side": "hold", "stop_price": 190.0})
+            )
+        )
+    assert verdict == "unverified"
+
+    assert cleared == ["sig-1", "sig-1"]
+    assert client.submitted == []
+    assert client.cancelled == []
+    assert any("unusable" in record.message for record in caplog.records)
+
+
+def test_recovery_clears_recorded_protection_with_no_recognisable_kind(
+    monkeypatch, caplog
+) -> None:
+    """Recorded candidates whose ``kind`` is neither ``stop`` nor ``tp``.
+
+    No kind means coverage can be neither verified nor rebuilt, so the
+    marker is cleared ``unverified`` - NOT ``resolved``, which would spend
+    the symbol's superseded markers on a check that never ran (#350 M17).
+    """
+    client = _FakeTradingClient(positions=[_FakePosition("AAPL", 6.0)])
+    adapter = _adapter(client)
+    cleared = _patch_marker_clears(monkeypatch)
+    row = _reprotect_row(
+        {
+            "side": "sell",
+            "protection": [
+                {
+                    "kind": "mleg",
+                    "order_type": "mleg",
+                    "stop_price": None,
+                    "limit_price": None,
+                    "qty": 6.0,
+                }
+            ],
+        }
+    )
+
+    with caplog.at_level("ERROR"):
+        verdict = asyncio.run(adapter._recover_exit_reprotection(row))
+
+    assert verdict == "unverified"
+    assert cleared == ["sig-1"]
+    assert client.submitted == []
+    assert client.cancelled == []
+    assert any(
+        "no recognisable kind" in record.message for record in caplog.records
+    )
+
+
+def test_recovery_clears_marker_with_no_levels_and_no_working_protection(
+    monkeypatch,
+) -> None:
+    """No recorded levels AND no working protection: ``unverified``, not
+    ``resolved``.
+
+    Both branches clear the marker, so only the verdict tells them apart -
+    ``resolved`` would also spend the symbol's superseded markers on a
+    coverage check that never ran (#350 M18).
+    """
+    client = _FakeTradingClient(positions=[_FakePosition("AAPL", 6.0)])
+    adapter = _adapter(client)
+    cleared = _patch_marker_clears(monkeypatch)
+    row = _reprotect_row({"side": "sell"})
+
+    verdict = asyncio.run(adapter._recover_exit_reprotection(row))
+
+    assert verdict == "unverified"
+    assert cleared == ["sig-1"]
+    assert client.submitted == []
+    assert client.cancelled == []
+
+
+# ─── #350 bundle-84 review: bounded marker re-read (S-A) ─────────────────────
+
+
+def _exit_reread_client(reads: list[_FakeOrder]) -> _FakeTradingClient:
+    """A client whose ``get_order_by_id`` walks ``reads`` in order."""
+    client = _FakeTradingClient(positions=[])
+    queue = list(reads)
+
+    def _get(order_id: str):
+        if not queue:
+            return reads[-1]
+        return queue.pop(0)
+
+    client.get_order_by_id = _get  # type: ignore[method-assign]
+    return client
+
+
+def _reread_order(status: str, *, filled_qty: float = 0.0) -> _FakeOrder:
+    return _FakeOrder(
+        id="exit-1",
+        symbol="AAPL",
+        side="sell",
+        order_type="market",
+        qty=4.0,
+        status=status,
+        filled_qty=filled_qty,
+    )
+
+
+def test_marker_clear_retries_the_exit_read_until_terminal(monkeypatch) -> None:
+    """First re-read ``new``, second ``filled``: the marker is spent (#350 S-A).
+
+    A market exit is usually still working on the first read right after the
+    re-place; the bounded retry is what lets the proven full fill clear the
+    marker instead of stranding it until the next connect.
+    """
+    client = _exit_reread_client(
+        [_reread_order("new"), _reread_order("filled", filled_qty=4.0)]
+    )
+    adapter = _adapter(client)
+    cleared = _patch_marker_clears(monkeypatch)
+    sleeps: list[float] = []
+
+    async def _sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    asyncio.run(
+        adapter._maybe_clear_exit_marker_on_full_fill(
+            client,
+            _reread_order("new"),
+            {"symbol": "AAPL", "exit_qty": 4.0},
+            signal_id="sig-1",
+            sleep=_sleep,
+        )
+    )
+
+    assert cleared == ["sig-1"]
+    assert sleeps == [alpaca_module._EXIT_MARKER_REREAD_INTERVAL_SECONDS]
+
+
+def test_marker_stays_when_the_exit_never_reads_terminal(monkeypatch) -> None:
+    """Three non-terminal reads: the marker stays, and the loop stops at the
+    bound - it does not poll forever under the account order lock (#350 S-A).
+    """
+    reads: list[str] = []
+    client = _FakeTradingClient(positions=[])
+
+    def _get(order_id: str):
+        reads.append(order_id)
+        return _reread_order("new")
+
+    client.get_order_by_id = _get  # type: ignore[method-assign]
+    adapter = _adapter(client)
+    cleared = _patch_marker_clears(monkeypatch)
+    sleeps: list[float] = []
+
+    async def _sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    asyncio.run(
+        adapter._maybe_clear_exit_marker_on_full_fill(
+            client,
+            _reread_order("new"),
+            {"symbol": "AAPL", "exit_qty": 4.0},
+            signal_id="sig-1",
+            sleep=_sleep,
+        )
+    )
+
+    assert cleared == []
+    assert reads == ["exit-1"] * alpaca_module._EXIT_MARKER_REREAD_ATTEMPTS
+    assert sleeps == [
+        alpaca_module._EXIT_MARKER_REREAD_INTERVAL_SECONDS
+    ] * (alpaca_module._EXIT_MARKER_REREAD_ATTEMPTS - 1)
+
+
+def test_marker_stays_and_stops_reading_when_the_re_read_fails(
+    monkeypatch,
+) -> None:
+    """A failed re-read keeps the marker and ends the retry loop at once:
+    the outcome is unknown, so no further reads are made (#350 S-A)."""
+    reads: list[str] = []
+    client = _FakeTradingClient(positions=[])
+
+    def _get(order_id: str):
+        reads.append(order_id)
+        raise RuntimeError("broker read failed")
+
+    client.get_order_by_id = _get  # type: ignore[method-assign]
+    adapter = _adapter(client)
+    cleared = _patch_marker_clears(monkeypatch)
+    sleeps: list[float] = []
+
+    async def _sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    asyncio.run(
+        adapter._maybe_clear_exit_marker_on_full_fill(
+            client,
+            _reread_order("new"),
+            {"symbol": "AAPL", "exit_qty": 4.0},
+            signal_id="sig-1",
+            sleep=_sleep,
+        )
+    )
+
+    assert cleared == []
+    assert reads == ["exit-1"]
+    assert sleeps == []
+
+
+# ─── #350 bundle-84 review: crypto flatten attribution through the real path ──
+
+
+def test_close_all_positions_attributes_a_crypto_flatten_fill(
+    monkeypatch, caplog
+) -> None:
+    """A ``BTCUSD`` position flatten is matched by fills naming ``BTC/USD``.
+
+    ``close_all_positions`` writes the in-flight marker under the *position*
+    symbol and the stream looks it up under the *order* symbol; both go
+    through ``_flatten_marker_key`` so the crypto forms meet (#350 N-a). The
+    second fill uses the position's own ``BTCUSD`` spelling on purpose: a
+    lookup that skipped canonicalisation would still match ``BTC/USD`` but
+    miss this one, so both call sites stay pinned.
+    """
+    client = _FakeTradingClient(positions=[_FakePosition("BTCUSD", 0.5)])
+    adapter = _adapter(client)
+    flagged: list[dict] = []
+    monkeypatch.setattr(
+        alpaca_module,
+        "flag_live_ledger_reconciliation",
+        lambda **kwargs: flagged.append(kwargs) or {},
+    )
+
+    outcome = asyncio.run(adapter.close_all_positions())
+
+    assert outcome.completed == 1
+    assert client.close_calls == ["BTCUSD"]
+    assert client.positions == []
+    # Written by the real flatten path, under the canonicalised key.
+    assert (
+        alpaca_module._flatten_marker_key("BTCUSD") in adapter._flatten_in_flight
+    )
+
+    with caplog.at_level("ERROR"):
+        for symbol in ("BTC/USD", "BTCUSD"):
+            asyncio.run(
+                adapter._on_trade_update(
+                    _unknown_uuid_fill(symbol, side="sell", order_type="market")
+                )
+            )
+
+    assert [flag["cause"] for flag in flagged] == [
+        "alpaca_flatten_fill",
+        "alpaca_flatten_fill",
+    ]
+    assert flagged[0]["symbol"] == "BTC/USD"
+    assert flagged[1]["symbol"] == "BTCUSD"
+    assert not any(
+        "could not be attributed" in record.message
+        for record in caplog.records
+    )

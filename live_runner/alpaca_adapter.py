@@ -133,6 +133,12 @@ _FLATTEN_IN_FLIGHT_TTL_SECONDS = 120.0
 #: attempt the markers wait for the next connect (#350 review).
 _RECOVERY_LOCK_ATTEMPTS = 3
 _RECOVERY_LOCK_RETRY_SECONDS = 30.0
+#: Bounded re-reads of the exit order after a partial exit's re-place, to
+#: spend the ``exit_reprotection`` marker once the exit proves terminal and
+#: fully filled (#350 review S-A). Two 0.5 s sleeps total ~1 s - the caller
+#: holds the account order lock, so the wait stays well under ~1.5 s.
+_EXIT_MARKER_REREAD_ATTEMPTS = 3
+_EXIT_MARKER_REREAD_INTERVAL_SECONDS = 0.5
 
 #: States in which a bracket leg still rests at the broker: ``held`` is the OCO-inactive
 #: leg of a filled parent, ``pending_cancel`` one whose cancel has not settled yet and may
@@ -4006,30 +4012,46 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         plan: Mapping[str, Any],
         *,
         signal_id: str,
+        sleep: Any = asyncio.sleep,
     ) -> None:
         """Spend the ``exit_reprotection`` marker when nothing is left to watch.
 
         Only a *proven* outcome clears: the exit order re-read by id must be
         terminal and its ``filled_qty`` must cover the requested exit
-        quantity. A still-working order, a short fill, an unknown status or a
-        failed re-read all keep the marker - the connect replay is the
-        backstop; the stream only alerts (#350 review).
+        quantity. The re-read is a short bounded retry - a market exit is
+        usually still ``new`` on the first read right after the re-place, so
+        a single read would strand the marker until the next connect. Up to
+        ``_EXIT_MARKER_REREAD_ATTEMPTS`` reads ``_EXIT_MARKER_REREAD_INTERVAL_SECONDS``
+        apart, only while the status is non-terminal; a terminal status or a
+        failed read ends the loop. The caller holds the account order lock,
+        so the sleeps total well under the ~1.5 s budget. A still-working
+        order, a short fill, an unknown status or a failed re-read all keep
+        the marker - the connect replay is the backstop; the stream only
+        alerts (#350 review).
         """
         order_id = _control_order_id(_order_attr(order, "id"))
         get_order = getattr(client, "get_order_by_id", None)
         if order_id is None or not callable(get_order):
             return
-        try:
-            fresh = await asyncio.to_thread(get_order, order_id)
-        except Exception as exc:  # except-kind: money-decision
-            logger.debug(
-                "Alpaca exit order %s could not be re-read after re-protect; "
-                "the marker stays pending: %r",
-                order_id,
-                exc,
-            )
-            return
-        if _order_status(fresh) not in _TERMINAL_ORDER_STATUSES:
+        fresh: Any = None
+        terminal = False
+        for attempt in range(_EXIT_MARKER_REREAD_ATTEMPTS):
+            try:
+                fresh = await asyncio.to_thread(get_order, order_id)
+            except Exception as exc:  # except-kind: money-decision
+                logger.debug(
+                    "Alpaca exit order %s could not be re-read after "
+                    "re-protect; the marker stays pending: %r",
+                    order_id,
+                    exc,
+                )
+                return
+            if _order_status(fresh) in _TERMINAL_ORDER_STATUSES:
+                terminal = True
+                break
+            if attempt + 1 < _EXIT_MARKER_REREAD_ATTEMPTS:
+                await sleep(_EXIT_MARKER_REREAD_INTERVAL_SECONDS)
+        if not terminal or fresh is None:
             return
         exit_qty = plan.get("exit_qty")
         if (
