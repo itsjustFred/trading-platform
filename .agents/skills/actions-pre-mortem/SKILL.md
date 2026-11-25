@@ -60,7 +60,7 @@ Rank the impact of every scenario against these; a scenario that reaches none of
 4. For each hunk, ask the pre-mortem question: **name the next reasonable change in this area** - a new mode, field, symbol, engine, config default, caller, dependency bump, performance tweak, rename - **or an input the code already accepts without checking** (NaN, empty, unsorted, legacy rows, a second broker). Follow it through the code you read. If it reaches one of the four harms, you have a scenario.
 5. Check detectability: what would surface the failure today - a test (name it), a log line, a commit status, an operator action - or nothing. "Nothing" raises severity; a named, clear test lowers it.
 6. State the mitigation: the smallest change that stops the scenario - an assertion, an enforced invariant, a test that names it, a guard, or a comment that records the constraint. Do not propose abstractions the diff does not need.
-7. Rank the scenarios most plausible first within each severity. Write the first **8** in full; all SEVERE scenarios are always written in full. Every further scenario still goes into the report, as a one-line entry under "Further scenarios" - a scenario is never left out because of the cap or because of its evidence level.
+7. Rank the scenarios most plausible first within each severity. Write them in full in that order until eight scenarios have been written in full - but a SEVERE scenario is never demoted to a one-line entry: every SEVERE scenario is written in full even when that takes the list past eight. Every scenario not written in full still goes into the report as a one-line entry under "Further scenarios" - a scenario is never left out because of the cap or because of its evidence level.
 8. **Budget.** Stop starting new scenarios when you estimate about 20 minutes of work have passed, and report what you have. The job is killed at 30 minutes, and a killed job posts nothing - a partial report beats no report. List every file or hunk you did not get to under "Not verified".
 
 A defect that is **already true today** is still a scenario: it is the most likely one. Report it first, with trigger "already the case", and the impact it has now.
@@ -127,13 +127,17 @@ Your final message is exactly this block, with no preamble and at most 1,000 wor
   **Settle by:** the test, command or log that would prove or refute it - one sentence.
 
 ### Moderate
+- `path/to/file.py:67` · `coincidental-correctness` · L2 located
+  > quoted code, at most two lines
+  **Trigger:** … **Impact:** … **Caught by:** … **Mitigation:** …
+  **Settle by:** the test, command or log that would prove or refute it - one sentence.
 - …
 
 ### Minor
 - …
 
 ### Further scenarios
-- `path:line` · `tag` · <severity> · <level> · one sentence: trigger → harm (scenarios beyond the eight written in full)
+- `path:line` · `tag` · <severity> · <level> · one sentence: trigger → harm (scenarios beyond those written in full)
 
 ### Noticed outside this diff
 - `path:line` · quoted line · one sentence (optional, at most one item, only fragility the diff relies on or makes worse; not counted)
@@ -156,7 +160,7 @@ Run this check silently; never print it.
 - Every hunk you reached got the pre-mortem question, and every changed symbol in one had its consumers read; every hunk the time budget cut short is listed under "Not verified" - procedure 8 stops the clock before a large diff is exhausted, so the report says what it finished and what it did not. This checklist may be stricter than the procedure about what was read, never about what was not.
 - Every cited line was re-read with `git show <head>:<path>` and the quote matches that line. Every claim about other code (imports, helpers, tests, rules) has a quoted source (rule 8).
 - Every scenario has location, quote, Trigger, Impact, Caught by, Mitigation, severity, tag and evidence level; every one below L3 has `Settle by:`; no level claims a step that is not quoted; every mitigation is small and concrete; every impact names one of the four harms.
-- No scenario was left out for its level or for the cap: beyond the eight in full, each one is a line under "Further scenarios".
+- No scenario was left out for its level or for the cap: beyond those written in full (eight, or more when SEVERE scenarios alone exceed eight), each one is a line under "Further scenarios".
 - Every scenario is grounded in the diff (rule 7); the dropped count and the mechanisms you dropped are stated under "Not verified"; at most one item sits under "Noticed outside this diff".
 - Nothing that is not a scenario sits under a severity heading. The list is final; only now write the summary counts, and they match the listed scenarios.
 - The verdict matches the highest severity and its evidence (`BLOCK` only for an L3 SEVERE) and is the last line; a PASS carries "advisory; static read, nothing executed"; the sign-off note is present when required.
