@@ -276,6 +276,45 @@ def _internal_runner_opted_in(deployment: LiveDeploymentConfig) -> bool:
     return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+def internal_runner_untradeable_reason(
+    deployment: LiveDeploymentConfig,
+    *,
+    load_target: Callable[[str], Any] = strategy_target,
+) -> str | None:
+    """Why this deployment can never trade, or ``None`` when the runner covers it.
+
+    The daemon's untradeable-ACTIVE-row alert asks this so the log cannot
+    drift from the runner: the answer is built from the runner's own
+    predicates — ``_deployment_is_active_internal`` and
+    ``_internal_runner_opted_in`` — and the same ``strategy_target``
+    resolution the promotion gate binds (a bare strategy slug naming
+    ``strategies/<name>/<name>.py``). Only the conditions that make a row
+    permanently inert are reported here; what the runner might still refuse
+    at evaluation time — an unserved timeframe, a missing adapter, an
+    unusable open-position cap — is a per-tick report of the runner itself,
+    not an untradeable deployment.
+    """
+    if not _deployment_is_active_internal(deployment):
+        return (
+            "signal source 'internal' without signal_source_type 'internal' "
+            "is evaluated by neither the Discord listener nor the internal "
+            "strategy runner"
+        )
+    if not _internal_runner_opted_in(deployment):
+        return (
+            "the internal strategy runner is not enabled for this deployment; "
+            f"set settings.{INTERNAL_RUNNER_ENABLED_KEY}=true to opt in"
+        )
+    try:
+        load_target(deployment.strategy_name)
+    except Exception as exc:  # except-kind: money-decision
+        return (
+            f"internal strategy '{deployment.strategy_name}' cannot be "
+            f"resolved: {exc}"
+        )
+    return None
+
+
 def _max_open_per_symbol(
     deployment: LiveDeploymentConfig, bundle: _StrategyBundle
 ) -> int:
