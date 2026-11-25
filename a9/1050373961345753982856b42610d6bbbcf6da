@@ -1,0 +1,27 @@
+.agents/skills/platform-pr-verify/SKILL.md
+  s_20440597b8bd9a::t_d2e4d440581241 3,6,8-12,14,16,18-19
+AGENTS.md
+  s_20440597b8bd9a::t_23fc4f2c00d4c3 8,13,21-22,25-26,29-30
+docs/testing-and-tooling.md
+  s_20440597b8bd9a::t_ae722f0ced30a9 1-30
+tests/test_ctrader_adapter.py
+  s_20440597b8bd9a::t_9307ed6fe96406 120-122
+tests/test_signal_archive_market_features.py
+  s_20440597b8bd9a::t_f8f456cd3ab0b5 390
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "a91050373961345753982856b42610d6bbbcf6da",
+  "prompts": {},
+  "sessions": {
+    "s_20440597b8bd9a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7bacd96d-4f15-4c78-9f52-a2364e148c93",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "itsjustFred <justfred.business@gmail.com>"
+    }
+  }
+}
