@@ -36,8 +36,8 @@ CLAUDE.local.md
 .cursor/
 .aider*
 .qodo/
-.pi/tau-instances/
-~/.pi/tau-instances/
+.pi/
+~/.pi/
 .playwright-mcp
 
 # Secrets / Environment (.env.example erlaubt)
