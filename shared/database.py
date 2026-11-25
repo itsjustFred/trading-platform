@@ -123,6 +123,9 @@ def _is_sqlite_url(url: str) -> bool:
 #: spelling that turns a ``file:`` database name into a SQLite URI filename.
 _SQLITE_URI_TRUE_VALUES = frozenset({"true", "yes", "on", "y", "t", "1"})
 
+#: The SQLite write-lock pragma every read-modify-write critical section opens with.
+_SQLITE_BEGIN_IMMEDIATE = "BEGIN IMMEDIATE"
+
 
 def _sqlite_uri_file_path(body: str) -> str:
     """The path inside a ``file:`` URI body, after ``uri=true`` was established.
@@ -1169,6 +1172,72 @@ class LiveAccountModel(SQLModel, table=True):
             ctid=self.ctid or "",
             broker_login=self.broker_login or "",
         )
+
+
+class LiveAdapterStateModel(SQLModel, table=True):
+    """Small persisted key/value store for adapter runtime state.
+
+    Adapters need a durable place for pass-to-pass bookkeeping that is not a
+    signal, an execution or an account attribute - e.g. the Alpaca
+    re-protect reconciliation watermark (#350 review). ``id`` is
+    ``"{account_id}|{key}"`` so one account can hold several keys.
+    """
+
+    __tablename__ = "live_adapter_state"
+
+    id: str = Field(primary_key=True)
+    account_id: str = Field(index=True)
+    key: str = Field(index=True)
+    value_json: dict[str, Any] = Field(
+        default_factory=dict,
+        sa_column=Column("value", JSON, nullable=False),
+    )
+    updated_at: datetime = Field(default_factory=_utcnow_naive)
+
+
+def _adapter_state_id(account_id: str, key: str) -> str:
+    return f"{account_id}|{key}"
+
+
+def get_live_adapter_state(account_id: str, key: str) -> dict[str, Any] | None:
+    """The persisted value for ``(account_id, key)``, or ``None`` when unset."""
+    normalized_account_id = str(account_id or "").strip()
+    normalized_key = str(key or "").strip()
+    if not normalized_account_id or not normalized_key:
+        return None
+    init_db()
+    state_id = _adapter_state_id(normalized_account_id, normalized_key)
+    with get_session() as session:
+        record = session.get(LiveAdapterStateModel, state_id)
+    if record is None or not isinstance(record.value_json, dict):
+        return None
+    return dict(record.value_json)
+
+
+def set_live_adapter_state(
+    account_id: str, key: str, value: Mapping[str, Any]
+) -> None:
+    """Persist ``value`` for ``(account_id, key)``, replacing any earlier one."""
+    normalized_account_id = str(account_id or "").strip()
+    normalized_key = str(key or "").strip()
+    if not normalized_account_id or not normalized_key:
+        raise ValueError("adapter state requires an account id and a key")
+    init_db()
+    state_id = _adapter_state_id(normalized_account_id, normalized_key)
+    with get_session() as session:
+        session.connection().exec_driver_sql(_SQLITE_BEGIN_IMMEDIATE)
+        record = session.get(LiveAdapterStateModel, state_id)
+        if record is None:
+            record = LiveAdapterStateModel(
+                id=state_id,
+                account_id=normalized_account_id,
+                key=normalized_key,
+            )
+            session.add(record)
+        record.value_json = dict(value)
+        record.updated_at = _utcnow_naive()
+        session.add(record)
+        session.commit()
 
 
 class LiveControlAuditModel(SQLModel, table=True):
@@ -4012,6 +4081,28 @@ def live_execution_dedupe_key_exists(dedupe_key: str) -> bool:
     return row is not None
 
 
+def live_execution_dedupe_keys_present(dedupe_keys: Iterable[str]) -> set[str]:
+    """The subset of ``dedupe_keys`` an execution row already carries.
+
+    Bulk form of :func:`live_execution_dedupe_key_exists` for callers that
+    must classify many flagged deals in one pass (the broker-close reconcile
+    skips re-queueing windows for deals the ledger already booked).
+    """
+    normalized_keys = {
+        str(key).strip() for key in dedupe_keys if str(key or "").strip()
+    }
+    if not normalized_keys:
+        return set()
+    init_db()
+    with get_session() as session:
+        rows = session.exec(
+            select(LiveExecutionModel.dedupe_key).where(
+                LiveExecutionModel.dedupe_key.in_(normalized_keys)
+            )
+        ).all()
+    return {str(row) for row in rows}
+
+
 def get_live_signal_filled_qty_for_broker_order(signal_id: str, broker_order_id: str) -> float:
     """The quantity already recorded for one signal and one broker order (a leg's own id).
 
@@ -4381,6 +4472,93 @@ def flag_live_ledger_reconciliation(
             **dict(detail or {}),
         },
     )
+
+
+def list_live_ledger_reconciliation_deal_ids(account_id: str) -> set[int]:
+    """Deal ids already carrying a ``ledger_reconciliation_required`` flag.
+
+    The flag rows are the durable "already surfaced" set: a restart must not
+    write a second flag (and re-break an operator resolution) for the same
+    unattributable broker close. The set suppresses RE-FLAGGING only - it is
+    NOT a reason to skip the booking attempt. A deal flagged for a transient
+    cause is retried by later reconcile passes and, once booked, supersedes
+    the flag with a ``ledger_reconciliation_resolved`` row. Resolved flags
+    still count here: resolution means the operator handled that deal, not
+    that the scan may flag it again.
+    """
+    normalized_account = str(account_id or "").strip()
+    if not normalized_account:
+        return set()
+    like_pattern = _ledger_flag_account_like(normalized_account)
+    init_db()
+    with get_session() as session:
+        rows = session.exec(
+            select(LiveControlAuditModel.detail_json)
+            .where(LiveControlAuditModel.action == LEDGER_RECONCILIATION_AUDIT_ACTION)
+            .where(LiveControlAuditModel.target_id.like(like_pattern, escape="\\"))
+        ).all()
+    deal_ids: set[int] = set()
+    for detail in rows:
+        if not isinstance(detail, dict):
+            continue
+        try:
+            deal_id = int(detail.get("deal_id") or 0)
+        except (TypeError, ValueError):
+            continue
+        if deal_id > 0:
+            deal_ids.add(deal_id)
+    return deal_ids
+
+
+def list_live_ledger_reconciliation_flag_entries(
+    account_id: str,
+) -> list[dict[str, Any]]:
+    """``{"target_id", "detail", "created_at"}`` per flag row on an account.
+
+    Same rows :func:`list_live_ledger_reconciliation_flag_details` returns,
+    plus the audit timestamp: flags written before ``deal_timestamp_ms``
+    existed have no deal time of their own, so the reconcile pass derives
+    their retry window from when the flag itself was raised.
+    """
+    normalized_account = str(account_id or "").strip()
+    if not normalized_account:
+        return []
+    like_pattern = _ledger_flag_account_like(normalized_account)
+    init_db()
+    with get_session() as session:
+        rows = session.exec(
+            select(
+                LiveControlAuditModel.target_id,
+                LiveControlAuditModel.detail_json,
+                LiveControlAuditModel.created_at,
+            )
+            .where(LiveControlAuditModel.action == LEDGER_RECONCILIATION_AUDIT_ACTION)
+            .where(LiveControlAuditModel.target_id.like(like_pattern, escape="\\"))
+        ).all()
+    return [
+        {
+            "target_id": str(target_id),
+            "detail": dict(detail),
+            "created_at": created_at,
+        }
+        for target_id, detail, created_at in rows
+        if isinstance(detail, dict)
+    ]
+
+
+def list_live_ledger_reconciliation_flag_details(account_id: str) -> list[dict[str, Any]]:
+    """The ``detail`` payloads of every ledger-reconciliation flag on an account.
+
+    The reconcile pass uses these to re-queue the deal windows of flags whose
+    cause was transient (an unreadable order list, a refused record): the
+    durable flag set suppresses re-flagging, but the booking attempt itself
+    must be retried. Resolved flags are included - flag resolution never
+    books the fill, so a still-transient deal stays worth retrying.
+    """
+    return [
+        entry["detail"]
+        for entry in list_live_ledger_reconciliation_flag_entries(account_id)
+    ]
 
 
 def get_live_deployment_net_filled_qty(deployment_id: str, symbol: str) -> float:
@@ -4768,6 +4946,97 @@ def list_live_deployment_open_position_lots(
                     "broker_order_id": entry["broker_order_id"],
                 }
             )
+    return lots
+
+
+def list_live_account_open_position_lots(account_id: str) -> list[dict[str, Any]]:
+    """Open position lots across every deployment on one account.
+
+    Same residual attribution as :func:`list_live_deployment_open_position_lots`,
+    grouped per ``(deployment_id, symbol)`` because each deployment keeps its own
+    ledger even when deployments share a netted broker symbol. The cTrader
+    broker-close scan uses the oldest lot timestamp as its floor: a close can
+    only belong to a position the ledger still holds, so flat history must not
+    widen the scan.
+    """
+    normalized_account_id = str(account_id or "").strip()
+    if not normalized_account_id:
+        raise ValueError("An account id is required for open position lots")
+    init_db()
+    with get_session() as session:
+        signal_rows = session.exec(
+            select(
+                LiveSignalModel.deployment_id,
+                LiveSignalModel.id,
+                LiveSignalModel.symbol,
+                LiveSignalModel.timestamp,
+                LiveSignalModel.action,
+                LiveSignalModel.broker_order_id,
+                LiveSignalModel.source,
+                LiveSignalModel.metadata_json,
+            )
+            .join(
+                LiveDeploymentModel,
+                LiveSignalModel.deployment_id == LiveDeploymentModel.id,
+            )
+            .where(LiveDeploymentModel.account_id == normalized_account_id)
+        ).all()
+        fill_rows = session.exec(
+            select(
+                LiveExecutionModel.signal_id,
+                func.coalesce(func.sum(LiveExecutionModel.filled_qty), 0.0),
+            )
+            .join(LiveSignalModel, LiveExecutionModel.signal_id == LiveSignalModel.id)
+            .join(
+                LiveDeploymentModel,
+                LiveSignalModel.deployment_id == LiveDeploymentModel.id,
+            )
+            .where(LiveDeploymentModel.account_id == normalized_account_id)
+            .group_by(LiveExecutionModel.signal_id)
+        ).all()
+    filled_by_signal = {str(signal_id): float(filled or 0.0) for signal_id, filled in fill_rows}
+
+    rows_by_lot_key: dict[tuple[str, str], list[tuple[Any, ...]]] = {}
+    for (
+        deployment_id,
+        signal_id,
+        symbol,
+        timestamp,
+        action,
+        broker_order_id,
+        source,
+        metadata,
+    ) in signal_rows:
+        normalized_symbol = str(symbol or "").strip().upper()
+        if not normalized_symbol:
+            continue
+        rows_by_lot_key.setdefault((str(deployment_id), normalized_symbol), []).append(
+            (signal_id, normalized_symbol, timestamp, action, broker_order_id, source, metadata)
+        )
+
+    lots: list[dict[str, Any]] = []
+    for (deployment_id, symbol), rows in rows_by_lot_key.items():
+        for entry in _position_lot_entries(rows, filled_by_signal):
+            residual = entry["residual_qty"]
+            if residual > _EXIT_FILL_TOLERANCE:
+                lots.append(
+                    {
+                        "deployment_id": deployment_id,
+                        "symbol": symbol,
+                        "signal_id": entry["signal_id"],
+                        "action": entry["action"],
+                        "qty": residual,
+                        "timestamp": entry["timestamp"],
+                        "broker_order_id": entry["broker_order_id"],
+                    }
+                )
+    lots.sort(
+        key=lambda item: (
+            item["timestamp"] is None,
+            item["timestamp"] or datetime.min.replace(tzinfo=timezone.utc),
+            item["signal_id"],
+        )
+    )
     return lots
 
 
@@ -7450,6 +7719,42 @@ def account_has_ledger_reconciliation_flags(account_id: str) -> bool:
     it is not trustworthy.
     """
     return bool(list_unresolved_ledger_reconciliation_flags(account_id))
+
+
+def list_outstanding_ledger_flag_details(
+    account_id: str, symbol: str
+) -> list[dict[str, Any]]:
+    """``detail`` payloads of the flag rows still outstanding on one target.
+
+    "Outstanding" means newer than the latest
+    ``ledger_reconciliation_resolved`` row for the SAME ``account:symbol`` -
+    exactly the set :func:`list_unresolved_ledger_reconciliation_flags`
+    counts as live, but with the per-flag payloads the bot needs to decide
+    whether a booking may supersede them. Empty means the target is already
+    resolved (or was never flagged).
+    """
+    normalized_account = str(account_id or "").strip()
+    normalized_symbol = str(symbol or "").strip().upper()
+    if not normalized_account or not normalized_symbol:
+        return []
+    target_id = f"{normalized_account}:{normalized_symbol}"
+    init_db()
+    with get_session() as session:
+        resolved_at = session.exec(
+            select(func.max(LiveControlAuditModel.created_at)).where(
+                LiveControlAuditModel.action
+                == LEDGER_RECONCILIATION_RESOLVED_AUDIT_ACTION,
+                LiveControlAuditModel.target_id == target_id,
+            )
+        ).first()
+        query = select(LiveControlAuditModel.detail_json).where(
+            LiveControlAuditModel.action == LEDGER_RECONCILIATION_AUDIT_ACTION,
+            LiveControlAuditModel.target_id == target_id,
+        )
+        if resolved_at is not None:
+            query = query.where(LiveControlAuditModel.created_at > resolved_at)
+        rows = session.exec(query).all()
+    return [dict(detail) for detail in rows if isinstance(detail, dict)]
 
 
 def resolve_ledger_reconciliation_flag(

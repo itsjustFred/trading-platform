@@ -1,22 +1,19 @@
 ---
 name: platform-pr-verify
-description: Mandatory verification pipeline for a pull request. Runs SonarQube comment check, mutation testing, pre-mortem, code review and CodeRabbit in sequence until all pass without findings.
+description: Explains what to verify in a PR to get it to `pr-verify-pass`. Use after every push to a PR, skip on PRs with the `strategy-integration` label.
 ---
 
-Use this guide as the verification pipeline for the PR.
+The repo has multiple PR review bots and checks running for PRs:
 
-If needed programs/skills are not installed, take from here:
-- https://docs.coderabbit.ai/cli
-- https://github.com/honnibal/claude-skills/blob/main/mutation-testing.md.txt
-- https://github.com/honnibal/claude-skills/blob/main/pre-mortem.md.txt
-- https://github.com/mattpocock/skills/tree/main/skills/engineering/code-review
+- SonarCloud: static analysis. You can also list all issues with `sonar list issues --project itsjustFred_trading-platform --pull-request <N> --format toon`. With many issues the output gets large (e.g. PR #139 about 190k characters), so filter with `--severities` or redirect to a file and search it instead of reading it whole.
+- `mutation-testing` action: Agent that mutates the PR's changed code and looks for surviving mutations. Add missing tests for surviving mutations.
+- `pre-mortem` action: Agent writing grounded future-failure scenarios for changed code. Fix valid findings without expanding scope.
+- `code-review` action: Agent reviewing the code for errors first, then clarity, then spec and repo standards. Fix valid findings.
+- cubic: AI-powered code review bot. Fix valid findings.
 
-Run the following review pipeline step-by-step. If a step fails, fix the issue first, then re-run that step; only after it passes, go to the next step.
+If you want a second AI-powered review bot, trigger CodeRabbit manually. Note limits: 3 reviews/h, max. 150 files/review.
 
-1. Check PR comments for SonarQube. Make sure that the quality gate passes or the failure reason is acceptable (e.g. Cognitive Complexity too high on unimportant functions, or rules explicitly accepted by the user).
-2. Run the `mutation-testing` skill, without asking questions to the user. The scope is the PR's changed files. A survived mutation means a missing test case: add a test in the PR, re-run until all mutations are killed. Only run on the first review cycle; in following cycles only verify mutation kill via tests.
-3. Run the `pre-mortem` skill with scope limited to changed files, without asking user questions, hardening without scope extension.
-4. Run the `code-review` skill (by Matt Pocock). If useful, run the standards- and spec-axis via subagents. The fixed point is `main`.
-5. Run the `coderabbit` CLI: info/trivial findings are allowed (on the free tier there is a limit of 150 files/review and 3 reviews/h; if rate-limited, the remaining time is shown).
+While these tools help provide valuable insights, they can be wrong, and the agent actions usually run on weaker models than you. Accept a finding only with a concrete reason. Record the result in one PR comment that starts with `<!-- platform-pr-verify -->`: the head commit SHA you verified and every accepted finding across all tools, each with a one-line reason, or "No accepted findings". Edit this comment when findings change instead of adding a new one.
 
-The loop is only done when all steps complete without findings.
+When every check on the head commit has finished and is green, or each of its findings is fixed or accepted, add the `pr-verify-pass` label.
+`pr-verify-pass` is valid only for the commit it was given on. Before you push a new commit to the PR, remove the label; after the push, run this skill again.
