@@ -1,0 +1,39 @@
+live_runner/ctrader_adapter.py
+  s_72b81e13fd197a::t_b9e116f11bf893 28,516,3506-3511,3516,3532-3538,3568-3571,3588-3598
+tests/test_live_execution_safety.py
+  s_72b81e13fd197a::t_5990bfb7096733 4012-4016,5053-5055,5246-5297
+live_runner/base_adapter.py
+  s_d774636f75aa64::t_5af102928a682f 65-86
+live_runner/daemon.py
+  s_d774636f75aa64::t_7e814022bf0b76 54,4412-4420,4445-4447,4450,4452-4470,4489,4497-4499
+live_runner/internal_strategy_runner.py
+  s_d774636f75aa64::t_48306f9183d6db 205-208
+tests/live_runner/test_exit_signal_sizing.py
+  s_d774636f75aa64::t_d70d5413916ea4 603-753
+tests/test_ctrader_adapter.py
+  s_d774636f75aa64::t_6d9f3360824843 3676-3747
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "7023cb5c65617595982dadbb3969bf47ab8b09bd",
+  "prompts": {},
+  "sessions": {
+    "s_72b81e13fd197a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b26fdc3a-6176-466d-9ab1-1ac4055c946c",
+        "model": "unknown"
+      },
+      "human_author": "itsjustFred <justfred.business@gmail.com>"
+    },
+    "s_d774636f75aa64": {
+      "agent_id": {
+        "tool": "devin",
+        "id": "s_d774636f75aa64",
+        "model": "unknown"
+      },
+      "human_author": "itsjustFred <justfred.business@gmail.com>"
+    }
+  }
+}
