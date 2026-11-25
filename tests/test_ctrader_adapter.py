@@ -117,8 +117,9 @@ def test_load_openapi_types_installs_connection_scoped_protocol(monkeypatch) -> 
 
     ``_ensure_asyncio_twisted_reactor`` is stubbed: the reactor install was
     the only reason this test needed a subprocess, and a child process would
-    have to be given a sandboxed environment explicitly (AGENTS.md) because
-    importing ``shared.constants`` loads the checkout's real ``.env``.
+    have to be given a sandboxed environment explicitly
+    (``tests/conftest.py``) because importing ``shared.constants``
+    loads the checkout's real ``.env``.
     """
     from live_runner import ctrader_adapter as module
 
