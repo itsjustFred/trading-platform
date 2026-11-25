@@ -387,7 +387,7 @@ def test_main_since_until_filters_days(tmp_path: Path) -> None:
 def _child_env(data_dir: Path) -> dict[str, str]:
     """Sandboxed environment for a script subprocess.
 
-    AGENTS.md: a child that imports ``shared.constants`` loads the checkout's
+    ``tests/conftest.py``: a child that imports ``shared.constants`` loads the checkout's
     real ``.env`` unless the data paths are redirected, so the inherited
     environment is not enough - point every data root at the test sandbox.
     """
