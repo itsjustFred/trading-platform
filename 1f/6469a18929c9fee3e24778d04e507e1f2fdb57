@@ -1,0 +1,27 @@
+docs/signal_bots.md
+  s_61734467f0d0f2::t_9a3b82e0b5d60a 510-512
+live_runner/ctrader_adapter.py
+  s_61734467f0d0f2::t_e93d98a9d8722f 3507,3588-3610,3612
+tests/live_runner/test_exit_signal_sizing.py
+  s_61734467f0d0f2::t_ec0246e2c09738 672-697,777-887
+tests/test_ctrader_adapter.py
+  s_61734467f0d0f2::t_b8c3444ac8decf 3683-3689,3692-3697,3703-3719,3721-3722,3728-3792,3794-3806,3809,3825,3828,3843,3846
+tests/test_live_execution_safety.py
+  s_61734467f0d0f2::t_21659ed2d9a260 5252
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "1f6469a18929c9fee3e24778d04e507e1f2fdb57",
+  "prompts": {},
+  "sessions": {
+    "s_61734467f0d0f2": {
+      "agent_id": {
+        "tool": "devin",
+        "id": "s_61734467f0d0f2",
+        "model": "unknown"
+      },
+      "human_author": "itsjustFred <justfred.business@gmail.com>"
+    }
+  }
+}
