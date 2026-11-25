@@ -51,6 +51,7 @@ from live_runner.base_adapter import (
     QUOTE_TIME_RULE_STALE,
     UNBOUNDED_TP_POLICY,
     BaseLiveAdapter,
+    BrokerOrderRejectedError,
     LivePipValue,
     LiveQuote,
     coerce_positive_live_qty,
@@ -4408,10 +4409,15 @@ async def _claim_and_submit_prepared_signal(
                 prepared_signal, qty=prepared_qty
             )
         except Exception as exc:  # except-kind: money-decision
-            if is_order_not_submitted(exc):
-                # The adapter marked the failure as provably pre-request: the
-                # order never left the process, so the lease can be released
-                # and the next signal is not locked out for the TTL.
+            # Two provably-definitive outcomes release the lease: a failure
+            # marked pre-request (nothing was sent) and a broker's correlated
+            # refusal of the request itself (nothing was opened/closed).
+            broker_rejected = isinstance(exc, BrokerOrderRejectedError)
+            if is_order_not_submitted(exc) or broker_rejected:
+                # The order never reached the broker, or the broker answered
+                # with a definitive refusal: either way nothing is in flight,
+                # so the lease can be released and the next signal is not
+                # locked out for the TTL.
                 try:
                     await asyncio.to_thread(
                         release_live_deployment_submission, claim_token
@@ -4436,14 +4442,32 @@ async def _claim_and_submit_prepared_signal(
                 # A refused exit leaves the position open (#121): error, so an
                 # operator sees it. A refused entry opened nothing: warning.
                 log = logger.error if is_exit else logger.warning
-                log(
-                    (
+                if broker_rejected:
+                    refusal_message = (
+                        "Exit signal was rejected by the broker; "
+                        "released the submission lease and the position stays open"
+                        if is_exit
+                        else f"{source_label} signal was rejected by the broker; "
+                        "released the submission lease"
+                    )
+                    refusal_reason = (
+                        "exit_broker_rejected" if is_exit else "broker_rejected"
+                    )
+                else:
+                    refusal_message = (
                         "Exit signal was refused before the broker request; "
                         "released the submission lease and the position stays open"
                         if is_exit
-                        else "Discord signal was refused before the broker request; "
-                        "released the submission lease"
-                    ),
+                        else f"{source_label} signal was refused before the "
+                        "broker request; released the submission lease"
+                    )
+                    refusal_reason = (
+                        "broker_refused_pre_request"
+                        if not is_exit
+                        else "exit_refused_pre_request"
+                    )
+                log(
+                    refusal_message,
                     extra={
                         "data": {
                             "account_id": account_id,
@@ -4462,12 +4486,7 @@ async def _claim_and_submit_prepared_signal(
                     exc=exc,
                 )
                 if decision is not None:
-                    decision.refused(
-                        "broker_refused_pre_request"
-                        if not is_exit
-                        else "exit_refused_pre_request",
-                        detail=str(exc),
-                    )
+                    decision.refused(refusal_reason, detail=str(exc))
                 return SUBMIT_OUTCOME_REFUSED
             # **Do not release the lease.** The broker may have accepted the
             # order and only the response was lost; releasing would let the next
@@ -4475,9 +4494,9 @@ async def _claim_and_submit_prepared_signal(
             # left to expire, which the drain reports as INDETERMINATE rather
             # than DRAINED.
             logger.error(
-                "Discord signal submission failed with an unknown outcome; "
-                "holding the submission lease until it expires and requiring "
-                "reconciliation before the next submit",
+                f"{source_label} signal submission failed with an unknown "
+                "outcome; holding the submission lease until it expires and "
+                "requiring reconciliation before the next submit",
                 extra={
                     "data": {
                         "account_id": account_id,

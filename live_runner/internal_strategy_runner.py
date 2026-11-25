@@ -202,9 +202,10 @@ SUBMIT_FAILURE_ESCALATION = 3
 #: Outcomes the daemon's submit chokepoint reports back through
 #: ``SubmitSignal``. ``submitted`` reached the broker; ``ignored`` was a
 #: deliberate no-op (e.g. an exit with nothing to close); ``refused`` was
-#: rejected before the broker saw anything; ``unknown`` means the broker may
-#: have the order and reconciliation is required. Anything else is treated
-#: as a failure.
+#: definitively rejected - before the broker saw anything, or by the broker's
+#: own correlated refusal, so nothing is in flight; ``unknown`` means the
+#: broker may have the order and reconciliation is required. Anything else
+#: is treated as a failure.
 SUBMIT_OUTCOME_SUBMITTED = "submitted"
 SUBMIT_OUTCOME_REFUSED = "refused"
 SUBMIT_OUTCOME_IGNORED = "ignored"

@@ -600,6 +600,157 @@ def test_internal_submit_reports_submitted_end_to_end(monkeypatch) -> None:
     assert len(adapter.submitted) == 1
 
 
+def _submit_raising(adapter, exc: BaseException):
+    """An ``submit_order`` that records the call then raises ``exc``."""
+
+    async def _submit(signal, *, qty=None):
+        adapter.submitted.append((signal, qty))
+        raise exc
+
+    return _submit
+
+
+def _run_internal_submit_with_lease(adapter, deployment, trade_signal):
+    """``_run_internal_submit`` that also reports the released lease tokens."""
+    import live_runner.daemon as daemon
+
+    original_can_dispatch = daemon._deployment_can_dispatch
+    original_claim = daemon.claim_live_deployment_submission
+    original_release = daemon.release_live_deployment_submission
+    released: list[str] = []
+    daemon._deployment_can_dispatch = lambda _deployment, **_kwargs: True
+    daemon.claim_live_deployment_submission = lambda *_a, **_k: True
+    daemon.release_live_deployment_submission = lambda token, *_a, **_k: (
+        released.append(str(token)) or True
+    )
+    try:
+        outcome = asyncio.run(
+            daemon._submit_internal_strategy_signal(adapter, deployment, trade_signal)
+        )
+    finally:
+        daemon._deployment_can_dispatch = original_can_dispatch
+        daemon.claim_live_deployment_submission = original_claim
+        daemon.release_live_deployment_submission = original_release
+    return outcome, released
+
+
+def _internal_entry_trade_signal() -> TradeSignal:
+    return TradeSignal(
+        action="buy",
+        symbol="AAPL",
+        entry_price=100.0,
+        stop_loss=95.0,
+        take_profit=110.0,
+        timeframe="1h",
+        metadata={
+            "source": "internal",
+            "internal_direction": "LONG",
+            "idempotency_key": "e" * 32,
+        },
+    )
+
+
+def _entry_ready_adapter(positions) -> _Adapter:
+    adapter = _Adapter(positions)
+    adapter.demo = True  # skip the promotion gate; the outcome contract is the point
+
+    async def _quote(_symbol: str):
+        from live_runner.base_adapter import LiveQuote
+
+        return LiveQuote(
+            bid=100.0,
+            ask=100.0,
+            timestamp=datetime.now(timezone.utc),
+            source="test",
+            timestamp_source="broker",
+        )
+
+    adapter.get_quote = _quote
+    return adapter
+
+
+def test_broker_rejected_entry_is_refused_and_the_lease_is_released(
+    monkeypatch, caplog
+) -> None:
+    """cTrader's correlated order-error event is a definitive refusal: the
+    submission lease is released and the signal is refused, not held for
+    reconciliation as an unknown outcome."""
+    deployment = _deployment()
+    _patch_ledger(monkeypatch, deployment, 0.0)
+    adapter = _entry_ready_adapter([])
+    from live_runner.base_adapter import BrokerOrderRejectedError
+
+    adapter.submit_order = _submit_raising(
+        adapter,
+        BrokerOrderRejectedError(
+            "Order rejected (INVALID_REQUEST): SL/TP have to be positive",
+            error_code="INVALID_REQUEST",
+        ),
+    )
+
+    with caplog.at_level(logging.INFO):
+        outcome, released = _run_internal_submit_with_lease(
+            adapter, deployment, _internal_entry_trade_signal()
+        )
+
+    assert outcome == "refused"
+    assert len(released) == 1
+    assert len(adapter.submitted) == 1
+    warnings = _records_at(
+        caplog, logging.WARNING, "Internal strategy signal was rejected by the broker"
+    )
+    assert warnings
+    assert not _records_at(caplog, logging.ERROR, "unknown outcome")
+
+
+def test_broker_rejected_exit_is_refused_and_the_lease_is_released(
+    monkeypatch, caplog
+) -> None:
+    deployment = _deployment()
+    _patch_ledger(monkeypatch, deployment, 10.0)
+    adapter = _Adapter([{"symbol": "AAPL", "qty": 10.0}])
+    from live_runner.base_adapter import BrokerOrderRejectedError
+
+    adapter.submit_order = _submit_raising(
+        adapter,
+        BrokerOrderRejectedError(
+            "Order rejected (INVALID_REQUEST): SL/TP have to be positive",
+            error_code="INVALID_REQUEST",
+        ),
+    )
+
+    with caplog.at_level(logging.INFO):
+        outcome, released = _run_internal_submit_with_lease(
+            adapter, deployment, _internal_exit_trade_signal()
+        )
+
+    assert outcome == "refused"
+    assert len(released) == 1
+    assert len(adapter.submitted) == 1
+    assert _records_at(
+        caplog, logging.ERROR, "Exit signal was rejected by the broker"
+    )
+    assert not _records_at(caplog, logging.ERROR, "unknown outcome")
+
+
+def test_a_submit_timeout_stays_an_unknown_outcome(monkeypatch, caplog) -> None:
+    """A lost response may still have opened the order: the lease must NOT be
+    released and the outcome stays unknown."""
+    deployment = _deployment()
+    _patch_ledger(monkeypatch, deployment, 0.0)
+    adapter = _entry_ready_adapter([])
+    adapter.submit_order = _submit_raising(adapter, TimeoutError("no response within 20s"))
+
+    with caplog.at_level(logging.INFO):
+        outcome, released = _run_internal_submit_with_lease(
+            adapter, deployment, _internal_entry_trade_signal()
+        )
+
+    assert outcome == "unknown"
+    assert released == []
+    assert _records_at(caplog, logging.ERROR, "unknown outcome")
+
+
 def test_exit_without_a_position_is_ignored_and_logged(monkeypatch, caplog) -> None:
     deployment = _deployment()
     _patch_ledger(monkeypatch, deployment, 0.0)
