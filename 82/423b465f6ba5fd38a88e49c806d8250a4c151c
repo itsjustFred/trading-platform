@@ -1,0 +1,21 @@
+live_runner/alpaca_adapter.py
+  s_605086c6ddc7de::t_5bbfd794fa056c 630-661,4055-4063,4072-4074,4152-4171
+tests/test_alpaca_adapter.py
+  s_605086c6ddc7de::t_bde0d9cc1bb040 4137-4163,5816-5817,5838-5840,5843,6250-6294,6301-6303,6314-6319,6321,6323,6454,6460-6463,6491-6493
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "82423b465f6ba5fd38a88e49c806d8250a4c151c",
+  "prompts": {},
+  "sessions": {
+    "s_605086c6ddc7de": {
+      "agent_id": {
+        "tool": "devin",
+        "id": "s_605086c6ddc7de",
+        "model": "unknown"
+      },
+      "human_author": "itsjustFred <justfred.business@gmail.com>"
+    }
+  }
+}
