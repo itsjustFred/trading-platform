@@ -1,0 +1,29 @@
+docs/live-deploy-runbook.md
+  s_d439eae8199854::t_7db7740ab7949c 1088-1091,1113-1128,1151-1155,1163-1169
+live_runner/loss_breaker.py
+  s_d439eae8199854::t_2c299932d1bb7c 78,82-83,437-438,441-442,945,971,1062,1074,1131-1261
+scripts/live_loss_breaker.py
+  s_d439eae8199854::t_9dcea6ff4f5b64 12,31-44,88,145-171,445-569,610-611
+shared/database.py
+  s_d439eae8199854::t_68c9d06d42ddf0 7404-7434,7505-7511,7600-7664
+tests/live_runner/test_loss_breaker.py
+  s_d439eae8199854::t_b05712949a02e0 31,2048-2357
+tests/test_loss_breaker_cli.py
+  s_d439eae8199854::t_f92a267c1eca25 94,505-662
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "f2093372f9e24efeae54e94730b71022c7ee8b92",
+  "prompts": {},
+  "sessions": {
+    "s_d439eae8199854": {
+      "agent_id": {
+        "tool": "devin",
+        "id": "s_d439eae8199854",
+        "model": "unknown"
+      },
+      "human_author": "itsjustFred <justfred.business@gmail.com>"
+    }
+  }
+}
