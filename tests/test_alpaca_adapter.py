@@ -4134,6 +4134,33 @@ def test_list_orders_status_all_pages_until_plus_one_microsecond() -> None:
     assert filters[1].until == page1_oldest + timedelta(microseconds=1)
 
 
+def test_list_orders_status_all_refuses_a_page_that_cannot_advance() -> None:
+    """A full page with no ``submitted_at`` can never move ``until`` forward.
+
+    Without the stall check the same page would repeat until the page cap
+    and only then fail with a vaguer error; the check refuses on the first
+    stalled page instead (#350 review, bot mutation #7).
+    """
+    orders = [
+        _FakeOrder(
+            id=f"ord-{index}",
+            symbol="AAPL",
+            side="buy",
+            order_type="limit",
+            status="canceled",
+            qty=1.0,
+        )
+        for index in range(_ALPACA_HELD_LEG_LOOKUP_LIMIT)
+    ]
+    client = _FakeTradingClient(orders=orders)
+    adapter = _adapter(client)
+
+    with pytest.raises(RuntimeError, match="cannot advance"):
+        asyncio.run(adapter._list_orders_status_all(client))
+
+    assert len(client.order_filters) == 1
+
+
 def test_held_leg_lookup_bounds_the_scan_at_the_ledger(monkeypatch) -> None:
     """The ``status=all`` held-leg scan passes the ledger ``after`` bound."""
     bound = datetime(2026, 1, 1, tzinfo=timezone.utc)
@@ -5786,6 +5813,8 @@ def test_marker_survives_when_re_read_shows_a_working_order(monkeypatch) -> None
     ``pending_replace`` is NOT terminal, so the terminal-status guard alone
     must keep the marker: with ``filled_qty == exit_qty`` the under-fill
     guard passes, and removing the terminal check is what this test kills.
+    The re-read sleeps between attempts are injected away - this test is
+    about the verdict, not the wait (#350 N3).
     """
     client = _FakeTradingClient(
         orders=[
@@ -5806,9 +5835,12 @@ def test_marker_survives_when_re_read_shows_a_working_order(monkeypatch) -> None
     order = client.orders[0]
     plan = {"symbol": "AAPL", "exit_qty": 4.0}
 
+    async def _no_sleep(_seconds: float) -> None:
+        return None
+
     asyncio.run(
         adapter._maybe_clear_exit_marker_on_full_fill(
-            client, order, plan, signal_id="sig-1"
+            client, order, plan, signal_id="sig-1", sleep=_no_sleep
         )
     )
 
@@ -6215,13 +6247,60 @@ def test_recovery_tops_up_clears_a_marker_that_recorded_no_levels(
     )
 
 
+def test_recovery_keeps_marker_and_places_nothing_on_an_unreadable_qty(
+    monkeypatch, caplog
+) -> None:
+    """One OCO leg whose qty cannot be read: coverage is unmeasurable.
+
+    ``_covered_exit_protection_qty`` counts an unreadable qty as 0, which
+    inflates ``uncovered`` and would top up protection on shares already
+    covered - over-protection, the opposite of fail-closed. Recovery must
+    alert, keep the marker pending and place nothing (#350 S2).
+    """
+    oco = _working_oco(qty=6.0)
+    oco.legs[0].qty = "unreadable"
+    client = _FakeTradingClient(
+        orders=[
+            oco,
+            _FakeOrder(
+                id="exit-1",
+                symbol="AAPL",
+                side="sell",
+                order_type="market",
+                qty=4.0,
+                status="expired",
+            ),
+        ],
+        positions=[_FakePosition("AAPL", 10.0)],
+    )
+    adapter = _adapter(client)
+    row = _reprotect_row(
+        {"side": "sell", "stop_price": 190.0, "take_profit_price": 210.0},
+        broker_order_id="exit-1",
+    )
+    cleared = _patch_marker_clears(monkeypatch)
+
+    with caplog.at_level("ERROR"):
+        verdict = asyncio.run(adapter._recover_exit_reprotection(row))
+
+    assert verdict == "pending"
+    assert cleared == []
+    assert client.submitted == []
+    assert client.cancelled == []
+    assert any(
+        "quantity is unreadable" in record.message for record in caplog.records
+    )
+
+
 def test_recovery_clears_an_unusable_marker(monkeypatch, caplog) -> None:
     """A marker with an empty symbol or an unknown side can never be replayed.
 
     Both halves of the guard end ``unverified``: the empty symbol would
     otherwise read as "position flat" (``resolved``) and spend superseded
     markers on a record that proved nothing, and the bad side must alert as
-    unusable rather than as a side mismatch (#350 M14).
+    unusable rather than as a side mismatch - on a FLAT position in
+    particular, where without the side check the marker would be recorded
+    ``resolved`` (#350 M14/S1).
     """
     client = _FakeTradingClient(positions=[_FakePosition("AAPL", 6.0)])
     adapter = _adapter(client)
@@ -6232,9 +6311,16 @@ def test_recovery_clears_an_unusable_marker(monkeypatch, caplog) -> None:
     )
     assert verdict == "unverified"
 
+    # Flat position + bad side: the side-mismatch path needs a live position
+    # on the other side, so with the side half of the guard deleted this
+    # marker falls through to "position flat" and reads ``resolved``. caplog
+    # is cleared first so the "unusable" assertion below can only come from
+    # THIS call, not the empty-symbol call above.
+    flat_adapter = _adapter(_FakeTradingClient(positions=[]))
     with caplog.at_level("ERROR"):
+        caplog.clear()
         verdict = asyncio.run(
-            adapter._recover_exit_reprotection(
+            flat_adapter._recover_exit_reprotection(
                 _reprotect_row({"side": "hold", "stop_price": 190.0})
             )
         )
@@ -6365,12 +6451,16 @@ def test_marker_clear_retries_the_exit_read_until_terminal(monkeypatch) -> None:
     )
 
     assert cleared == ["sig-1"]
-    assert sleeps == [alpaca_module._EXIT_MARKER_REREAD_INTERVAL_SECONDS]
+    assert sleeps == [0.5]
 
 
 def test_marker_stays_when_the_exit_never_reads_terminal(monkeypatch) -> None:
     """Three non-terminal reads: the marker stays, and the loop stops at the
     bound - it does not poll forever under the account order lock (#350 S-A).
+
+    The bound itself is pinned, not the constants read back: at most 3 reads
+    and a total sleep budget of 1.5 s, so raising the attempts or the
+    interval fails here (#350 N1).
     """
     reads: list[str] = []
     client = _FakeTradingClient(positions=[])
@@ -6398,10 +6488,9 @@ def test_marker_stays_when_the_exit_never_reads_terminal(monkeypatch) -> None:
     )
 
     assert cleared == []
-    assert reads == ["exit-1"] * alpaca_module._EXIT_MARKER_REREAD_ATTEMPTS
-    assert sleeps == [
-        alpaca_module._EXIT_MARKER_REREAD_INTERVAL_SECONDS
-    ] * (alpaca_module._EXIT_MARKER_REREAD_ATTEMPTS - 1)
+    assert reads == ["exit-1"] * 3
+    assert sleeps == [0.5, 0.5]
+    assert sum(sleeps) <= 1.5
 
 
 def test_marker_stays_and_stops_reading_when_the_re_read_fails(
