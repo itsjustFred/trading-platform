@@ -1,0 +1,19 @@
+AGENTS.md
+  s_36d4d1da9fda69::t_5731dc7ecb10a7 13
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "b64bebc6430112b6601b8a81bdef57429ce076cc",
+  "prompts": {},
+  "sessions": {
+    "s_36d4d1da9fda69": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9ab0fcdd-5385-40f9-9f2b-606ef91d31a0",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "itsjustFred <justfred.business@gmail.com>"
+    }
+  }
+}
