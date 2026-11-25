@@ -10,6 +10,7 @@ If making changes, also check if you need to update other things such as docs, s
 ## Tests
 
 Do NOT weaken, remove, bypass or rewrite a test just to achieve a passing result, instead fix the underlying problem. Change tests only when the task changes or you can independently identify that the test is wrong.
+Bug fixes start with a test that fails on the unfixed code; say in the PR that it failed before the fix. New behaviour on the money path (`live_runner`, `risk`, the backtest engines, sizing) is written test-first: the test lands in the same PR and fails without the change.
 Install the dev tooling with `uv sync --frozen --extra dev` and run `uv run ruff check <changed files>` and `uv run mypy` (no arguments) before a PR.
 The test sandbox (see `tests/conftest.py`) guards only the pytest process: a test that starts a Python subprocess must give it a sandboxed environment explicitly, or a child importing `shared.constants` loads the checkout's real `.env`.
 
