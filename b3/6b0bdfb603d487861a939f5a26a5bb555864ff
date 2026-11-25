@@ -1,0 +1,19 @@
+tests/test_adr_numbering.py
+  s_097c79e8e6325d::t_60004a34250c46 1,5-6,11,20-24,32-52,70-75,77-87
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "b36b0bdfb603d487861a939f5a26a5bb555864ff",
+  "prompts": {},
+  "sessions": {
+    "s_097c79e8e6325d": {
+      "agent_id": {
+        "tool": "devin",
+        "id": "s_097c79e8e6325d",
+        "model": "unknown"
+      },
+      "human_author": "itsjustFred <justfred.business@gmail.com>"
+    }
+  }
+}
