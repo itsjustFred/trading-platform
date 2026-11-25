@@ -8,7 +8,7 @@ import os
 import re
 import subprocess
 import threading
-from collections.abc import Collection, Iterable, Mapping
+from collections.abc import Callable, Collection, Iterable, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -7432,6 +7432,138 @@ def _apply_loss_breaker_observation(
     row.updated_at = observed_naive
 
 
+def _validate_loss_breaker_series(
+    normalized_scope: str,
+    equity_value: float,
+    anchor_value: float | None,
+    *,
+    equity_raw: object,
+    anchor_raw: object,
+) -> None:
+    """Refuse a non-finite equity/anchor or an anchor on an account scope."""
+    if not math.isfinite(equity_value):
+        raise ValueError(f"loss breaker equity must be finite, got {equity_raw!r}")
+    if anchor_value is not None and not math.isfinite(anchor_value):
+        raise ValueError(
+            f"loss breaker equity anchor must be finite, got {anchor_raw!r}"
+        )
+    if anchor_value is not None and normalized_scope.startswith("account:"):
+        raise ValueError(
+            "account scopes never carry an equity anchor; "
+            f"got one for {normalized_scope!r}"
+        )
+
+
+def _observe_live_loss_breaker_row(
+    normalized_scope: str,
+    normalized_account: str,
+    observed_at: datetime,
+    resolve_series: Callable[
+        [LiveLossBreakerRecord | None], tuple[float, float | None]
+    ],
+) -> LiveLossBreakerRecord:
+    """One atomic equity-series write for ``normalized_scope``.
+
+    ``resolve_series`` is invoked INSIDE the write transaction with the
+    scope's current record (``None`` when it has no row yet) and returns
+    ``(equity, equity_anchor_to_persist)``. Because the row read, the series
+    computation and the write share one ``BEGIN IMMEDIATE`` transaction, a
+    concurrent writer (the ``re-anchor`` CLI in another process) cannot land
+    between the anchor read and the series write - the deployment scope's
+    equity is always computed from the anchor that is actually stored.
+    """
+    observed_naive = _naive_utc(observed_at)
+    utc_day = _loss_breaker_utc_day(observed_at)
+
+    init_db()
+    with _loss_breaker_observe_lock(normalized_scope), get_session() as session:
+        session.connection().exec_driver_sql(_SQLITE_BEGIN_IMMEDIATE)
+        try:
+            row = session.get(LiveLossBreakerStateModel, normalized_scope)
+            prior = row.to_record() if row is not None else None
+            equity_raw, anchor_raw = resolve_series(prior)
+            equity_value = float(equity_raw)
+            anchor_value = (
+                float(anchor_raw) if anchor_raw is not None else None
+            )
+            _validate_loss_breaker_series(
+                normalized_scope,
+                equity_value,
+                anchor_value,
+                equity_raw=equity_raw,
+                anchor_raw=anchor_raw,
+            )
+            if row is None:
+                row = LiveLossBreakerStateModel(
+                    scope=normalized_scope,
+                    account_id=normalized_account,
+                    utc_day=utc_day,
+                    day_start_equity=equity_value,
+                    peak_equity=equity_value,
+                    daily_breached=False,
+                    drawdown_breached=False,
+                    last_equity=equity_value,
+                    last_observed_at=observed_naive,
+                    equity_anchor=anchor_value,
+                    breach_detail_json=None,
+                    updated_at=observed_naive,
+                )
+                session.add(row)
+            else:
+                if (
+                    normalized_scope.startswith("deployment:")
+                    and row.account_id != normalized_account
+                ):
+                    # The deployment was re-pointed at another account: the
+                    # row follows it, so the old account's scope list (and
+                    # its re-anchor P&L total) stops counting a deployment
+                    # that no longer trades there.
+                    row.account_id = normalized_account
+                _apply_loss_breaker_observation(
+                    row,
+                    equity_value=equity_value,
+                    utc_day=utc_day,
+                    observed_naive=observed_naive,
+                    anchor_value=anchor_value,
+                )
+            session.add(row)
+            session.commit()
+            session.refresh(row)
+            return row.to_record()
+        except Exception:
+            session.rollback()
+            raise
+
+
+def observe_live_loss_breaker_series(
+    scope: str,
+    account_id: str,
+    observed_at: datetime,
+    resolve_series: Callable[
+        [LiveLossBreakerRecord | None], tuple[float, float | None]
+    ],
+) -> LiveLossBreakerRecord:
+    """Observe ``scope`` with its equity computed inside the write transaction.
+
+    ``resolve_series`` receives the scope's current record (``None`` when it
+    has no row yet) and returns ``(equity, equity_anchor_to_persist)``; it
+    runs after ``BEGIN IMMEDIATE``, so the anchor it reads and the series it
+    writes are one atomic step. Deployment scopes use this: their equity is
+    ``equity_anchor + own P&L``, and computing it from a separately-read
+    anchor would let a concurrent ``re-anchor`` overwrite the series with a
+    stale-anchor value.
+    """
+    normalized_scope = str(scope or "").strip()
+    normalized_account = str(account_id or "").strip()
+    if not normalized_scope or not normalized_account:
+        raise ValueError(
+            "observe_live_loss_breaker_series requires a scope and an account_id"
+        )
+    return _observe_live_loss_breaker_row(
+        normalized_scope, normalized_account, observed_at, resolve_series
+    )
+
+
 def observe_live_loss_breaker(
     scope: str,
     account_id: str,
@@ -7463,6 +7595,11 @@ def observe_live_loss_breaker(
     observation fixes it and ``observe`` never rewrites it, so the scope's
     equity series moves only with the deployment's own P&L afterwards.
     ``reset_live_loss_breaker_drawdown`` is the only other writer.
+
+    Scopes whose equity must be computed from the stored row (deployment
+    scopes: ``anchor + own P&L``) must use
+    :func:`observe_live_loss_breaker_series` instead, so the anchor read and
+    the series write stay inside one transaction.
     """
     normalized_scope = str(scope or "").strip()
     normalized_account = str(account_id or "").strip()
@@ -7483,41 +7620,12 @@ def observe_live_loss_breaker(
             "account scopes never carry an equity anchor; "
             f"got one for {normalized_scope!r}"
         )
-    observed_naive = _naive_utc(observed_at)
-    utc_day = _loss_breaker_utc_day(observed_at)
-
-    init_db()
-    with _loss_breaker_observe_lock(normalized_scope):
-        with get_session() as session:
-            row = session.get(LiveLossBreakerStateModel, normalized_scope)
-            if row is None:
-                row = LiveLossBreakerStateModel(
-                    scope=normalized_scope,
-                    account_id=normalized_account,
-                    utc_day=utc_day,
-                    day_start_equity=equity_value,
-                    peak_equity=equity_value,
-                    daily_breached=False,
-                    drawdown_breached=False,
-                    last_equity=equity_value,
-                    last_observed_at=observed_naive,
-                    equity_anchor=anchor_value,
-                    breach_detail_json=None,
-                    updated_at=observed_naive,
-                )
-                session.add(row)
-            else:
-                _apply_loss_breaker_observation(
-                    row,
-                    equity_value=equity_value,
-                    utc_day=utc_day,
-                    observed_naive=observed_naive,
-                    anchor_value=anchor_value,
-                )
-            session.add(row)
-            session.commit()
-            session.refresh(row)
-            return row.to_record()
+    return _observe_live_loss_breaker_row(
+        normalized_scope,
+        normalized_account,
+        observed_at,
+        lambda _record: (equity_value, anchor_value),
+    )
 
 
 def latch_live_loss_breaker_breach(
@@ -7608,6 +7716,7 @@ def reanchor_live_loss_breaker_deployment(
     equity_anchor: float,
     scope_equity: float,
     reanchored_at: datetime,
+    account_id: str,
 ) -> LiveLossBreakerRecord | None:
     """Operator re-anchor of a deployment scope's ``equity_anchor``.
 
@@ -7618,6 +7727,9 @@ def reanchor_live_loss_breaker_deployment(
     delta so no breaker fraction jumps. Existing breach latches are kept:
     re-anchoring fixes the measurement basis (after e.g. a large
     deposit/withdrawal or an account repoint); it does not clear a trip.
+    ``account_id`` is the deployment's CURRENT account: the row's
+    ``account_id`` is rewritten to it, so a re-pointed deployment's scope
+    list and re-anchor P&L total follow the account it actually trades on.
 
     Deployment scopes only - account scopes never carry an anchor, so they
     are refused. ``last_observed_at`` is left alone: a re-anchor is not a
@@ -7632,6 +7744,12 @@ def reanchor_live_loss_breaker_deployment(
             "re-anchor applies to deployment scopes only, got "
             f"{normalized_scope!r}"
         )
+    normalized_account = str(account_id or "").strip()
+    if not normalized_account:
+        raise ValueError(
+            "reanchor_live_loss_breaker_deployment requires the deployment's "
+            "current account_id"
+        )
     anchor_value = float(equity_anchor)
     if not math.isfinite(anchor_value):
         raise ValueError(
@@ -7645,8 +7763,9 @@ def reanchor_live_loss_breaker_deployment(
     reanchored_naive = _naive_utc(reanchored_at)
 
     init_db()
-    with _loss_breaker_observe_lock(normalized_scope):
-        with get_session() as session:
+    with _loss_breaker_observe_lock(normalized_scope), get_session() as session:
+        session.connection().exec_driver_sql(_SQLITE_BEGIN_IMMEDIATE)
+        try:
             row = session.get(LiveLossBreakerStateModel, normalized_scope)
             if row is None:
                 return None
@@ -7657,6 +7776,7 @@ def reanchor_live_loss_breaker_deployment(
                 )
             delta = equity_value - float(row.last_equity)
             row.equity_anchor = anchor_value
+            row.account_id = normalized_account
             row.day_start_equity = float(row.day_start_equity) + delta
             row.peak_equity = float(row.peak_equity) + delta
             row.last_equity = equity_value
@@ -7665,6 +7785,9 @@ def reanchor_live_loss_breaker_deployment(
             session.commit()
             session.refresh(row)
             return row.to_record()
+        except Exception:
+            session.rollback()
+            raise
 
 
 # ─── Deployment trading flows (loss breaker, #301) ────────────────────────────

@@ -63,7 +63,7 @@ from __future__ import annotations
 import asyncio
 import math
 import re
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -73,12 +73,14 @@ from live_runner.base_adapter import validate_live_quote_prices
 from live_runner.credential_env import load_accounts_env_values
 from shared.database import (
     get_account_deployment_trading_flows,
+    get_live_deployment,
     get_live_loss_breaker_state,
     latch_live_loss_breaker_breach,
     list_live_loss_breaker_states,
     list_unresolved_ledger_reconciliation_flags,
     list_untrusted_fill_references,
     observe_live_loss_breaker,
+    observe_live_loss_breaker_series,
     reanchor_live_loss_breaker_deployment,
     record_live_control_audit,
     reset_live_loss_breaker_drawdown,
@@ -90,6 +92,11 @@ logger = get_logger("live-runner")
 
 DEFAULT_DAILY_LOSS_FRACTION = 0.05
 DEFAULT_MAX_DRAWDOWN_FRACTION = 0.20
+
+#: A breaker equity observation older than this is too stale to anchor or
+#: re-base on (the ``re-anchor`` CLI's freshness bound; also the bound on
+#: each deployment row's last observation when re-anchoring).
+STALE_SNAPSHOT_SECONDS = 600.0
 
 _ENV_PREFIX = "LOSS_BREAKER_"
 _ENV_ENABLED = f"{_ENV_PREFIX}ENABLED"
@@ -412,6 +419,43 @@ def _latch_and_alert(
         )
 
 
+def _deployment_scope_series(
+    record: LiveLossBreakerRecord | None,
+    *,
+    account_equity: float,
+    own_pnl: float,
+    deployment_pnls: Mapping[str, float],
+) -> tuple[float, float | None]:
+    """``(scope_equity, anchor_to_persist)`` from ONE breaker ``record``.
+
+    The pure half of :func:`deployment_scope_equity`: ``record`` is the
+    scope's stored state (``None`` when it has no row yet). Callers that
+    observe pass the row read INSIDE the write transaction
+    (:func:`observe_live_loss_breaker_series`), so the anchor they compute
+    from is the anchor that is actually stored.
+    """
+    if not math.isfinite(account_equity):
+        raise ValueError(
+            f"account equity must be finite, got {account_equity!r}"
+        )
+    if not math.isfinite(own_pnl):
+        raise ValueError(f"deployment own P&L must be finite, got {own_pnl!r}")
+    for dep_id, pnl in deployment_pnls.items():
+        if not math.isfinite(float(pnl)):
+            raise ValueError(
+                f"deployment P&L for {dep_id!r} must be finite, got {pnl!r}"
+            )
+    total_pnl = sum(float(pnl) for pnl in deployment_pnls.values())
+    residual = account_equity - total_pnl
+    if record is not None and record.equity_anchor is not None:
+        return float(record.equity_anchor) + own_pnl, None
+    if record is not None and record.last_equity is not None:
+        last_equity = float(record.last_equity)
+        if math.isfinite(last_equity):
+            return last_equity, last_equity - own_pnl
+    return residual + own_pnl, residual
+
+
 def deployment_scope_equity(
     *,
     scope: str,
@@ -437,28 +481,48 @@ def deployment_scope_equity(
       trip the breaker, and that continuity base ``last_equity - own_pnl``
       is persisted;
     * no row -> the residual anchors the scope's first observation.
+
+    This reads the stored row in its own session; observations must go
+    through :func:`_observe_deployment_scope`, which computes the same
+    formula inside the write transaction.
     """
-    if not math.isfinite(account_equity):
-        raise ValueError(
-            f"account equity must be finite, got {account_equity!r}"
-        )
-    if not math.isfinite(own_pnl):
-        raise ValueError(f"deployment own P&L must be finite, got {own_pnl!r}")
-    for dep_id, pnl in deployment_pnls.items():
-        if not math.isfinite(float(pnl)):
-            raise ValueError(
-                f"deployment P&L for {dep_id!r} must be finite, got {pnl!r}"
-            )
-    total_pnl = sum(float(pnl) for pnl in deployment_pnls.values())
-    residual = account_equity - total_pnl
     record = get_live_loss_breaker_state(scope)
-    if record is not None and record.equity_anchor is not None:
-        return float(record.equity_anchor) + own_pnl, None
-    if record is not None and record.last_equity is not None:
-        last_equity = float(record.last_equity)
-        if math.isfinite(last_equity):
-            return last_equity, last_equity - own_pnl
-    return residual + own_pnl, residual
+    return _deployment_scope_series(
+        record,
+        account_equity=account_equity,
+        own_pnl=own_pnl,
+        deployment_pnls=deployment_pnls,
+    )
+
+
+def _observe_deployment_scope(
+    *,
+    scope: str,
+    account_id: str,
+    account_equity: float,
+    own_pnl: float,
+    deployment_pnls: Mapping[str, float],
+    now: datetime,
+) -> LiveLossBreakerRecord:
+    """One deployment-scope observation, anchor read and write atomic.
+
+    The scope's equity is ``equity_anchor + own_pnl`` (or the residual on
+    first/legacy anchoring); computing it from a separately-read anchor
+    would let a concurrent ``re-anchor`` commit between the read and the
+    write and leave the series on the stale anchor. The resolver runs
+    inside the observe transaction instead.
+    """
+    return observe_live_loss_breaker_series(
+        scope,
+        account_id,
+        now,
+        lambda record: _deployment_scope_series(
+            record,
+            account_equity=account_equity,
+            own_pnl=own_pnl,
+            deployment_pnls=deployment_pnls,
+        ),
+    )
 
 
 def _observe_scope(
@@ -537,12 +601,16 @@ def _gate_scope(
     *,
     scope: str,
     account_id: str,
-    equity: float,
+    equity: float | None,
     now: datetime,
     limits: LossBreakerLimits,
     deployment_id: str | None = None,
     symbol: str | None = None,
     equity_anchor: float | None = None,
+    resolve_series: Callable[
+        [LiveLossBreakerRecord | None], tuple[float, float | None]
+    ]
+    | None = None,
 ) -> LiveLossBreakerRecord:
     """Observe ``scope`` and refuse the entry when its breaker is breached.
 
@@ -550,15 +618,29 @@ def _gate_scope(
     later re-enable would start blind); evaluates only when ``limits`` enables
     the breaker. The caller decides which scopes reach this function - both
     disabled scopes return before any observation. Returns the observed record.
+
+    ``resolve_series`` observes through
+    :func:`observe_live_loss_breaker_series` - the equity is computed from
+    the stored row INSIDE the write transaction (deployment scopes), so a
+    concurrent ``re-anchor`` cannot land a stale anchor between the read and
+    the write. Without it the static ``equity``/``equity_anchor`` are
+    observed as given (account scopes).
     """
     try:
-        record = _observe_scope(
-            scope=scope,
-            account_id=account_id,
-            equity=equity,
-            now=now,
-            equity_anchor=equity_anchor,
-        )
+        if resolve_series is not None:
+            record = observe_live_loss_breaker_series(
+                scope, account_id, now, resolve_series
+            )
+        else:
+            if equity is None:
+                raise ValueError("equity is required without resolve_series")
+            record = _observe_scope(
+                scope=scope,
+                account_id=account_id,
+                equity=equity,
+                now=now,
+                equity_anchor=equity_anchor,
+            )
         kinds = (
             _evaluate_kinds(
                 scope=scope,
@@ -598,7 +680,11 @@ def _gate_scope(
             state_unreadable=True,
         ) from exc
     if kinds:
-        current_equity = float(record.last_equity or equity)
+        current_equity = (
+            float(record.last_equity)
+            if record.last_equity is not None
+            else float(equity or 0.0)
+        )
         raise LossBreakerBreachError(
             f"Refusing a live entry: the {'+'.join(kinds)} loss breaker tripped on "
             f"{scope} "
@@ -950,34 +1036,20 @@ def refuse_entry_if_loss_breaker_tripped(
             )
         return
     own_pnl = float(deployment_pnls.get(str(deployment.id), 0.0))
-    try:
-        scope_equity, anchor_to_persist = deployment_scope_equity(
-            scope=deployment_scope,
-            account_equity=equity_value,
-            own_pnl=own_pnl,
-            deployment_pnls=deployment_pnls,
-        )
-    except Exception as exc:  # except-kind: money-decision
-        # Same fail-closed rule as _gate_scope: the anchor lives in the
-        # breaker state, so a state that cannot be read is never "all clear".
-        raise LossBreakerBreachError(
-            f"Refusing a live entry: the deployment loss breaker state for "
-            f"{deployment_scope} could not be read ({exc!r}); an unreadable "
-            "state is never 'all clear'.",
-            scope=deployment_scope,
-            account_id=account_id,
-            deployment_id=str(deployment.id),
-            state_unreadable=True,
-        ) from exc
     _gate_scope(
         scope=deployment_scope,
         account_id=account_id,
-        equity=scope_equity,
+        equity=None,
         now=observed_at,
         limits=deployment_limits,
         deployment_id=str(deployment.id),
         symbol=symbol,
-        equity_anchor=anchor_to_persist,
+        resolve_series=lambda record: _deployment_scope_series(
+            record,
+            account_equity=equity_value,
+            own_pnl=own_pnl,
+            deployment_pnls=deployment_pnls,
+        ),
     )
 
 
@@ -1068,19 +1140,14 @@ def observe_account_loss_breaker_equity(
                 continue
             own_pnl = float(deployment_pnls.get(str(deployment.id), 0.0))  # type: ignore[union-attr]
             dep_scope = deployment_loss_breaker_scope(str(deployment.id))
-            scope_equity, anchor_to_persist = deployment_scope_equity(
+            limits = deployment_loss_breaker_limits(deployment, env_values=env_values)
+            dep_record = _observe_deployment_scope(
                 scope=dep_scope,
+                account_id=account_id,
                 account_equity=equity_value,
                 own_pnl=own_pnl,
                 deployment_pnls=deployment_pnls,  # type: ignore[arg-type]
-            )
-            limits = deployment_loss_breaker_limits(deployment, env_values=env_values)
-            dep_record = _observe_scope(
-                scope=dep_scope,
-                account_id=account_id,
-                equity=scope_equity,
                 now=observed_at,
-                equity_anchor=anchor_to_persist,
             )
             scopes.append(
                 (
@@ -1139,12 +1206,27 @@ def reset_drawdown_breaker(
     )
 
 
+def _breaker_row_age_seconds(
+    row: LiveLossBreakerRecord, reference: datetime
+) -> float | None:
+    """``reference - row.last_observed_at`` in seconds, or None if unrecorded."""
+    observed = row.last_observed_at
+    if observed is None:
+        return None
+    if observed.tzinfo is None:
+        observed = observed.replace(tzinfo=timezone.utc)
+    if reference.tzinfo is None:
+        reference = reference.replace(tzinfo=timezone.utc)
+    return (reference - observed).total_seconds()
+
+
 def reanchor_deployment_loss_breaker_scope(
     scope: str,
     *,
     account_equity: float,
     actor: str = "operator",
     now: datetime | None = None,
+    equity_observed_at: datetime | None = None,
 ) -> LiveLossBreakerRecord:
     """Operator re-anchor of one deployment scope (``re-anchor`` CLI).
 
@@ -1155,6 +1237,16 @@ def reanchor_deployment_loss_breaker_scope(
     Existing latches are kept: re-anchoring fixes the measurement basis
     after e.g. a large deposit/withdrawal or an account repoint; it does
     not clear a trip.
+
+    The account is the deployment's CURRENT ``account_id`` resolved from
+    the live deployment row - never the breaker row's stored ``account_id``,
+    which a re-point leaves stale until the next observation. The re-anchor
+    refuses when the deployment row is missing, when the account carries an
+    unresolved ``ledger_reconciliation_required`` flag or an untrusted fill
+    (the same conditions that make the live P&L unmeasurable), or when a
+    deployment row that has fills was last observed more than
+    ``STALE_SNAPSHOT_SECONDS`` before ``equity_observed_at`` (default: the
+    re-anchor time) - a stale row P&L would silently skew the residual.
 
     Deployment P&L is reconstructed from the persisted breaker rows
     (``last_equity - equity_anchor`` per anchored deployment scope) - the
@@ -1179,8 +1271,31 @@ def reanchor_deployment_loss_breaker_scope(
     record = get_live_loss_breaker_state(normalized_scope)
     if record is None:
         raise ValueError(f"no loss breaker state for scope {normalized_scope!r}")
-    account_id = record.account_id
+    deployment = get_live_deployment(deployment_id)
+    if deployment is None:
+        raise ValueError(
+            f"no live deployment {deployment_id!r}; the re-anchor resolves "
+            "the deployment's CURRENT account from the deployment row"
+        )
+    account_id = str(deployment.account_id)
     observed_at = now or datetime.now(timezone.utc)
+    equity_time = equity_observed_at or observed_at
+
+    unresolved_flags = list_unresolved_ledger_reconciliation_flags(account_id)
+    if unresolved_flags:
+        raise ValueError(
+            "deployment P&L cannot be fully measured: unresolved "
+            f"ledger_reconciliation_required flags on {account_id!r} "
+            f"({', '.join(unresolved_flags)}); resolve them with "
+            "`python -m scripts.live_loss_breaker resolve-ledger-flag` first"
+        )
+    untrusted_fills = list_untrusted_fill_references(account_id)
+    if untrusted_fills:
+        raise ValueError(
+            "deployment P&L cannot be fully measured: "
+            f"{len(untrusted_fills)} fill(s) on {account_id!r} have no "
+            "trusted price; repair the fill ledger before re-anchoring"
+        )
 
     states = list_live_loss_breaker_states(account_id)
     dep_rows = [
@@ -1209,6 +1324,27 @@ def reanchor_deployment_loss_breaker_scope(
         for dep in flows
         if dep not in anchored_pnls and dep not in unanchored
     )
+    for row in dep_rows:
+        dep = row.scope.split(":", 1)[1]
+        if dep not in flows:
+            continue
+        age = _breaker_row_age_seconds(row, equity_time)
+        if age is None:
+            problems.append(
+                f"deployment {dep} has fills but its breaker row has no "
+                "recorded observation time"
+            )
+        elif age > STALE_SNAPSHOT_SECONDS:
+            problems.append(
+                f"deployment {dep} was last observed {age:.0f}s before the "
+                f"equity observation (limit {STALE_SNAPSHOT_SECONDS:.0f}s); "
+                "wait for a fresh breaker observation"
+            )
+        elif age < -60:
+            problems.append(
+                f"deployment {dep} was last observed {-age:.0f}s AFTER the "
+                "equity observation; check the observation timestamps"
+            )
     if problems:
         raise ValueError(
             "deployment P&L cannot be fully measured, so the residual is "
@@ -1225,6 +1361,7 @@ def reanchor_deployment_loss_breaker_scope(
         equity_anchor=residual,
         scope_equity=scope_equity,
         reanchored_at=observed_at,
+        account_id=account_id,
     )
     if updated is None:
         raise ValueError(

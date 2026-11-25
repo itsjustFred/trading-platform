@@ -40,7 +40,10 @@ and any latch is kept:
 Without ``--account-equity`` the account equity is the account scope's own
 last observed breaker equity, refused when missing, non-positive or older
 than ``STALE_SNAPSHOT_SECONDS`` - the same freshness rule ``reset-drawdown``
-applies. ``re-anchor`` refuses account scopes: they carry no anchor.
+applies. The account is the deployment's CURRENT account (resolved from the
+deployment row, so a re-pointed deployment re-anchors on its new account).
+``re-anchor`` refuses account scopes: they carry no anchor. Prefer running
+it while the deployment is paused, so no poll observation lands mid-command.
 
 An unresolved ``ledger_reconciliation_required`` audit flag (#277) fails
 deployment-scoped entries closed until an operator reconciles it:
@@ -81,6 +84,7 @@ _guard.ensure_own_checkout("live_loss_breaker")
 # --- end import-origin guard ---
 
 from live_runner.loss_breaker import (
+    STALE_SNAPSHOT_SECONDS,
     account_loss_breaker_limits,
     account_loss_breaker_scope,
     deployment_loss_breaker_limits,
@@ -89,6 +93,7 @@ from live_runner.loss_breaker import (
 )
 from shared.database import (
     get_latest_live_balance,
+    get_live_deployment,
     get_live_loss_breaker_state,
     list_live_deployments,
     list_live_loss_breaker_states,
@@ -99,9 +104,6 @@ from shared.logging import get_logger, route_console_logs_to_stderr
 from shared.models import LiveLossBreakerRecord
 
 logger = get_logger("live-runner")
-
-#: A balance snapshot older than this is too stale to re-base a peak on.
-STALE_SNAPSHOT_SECONDS = 600.0
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -147,7 +149,8 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "Re-base a deployment scope's equity_anchor to the current "
             "residual (account equity minus all deployment P&L) and shift "
-            "its equity series by the same delta. Keeps any latch."
+            "its equity series by the same delta. Keeps any latch. Prefer "
+            "running it while the deployment is paused."
         ),
     )
     reanchor_target = reanchor.add_mutually_exclusive_group(required=True)
@@ -331,6 +334,17 @@ def _reset_equity_for_scope(
     if observed_at.tzinfo is None:
         observed_at = observed_at.replace(tzinfo=timezone.utc)
     age = (now - observed_at).total_seconds()
+    if age < -60:
+        return (
+            None,
+            None,
+            (
+                f"last breaker observation for scope {record.scope!r} is "
+                f"{-age:.0f}s in the future; check the observation "
+                "timestamps or pass --equity to state the re-base equity "
+                "explicitly"
+            ),
+        )
     if kind != "deployment" and age > STALE_SNAPSHOT_SECONDS:
         return (
             None,
@@ -443,18 +457,20 @@ def _cmd_reset_drawdown(args: argparse.Namespace) -> int:
 
 
 def _reanchor_account_equity(
-    record: LiveLossBreakerRecord,
+    account_id: str,
     args: argparse.Namespace,
     *,
     now: datetime,
-) -> tuple[float | None, str | None]:
-    """``(equity, source)`` for the re-anchor's residual, or ``(None, error)``.
+) -> tuple[float | None, str | None, datetime | None]:
+    """``(equity, source, equity_observed_at)`` or ``(None, error, None)``.
 
-    ``--account-equity`` always wins. Otherwise the account scope's own last
-    observed breaker equity is used - the same broker-equity series the
+    ``--account-equity`` always wins (its equity time is ``now``: the
+    operator asserts the CURRENT equity). Otherwise the account scope's own
+    last observed breaker equity is used - the same broker-equity series the
     breaker measures - refused when missing, non-positive or older than
     ``STALE_SNAPSHOT_SECONDS`` so a re-anchor never runs on an hours-old
-    basis.
+    basis. ``equity_observed_at`` is when that equity was observed; the
+    library bounds each deployment row's last observation against it.
     """
     if args.account_equity is not None:
         equity = float(args.account_equity)
@@ -462,19 +478,19 @@ def _reanchor_account_equity(
             return None, (
                 f"--account-equity must be a positive finite number, got "
                 f"{args.account_equity!r}"
-            )
-        return equity, "--account-equity"
-    account_record = get_live_loss_breaker_state(
-        account_loss_breaker_scope(record.account_id)
-    )
+            ), None
+        return equity, "--account-equity", now
+    account_scope = account_loss_breaker_scope(account_id)
+    account_record = get_live_loss_breaker_state(account_scope)
     if account_record is None or account_record.last_equity is None:
         return (
             None,
             (
-                f"account scope {account_loss_breaker_scope(record.account_id)!r} "
+                f"account scope {account_scope!r} "
                 "has no observed equity; pass --account-equity to state the "
                 "current account equity explicitly"
             ),
+            None,
         )
     last = float(account_record.last_equity)
     if not math.isfinite(last) or last <= 0:
@@ -484,6 +500,7 @@ def _reanchor_account_equity(
                 f"account scope last observed equity {last!r} is not a usable "
                 "positive finite number; pass --account-equity explicitly"
             ),
+            None,
         )
     observed_at = account_record.last_observed_at
     if observed_at is None:
@@ -493,10 +510,22 @@ def _reanchor_account_equity(
                 "the account scope has no recorded observation time; pass "
                 "--account-equity to state the current account equity explicitly"
             ),
+            None,
         )
     if observed_at.tzinfo is None:
         observed_at = observed_at.replace(tzinfo=timezone.utc)
     age = (now - observed_at).total_seconds()
+    if age < -60:
+        return (
+            None,
+            (
+                f"last account equity observation is {-age:.0f}s in the "
+                "future; check the observation timestamps or pass "
+                "--account-equity to state the current account equity "
+                "explicitly"
+            ),
+            None,
+        )
     if age > STALE_SNAPSHOT_SECONDS:
         return (
             None,
@@ -505,8 +534,9 @@ def _reanchor_account_equity(
                 f"(limit {STALE_SNAPSHOT_SECONDS:.0f}s); pass --account-equity "
                 "to state the current account equity explicitly"
             ),
+            None,
         )
-    return last, "last_observed_equity"
+    return last, "last_observed_equity", observed_at
 
 
 def _cmd_reanchor(args: argparse.Namespace) -> int:
@@ -530,14 +560,33 @@ def _cmd_reanchor(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 1
+    # The equity source is the deployment's CURRENT account, resolved from
+    # the deployment row - the breaker row's account_id is stale after a
+    # re-point until the next observation.
+    deployment_id = scope.split(":", 1)[1]
+    deployment = get_live_deployment(deployment_id)
+    if deployment is None:
+        print(
+            f"error: no live deployment {deployment_id!r}; the re-anchor "
+            "resolves the deployment's current account from the deployment "
+            "row",
+            file=sys.stderr,
+        )
+        return 1
     now = datetime.now(timezone.utc)
-    equity, source = _reanchor_account_equity(record, args, now=now)
+    equity, source, equity_observed_at = _reanchor_account_equity(
+        str(deployment.account_id), args, now=now
+    )
     if equity is None:
         print(f"error: {source}", file=sys.stderr)
         return 1
     try:
         updated = reanchor_deployment_loss_breaker_scope(
-            scope, account_equity=equity, actor=args.actor, now=now
+            scope,
+            account_equity=equity,
+            actor=args.actor,
+            now=now,
+            equity_observed_at=equity_observed_at,
         )
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)

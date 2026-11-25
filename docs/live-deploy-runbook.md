@@ -1115,20 +1115,27 @@ On the ACCOUNT scope deposits and withdrawals are NOT separated from P&L: a
 5 % withdrawal trips the daily breaker and a 20 % withdrawal latches
 drawdown. Deployment scopes are immune to the *movement* — a deposit does
 not move their anchored equity at all — but their fraction basis is FROZEN
-at the account equity captured when the anchor was written. After a large
-withdrawal the deployment breaker is effectively looser in real terms (a
-5 % daily trip then needs a smaller absolute loss on the smaller account),
-and after a large deposit it is stricter; the account scope still measures
-the real account equity, so this is a calibration issue, not a hole. After
-a planned large deposit/withdrawal, or after repointing a deployment to a
-different account (`update_live_deployment_account` keeps the scope row,
-so the anchor keeps the OLD account's scale while own P&L is measured on
-the new one), run `re-anchor` on each affected deployment scope once the
-new equity is being observed. `re-anchor` also preserves any existing
-latch — it re-bases the measurement, it does not clear a trip; use
-`reset-drawdown` for that. For a planned withdrawal that trips only the
-account breaker, `reset-drawdown` on the account scope is still the right
-command.
+at the account equity captured when the anchor was written, so after a
+large withdrawal the deployment breaker is effectively LOOSER in real
+terms: anchored at $100k and $90k withdrawn, the account is now $10k but a
+5 % daily trip still needs a $5k loss — 50 % of the real account, not 5 %.
+After a large deposit it is stricter for the same reason; the account
+scope still measures the real account equity, so this is a calibration
+issue, not a hole. After a planned large deposit/withdrawal, or after
+repointing a deployment to a different account (`update_live_deployment_account`
+keeps the scope row, so the anchor keeps the OLD account's scale while own
+P&L is measured on the new one), run `re-anchor` on each affected
+deployment scope once the new equity is being observed — prefer running it
+while the deployment is paused. `re-anchor` resolves the deployment's
+CURRENT account from the deployment row (a re-pointed deployment
+re-anchors on its new account, and the scope row follows it), refuses when
+the fill-ledger P&L is not fully measurable (unresolved
+`ledger_reconciliation_required` flag, untrusted fill, or a deployment row
+with fills whose last observation is stale), re-bases the anchor to the
+current residual, and preserves any existing latch — it re-bases the
+measurement, it does not clear a trip; use `reset-drawdown` for that. For
+a planned withdrawal that trips only the account breaker,
+`reset-drawdown` on the account scope is still the right command.
 
 Thresholds, most specific first: deployment `settings` keys
 (`loss_breaker_enabled`, `loss_breaker_daily_loss_fraction`,

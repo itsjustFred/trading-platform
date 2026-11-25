@@ -20,6 +20,9 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 ACCOUNT = "acc-cli"
+# ``get_live_deployment`` validates the id as a UUID, so the seeded
+# deployment uses a real one; the breaker scope is ``deployment:<id>``.
+DEP_ID = "11111111-2222-4333-8444-555555555555"
 
 
 def _child_env(data_dir: Path) -> dict[str, str]:
@@ -516,11 +519,21 @@ def _seed_reanchor_state(data_dir: Path, *, stale_account: bool = False) -> None
     )
     code = f"""
 from datetime import datetime, timezone
-from shared.database import observe_live_loss_breaker
+from shared.database import (
+    LiveAccountModel, LiveDeploymentModel, get_session, init_db,
+    observe_live_loss_breaker,
+)
+init_db()
 now = datetime.now(timezone.utc)
+with get_session() as session:
+    session.add(LiveAccountModel(id='acc-cli', broker='test', name='acc-cli'))
+    session.add(LiveDeploymentModel(
+        id='{DEP_ID}', strategy_name='t', account_id='acc-cli',
+        symbols_json=['AAPL'], timeframe='1h', status='PAUSED'))
+    session.commit()
 observe_live_loss_breaker('account:acc-cli', 'acc-cli', 20000.0, {account_when})
 observe_live_loss_breaker(
-    'deployment:dep-1', 'acc-cli', 96000.0, now, equity_anchor=102000.0)
+    'deployment:{DEP_ID}', 'acc-cli', 96000.0, now, equity_anchor=102000.0)
 """
     result = subprocess.run(
         [sys.executable, "-c", code],
@@ -545,7 +558,7 @@ def test_reanchor_rebases_anchor_and_shifts_series(tmp_path: Path) -> None:
             "-c",
             "from datetime import datetime, timezone;"
             "from shared.database import latch_live_loss_breaker_breach;"
-            "latch_live_loss_breaker_breach('deployment:dep-1', 'drawdown',"
+            f"latch_live_loss_breaker_breach('deployment:{DEP_ID}', 'drawdown',"
             " {'kind': 'drawdown'}, datetime.now(timezone.utc))",
         ],
         capture_output=True,
@@ -557,7 +570,7 @@ def test_reanchor_rebases_anchor_and_shifts_series(tmp_path: Path) -> None:
     assert latch.returncode == 0, latch.stderr
 
     result = _run(
-        ["re-anchor", "--deployment", "dep-1", "--account-equity", "20000"],
+        ["re-anchor", "--deployment", DEP_ID, "--account-equity", "20000"],
         data_dir,
     )
 
@@ -572,7 +585,7 @@ def test_reanchor_rebases_anchor_and_shifts_series(tmp_path: Path) -> None:
     assert payload["drawdown_breached"] is True
     assert payload["equity_source"] == "--account-equity"
 
-    status = _run(["status", "--deployment", "dep-1"], data_dir)
+    status = _run(["status", "--deployment", DEP_ID], data_dir)
     assert status.returncode == 0, status.stderr
     state = json.loads(status.stdout)["scopes"][0]
     assert state["equity_anchor"] == pytest.approx(26_000.0)
@@ -585,7 +598,8 @@ def test_reanchor_rebases_anchor_and_shifts_series(tmp_path: Path) -> None:
             "-c",
             "import json;"
             "from shared.database import list_live_control_audit;"
-            "rows = [r for r in list_live_control_audit(target_id='deployment:dep-1')"
+            f"rows = [r for r in list_live_control_audit("
+            f"target_id='deployment:{DEP_ID}')"
             "        if r['action'] == 'loss_breaker.reanchor'];"
             "print(json.dumps(rows))",
         ],
@@ -608,7 +622,7 @@ def test_reanchor_defaults_to_fresh_account_scope_equity(tmp_path: Path) -> None
     data_dir = tmp_path / "data"
     _seed_reanchor_state(data_dir)
 
-    result = _run(["re-anchor", "--deployment", "dep-1"], data_dir)
+    result = _run(["re-anchor", "--deployment", DEP_ID], data_dir)
 
     assert result.returncode == 0, result.stderr
     payload = json.loads(result.stdout)
@@ -636,13 +650,76 @@ def test_reanchor_refuses_stale_account_equity(tmp_path: Path) -> None:
     data_dir = tmp_path / "data"
     _seed_reanchor_state(data_dir, stale_account=True)
 
-    result = _run(["re-anchor", "--deployment", "dep-1"], data_dir)
+    result = _run(["re-anchor", "--deployment", DEP_ID], data_dir)
 
     assert result.returncode == 1
     assert "--account-equity" in result.stderr
 
     explicit = _run(
-        ["re-anchor", "--deployment", "dep-1", "--account-equity", "20000"],
+        ["re-anchor", "--deployment", DEP_ID, "--account-equity", "20000"],
+        data_dir,
+    )
+    assert explicit.returncode == 0, explicit.stderr
+
+
+def test_reanchor_rejects_non_positive_account_equity(tmp_path: Path) -> None:
+    """``--account-equity`` is operator-asserted CURRENT equity: a
+    non-positive or non-finite figure is refused before any state moves."""
+    data_dir = tmp_path / "data"
+    _seed_reanchor_state(data_dir)
+
+    for bad in ("0", "-5", "nan", "inf"):
+        result = _run(
+            ["re-anchor", "--deployment", DEP_ID, "--account-equity", bad],
+            data_dir,
+        )
+        assert result.returncode == 1, (bad, result.stdout, result.stderr)
+        assert "positive finite" in result.stderr
+
+
+def test_reanchor_refuses_non_positive_stored_account_equity(
+    tmp_path: Path,
+) -> None:
+    """Without ``--account-equity`` the account scope's stored equity is the
+    basis; a zero/negative stored figure must be refused, not re-anchored on.
+    """
+    data_dir = tmp_path / "data"
+    code = f"""
+from datetime import datetime, timezone
+from shared.database import (
+    LiveAccountModel, LiveDeploymentModel, get_session, init_db,
+    observe_live_loss_breaker,
+)
+init_db()
+now = datetime.now(timezone.utc)
+with get_session() as session:
+    session.add(LiveAccountModel(id='acc-cli', broker='test', name='acc-cli'))
+    session.add(LiveDeploymentModel(
+        id='{DEP_ID}', strategy_name='t', account_id='acc-cli',
+        symbols_json=['AAPL'], timeframe='1h', status='PAUSED'))
+    session.commit()
+observe_live_loss_breaker('account:acc-cli', 'acc-cli', 0.0, now)
+observe_live_loss_breaker(
+    'deployment:{DEP_ID}', 'acc-cli', 50000.0, now, equity_anchor=50000.0)
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        cwd=str(REPO_ROOT),
+        env=_child_env(data_dir),
+        timeout=300,
+    )
+    assert result.returncode == 0, result.stderr
+
+    result = _run(["re-anchor", "--deployment", DEP_ID], data_dir)
+
+    assert result.returncode == 1
+    assert "positive finite" in result.stderr
+
+    # --account-equity still works: the operator states the figure explicitly.
+    explicit = _run(
+        ["re-anchor", "--deployment", DEP_ID, "--account-equity", "20000"],
         data_dir,
     )
     assert explicit.returncode == 0, explicit.stderr
