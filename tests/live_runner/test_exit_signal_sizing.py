@@ -669,6 +669,32 @@ def _entry_ready_adapter(positions) -> _Adapter:
     return adapter
 
 
+def _discord_entry_trade_signal() -> TradeSignal:
+    return TradeSignal(
+        action="buy",
+        symbol="AAPL",
+        entry_price=100.0,
+        stop_loss=95.0,
+        take_profit=110.0,
+        timeframe="1h",
+        metadata={
+            "source": "discord",
+            "discord_channel_id": "100000000000000121",
+            "discord_message_id": "900000000000000124",
+            "discord_author_id": "bot-121",
+            "received_at": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+
+
+class _DecisionArchive:
+    def __init__(self) -> None:
+        self.records: list[dict] = []
+
+    def record(self, record: dict) -> None:
+        self.records.append(record)
+
+
 def test_broker_rejected_entry_is_refused_and_the_lease_is_released(
     monkeypatch, caplog
 ) -> None:
@@ -748,7 +774,117 @@ def test_a_submit_timeout_stays_an_unknown_outcome(monkeypatch, caplog) -> None:
 
     assert outcome == "unknown"
     assert released == []
-    assert _records_at(caplog, logging.ERROR, "unknown outcome")
+    unknown_logs = _records_at(caplog, logging.ERROR, "unknown outcome")
+    assert unknown_logs
+    assert any(
+        record.getMessage().startswith(
+            "Internal strategy signal submission failed with an unknown outcome"
+        )
+        for record in unknown_logs
+    )
+
+
+@pytest.mark.parametrize(
+    ("is_exit", "broker_rejected", "expected_reason"),
+    [
+        (False, True, "broker_rejected"),
+        (True, True, "exit_broker_rejected"),
+        (False, False, "broker_refused_pre_request"),
+        (True, False, "exit_refused_pre_request"),
+    ],
+    ids=[
+        "broker-rejected-entry",
+        "broker-rejected-exit",
+        "pre-request-entry",
+        "pre-request-exit",
+    ],
+)
+def test_claim_submit_records_the_decision_reason_for_definitive_refusals(
+    monkeypatch, is_exit: bool, broker_rejected: bool, expected_reason: str
+) -> None:
+    """The archived decision reason distinguishes broker refusals from
+    pre-request refusals, for entries and exits alike."""
+    import live_runner.daemon as daemon
+    from live_runner.base_adapter import BrokerOrderRejectedError, order_not_submitted
+    from live_runner.signal_archive import SignalDecisionRecorder
+
+    deployment = _deployment()
+    trade_signal = _exit_trade_signal() if is_exit else _discord_entry_trade_signal()
+    live_signal = daemon._trade_signal_to_live_signal(trade_signal, deployment)
+    adapter = _Adapter([])
+    if broker_rejected:
+        adapter.submit_order = _submit_raising(
+            adapter,
+            BrokerOrderRejectedError(
+                "Order rejected (INVALID_REQUEST): SL/TP have to be positive",
+                error_code="INVALID_REQUEST",
+            ),
+        )
+    else:
+
+        async def _refuse_pre_request(signal, *, qty=None):
+            adapter.submitted.append((signal, qty))
+            with order_not_submitted():
+                raise ValueError("refused before the broker request")
+
+        adapter.submit_order = _refuse_pre_request
+
+    archive = _DecisionArchive()
+    decision = SignalDecisionRecorder(
+        trade_signal=trade_signal,
+        account_id=deployment.account_id,
+        deployment=deployment,
+        archive=archive,
+    )
+    released: list[str] = []
+
+    async def _caps(_adapter, _deployment, _signal, *, qty, risk_config):
+        return qty
+
+    async def _no_halt(*_args, **_kwargs):
+        return None
+
+    async def _persist(*_args, **_kwargs):
+        return None
+
+    async def _renew(_token):
+        await asyncio.sleep(3600)
+
+    monkeypatch.setattr(daemon, "claim_live_deployment_submission", lambda *a, **k: True)
+    monkeypatch.setattr(
+        daemon,
+        "release_live_deployment_submission",
+        lambda token, *_a, **_k: released.append(str(token)) or True,
+    )
+    monkeypatch.setattr(daemon, "refuse_entry_while_halted", _no_halt)
+    monkeypatch.setattr(daemon, "_risk_config_for_deployment", lambda _d: None)
+    monkeypatch.setattr(daemon, "enforce_pre_submit_caps", _caps)
+    monkeypatch.setattr(daemon, "_persist_submission_rejection", _persist)
+    monkeypatch.setattr(daemon, "_renew_submission_claim_until_cancelled", _renew)
+
+    outcome = asyncio.run(
+        daemon._claim_and_submit_prepared_signal(
+            deployment.account_id,
+            adapter,
+            deployment,
+            trade_signal,
+            live_signal,
+            live_signal,
+            1.0,
+            is_exit=is_exit,
+            decision=decision,
+            source_label="Discord",
+        )
+    )
+
+    assert outcome == "refused"
+    assert len(released) == 1
+    assert len(adapter.submitted) == 1
+    assert len(archive.records) == 1
+    record = archive.records[0]
+    assert record["type"] == "discord_signal_decision"
+    assert record["outcome"] == "refused"
+    assert record["reason"] == expected_reason
 
 
 def test_exit_without_a_position_is_ignored_and_logged(monkeypatch, caplog) -> None:

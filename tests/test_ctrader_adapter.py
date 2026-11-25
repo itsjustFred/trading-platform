@@ -3680,35 +3680,133 @@ def test_cancel_orders_refused_cancel_is_failed_not_dropped() -> None:
 # cTrader answers a refused NewOrderReq/ClosePositionReq with a
 # ProtoOAOrderErrorEvent as the correlated response payload (matched by
 # clientMsgId). That is a definitive refusal - nothing was opened or closed -
-# so it must surface as BrokerOrderRejectedError, which the daemon treats like
-# a pre-request refusal (lease released, signal rejected) instead of an
-# unknown outcome held for reconciliation. A timeout or transport failure is
-# NOT a refusal: the request may have landed, so it stays an ordinary
-# exception.
+# only when the event carries no orderId (and, for a new-order request, no
+# positionId): an order or position id means the broker may have created
+# state, so the outcome stays unknown. A definitive refusal must surface as
+# BrokerOrderRejectedError, which the daemon treats like a pre-request
+# refusal (lease released, signal rejected) instead of an unknown outcome
+# held for reconciliation. A timeout or transport failure is NOT a refusal:
+# the request may have landed, so it stays an ordinary exception.
 
 
-def test_order_error_event_response_is_a_definitive_broker_rejection() -> None:
-    from ctrader_open_api.messages.OpenApiMessages_pb2 import ProtoOAOrderErrorEvent
-
-    from live_runner.base_adapter import BrokerOrderRejectedError
+def _order_error_response_adapter(error_event):
+    from ctrader_open_api.messages.OpenApiMessages_pb2 import (
+        ProtoOAClosePositionReq,
+        ProtoOANewOrderReq,
+        ProtoOAOrderErrorEvent,
+    )
 
     adapter = CTraderLiveAdapter(
         app_id="app", app_secret="secret", access_token="token", account_id="1"
     )
     adapter._ProtoOAOrderErrorEvent = ProtoOAOrderErrorEvent
+    adapter._ProtoOANewOrderReq = ProtoOANewOrderReq
+    adapter._ProtoOAClosePositionReq = ProtoOAClosePositionReq
 
-    async def refuse_send(_request, *, timeout_seconds: int = 20):
-        return ProtoOAOrderErrorEvent(
+    async def send(_request, *, timeout_seconds: int = 20):
+        return error_event
+
+    adapter._send_request_with_refresh_retry = send
+    return adapter
+
+
+def test_order_error_event_response_is_a_definitive_broker_rejection() -> None:
+    from ctrader_open_api.messages.OpenApiMessages_pb2 import (
+        ProtoOANewOrderReq,
+        ProtoOAOrderErrorEvent,
+    )
+
+    from live_runner.base_adapter import BrokerOrderRejectedError
+
+    adapter = _order_error_response_adapter(
+        ProtoOAOrderErrorEvent(
             ctidTraderAccountId=1,
             errorCode="INVALID_REQUEST",
             orderId=0,
             description="SL/TP have to be positive",
         )
-
-    adapter._send_request_with_refresh_retry = refuse_send
+    )
+    submission = adapter._submit_new_order_request(ProtoOANewOrderReq())
 
     with pytest.raises(BrokerOrderRejectedError, match="Order rejected") as excinfo:
-        asyncio.run(adapter._submit_new_order_request(object()))
+        asyncio.run(submission)
+    assert excinfo.value.error_code == "INVALID_REQUEST"
+
+
+def test_order_error_event_with_order_id_stays_an_unknown_outcome() -> None:
+    """A broker order id means an order record may exist: never release the lease."""
+    from ctrader_open_api.messages.OpenApiMessages_pb2 import (
+        ProtoOANewOrderReq,
+        ProtoOAOrderErrorEvent,
+    )
+
+    from live_runner.base_adapter import BrokerOrderRejectedError
+
+    adapter = _order_error_response_adapter(
+        ProtoOAOrderErrorEvent(
+            ctidTraderAccountId=1,
+            errorCode="INVALID_REQUEST",
+            orderId=123,
+            description="rejected after order creation",
+        )
+    )
+    submission = adapter._submit_new_order_request(ProtoOANewOrderReq())
+
+    with pytest.raises(RuntimeError, match="Order rejected") as excinfo:
+        asyncio.run(submission)
+    assert not isinstance(excinfo.value, BrokerOrderRejectedError)
+
+
+def test_new_order_error_with_position_id_stays_an_unknown_outcome() -> None:
+    """A non-zero positionId on a new-order error is not a clean refusal."""
+    from ctrader_open_api.messages.OpenApiMessages_pb2 import (
+        ProtoOANewOrderReq,
+        ProtoOAOrderErrorEvent,
+    )
+
+    from live_runner.base_adapter import BrokerOrderRejectedError
+
+    adapter = _order_error_response_adapter(
+        ProtoOAOrderErrorEvent(
+            ctidTraderAccountId=1,
+            errorCode="INVALID_REQUEST",
+            orderId=0,
+            positionId=123,
+            description="rejected with a position attached",
+        )
+    )
+    submission = adapter._submit_new_order_request(ProtoOANewOrderReq())
+
+    with pytest.raises(RuntimeError, match="Order rejected") as excinfo:
+        asyncio.run(submission)
+    assert not isinstance(excinfo.value, BrokerOrderRejectedError)
+
+
+def test_close_position_error_with_echoed_position_id_is_definitive() -> None:
+    """ClosePositionReq echoes positionId; only a non-zero orderId stays unknown."""
+    from ctrader_open_api.messages.OpenApiMessages_pb2 import (
+        ProtoOAClosePositionReq,
+        ProtoOAOrderErrorEvent,
+    )
+
+    from live_runner.base_adapter import BrokerOrderRejectedError
+
+    adapter = _order_error_response_adapter(
+        ProtoOAOrderErrorEvent(
+            ctidTraderAccountId=1,
+            errorCode="INVALID_REQUEST",
+            orderId=0,
+            positionId=123,
+            description="SL/TP have to be positive",
+        )
+    )
+    request = ProtoOAClosePositionReq(
+        ctidTraderAccountId=1, positionId=123, volume=1000
+    )
+    submission = adapter._submit_new_order_request(request)
+
+    with pytest.raises(BrokerOrderRejectedError, match="Order rejected") as excinfo:
+        asyncio.run(submission)
     assert excinfo.value.error_code == "INVALID_REQUEST"
 
 
@@ -3724,9 +3822,10 @@ def test_submit_timeout_stays_an_ordinary_unknown_outcome() -> None:
         raise TimeoutError("no response within 20s")
 
     adapter._send_request_with_refresh_retry = timeout_send
+    submission = adapter._submit_new_order_request(object())
 
     with pytest.raises(TimeoutError) as excinfo:
-        asyncio.run(adapter._submit_new_order_request(object()))
+        asyncio.run(submission)
     assert not isinstance(excinfo.value, BrokerOrderRejectedError)
 
 
@@ -3741,7 +3840,8 @@ def test_submit_transport_error_stays_an_ordinary_unknown_outcome() -> None:
         raise ConnectionResetError("socket closed mid-request")
 
     adapter._send_request_with_refresh_retry = broken_send
+    submission = adapter._submit_new_order_request(object())
 
     with pytest.raises(ConnectionResetError) as excinfo:
-        asyncio.run(adapter._submit_new_order_request(object()))
+        asyncio.run(submission)
     assert not isinstance(excinfo.value, BrokerOrderRejectedError)

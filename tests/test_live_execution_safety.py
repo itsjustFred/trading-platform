@@ -3738,7 +3738,6 @@ def test_ctrader_request_build_refusal_persists_no_signal_row(monkeypatch):
             self.timeInForce = 0
             self.clientOrderId = ""
             self.relativeStopLoss = 0
-            self.relativeTakeProfit = 0
 
     adapter._ProtoOANewOrderReq = _NewOrderReq
     adapter._ProtoOAOrderType = SimpleNamespace(MARKET=1)
@@ -5250,7 +5249,7 @@ def test_unbounded_tp_policy_builds_stop_only_requests() -> None:
 def test_ctrader_unbounded_tp_leaves_relative_take_profit_unset_on_the_wire() -> None:
     """Live soak regression (2026-11-25): cTrader rejected the order with
     INVALID_REQUEST "SL/TP have to be positive" because the builder assigned
-    ``relativeTakeProfit = 0``. On the proto3-optional int64 field a present
+    ``relativeTakeProfit = 0``. On the proto2 optional int64 field a present
     zero is a VALUE, not "no TP" - the field must be absent. This test uses
     the real generated message so ``HasField`` is the wire truth, not a fake.
     """

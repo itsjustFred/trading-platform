@@ -3504,7 +3504,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         )
         request.relativeStopLoss = relative_stop
         if relative_take is not None:
-            # proto3-optional int64: assigning 0 would make the field PRESENT
+            # proto2 optional int64: assigning 0 would make the field PRESENT
             # and the broker validates a present relativeTakeProfit as > 0
             # ("SL/TP have to be positive"). "No take profit" means the field
             # is absent, so it is only ever assigned a positive distance.
@@ -3585,16 +3585,31 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             self._raise_terminal_auth_from_api_error(exc)
             raise
         if isinstance(response, self._ProtoOAOrderErrorEvent):
-            # The response is correlated to THIS request by clientMsgId, so an
-            # order-error event here is the broker's definitive refusal of the
-            # order just sent - nothing was opened or closed. Raise the
-            # dedicated type so the daemon releases the submission lease
-            # instead of holding it for reconciliation. Timeouts and transport
-            # failures still propagate as ordinary exceptions (unknown
-            # outcome): the request may have landed.
+            # The response is correlated to THIS request by clientMsgId, but
+            # only an error event with no broker order id is a clean refusal:
+            # a non-zero orderId means the broker created an order record, and
+            # for a new-order request a non-zero positionId is not provably
+            # pre-position either. A close request echoes positionId, so only
+            # its orderId decides. Timeouts and transport failures still
+            # propagate as ordinary exceptions (unknown outcome): the request
+            # may have landed.
+            order_id = _present_proto_field(response, "orderId")
+            position_id = _present_proto_field(response, "positionId")
+            is_close_position = (
+                self._ProtoOAClosePositionReq is not None
+                and isinstance(request, self._ProtoOAClosePositionReq)
+            )
+            definitive_refusal = order_id in (None, 0) and (
+                is_close_position or position_id in (None, 0)
+            )
+            message = (
+                f"Order rejected ({getattr(response, 'errorCode', '') or ''}): "
+                f"{getattr(response, 'description', '') or 'no description'}"
+            )
+            if not definitive_refusal:
+                raise RuntimeError(message)
             raise BrokerOrderRejectedError(
-                f"Order rejected ({response.errorCode}): "
-                f"{response.description or 'no description'}",
+                message,
                 error_code=str(getattr(response, "errorCode", "") or ""),
             )
         return response
