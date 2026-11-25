@@ -179,6 +179,7 @@ def _format_state(record: LiveLossBreakerRecord, *, equity: float | None) -> dic
         "day_start_equity": record.day_start_equity,
         "peak_equity": record.peak_equity,
         "last_equity": record.last_equity if record.last_equity is not None else equity,
+        "equity_anchor": record.equity_anchor,
         "daily_breached": record.daily_breached,
         "drawdown_breached": record.drawdown_breached,
         "daily_loss_fraction_now": daily_loss,

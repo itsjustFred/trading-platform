@@ -8,13 +8,18 @@ Two breakers, measured on an equity series per scope:
 * **Deployment scope** (``deployment:<deployment_id>``) - the deployment's
   OWN trading P&L, not the whole account's. Broker positions on a netted
   account cannot be attributed to a deployment, so the scope observes a
-  synthetic equity ``V = account_equity - sum(other deployments' P&L)``:
-  account equity minus every other deployment's realized+unrealized P&L
-  (reconstructed from the persisted fill ledger and marked to market, see
-  :func:`account_deployment_trading_pnls`). ``V`` moves only when THIS
-  deployment's P&L moves, on the same account-equity scale, so the same
-  fractions apply: a deployment that loses 6 % of account equity while the
-  rest of the account gains 3 % still trips its own 5 % daily breaker.
+  synthetic equity anchored at first observation: ``V = equity_anchor +
+  own P&L``, where ``own P&L`` is realized+unrealized P&L reconstructed from
+  the persisted fill ledger and marked to market (see
+  :func:`account_deployment_trading_pnls`) and ``equity_anchor`` is the
+  residual ``account_equity - sum(all deployments' P&L)`` persisted on the
+  breaker row. Everything else that moves account equity - P&L no
+  deployment owns (a broker-side close of a foreign position, a manual
+  trade, swap/fees), deposits and withdrawals - moves the residual but NOT
+  the anchor, so it cannot move a deployment scope; only that deployment's
+  own trading P&L does. ``V`` stays on the account-equity scale, so the
+  same fractions apply: a deployment that loses 6 % of account equity while
+  the rest of the account gains 3 % still trips its own 5 % daily breaker.
 
 * **Daily loss** — equity is down ``daily_loss_fraction`` (default 5 %) of the
   start-of-day equity. "Start of day" is the last equity observed before the
@@ -68,6 +73,7 @@ from live_runner.base_adapter import validate_live_quote_prices
 from live_runner.credential_env import load_accounts_env_values
 from shared.database import (
     get_account_deployment_trading_flows,
+    get_live_loss_breaker_state,
     latch_live_loss_breaker_breach,
     list_unresolved_ledger_reconciliation_flags,
     list_untrusted_fill_references,
@@ -403,12 +409,50 @@ def _latch_and_alert(
         )
 
 
+def deployment_scope_equity(
+    *,
+    scope: str,
+    account_equity: float,
+    own_pnl: float,
+    deployment_pnls: Mapping[str, float],
+) -> tuple[float, float | None]:
+    """The deployment scope's equity and the anchor to persist, ONE formula.
+
+    Both the balance poll and the entry gate measure a deployment scope the
+    same way: ``equity = equity_anchor + own_pnl``. ``equity_anchor`` is the
+    residual ``account_equity - sum(all deployments' P&L)`` captured when the
+    scope anchored; while the row carries one, the residual's later drift -
+    unattributed broker-side P&L, manual trades, swap/fees, deposits and
+    withdrawals - cannot move the scope. Only ``own_pnl`` (this deployment's
+    cumulative trading P&L) does.
+
+    Returns ``(scope_equity, anchor_to_persist)``:
+
+    * anchored row -> the stored anchor, ``None`` to persist (it is fixed);
+    * row without an anchor (legacy/pre-migration) -> the scope continues
+      from its ``last_equity`` so the anchoring observation itself cannot
+      trip the breaker, and that continuity base is persisted;
+    * no row -> the residual anchors the scope's first observation.
+    """
+    total_pnl = sum(float(pnl) for pnl in deployment_pnls.values())
+    residual = account_equity - total_pnl
+    record = get_live_loss_breaker_state(scope)
+    if record is not None and record.equity_anchor is not None:
+        return float(record.equity_anchor) + own_pnl, None
+    if record is not None and record.last_equity is not None:
+        last_equity = float(record.last_equity)
+        if math.isfinite(last_equity):
+            return last_equity, last_equity - own_pnl
+    return residual + own_pnl, residual
+
+
 def _observe_scope(
     *,
     scope: str,
     account_id: str,
     equity: float,
     now: datetime,
+    equity_anchor: float | None = None,
 ) -> LiveLossBreakerRecord:
     """One equity observation for ``scope``.
 
@@ -418,7 +462,9 @@ def _observe_scope(
     account-seeded baseline would trip a brand-new deployment instantly (or
     hide its first-day losses when other deployments run at a loss).
     """
-    return observe_live_loss_breaker(scope, account_id, equity, now)
+    return observe_live_loss_breaker(
+        scope, account_id, equity, now, equity_anchor=equity_anchor
+    )
 
 
 def _evaluate_kinds(
@@ -481,6 +527,7 @@ def _gate_scope(
     limits: LossBreakerLimits,
     deployment_id: str | None = None,
     symbol: str | None = None,
+    equity_anchor: float | None = None,
 ) -> LiveLossBreakerRecord:
     """Observe ``scope`` and refuse the entry when its breaker is breached.
 
@@ -495,6 +542,7 @@ def _gate_scope(
             account_id=account_id,
             equity=equity,
             now=now,
+            equity_anchor=equity_anchor,
         )
         kinds = (
             _evaluate_kinds(
@@ -796,7 +844,7 @@ def refuse_entry_if_loss_breaker_tripped(
     deployment: LiveDeploymentConfig,
     *,
     equity: float,
-    deployment_equity: float | None = None,
+    deployment_pnls: Mapping[str, float] | None = None,
     now: datetime | None = None,
     env_values: Mapping[str, str] | None = None,
     symbol: str | None = None,
@@ -806,11 +854,13 @@ def refuse_entry_if_loss_breaker_tripped(
     Called from ``prepare_order_with_risk`` after the exit branch, so exits are
     never blocked. ``equity`` is the BROKER account equity the caller resolved
     for the breaker - never a caller-supplied sizing balance, which would
-    poison the persisted equity series. ``deployment_equity`` is the
-    deployment scope's synthetic equity (account equity minus the other
-    deployments' P&L, see :func:`account_deployment_trading_pnls`); ``None``
-    means it could not be measured, which fails closed when the deployment
-    breaker is enabled and skips the scope when it is disabled.
+    poison the persisted equity series. ``deployment_pnls`` maps deployment id
+    to its trading P&L on the account
+    (:func:`account_deployment_trading_pnls`); the deployment scope's equity
+    is computed from it by :func:`deployment_scope_equity` - the same anchored
+    formula the balance poll uses. ``None`` means the P&L could not be
+    measured, which fails closed when the deployment breaker is enabled and
+    skips the scope when it is disabled.
     """
     observed_at = now or datetime.now(timezone.utc)
     equity_value = float(equity)
@@ -868,7 +918,7 @@ def refuse_entry_if_loss_breaker_tripped(
         deployment_id=str(deployment.id),
         symbol=symbol,
     )
-    if deployment_equity is None:
+    if deployment_pnls is None:
         if deployment_limits.enabled:
             # The deployment scope measures the deployment's own P&L; without
             # it there is nothing to measure against, and "cannot measure" is
@@ -884,14 +934,35 @@ def refuse_entry_if_loss_breaker_tripped(
                 state_unreadable=True,
             )
         return
+    own_pnl = float(deployment_pnls.get(str(deployment.id), 0.0))
+    try:
+        scope_equity, equity_anchor = deployment_scope_equity(
+            scope=deployment_scope,
+            account_equity=equity_value,
+            own_pnl=own_pnl,
+            deployment_pnls=deployment_pnls,
+        )
+    except Exception as exc:  # except-kind: money-decision
+        # Same fail-closed rule as _gate_scope: the anchor lives in the
+        # breaker state, so a state that cannot be read is never "all clear".
+        raise LossBreakerBreachError(
+            f"Refusing a live entry: the deployment loss breaker state for "
+            f"{deployment_scope} could not be read ({exc!r}); an unreadable "
+            "state is never 'all clear'.",
+            scope=deployment_scope,
+            account_id=account_id,
+            deployment_id=str(deployment.id),
+            state_unreadable=True,
+        ) from exc
     _gate_scope(
         scope=deployment_scope,
         account_id=account_id,
-        equity=float(deployment_equity),
+        equity=scope_equity,
         now=observed_at,
         limits=deployment_limits,
         deployment_id=str(deployment.id),
         symbol=symbol,
+        equity_anchor=equity_anchor,
     )
 
 
@@ -914,11 +985,13 @@ def observe_account_loss_breaker_equity(
 
     ``deployment_pnls`` maps deployment id to its trading P&L
     (:func:`account_deployment_trading_pnls`); each deployment scope observes
-    ``equity - sum(all deployment P&L) + own P&L`` - the account equity with
-    every OTHER deployment's P&L subtracted out, so the scope moves only with
-    its own deployment's P&L. ``None`` means the P&L could not be measured:
-    deployment scopes are skipped this round (the entry gate still refuses
-    entries it cannot measure) while the account scope is always observed.
+    the anchored equity :func:`deployment_scope_equity` computes - the
+    persisted ``equity_anchor`` plus its own P&L - so the scope moves only
+    with its own deployment's P&L and is immune to unattributed equity
+    changes, deposits and other deployments' P&L. ``None`` means the P&L
+    could not be measured: deployment scopes are skipped this round (the
+    entry gate still refuses entries it cannot measure) while the account
+    scope is always observed.
     """
     observed_at = now or datetime.now(timezone.utc)
     deployment_list = list(deployments)
@@ -979,13 +1052,20 @@ def observe_account_loss_breaker_equity(
                 # The entry gate refuses entries it cannot measure.
                 continue
             own_pnl = float(deployment_pnls.get(str(deployment.id), 0.0))  # type: ignore[union-attr]
-            scope_equity = equity_value - total_pnl + own_pnl
+            dep_scope = deployment_loss_breaker_scope(str(deployment.id))
+            scope_equity, equity_anchor = deployment_scope_equity(
+                scope=dep_scope,
+                account_equity=equity_value,
+                own_pnl=own_pnl,
+                deployment_pnls=deployment_pnls,  # type: ignore[arg-type]
+            )
             limits = deployment_loss_breaker_limits(deployment, env_values=env_values)
             dep_record = _observe_scope(
-                scope=deployment_loss_breaker_scope(str(deployment.id)),
+                scope=dep_scope,
                 account_id=account_id,
                 equity=scope_equity,
                 now=observed_at,
+                equity_anchor=equity_anchor,
             )
             scopes.append(
                 (

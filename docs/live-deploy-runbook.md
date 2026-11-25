@@ -1067,12 +1067,28 @@ Every live account and every deployment carries a persisted loss breaker
 (`live_loss_breaker_state`, one row per `account:<id>` and `deployment:<id>`
 scope). The account scope measures the broker account's equity — for cTrader
 that is balance **plus unrealized P&L** of open positions, so an open position
-under water counts before it is closed. The deployment scope cannot read a
-"deployment equity" from the broker (positions on a netted account belong to
-the account), so it observes a synthetic equity: account equity minus every
-OTHER deployment's trading P&L, reconstructed from the persisted fill ledger
-and marked to market. The scope therefore moves only with its own
-deployment's realized+unrealized P&L, on the account-equity scale:
+under water counts before it is closed. It is the scope that catches losses
+nobody attributed: a broker-side close of a position no deployment owns, a
+manual trade, swap/fees on foreign positions, deposits and withdrawals all
+move it.
+
+The deployment scope cannot read a "deployment equity" from the broker
+(positions on a netted account belong to the account), so it observes a
+synthetic equity anchored at first observation: `equity_anchor + own P&L`,
+where `own P&L` is the deployment's realized+unrealized trading P&L
+reconstructed from the persisted fill ledger and marked to market, and
+`equity_anchor` is the residual `account_equity - sum(all deployments' P&L)`
+persisted on the breaker row (`equity_anchor` column; `status` prints it).
+Once anchored, the scope moves ONLY with that deployment's own trading
+P&L — unattributed equity changes, deposits/withdrawals and other
+deployments' P&L move the residual but not the anchor, so they cannot trip
+a deployment scope (this is the fix for the 2026-11-25 incident where one
+unattributed broker-side close tripped every deployment scope on the
+account). Rows written before the anchor existed carry NULL and anchor on
+their next observation, continuing from their last observed equity so the
+migration itself cannot trip a breaker; `reset-drawdown` shifts the anchor
+with the re-based equity so the operator reset keeps working. The scope
+stays on the account-equity scale, so the same fractions apply:
 
 - **Daily loss** — equity down the configured fraction (default 5 %) of the
   start-of-day equity. The baseline is the last equity observed before the UTC
@@ -1091,9 +1107,11 @@ webhook. An unreadable breaker state, unreadable equity, or a deployment P&L
 that cannot be measured (untrusted fill price, missing quote/pip value) fails
 closed and refuses entries.
 
-Deposits and withdrawals are NOT separated from P&L: a 5 % withdrawal trips
-the daily breaker and a 20 % withdrawal latches drawdown. After a planned
-withdrawal, run `reset-drawdown` once the new equity is being observed.
+On the ACCOUNT scope deposits and withdrawals are NOT separated from P&L: a
+5 % withdrawal trips the daily breaker and a 20 % withdrawal latches
+drawdown. Deployment scopes are immune — a deposit does not move their
+anchored equity at all. After a planned withdrawal that trips the account
+breaker, run `reset-drawdown` once the new equity is being observed.
 
 Thresholds, most specific first: deployment `settings` keys
 (`loss_breaker_enabled`, `loss_breaker_daily_loss_fraction`,
@@ -1123,7 +1141,10 @@ the same series the breaker measures (on cTrader that includes unrealized
 P&L, which the balance snapshot's equity slot does not carry). An account
 scope refuses an observation older than 10 minutes; pass `--equity` to state
 the figure explicitly. A deployment scope always re-bases to its own last
-observed (P&L-adjusted) equity; `--equity` does not apply to it.
+observed (P&L-adjusted) equity; `--equity` does not apply to it. The reset
+also shifts the deployment scope's `equity_anchor` by the same delta, so the
+anchored series continues from the re-based equity instead of jumping back
+to the pre-reset base.
 
 There is deliberately no daily reset command: the daily breaker resets itself
 at the UTC boundary.

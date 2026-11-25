@@ -1106,6 +1106,11 @@ class LiveLossBreakerStateModel(SQLModel, table=True):
     drawdown_breached: bool = Field(default=False)
     last_equity: float | None = Field(default=None)
     last_observed_at: datetime | None = Field(default=None)
+    # Deployment scopes only: the anchored base the synthetic equity is
+    # measured from (``equity = equity_anchor + own trading P&L``). NULL on
+    # account scopes and on deployment rows not yet anchored; the first
+    # anchored observation fills it and it is never rewritten by ``observe``.
+    equity_anchor: float | None = Field(default=None)
     breach_detail_json: dict[str, Any] | None = Field(
         default=None, sa_column=Column(JSON, nullable=True)
     )
@@ -1123,6 +1128,7 @@ class LiveLossBreakerStateModel(SQLModel, table=True):
             drawdown_breached=record.drawdown_breached,
             last_equity=record.last_equity,
             last_observed_at=record.last_observed_at,
+            equity_anchor=record.equity_anchor,
             breach_detail_json=record.breach_detail,
         )
 
@@ -1137,6 +1143,7 @@ class LiveLossBreakerStateModel(SQLModel, table=True):
             drawdown_breached=bool(self.drawdown_breached),
             last_equity=self.last_equity,
             last_observed_at=self.last_observed_at,
+            equity_anchor=self.equity_anchor,
             breach_detail=self.breach_detail_json,
         )
 
@@ -2236,6 +2243,25 @@ def _add_background_task_columns(connection: Connection) -> None:
         )
 
 
+def _add_live_loss_breaker_state_columns(connection: Connection) -> None:
+    """Add ``live_loss_breaker_state.equity_anchor`` to legacy tables.
+
+    Deployment scopes anchor their synthetic equity to a persisted base
+    (``equity = equity_anchor + own trading P&L``) so P&L no deployment owns,
+    deposits/withdrawals and other deployments' P&L cannot move them. Existing
+    rows get NULL: they anchor on their next observation, continuing from
+    their last observed equity so the migration itself cannot trip a breaker.
+    """
+    column_names = _table_column_names(connection, "live_loss_breaker_state")
+    if column_names and "equity_anchor" not in column_names:
+        connection.execute(
+            text(
+                "ALTER TABLE live_loss_breaker_state "
+                "ADD COLUMN equity_anchor FLOAT"
+            )
+        )
+
+
 def _add_trade_columns(connection: Connection) -> None:
     """Add risk and exit columns to legacy trades tables."""
     column_names = _table_column_names(connection, "trades")
@@ -2998,6 +3024,7 @@ def _migrate_schema() -> None:
         _add_service_columns(connection)
         _add_background_task_columns(connection)
         _add_trade_columns(connection)
+        _add_live_loss_breaker_state_columns(connection)
 
         # Parent the smoke-sourced orphans before the FK is added, so the rebuild never copies a
         # row that violates the constraint it is introducing. On a database whose only orphans are
@@ -7379,6 +7406,8 @@ def observe_live_loss_breaker(
     account_id: str,
     equity: float,
     observed_at: datetime,
+    *,
+    equity_anchor: float | None = None,
 ) -> LiveLossBreakerRecord:
     """Record one equity observation for ``scope`` and return the new state.
 
@@ -7392,10 +7421,17 @@ def observe_live_loss_breaker(
 
     A scope's first-ever observation always seeds ``day_start_equity`` and
     ``peak_equity`` from THAT observation - never from another scope's
-    baseline. A deployment scope observes a synthetic equity
-    (``account_equity - other deployments' P&L``) on a different basis than
-    the account scope, so inheriting the account row's baseline would trip a
-    brand-new deployment instantly (or hide its first-day losses).
+    baseline. A deployment scope observes a synthetic equity on a different
+    basis than the account scope, so inheriting the account row's baseline
+    would trip a brand-new deployment instantly (or hide its first-day
+    losses).
+
+    ``equity_anchor`` is the deployment scope's anchored base (the scope's
+    equity with its own P&L removed; see ``LiveLossBreakerRecord``). It is
+    written only while the row's anchor is NULL - the first anchored
+    observation fixes it and ``observe`` never rewrites it, so the scope's
+    equity series moves only with the deployment's own P&L afterwards.
+    ``reset_live_loss_breaker_drawdown`` is the only other writer.
     """
     normalized_scope = str(scope or "").strip()
     normalized_account = str(account_id or "").strip()
@@ -7404,6 +7440,13 @@ def observe_live_loss_breaker(
     equity_value = float(equity)
     if not math.isfinite(equity_value):
         raise ValueError(f"loss breaker equity must be finite, got {equity!r}")
+    anchor_value = (
+        float(equity_anchor) if equity_anchor is not None else None
+    )
+    if anchor_value is not None and not math.isfinite(anchor_value):
+        raise ValueError(
+            f"loss breaker equity anchor must be finite, got {equity_anchor!r}"
+        )
     observed_naive = _naive_utc(observed_at)
     utc_day = _loss_breaker_utc_day(observed_at)
 
@@ -7422,6 +7465,7 @@ def observe_live_loss_breaker(
                     drawdown_breached=False,
                     last_equity=equity_value,
                     last_observed_at=observed_naive,
+                    equity_anchor=anchor_value,
                     breach_detail_json=None,
                     updated_at=observed_naive,
                 )
@@ -7439,6 +7483,8 @@ def observe_live_loss_breaker(
                         else equity_value
                     )
                     row.daily_breached = False
+                if row.equity_anchor is None and anchor_value is not None:
+                    row.equity_anchor = anchor_value
                 row.peak_equity = max(float(row.peak_equity), equity_value)
                 row.last_equity = equity_value
                 row.last_observed_at = observed_naive
@@ -7494,6 +7540,11 @@ def reset_live_loss_breaker_drawdown(
     breaker measures from the peak, so a reset that kept the old high-water
     mark would re-trip on the very next observation. Returns ``None`` when the
     scope has no state row.
+
+    A deployment scope's ``equity_anchor`` shifts by the same delta so the
+    synthetic equity series (``equity_anchor + own P&L``) continues from the
+    re-based equity instead of jumping back to the pre-reset anchor. Account
+    scopes never carry an anchor, so this is a no-op for them.
     """
     normalized_scope = str(scope or "").strip()
     if not normalized_scope:
@@ -7508,9 +7559,16 @@ def reset_live_loss_breaker_drawdown(
         row = session.get(LiveLossBreakerStateModel, normalized_scope)
         if row is None:
             return None
+        previous_equity = (
+            float(row.last_equity) if row.last_equity is not None else None
+        )
         row.drawdown_breached = False
         row.peak_equity = equity_value
         row.last_equity = equity_value
+        if row.equity_anchor is not None and previous_equity is not None:
+            row.equity_anchor = float(row.equity_anchor) + (
+                equity_value - previous_equity
+            )
         row.last_observed_at = reset_naive
         row.updated_at = reset_naive
         session.add(row)

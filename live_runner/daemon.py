@@ -2541,7 +2541,7 @@ async def prepare_order_with_risk(
     # deployment-P&L lookup happens at all. A failed equity read refuses the
     # entry: unreadable equity is never "no loss".
     breaker_equity: float | None = None
-    deployment_equity: float | None = None
+    deployment_pnls: dict[str, float] | None = None
     breaker_config_invalid = False
     deployment_breaker_enabled = False
     try:
@@ -2581,23 +2581,19 @@ async def prepare_order_with_risk(
             _, broker_equity = await adapter.get_balance()
             breaker_equity = float(broker_equity)
         if deployment_breaker_enabled:
-            # The deployment scope measures the deployment's own P&L:
-            # synthetic equity = account equity - every OTHER deployment's
-            # P&L. ``None`` (unmeasurable) fails closed inside the gate.
-            pnls = await account_deployment_trading_pnls(
+            # The deployment scope measures the deployment's own P&L: the
+            # gate anchors the scope's synthetic equity (persisted
+            # equity_anchor + own P&L) so unattributed equity changes cannot
+            # move it. ``None`` (unmeasurable) fails closed inside the gate.
+            deployment_pnls = await account_deployment_trading_pnls(
                 adapter, deployment.account_id
             )
-            if pnls is not None:
-                total_pnl = sum(pnls.values())
-                deployment_equity = (
-                    breaker_equity - total_pnl + pnls.get(str(deployment.id), 0.0)
-                )
     if breaker_scopes_enabled:
         await asyncio.to_thread(
             refuse_entry_if_loss_breaker_tripped,
             deployment,
             equity=breaker_equity if breaker_equity is not None else 0.0,
-            deployment_equity=deployment_equity,
+            deployment_pnls=deployment_pnls,
             symbol=signal.symbol,
         )
     if pip_value is None:
