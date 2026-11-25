@@ -1,0 +1,21 @@
+.agents/skills/actions-pre-mortem/SKILL.md
+  s_36d4d1da9fda69::t_e02f9f2af48664 3,27,63,94-108,111,114,118,124-127,135-137,145,149,158-159,162
+tests/test_agent_pipeline_contracts.py
+  s_36d4d1da9fda69::t_92a103d77e690e 1143-1177
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "daafaae7e8f6d906e662c304342d5a46e3752e61",
+  "prompts": {},
+  "sessions": {
+    "s_36d4d1da9fda69": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9ab0fcdd-5385-40f9-9f2b-606ef91d31a0",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "itsjustFred <justfred.business@gmail.com>"
+    }
+  }
+}
