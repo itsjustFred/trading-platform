@@ -10,7 +10,7 @@ If making changes, also check if you need to update other things such as docs, s
 ## Tests
 
 Do NOT weaken, remove, bypass or rewrite a test just to achieve a passing result, instead fix the underlying problem. Change tests only when the task changes or you can independently identify that the test is wrong.
-Install the dev tooling with `uv sync --frozen --extra dev` and run `uv run ruff check <changed files>` and `uv run mypy` (no arguments) before a PR. `docs/testing-and-tooling.md` explains the test sandbox, `scripts/gate-tests.sh`, the lint and type-check scope and the Sonar policy.
+Install the dev tooling with `uv sync --frozen --extra dev` and run `uv run ruff check <changed files>` and `uv run mypy` (no arguments) before a PR.
 
 ## Issues
 
