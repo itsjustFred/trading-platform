@@ -562,12 +562,22 @@ class _SpotWaiter:
     received_at: datetime | None = None
 
 
-def _present_proto_field(payload: Any, name: str) -> Any | None:
+# Sentinel returned by ``_present_proto_field`` when field presence cannot be
+# proven. For refusal classification "absent" would release the order lease,
+# so an unanswerable ``HasField`` must read as "present / unknown" instead.
+_PRESENT_BUT_UNKNOWN = object()
+
+
+def _present_proto_field(
+    payload: Any, name: str, *, fail_closed: bool = False
+) -> Any | None:
     """The field's value when it was sent, else ``None``.
 
     Spot ``bid``/``ask`` are ``optional uint64``: ``HasField`` tells an omitted
     side from a sent one. A payload without ``HasField`` (a test double) falls
-    back to attribute presence.
+    back to attribute presence. With ``fail_closed`` a ``HasField`` failure
+    reports the field as present but unknown (the sentinel) rather than
+    absent, for callers where "absent" is the unsafe direction.
     """
     has_field = getattr(payload, "HasField", None)
     if has_field is not None:
@@ -575,6 +585,8 @@ def _present_proto_field(payload: Any, name: str) -> Any | None:
             if not bool(has_field(name)):
                 return None
         except (TypeError, ValueError):
+            if fail_closed:
+                return _PRESENT_BUT_UNKNOWN
             return None
     return getattr(payload, name, None)
 
@@ -3503,7 +3515,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             signal, stop_loss, take_profit
         )
         request.relativeStopLoss = relative_stop
-        if relative_take is not None:
+        if relative_take is not None and relative_take > 0:
             # proto2 optional int64: assigning 0 would make the field PRESENT
             # and the broker validates a present relativeTakeProfit as > 0
             # ("SL/TP have to be positive"). "No take profit" means the field
@@ -3593,8 +3605,8 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             # its orderId decides. Timeouts and transport failures still
             # propagate as ordinary exceptions (unknown outcome): the request
             # may have landed.
-            order_id = _present_proto_field(response, "orderId")
-            position_id = _present_proto_field(response, "positionId")
+            order_id = _present_proto_field(response, "orderId", fail_closed=True)
+            position_id = _present_proto_field(response, "positionId", fail_closed=True)
             is_close_position = (
                 self._ProtoOAClosePositionReq is not None
                 and isinstance(request, self._ProtoOAClosePositionReq)

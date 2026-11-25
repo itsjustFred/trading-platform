@@ -3810,6 +3810,56 @@ def test_close_position_error_with_echoed_position_id_is_definitive() -> None:
     assert excinfo.value.error_code == "INVALID_REQUEST"
 
 
+def test_close_position_error_with_order_id_stays_an_unknown_outcome() -> None:
+    """A close error carrying a broker orderId may have a close order working."""
+    from ctrader_open_api.messages.OpenApiMessages_pb2 import (
+        ProtoOAClosePositionReq,
+        ProtoOAOrderErrorEvent,
+    )
+
+    from live_runner.base_adapter import BrokerOrderRejectedError
+
+    adapter = _order_error_response_adapter(
+        ProtoOAOrderErrorEvent(
+            ctidTraderAccountId=1,
+            errorCode="INVALID_REQUEST",
+            orderId=456,
+            positionId=123,
+            description="rejected after order creation",
+        )
+    )
+    request = ProtoOAClosePositionReq(
+        ctidTraderAccountId=1, positionId=123, volume=1000
+    )
+    submission = adapter._submit_new_order_request(request)
+
+    with pytest.raises(RuntimeError, match="Order rejected") as excinfo:
+        asyncio.run(submission)
+    assert not isinstance(excinfo.value, BrokerOrderRejectedError)
+
+
+def test_order_error_event_with_unanswerable_field_presence_stays_unknown() -> None:
+    """A HasField failure must read as present/unknown, never as absent."""
+    from ctrader_open_api.messages.OpenApiMessages_pb2 import ProtoOANewOrderReq
+
+    from live_runner.base_adapter import BrokerOrderRejectedError
+
+    class _ErrorEventWithBrokenHasField:
+        errorCode = "INVALID_REQUEST"
+        description = "field presence cannot be determined"
+
+        def HasField(self, _name: str) -> bool:
+            raise ValueError("not a proto2 optional field")
+
+    adapter = _order_error_response_adapter(_ErrorEventWithBrokenHasField())
+    adapter._ProtoOAOrderErrorEvent = _ErrorEventWithBrokenHasField
+    submission = adapter._submit_new_order_request(ProtoOANewOrderReq())
+
+    with pytest.raises(RuntimeError, match="Order rejected") as excinfo:
+        asyncio.run(submission)
+    assert not isinstance(excinfo.value, BrokerOrderRejectedError)
+
+
 def test_submit_timeout_stays_an_ordinary_unknown_outcome() -> None:
     """A lost response may still have opened the order: never a rejection."""
     from live_runner.base_adapter import BrokerOrderRejectedError
