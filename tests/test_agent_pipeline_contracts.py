@@ -1140,6 +1140,41 @@ def test_the_pre_mortem_checklist_agrees_with_the_time_budget() -> None:
     )
 
 
+def test_the_pre_mortem_labels_evidence_instead_of_filtering_on_it() -> None:
+    """The maintainer wants every scenario the pre-mortem finds in the report, with a label for
+    how much of it was proven, instead of a list pre-filtered to the confident ones (decision of
+    2026-11-25). Three things keep that true:
+
+    - the evidence scale is defined (L1 suspected, L2 located, L3 traced) and says it never
+      filters, so a weak but real scenario is labelled rather than silently left out;
+    - the cap of eight is a cap on *full* entries only - everything beyond it still appears as a
+      one-line entry under "Further scenarios", and the final checklist checks that;
+    - `BLOCK` needs a SEVERE scenario traced end to end (L3): an unproven SEVERE stays listed and
+      marked, but cannot alone produce the loudest verdict - the false-critical problem the levels
+      exist for (2 of 8 "critical" findings of one run were wrong when read against the code)."""
+    skill = (SKILLS / SKILL_DIR / "SKILL.md").read_text(encoding="utf-8")
+    levels = skill.split("## Evidence levels", 1)
+    assert len(levels) == 2, "the skill defines no evidence levels"
+    section = levels[1].split("\n## ", 1)[0]
+    for level in ("L1 suspected", "L2 located", "L3 traced"):
+        assert level in section, f"the evidence scale lacks {level!r}"
+    assert "Levels never filter" in section, "the evidence scale does not say it never filters"
+    assert "Settle by:" in section, "an unproven scenario is not told how to be settled"
+
+    procedure = skill.split("## Procedure", 1)[1].split("\n## ", 1)[0]
+    assert "Further scenarios" in procedure, "the cap still drops scenarios instead of listing them"
+    assert "Drop the least plausible" not in skill, "the cap still drops scenarios"
+    assert "### Further scenarios" in skill, "the output template has no 'Further scenarios' list"
+    checklist = skill.split("## Before you output", 1)[1]
+    assert "Further scenarios" in checklist, "the checklist does not check the overflow list"
+
+    verdicts_line = re.search(r"^- Verdicts:.*$", skill, re.M)
+    assert verdicts_line, "the skill documents no verdict line"
+    assert "`BLOCK` (at least one SEVERE scenario at L3)" in verdicts_line.group(0), (
+        "BLOCK does not require a SEVERE scenario traced to L3"
+    )
+
+
 def test_a_dispatch_refuses_a_fork_a_draft_and_the_current_head() -> None:
     """A dispatch is the only path that reaches what a push never opens, and all three of its
     refusals are the difference between a run that says why it did nothing and a green run that
