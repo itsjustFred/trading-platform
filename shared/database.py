@@ -7478,6 +7478,11 @@ def observe_live_loss_breaker(
         raise ValueError(
             f"loss breaker equity anchor must be finite, got {equity_anchor!r}"
         )
+    if anchor_value is not None and normalized_scope.startswith("account:"):
+        raise ValueError(
+            "account scopes never carry an equity anchor; "
+            f"got one for {normalized_scope!r}"
+        )
     observed_naive = _naive_utc(observed_at)
     utc_day = _loss_breaker_utc_day(observed_at)
 

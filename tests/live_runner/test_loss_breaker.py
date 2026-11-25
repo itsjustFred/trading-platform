@@ -2205,6 +2205,42 @@ def test_observe_rejects_non_finite_equity_anchor():
             )
 
 
+def test_deployment_scope_equity_rejects_non_finite_inputs():
+    """Every input to the anchored-equity formula must be finite: a NaN
+    account equity or a NaN sibling P&L is refused, never propagated into a
+    scope equity a caller could act on."""
+    from live_runner.loss_breaker import deployment_scope_equity
+
+    with pytest.raises(ValueError, match="account equity"):
+        deployment_scope_equity(
+            scope="deployment:x", account_equity=float("nan"),
+            own_pnl=0.0, deployment_pnls={"x": 0.0},
+        )
+    with pytest.raises(ValueError, match="own P&L"):
+        deployment_scope_equity(
+            scope="deployment:x", account_equity=100.0,
+            own_pnl=float("nan"), deployment_pnls={"x": float("nan")},
+        )
+    with pytest.raises(ValueError, match="dep-b"):
+        deployment_scope_equity(
+            scope="deployment:x", account_equity=100.0,
+            own_pnl=0.0, deployment_pnls={"x": 0.0, "dep-b": float("inf")},
+        )
+
+
+def test_observe_rejects_anchor_on_account_scope():
+    """Account scopes never carry an equity anchor; ``observe`` refuses one
+    rather than storing an invariant violation."""
+    with pytest.raises(ValueError, match="account scopes never carry"):
+        observe_live_loss_breaker(
+            account_loss_breaker_scope("acc-anchor-forbidden"),
+            "acc-anchor-forbidden",
+            100.0,
+            DAY1,
+            equity_anchor=50.0,
+        )
+
+
 def test_gate_fails_closed_when_deployment_state_read_raises(monkeypatch):
     """The gate's fail-closed wrapper: a breaker-state read that raises for
     the deployment scope must surface as ``state_unreadable``, never as a

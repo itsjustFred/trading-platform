@@ -438,8 +438,17 @@ def deployment_scope_equity(
       is persisted;
     * no row -> the residual anchors the scope's first observation.
     """
+    if not math.isfinite(account_equity):
+        raise ValueError(
+            f"account equity must be finite, got {account_equity!r}"
+        )
     if not math.isfinite(own_pnl):
         raise ValueError(f"deployment own P&L must be finite, got {own_pnl!r}")
+    for dep_id, pnl in deployment_pnls.items():
+        if not math.isfinite(float(pnl)):
+            raise ValueError(
+                f"deployment P&L for {dep_id!r} must be finite, got {pnl!r}"
+            )
     total_pnl = sum(float(pnl) for pnl in deployment_pnls.values())
     residual = account_equity - total_pnl
     record = get_live_loss_breaker_state(scope)

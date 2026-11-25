@@ -1088,7 +1088,10 @@ account). Rows written before the anchor existed carry NULL and anchor on
 their next observation: the scope continues from its last observed equity
 (`last_equity`) and the persisted anchor is the continuity base
 `last_equity - own_pnl`, so the anchoring observation itself cannot trip
-the breaker and own P&L is never double-counted afterwards. The scope
+the breaker and own P&L is never double-counted afterwards. Own P&L that
+moved between the last pre-anchor observation and the first anchored one
+is absorbed into the anchor; if that drift matters, `re-anchor` re-bases
+it explicitly. The scope
 stays on the account-equity scale, so the same fractions apply:
 
 - **Daily loss** — equity down the configured fraction (default 5 %) of the
