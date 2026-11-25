@@ -9,6 +9,7 @@ daemon observes broker equity on every balance poll and refuses new entries
     python -m scripts.live_loss_breaker reset-drawdown --account ID
     python -m scripts.live_loss_breaker reset-drawdown --deployment ID
     python -m scripts.live_loss_breaker reset-drawdown --scope account:ID --equity 95000
+    python -m scripts.live_loss_breaker re-anchor --deployment ID [--account-equity 90000]
 
 The daily breaker resets itself at the UTC day boundary; there is no daily
 reset command on purpose. The drawdown breaker needs this explicit reset: it
@@ -26,6 +27,20 @@ deployment scope latches together with the account scope, so resetting only
 ``--equity`` applies to the account scope; deployment scopes always re-base
 to their own last equity because it lives in deployment-P&L-adjusted units,
 not raw account equity.
+
+A deployment scope's ``equity_anchor`` freezes the account-equity basis it
+was anchored at. After a large deposit/withdrawal or an account repoint the
+operator re-anchors it to the CURRENT residual (account equity minus the sum
+of all deployment P&L); the scope's equity series shifts by the same delta
+and any latch is kept:
+
+    python -m scripts.live_loss_breaker re-anchor --deployment ID
+    python -m scripts.live_loss_breaker re-anchor --scope deployment:ID --account-equity 90000
+
+Without ``--account-equity`` the account equity is the account scope's own
+last observed breaker equity, refused when missing, non-positive or older
+than ``STALE_SNAPSHOT_SECONDS`` - the same freshness rule ``reset-drawdown``
+applies. ``re-anchor`` refuses account scopes: they carry no anchor.
 
 An unresolved ``ledger_reconciliation_required`` audit flag (#277) fails
 deployment-scoped entries closed until an operator reconciles it:
@@ -70,6 +85,7 @@ from live_runner.loss_breaker import (
     account_loss_breaker_scope,
     deployment_loss_breaker_limits,
     deployment_loss_breaker_scope,
+    reanchor_deployment_loss_breaker_scope,
 )
 from shared.database import (
     get_latest_live_balance,
@@ -124,6 +140,33 @@ def _build_parser() -> argparse.ArgumentParser:
             "Equity to re-base the peak to. Defaults to the scope's own "
             "last observed breaker equity."
         ),
+    )
+
+    reanchor = sub.add_parser(
+        "re-anchor",
+        help=(
+            "Re-base a deployment scope's equity_anchor to the current "
+            "residual (account equity minus all deployment P&L) and shift "
+            "its equity series by the same delta. Keeps any latch."
+        ),
+    )
+    reanchor_target = reanchor.add_mutually_exclusive_group(required=True)
+    reanchor_target.add_argument("--deployment", help="Re-anchor the deployment:<id> scope.")
+    reanchor_target.add_argument("--scope", help="Raw scope, must be deployment:<id>.")
+    reanchor.add_argument(
+        "--account-equity",
+        type=float,
+        default=None,
+        help=(
+            "Current broker account equity. Defaults to the account "
+            "scope's own last observed breaker equity (refused when "
+            "missing, non-positive or stale)."
+        ),
+    )
+    reanchor.add_argument(
+        "--actor",
+        default="operator",
+        help="Attribution recorded on the audit row.",
     )
 
     resolve = sub.add_parser(
@@ -399,6 +442,131 @@ def _cmd_reset_drawdown(args: argparse.Namespace) -> int:
     return 0
 
 
+def _reanchor_account_equity(
+    record: LiveLossBreakerRecord,
+    args: argparse.Namespace,
+    *,
+    now: datetime,
+) -> tuple[float | None, str | None]:
+    """``(equity, source)`` for the re-anchor's residual, or ``(None, error)``.
+
+    ``--account-equity`` always wins. Otherwise the account scope's own last
+    observed breaker equity is used - the same broker-equity series the
+    breaker measures - refused when missing, non-positive or older than
+    ``STALE_SNAPSHOT_SECONDS`` so a re-anchor never runs on an hours-old
+    basis.
+    """
+    if args.account_equity is not None:
+        equity = float(args.account_equity)
+        if not math.isfinite(equity) or equity <= 0:
+            return None, (
+                f"--account-equity must be a positive finite number, got "
+                f"{args.account_equity!r}"
+            )
+        return equity, "--account-equity"
+    account_record = get_live_loss_breaker_state(
+        account_loss_breaker_scope(record.account_id)
+    )
+    if account_record is None or account_record.last_equity is None:
+        return (
+            None,
+            (
+                f"account scope {account_loss_breaker_scope(record.account_id)!r} "
+                "has no observed equity; pass --account-equity to state the "
+                "current account equity explicitly"
+            ),
+        )
+    last = float(account_record.last_equity)
+    if not math.isfinite(last) or last <= 0:
+        return (
+            None,
+            (
+                f"account scope last observed equity {last!r} is not a usable "
+                "positive finite number; pass --account-equity explicitly"
+            ),
+        )
+    observed_at = account_record.last_observed_at
+    if observed_at is None:
+        return (
+            None,
+            (
+                "the account scope has no recorded observation time; pass "
+                "--account-equity to state the current account equity explicitly"
+            ),
+        )
+    if observed_at.tzinfo is None:
+        observed_at = observed_at.replace(tzinfo=timezone.utc)
+    age = (now - observed_at).total_seconds()
+    if age > STALE_SNAPSHOT_SECONDS:
+        return (
+            None,
+            (
+                f"last account equity observation is {age:.0f}s old "
+                f"(limit {STALE_SNAPSHOT_SECONDS:.0f}s); pass --account-equity "
+                "to state the current account equity explicitly"
+            ),
+        )
+    return last, "last_observed_equity"
+
+
+def _cmd_reanchor(args: argparse.Namespace) -> int:
+    scope = (
+        args.scope.strip()
+        if args.scope
+        else deployment_loss_breaker_scope(args.deployment)
+    )
+    kind = scope.split(":", 1)[0]
+    if kind != "deployment":
+        print(
+            f"error: re-anchor applies to deployment scopes only "
+            f"(deployment:<id>), got {scope!r}",
+            file=sys.stderr,
+        )
+        return 1
+    record = get_live_loss_breaker_state(scope)
+    if record is None:
+        print(
+            f"error: no loss breaker state for scope {scope!r}; nothing to re-anchor",
+            file=sys.stderr,
+        )
+        return 1
+    now = datetime.now(timezone.utc)
+    equity, source = _reanchor_account_equity(record, args, now=now)
+    if equity is None:
+        print(f"error: {source}", file=sys.stderr)
+        return 1
+    try:
+        updated = reanchor_deployment_loss_breaker_scope(
+            scope, account_equity=equity, actor=args.actor, now=now
+        )
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(
+        json.dumps(
+            {
+                "reanchored": scope,
+                "reanchored_at": now.isoformat(),
+                "account_equity": equity,
+                "equity_source": source,
+                "equity_anchor_before": record.equity_anchor,
+                "equity_anchor_after": updated.equity_anchor,
+                "last_equity_before": record.last_equity,
+                "last_equity_after": updated.last_equity,
+                "day_start_equity_before": record.day_start_equity,
+                "day_start_equity_after": updated.day_start_equity,
+                "peak_equity_before": record.peak_equity,
+                "peak_equity_after": updated.peak_equity,
+                "daily_breached": updated.daily_breached,
+                "drawdown_breached": updated.drawdown_breached,
+            },
+            indent=2,
+            default=str,
+        )
+    )
+    return 0
+
+
 def _cmd_resolve_ledger_flag(args: argparse.Namespace) -> int:
     account = str(args.account or "").strip()
     symbol = str(args.symbol or "").strip().upper()
@@ -439,6 +607,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_status(args)
     if args.command == "reset-drawdown":
         return _cmd_reset_drawdown(args)
+    if args.command == "re-anchor":
+        return _cmd_reanchor(args)
     if args.command == "resolve-ledger-flag":
         return _cmd_resolve_ledger_flag(args)
     return 2

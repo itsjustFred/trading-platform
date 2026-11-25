@@ -91,6 +91,7 @@ def _seed_state(data_dir: Path, *, stale: bool = False) -> None:
         ["--help"],
         ["status", "--help"],
         ["reset-drawdown", "--help"],
+        ["re-anchor", "--help"],
         ["resolve-ledger-flag", "--help"],
     ],
 )
@@ -499,6 +500,164 @@ def test_resolve_ledger_flag_clears_the_unresolved_flag(tmp_path: Path) -> None:
     )
     assert check.returncode == 0, check.stderr
     assert check.stdout.strip() == "False"
+
+
+def _seed_reanchor_state(data_dir: Path, *, stale_account: bool = False) -> None:
+    """Account scope (equity 20k) + one anchored deployment scope.
+
+    The deployment row implies own P&L ``last_equity - equity_anchor`` =
+    96000 - 102000 = -6000, so the residual at account equity E is
+    ``E + 6000`` and the scope equity after re-anchor is E.
+    """
+    account_when = (
+        "datetime(2020, 1, 1, 12, 0, tzinfo=timezone.utc)"
+        if stale_account
+        else "datetime.now(timezone.utc)"
+    )
+    code = f"""
+from datetime import datetime, timezone
+from shared.database import observe_live_loss_breaker
+now = datetime.now(timezone.utc)
+observe_live_loss_breaker('account:acc-cli', 'acc-cli', 20000.0, {account_when})
+observe_live_loss_breaker(
+    'deployment:dep-1', 'acc-cli', 96000.0, now, equity_anchor=102000.0)
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        cwd=str(REPO_ROOT),
+        env=_child_env(data_dir),
+        timeout=300,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_reanchor_rebases_anchor_and_shifts_series(tmp_path: Path) -> None:
+    """``re-anchor --deployment`` sets the anchor to the current residual,
+    moves the whole equity series by the same delta, keeps the latch and
+    writes a ``loss_breaker.reanchor`` audit row."""
+    data_dir = tmp_path / "data"
+    _seed_reanchor_state(data_dir)
+    latch = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from datetime import datetime, timezone;"
+            "from shared.database import latch_live_loss_breaker_breach;"
+            "latch_live_loss_breaker_breach('deployment:dep-1', 'drawdown',"
+            " {'kind': 'drawdown'}, datetime.now(timezone.utc))",
+        ],
+        capture_output=True,
+        text=True,
+        cwd=str(REPO_ROOT),
+        env=_child_env(data_dir),
+        timeout=300,
+    )
+    assert latch.returncode == 0, latch.stderr
+
+    result = _run(
+        ["re-anchor", "--deployment", "dep-1", "--account-equity", "20000"],
+        data_dir,
+    )
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    # residual = 20000 - (-6000) = 26000; scope equity = 26000 + (-6000) = 20000.
+    assert payload["equity_anchor_after"] == pytest.approx(26_000.0)
+    assert payload["equity_anchor_before"] == pytest.approx(102_000.0)
+    assert payload["last_equity_after"] == pytest.approx(20_000.0)
+    assert payload["day_start_equity_after"] == pytest.approx(20_000.0)
+    assert payload["peak_equity_after"] == pytest.approx(20_000.0)
+    assert payload["drawdown_breached"] is True
+    assert payload["equity_source"] == "--account-equity"
+
+    status = _run(["status", "--deployment", "dep-1"], data_dir)
+    assert status.returncode == 0, status.stderr
+    state = json.loads(status.stdout)["scopes"][0]
+    assert state["equity_anchor"] == pytest.approx(26_000.0)
+    assert state["last_equity"] == pytest.approx(20_000.0)
+    assert state["drawdown_breached"] is True
+
+    audit = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import json;"
+            "from shared.database import list_live_control_audit;"
+            "rows = [r for r in list_live_control_audit(target_id='deployment:dep-1')"
+            "        if r['action'] == 'loss_breaker.reanchor'];"
+            "print(json.dumps(rows))",
+        ],
+        capture_output=True,
+        text=True,
+        cwd=str(REPO_ROOT),
+        env=_child_env(data_dir),
+        timeout=300,
+    )
+    assert audit.returncode == 0, audit.stderr
+    rows = json.loads(audit.stdout)
+    assert len(rows) == 1
+    assert rows[0]["succeeded"] is True
+    assert rows[0]["detail"]["equity_anchor_after"] == pytest.approx(26_000.0)
+
+
+def test_reanchor_defaults_to_fresh_account_scope_equity(tmp_path: Path) -> None:
+    """Without ``--account-equity`` the account scope's own last observed
+    breaker equity is the basis (fresh observation required)."""
+    data_dir = tmp_path / "data"
+    _seed_reanchor_state(data_dir)
+
+    result = _run(["re-anchor", "--deployment", "dep-1"], data_dir)
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["equity_source"] == "last_observed_equity"
+    assert payload["account_equity"] == pytest.approx(20_000.0)
+    assert payload["equity_anchor_after"] == pytest.approx(26_000.0)
+
+
+def test_reanchor_refuses_account_scope(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    _seed_reanchor_state(data_dir)
+
+    result = _run(
+        ["re-anchor", "--scope", f"account:{ACCOUNT}", "--account-equity", "20000"],
+        data_dir,
+    )
+
+    assert result.returncode == 1
+    assert "deployment scopes only" in result.stderr
+
+
+def test_reanchor_refuses_stale_account_equity(tmp_path: Path) -> None:
+    """A stale account-scope observation must not re-base the anchor; the
+    operator states the figure with ``--account-equity`` instead."""
+    data_dir = tmp_path / "data"
+    _seed_reanchor_state(data_dir, stale_account=True)
+
+    result = _run(["re-anchor", "--deployment", "dep-1"], data_dir)
+
+    assert result.returncode == 1
+    assert "--account-equity" in result.stderr
+
+    explicit = _run(
+        ["re-anchor", "--deployment", "dep-1", "--account-equity", "20000"],
+        data_dir,
+    )
+    assert explicit.returncode == 0, explicit.stderr
+
+
+def test_reanchor_refuses_scope_with_no_state(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+
+    result = _run(
+        ["re-anchor", "--deployment", "dep-missing", "--account-equity", "20000"],
+        data_dir,
+    )
+
+    assert result.returncode == 1
+    assert "no loss breaker state" in result.stderr
 
 
 def test_resolve_ledger_flag_reports_when_nothing_was_flagged(tmp_path: Path) -> None:

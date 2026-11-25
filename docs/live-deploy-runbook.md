@@ -1085,9 +1085,10 @@ deployments' P&L move the residual but not the anchor, so they cannot trip
 a deployment scope (this is the fix for the 2026-11-25 incident where one
 unattributed broker-side close tripped every deployment scope on the
 account). Rows written before the anchor existed carry NULL and anchor on
-their next observation, continuing from their last observed equity so the
-migration itself cannot trip a breaker; `reset-drawdown` shifts the anchor
-with the re-based equity so the operator reset keeps working. The scope
+their next observation: the scope continues from its last observed equity
+(`last_equity`) and the persisted anchor is the continuity base
+`last_equity - own_pnl`, so the anchoring observation itself cannot trip
+the breaker and own P&L is never double-counted afterwards. The scope
 stays on the account-equity scale, so the same fractions apply:
 
 - **Daily loss** — equity down the configured fraction (default 5 %) of the
@@ -1109,9 +1110,22 @@ closed and refuses entries.
 
 On the ACCOUNT scope deposits and withdrawals are NOT separated from P&L: a
 5 % withdrawal trips the daily breaker and a 20 % withdrawal latches
-drawdown. Deployment scopes are immune — a deposit does not move their
-anchored equity at all. After a planned withdrawal that trips the account
-breaker, run `reset-drawdown` once the new equity is being observed.
+drawdown. Deployment scopes are immune to the *movement* — a deposit does
+not move their anchored equity at all — but their fraction basis is FROZEN
+at the account equity captured when the anchor was written. After a large
+withdrawal the deployment breaker is effectively looser in real terms (a
+5 % daily trip then needs a smaller absolute loss on the smaller account),
+and after a large deposit it is stricter; the account scope still measures
+the real account equity, so this is a calibration issue, not a hole. After
+a planned large deposit/withdrawal, or after repointing a deployment to a
+different account (`update_live_deployment_account` keeps the scope row,
+so the anchor keeps the OLD account's scale while own P&L is measured on
+the new one), run `re-anchor` on each affected deployment scope once the
+new equity is being observed. `re-anchor` also preserves any existing
+latch — it re-bases the measurement, it does not clear a trip; use
+`reset-drawdown` for that. For a planned withdrawal that trips only the
+account breaker, `reset-drawdown` on the account scope is still the right
+command.
 
 Thresholds, most specific first: deployment `settings` keys
 (`loss_breaker_enabled`, `loss_breaker_daily_loss_fraction`,
@@ -1134,6 +1148,11 @@ uv run python -m scripts.live_loss_breaker status --account alpaca-paper
 # latched - the daily latches intentionally survive until the UTC rollover:
 uv run python -m scripts.live_loss_breaker reset-drawdown --account alpaca-paper
 uv run python -m scripts.live_loss_breaker reset-drawdown --deployment <id>
+
+# Re-base a deployment scope's equity_anchor to the CURRENT residual after a
+# large deposit/withdrawal or an account repoint (keeps any latch):
+uv run python -m scripts.live_loss_breaker re-anchor --deployment <id>
+uv run python -m scripts.live_loss_breaker re-anchor --scope deployment:<id> --account-equity 90000
 ```
 
 Without `--equity` a scope re-bases to its OWN last observed breaker equity -
@@ -1141,10 +1160,13 @@ the same series the breaker measures (on cTrader that includes unrealized
 P&L, which the balance snapshot's equity slot does not carry). An account
 scope refuses an observation older than 10 minutes; pass `--equity` to state
 the figure explicitly. A deployment scope always re-bases to its own last
-observed (P&L-adjusted) equity; `--equity` does not apply to it. The reset
-also shifts the deployment scope's `equity_anchor` by the same delta, so the
-anchored series continues from the re-based equity instead of jumping back
-to the pre-reset base.
+observed (P&L-adjusted) equity; `--equity` does not apply to it. Because a
+deployment scope always re-bases to its own last observed equity, the reset
+delta for a deployment scope is always 0 and its `equity_anchor` does not
+move — the CLI never offers a different re-base figure for it.
+(`reset_live_loss_breaker_drawdown` itself shifts the anchor by whatever
+delta it is given; only a caller bypassing the CLI could produce a non-zero
+one.)
 
 There is deliberately no daily reset command: the daily breaker resets itself
 at the UTC boundary.

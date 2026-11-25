@@ -7401,6 +7401,37 @@ def list_live_loss_breaker_states(
     return [row.to_record() for row in rows]
 
 
+def _apply_loss_breaker_observation(
+    row: LiveLossBreakerStateModel,
+    *,
+    equity_value: float,
+    utc_day: str,
+    observed_naive: datetime,
+    anchor_value: float | None,
+) -> None:
+    """Apply one equity observation to an existing breaker ``row``.
+
+    UTC day boundary: the daily breaker resets automatically. The new day's
+    baseline is the equity last seen before the boundary, not this
+    observation - a gap across midnight is a loss of the new day, not its
+    starting capital. ``equity_anchor`` is write-once: it is filled only
+    while the row's anchor is NULL, so the scope's equity series moves only
+    with the deployment's own P&L afterwards.
+    """
+    if row.utc_day != utc_day:
+        row.utc_day = utc_day
+        row.day_start_equity = (
+            float(row.last_equity) if row.last_equity is not None else equity_value
+        )
+        row.daily_breached = False
+    if row.equity_anchor is None and anchor_value is not None:
+        row.equity_anchor = anchor_value
+    row.peak_equity = max(float(row.peak_equity), equity_value)
+    row.last_equity = equity_value
+    row.last_observed_at = observed_naive
+    row.updated_at = observed_naive
+
+
 def observe_live_loss_breaker(
     scope: str,
     account_id: str,
@@ -7471,24 +7502,13 @@ def observe_live_loss_breaker(
                 )
                 session.add(row)
             else:
-                if row.utc_day != utc_day:
-                    # UTC day boundary: the daily breaker resets automatically.
-                    # The new day's baseline is the equity last seen before the
-                    # boundary, not this observation - a gap across midnight is a
-                    # loss of the new day, not its starting capital.
-                    row.utc_day = utc_day
-                    row.day_start_equity = (
-                        float(row.last_equity)
-                        if row.last_equity is not None
-                        else equity_value
-                    )
-                    row.daily_breached = False
-                if row.equity_anchor is None and anchor_value is not None:
-                    row.equity_anchor = anchor_value
-                row.peak_equity = max(float(row.peak_equity), equity_value)
-                row.last_equity = equity_value
-                row.last_observed_at = observed_naive
-                row.updated_at = observed_naive
+                _apply_loss_breaker_observation(
+                    row,
+                    equity_value=equity_value,
+                    utc_day=utc_day,
+                    observed_naive=observed_naive,
+                    anchor_value=anchor_value,
+                )
             session.add(row)
             session.commit()
             session.refresh(row)
@@ -7575,6 +7595,71 @@ def reset_live_loss_breaker_drawdown(
         session.commit()
         session.refresh(row)
         return row.to_record()
+
+
+def reanchor_live_loss_breaker_deployment(
+    scope: str,
+    *,
+    equity_anchor: float,
+    scope_equity: float,
+    reanchored_at: datetime,
+) -> LiveLossBreakerRecord | None:
+    """Operator re-anchor of a deployment scope's ``equity_anchor``.
+
+    Sets ``equity_anchor`` to ``equity_anchor`` (the CURRENT residual -
+    account equity minus the sum of all deployment P&L on the account) and
+    moves ``last_equity`` to ``scope_equity`` (``equity_anchor + own
+    P&L``), shifting ``day_start_equity`` and ``peak_equity`` by the same
+    delta so no breaker fraction jumps. Existing breach latches are kept:
+    re-anchoring fixes the measurement basis (after e.g. a large
+    deposit/withdrawal or an account repoint); it does not clear a trip.
+
+    Deployment scopes only - account scopes never carry an anchor, so they
+    are refused. ``last_observed_at`` is left alone: a re-anchor is not a
+    market observation. Returns ``None`` when the scope has no state row.
+    """
+    normalized_scope = str(scope or "").strip()
+    if not normalized_scope:
+        raise ValueError("reanchor_live_loss_breaker_deployment requires a scope")
+    kind, _, _ = normalized_scope.partition(":")
+    if kind != "deployment":
+        raise ValueError(
+            "re-anchor applies to deployment scopes only, got "
+            f"{normalized_scope!r}"
+        )
+    anchor_value = float(equity_anchor)
+    if not math.isfinite(anchor_value):
+        raise ValueError(
+            f"loss breaker equity anchor must be finite, got {equity_anchor!r}"
+        )
+    equity_value = float(scope_equity)
+    if not math.isfinite(equity_value):
+        raise ValueError(
+            f"loss breaker scope equity must be finite, got {scope_equity!r}"
+        )
+    reanchored_naive = _naive_utc(reanchored_at)
+
+    init_db()
+    with _loss_breaker_observe_lock(normalized_scope):
+        with get_session() as session:
+            row = session.get(LiveLossBreakerStateModel, normalized_scope)
+            if row is None:
+                return None
+            if row.last_equity is None:
+                raise ValueError(
+                    f"loss breaker scope {normalized_scope!r} has no last "
+                    "observed equity; there is no series to re-anchor"
+                )
+            delta = equity_value - float(row.last_equity)
+            row.equity_anchor = anchor_value
+            row.day_start_equity = float(row.day_start_equity) + delta
+            row.peak_equity = float(row.peak_equity) + delta
+            row.last_equity = equity_value
+            row.updated_at = reanchored_naive
+            session.add(row)
+            session.commit()
+            session.refresh(row)
+            return row.to_record()
 
 
 # ─── Deployment trading flows (loss breaker, #301) ────────────────────────────

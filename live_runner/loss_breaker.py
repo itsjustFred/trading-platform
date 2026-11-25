@@ -75,9 +75,12 @@ from shared.database import (
     get_account_deployment_trading_flows,
     get_live_loss_breaker_state,
     latch_live_loss_breaker_breach,
+    list_live_loss_breaker_states,
     list_unresolved_ledger_reconciliation_flags,
     list_untrusted_fill_references,
     observe_live_loss_breaker,
+    reanchor_live_loss_breaker_deployment,
+    record_live_control_audit,
     reset_live_loss_breaker_drawdown,
 )
 from shared.logging import get_logger
@@ -431,9 +434,12 @@ def deployment_scope_equity(
     * anchored row -> the stored anchor, ``None`` to persist (it is fixed);
     * row without an anchor (legacy/pre-migration) -> the scope continues
       from its ``last_equity`` so the anchoring observation itself cannot
-      trip the breaker, and that continuity base is persisted;
+      trip the breaker, and that continuity base ``last_equity - own_pnl``
+      is persisted;
     * no row -> the residual anchors the scope's first observation.
     """
+    if not math.isfinite(own_pnl):
+        raise ValueError(f"deployment own P&L must be finite, got {own_pnl!r}")
     total_pnl = sum(float(pnl) for pnl in deployment_pnls.values())
     residual = account_equity - total_pnl
     record = get_live_loss_breaker_state(scope)
@@ -936,7 +942,7 @@ def refuse_entry_if_loss_breaker_tripped(
         return
     own_pnl = float(deployment_pnls.get(str(deployment.id), 0.0))
     try:
-        scope_equity, equity_anchor = deployment_scope_equity(
+        scope_equity, anchor_to_persist = deployment_scope_equity(
             scope=deployment_scope,
             account_equity=equity_value,
             own_pnl=own_pnl,
@@ -962,7 +968,7 @@ def refuse_entry_if_loss_breaker_tripped(
         limits=deployment_limits,
         deployment_id=str(deployment.id),
         symbol=symbol,
-        equity_anchor=equity_anchor,
+        equity_anchor=anchor_to_persist,
     )
 
 
@@ -1053,7 +1059,7 @@ def observe_account_loss_breaker_equity(
                 continue
             own_pnl = float(deployment_pnls.get(str(deployment.id), 0.0))  # type: ignore[union-attr]
             dep_scope = deployment_loss_breaker_scope(str(deployment.id))
-            scope_equity, equity_anchor = deployment_scope_equity(
+            scope_equity, anchor_to_persist = deployment_scope_equity(
                 scope=dep_scope,
                 account_equity=equity_value,
                 own_pnl=own_pnl,
@@ -1065,7 +1071,7 @@ def observe_account_loss_breaker_equity(
                 account_id=account_id,
                 equity=scope_equity,
                 now=observed_at,
-                equity_anchor=equity_anchor,
+                equity_anchor=anchor_to_persist,
             )
             scopes.append(
                 (
@@ -1122,3 +1128,134 @@ def reset_drawdown_breaker(
     return reset_live_loss_breaker_drawdown(
         scope, equity, now or datetime.now(timezone.utc)
     )
+
+
+def reanchor_deployment_loss_breaker_scope(
+    scope: str,
+    *,
+    account_equity: float,
+    actor: str = "operator",
+    now: datetime | None = None,
+) -> LiveLossBreakerRecord:
+    """Operator re-anchor of one deployment scope (``re-anchor`` CLI).
+
+    Re-bases ``equity_anchor`` to the CURRENT residual - ``account_equity``
+    minus the sum of all deployment P&L on the account - and shifts the
+    scope's whole equity series (``last_equity``, ``day_start_equity``,
+    ``peak_equity``) by the same delta, so no breaker fraction jumps.
+    Existing latches are kept: re-anchoring fixes the measurement basis
+    after e.g. a large deposit/withdrawal or an account repoint; it does
+    not clear a trip.
+
+    Deployment P&L is reconstructed from the persisted breaker rows
+    (``last_equity - equity_anchor`` per anchored deployment scope) - the
+    same measure the scopes themselves observe, as of each row's last
+    observation. The command refuses when the total cannot be known: a
+    deployment scope that has not anchored yet while the fill ledger shows
+    it has fills, or a deployment with fills but no anchored scope row at
+    all. Deployments without fills contribute exactly 0.
+    """
+    normalized_scope = str(scope or "").strip()
+    kind, _, deployment_id = normalized_scope.partition(":")
+    if kind != "deployment" or not deployment_id:
+        raise ValueError(
+            "re-anchor applies to deployment scopes only "
+            f"(deployment:<id>), got {scope!r}"
+        )
+    equity_value = float(account_equity)
+    if not math.isfinite(equity_value) or equity_value <= 0:
+        raise ValueError(
+            f"account equity must be a positive finite number, got {account_equity!r}"
+        )
+    record = get_live_loss_breaker_state(normalized_scope)
+    if record is None:
+        raise ValueError(f"no loss breaker state for scope {normalized_scope!r}")
+    account_id = record.account_id
+    observed_at = now or datetime.now(timezone.utc)
+
+    states = list_live_loss_breaker_states(account_id)
+    dep_rows = [
+        row for row in states if row.scope.startswith("deployment:")
+    ]
+    flows = get_account_deployment_trading_flows(account_id)
+
+    anchored_pnls: dict[str, float] = {}
+    unanchored: list[str] = []
+    for row in dep_rows:
+        dep = row.scope.split(":", 1)[1]
+        if row.equity_anchor is not None and row.last_equity is not None:
+            anchored_pnls[dep] = float(row.last_equity) - float(row.equity_anchor)
+        else:
+            unanchored.append(dep)
+
+    problems: list[str] = [
+        f"deployment {dep} has fills but its breaker scope has not "
+        "anchored yet; wait for the next breaker observation"
+        for dep in unanchored
+        if dep in flows
+    ]
+    problems.extend(
+        f"deployment {dep} has fills but no anchored breaker scope "
+        "row on this account"
+        for dep in flows
+        if dep not in anchored_pnls and dep not in unanchored
+    )
+    if problems:
+        raise ValueError(
+            "deployment P&L cannot be fully measured, so the residual is "
+            "unknown: " + "; ".join(sorted(problems))
+        )
+
+    own_pnl = anchored_pnls.get(deployment_id, 0.0)
+    total_pnl = sum(anchored_pnls.values())
+    residual = equity_value - total_pnl
+    scope_equity = residual + own_pnl
+
+    updated = reanchor_live_loss_breaker_deployment(
+        normalized_scope,
+        equity_anchor=residual,
+        scope_equity=scope_equity,
+        reanchored_at=observed_at,
+    )
+    if updated is None:
+        raise ValueError(
+            f"loss breaker state for scope {normalized_scope!r} disappeared "
+            "mid-re-anchor"
+        )
+    record_live_control_audit(
+        action="loss_breaker.reanchor",
+        target_type="live_loss_breaker_state",
+        target_id=normalized_scope,
+        actor=actor,
+        succeeded=True,
+        detail={
+            "account_id": account_id,
+            "account_equity": equity_value,
+            "total_deployment_pnl": total_pnl,
+            "own_pnl": own_pnl,
+            "equity_anchor_before": record.equity_anchor,
+            "equity_anchor_after": residual,
+            "last_equity_before": record.last_equity,
+            "last_equity_after": updated.last_equity,
+            "day_start_equity_before": record.day_start_equity,
+            "day_start_equity_after": updated.day_start_equity,
+            "peak_equity_before": record.peak_equity,
+            "peak_equity_after": updated.peak_equity,
+            "daily_breached": updated.daily_breached,
+            "drawdown_breached": updated.drawdown_breached,
+        },
+    )
+    logger.warning(
+        "Loss breaker deployment scope re-anchored by the operator",
+        extra={
+            "data": {
+                "scope": normalized_scope,
+                "account_id": account_id,
+                "actor": actor,
+                "account_equity": equity_value,
+                "equity_anchor_before": record.equity_anchor,
+                "equity_anchor_after": residual,
+            }
+        },
+    )
+    return updated
