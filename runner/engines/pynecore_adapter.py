@@ -248,7 +248,7 @@ def _pyne_cli_start_bound(start_date: str) -> str:
 def _frozen_signal_exit_fill(config: BacktestConfig) -> BacktestConfig:
     """Refuse the native-only ``next_open`` exit model on this frozen adapter.
 
-    ADR ``docs/adr/0001-native-single-strategy-engine.md``: frozen engines
+    ADR ``docs/adr/0002-native-single-strategy-engine.md``: frozen engines
     keep their existing semantics until removal and get fail-loud guards, not
     silent re-interpretation. ``next_open`` is the native default, so a
     ``BacktestConfig`` that never touched the field would otherwise simulate

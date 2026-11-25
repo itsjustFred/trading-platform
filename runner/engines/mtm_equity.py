@@ -17,7 +17,7 @@ drawing on realized cash (``TradeEngine._sizing_equity``, see
 
 Semantics (native adapter, single- and multi-symbol; the frozen vectorbt /
 pynecore / signal-replay adapters keep their realized-only curves until they
-are removed under ADR ``docs/adr/0001-native-single-strategy-engine.md``):
+are removed under ADR ``docs/adr/0002-native-single-strategy-engine.md``):
 
 * The curve has one observation per bar timestamp of the traded symbols (plus
   every entry / exit leg time), starting at ``start_time`` with the initial
