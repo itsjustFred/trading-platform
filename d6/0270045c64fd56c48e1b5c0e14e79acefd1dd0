@@ -1,0 +1,42 @@
+tests/test_adr_numbering.py
+  s_36d4d1da9fda69::t_7ca3d76241ceac 1-57
+  s_36d4d1da9fda69::t_c33e29e5c446b8 58-62
+docs/ARCHITECTURE.md
+  s_36d4d1da9fda69::t_8a9ca333f7df88 11
+docs/adr/0002-native-single-strategy-engine.md
+  s_36d4d1da9fda69::t_94139e519ae51e 1
+docs/cross-engine-backtest-contract.md
+  s_36d4d1da9fda69::t_fe4f3bea656c06 4,92,237,591
+runner/engines/base.py
+  s_36d4d1da9fda69::t_e360c0b5086972 73,100
+runner/engines/mtm_equity.py
+  s_36d4d1da9fda69::t_915c45274e0bf3 20
+runner/engines/pynecore_adapter.py
+  s_36d4d1da9fda69::t_a8452639c2d213 251
+runner/engines/vectorbt_adapter.py
+  s_36d4d1da9fda69::t_f8d4e328c62f24 813,1592
+scripts/engine_migration_gate.py
+  s_36d4d1da9fda69::t_253afbd1eb1b62 7
+scripts/engine_speed_benchmark.py
+  s_36d4d1da9fda69::t_ec3adeba378e4d 5
+tests/test_mtm_equity.py
+  s_36d4d1da9fda69::t_8fc54caacae15c 9,19
+tests/test_realistic_fills.py
+  s_36d4d1da9fda69::t_ef867d7e3fd980 12
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "d60270045c64fd56c48e1b5c0e14e79acefd1dd0",
+  "prompts": {},
+  "sessions": {
+    "s_36d4d1da9fda69": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9ab0fcdd-5385-40f9-9f2b-606ef91d31a0",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "itsjustFred <justfred.business@gmail.com>"
+    }
+  }
+}
