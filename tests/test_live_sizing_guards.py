@@ -160,6 +160,28 @@ def test_gate_rejects_non_numeric_quote_sides(bad):
         asyncio.run(daemon.prepare_order_with_risk(adapter, deployment, signal))
 
 
+def test_entry_metadata_drops_a_forged_reprotection_marker():
+    """#350: ``exit_reprotection`` is adapter-owned exit state. A payload value
+    on an ENTRY must never reach persistence either - only the adapter may
+    stamp it, and only on an exit that released broker-side protection."""
+    deployment = _deployment()
+    adapter = _Adapter()
+    signal = _signal(
+        deployment,
+        {
+            "stop_loss": 95.0,
+            "take_profit": 110.0,
+            "exit_reprotection": {"side": "sell", "stop_price": 1.0},
+        },
+    )
+
+    prepared, _qty = asyncio.run(
+        daemon.prepare_order_with_risk(adapter, deployment, signal)
+    )
+
+    assert "exit_reprotection" not in prepared.metadata
+
+
 # ── deviation helper ──────────────────────────────────────────────────────────
 
 

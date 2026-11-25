@@ -684,7 +684,7 @@ def test_alpaca_submit_stamps_order_timing(db, monkeypatch) -> None:
     assert alpaca_module.set_live_signal_broker_order_id is db.set_live_signal_broker_order_id
 
 
-def test_alpaca_stream_fill_records_order_context(monkeypatch) -> None:
+def test_alpaca_stream_fill_records_order_context(monkeypatch, db) -> None:
     """A stream fill stores the order's own type and requested quantity."""
     from live_runner import alpaca_adapter as module
     from live_runner.alpaca_adapter import AlpacaLiveAdapter
@@ -701,7 +701,11 @@ def test_alpaca_stream_fill_records_order_context(monkeypatch) -> None:
 
     adapter = AlpacaLiveAdapter(api_key="k", secret_key="s", paper=True)
     adapter._connected = True
-    signal_id = str(uuid4())
+    # #350: a UUID client_order_id naming no persisted signal is flagged
+    # unattributed rather than booked, so the fill's signal must exist.
+    signal = _signal(metadata={})
+    db.save_live_signal(signal)
+    signal_id = str(signal.id)
     order_id = str(uuid4())
     update = SimpleNamespace(
         event="fill",

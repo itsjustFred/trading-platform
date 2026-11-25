@@ -44,6 +44,7 @@ from live_runner.account_routing import (
 from live_runner.alpaca_adapter import AlpacaLiveAdapter, resolve_alpaca_credentials
 from live_runner.base_adapter import (
     EXIT_ONLY_RISK_SIZING_MODE,
+    EXIT_REPROTECTION_METADATA_KEY,
     LIVE_QUOTE_FUTURE_SKEW_SECONDS,
     QUOTE_TIME_RULE_IN_FUTURE,
     QUOTE_TIME_RULE_INVALID,
@@ -2188,6 +2189,9 @@ async def prepare_exit_intent_order(
         "tp_price",
         "stop_price",
         "resolved_stop_loss",
+        # Adapter-owned crash-recovery state (#145): only the adapter may
+        # stamp it, after it has released the broker-side protection itself.
+        EXIT_REPROTECTION_METADATA_KEY,
     ):
         metadata.pop(key, None)
     # Stamp the instruction actually executed, so the persisted signal records
@@ -2788,6 +2792,13 @@ async def prepare_order_with_risk(
     # under one of these keys can neither shadow nor survive them.
     final_metadata.update(quote_metadata)
     final_metadata.update(pip_metadata)
+    # ``exit_reprotection`` is adapter-owned crash-recovery state stamped only
+    # on exits (#145): a payload value on an entry must never reach
+    # persistence, or the recovery sweep would replay protection for a signal
+    # that never exited (#350 review). Both merge sources are stripped here -
+    # the incoming metadata (via ``preserved_metadata``) and the sized
+    # metadata, which the sizing engine rebuilds from the original signal.
+    final_metadata.pop(EXIT_REPROTECTION_METADATA_KEY, None)
     # theoretical_price carries the resolved entry so an adapter that places
     # SL/TP as distances from it (cTrader) uses the distance that was sized.
     sized_signal = sized_signal.model_copy(

@@ -444,7 +444,19 @@ Alpaca accepts bracket/OTO entries only in whole shares and with SL/TP on the pr
 (0.01 from 1 USD, 0.0001 below that). `AlpacaLiveAdapter` normalizes every entry before it
 is persisted: the risk-sized `qty` is rounded **down** to whole shares (below 1 share → refused),
 and SL and TP are rounded **toward the entry**. The actual risk therefore never exceeds the
-sized budget. Exit-only orders (simple) stay unchanged.
+sized budget. Exit-only orders themselves stay simple market/limit close orders; a
+**partial** exit-only order first releases the position's reserved bracket/OCO
+protection and places a new OCO for the remaining quantity at the original SL/TP
+(or the current trailing level) (#145/#350) - a persisted `exit_reprotection`
+marker secures crash recovery, and recovery tops up missing shares once the exit
+order is terminal: `connect()` schedules a tracked recovery task (never inline -
+`connect` itself runs inside the account order-placement lock and
+`_order_book_lock`, and the account lock is not re-entrant) that replays the
+marker under the account order lock and then `_order_book_lock`; a terminal
+trade update of the exit order on the stream raises an ERROR alert only and
+never places orders (maintainer decision 2026-11-22 - the stream replay raced
+the exit path's own cancel/submit/re-place), and the marker is also cleared
+right after the re-place when the exit order is already fully filled.
 
 Refused before persistence in addition (ValueError, no signal row, no order): SL/TP on the
 wrong side of the entry, SL/TP within one tick of the entry, a missing/invalid SL/TP level,
