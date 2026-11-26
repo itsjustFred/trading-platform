@@ -6367,6 +6367,9 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         key = f"{symbol}:{reason}:{','.join(str(item) for item in leg_ids)}"
         if key in self._expired_stop_heal_alerted:
             return
+        # Cap the dedupe set: clearing only risks a re-alert for a still-bad
+        # symbol, never a missed one, and the key shape (symbol:reason:leg
+        # ids) is what lets a NEW leg on the same symbol alert again.
         if len(self._expired_stop_heal_alerted) > 500:
             self._expired_stop_heal_alerted.clear()
         self._expired_stop_heal_alerted.add(key)
@@ -6557,13 +6560,21 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         order's ``canceled_at`` far from the expiry proof window, so it would
         read as an unproven operator cancel - alerted, never healed. The
         cancel writes a ``_EXPIRED_STOP_REPLACE_CANCEL_ACTION`` audit row
-        first, so the intent survives the restart. A read failure returns an
+        first, so the intent survives the restart. The read is bounded to the
+        intent TTL window: ``list_live_control_audit`` caps at 1000 rows, and
+        bounding by ``created_after`` keeps that cap from silently dropping
+        in-window intents under audit-table growth. A read failure returns an
         empty set: unproven cancels still alert rather than heal.
         """
+        cutoff = (
+            datetime.now(timezone.utc)
+            - _EXPIRED_STOP_REPLACE_CANCEL_INTENT_TTL
+        )
         try:
             rows = await asyncio.to_thread(
                 list_live_control_audit,
                 action=_EXPIRED_STOP_REPLACE_CANCEL_ACTION,
+                created_after=cutoff,
                 limit=1000,
             )
         except asyncio.CancelledError:
@@ -6580,10 +6591,6 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 },
             )
             return set()
-        cutoff = (
-            datetime.now(timezone.utc)
-            - _EXPIRED_STOP_REPLACE_CANCEL_INTENT_TTL
-        )
         ids: set[str] = set()
         for row in rows:
             if not row.get("succeeded"):

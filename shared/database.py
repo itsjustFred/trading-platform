@@ -7576,8 +7576,14 @@ def list_live_control_audit(
     limit: int = 100,
     target_id: str | None = None,
     action: str | None = None,
+    created_after: datetime | None = None,
 ) -> list[dict[str, Any]]:
-    """Most recent first. Read-only; there is no delete path on purpose."""
+    """Most recent first. Read-only; there is no delete path on purpose.
+
+    ``limit`` is capped at 1000 rows, so callers needing a complete window
+    must bound it with ``created_after`` - the cap silently drops the oldest
+    rows otherwise.
+    """
     bounded = max(1, min(int(limit or 100), 1000))
     init_db()
     with get_session() as session:
@@ -7589,6 +7595,15 @@ def list_live_control_audit(
         if action is not None:
             statement = statement.where(
                 LiveControlAuditModel.action == str(action).strip()
+            )
+        if created_after is not None:
+            # ``created_at`` is stored naive UTC (``_utcnow_naive``).
+            if created_after.tzinfo is not None:
+                created_after = created_after.astimezone(timezone.utc).replace(
+                    tzinfo=None
+                )
+            statement = statement.where(
+                LiveControlAuditModel.created_at >= created_after
             )
         rows = session.exec(
             statement.order_by(LiveControlAuditModel.created_at.desc()).limit(bounded)
