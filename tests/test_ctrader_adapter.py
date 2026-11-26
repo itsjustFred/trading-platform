@@ -983,6 +983,92 @@ def test_token_invalidation_between_refresh_and_reauth_keeps_session(
         return await task
 
     assert asyncio.run(_run()) == "order_response"
+
+
+def test_token_invalidation_during_reauth_does_not_adopt_sibling_pair(
+    tmp_path,
+) -> None:
+    """Between refresh completion and the AccountAuthRes the refresh lock is
+    already released but ``_own_token_rotation_in_flight`` is still set. An
+    invalidation event landing in that window must not adopt a sibling's
+    persisted pair: mutating ``access_token`` mid-rotation would desync it
+    from the token the in-flight AccountAuthReq carries."""
+    from ctrader_open_api.messages.OpenApiMessages_pb2 import (
+        ProtoOAAccountsTokenInvalidatedEvent,
+    )
+
+    adapter, client, ProtoMessage = _lifecycle_event_adapter()
+    env_path = tmp_path / ".accounts.env"
+    env_path.write_text(
+        "CTRADER_ACCESS_TOKEN=old_access\nCTRADER_REFRESH_TOKEN=old_refresh\n",
+        encoding="utf-8",
+    )
+    adapter.accounts_env_path = env_path
+    adapter.access_token = "old_access"
+    adapter.refresh_token = "old_refresh"
+    adapter._session_access_token = "old_access"
+
+    order_request = object()
+    sent: list[object] = []
+    auth_gate = asyncio.Event()
+
+    async def _fake_send(request, **_kwargs):
+        sent.append(request)
+        if request is order_request:
+            if sent.count(order_request) == 1:
+                raise CTraderApiError("CH_ACCESS_TOKEN_INVALID", "expired")
+            return "order_response"
+        if isinstance(request, _StubRefreshTokenReq):
+            return _StubRefreshTokenRes()
+        if isinstance(request, _StubAccountAuthReq):
+            # A sibling rotates and persists its pair while our re-auth is
+            # still awaiting the response.
+            env_path.write_text(
+                "CTRADER_ACCESS_TOKEN=sibling_access\n"
+                "CTRADER_REFRESH_TOKEN=sibling_refresh\n",
+                encoding="utf-8",
+            )
+            await auth_gate.wait()
+            return _StubAccountAuthRes()
+        raise AssertionError(f"unexpected request: {type(request).__name__}")
+
+    adapter._ProtoOARefreshTokenReq = _StubRefreshTokenReq
+    adapter._ProtoOARefreshTokenRes = _StubRefreshTokenRes
+    adapter._ProtoOAAccountAuthReq = _StubAccountAuthReq
+    adapter._ProtoOAAccountAuthRes = _StubAccountAuthRes
+    adapter._send_request = _fake_send
+
+    async def _run() -> object:
+        task = asyncio.create_task(
+            adapter._send_request_with_refresh_retry(order_request)
+        )
+        for _ in range(1000):
+            if any(isinstance(r, _StubAccountAuthReq) for r in sent):
+                break
+            await asyncio.sleep(0)
+        assert any(isinstance(r, _StubAccountAuthReq) for r in sent), (
+            "re-auth request was never sent"
+        )
+        adapter._on_message(
+            client,
+            _wire_payload(
+                ProtoMessage,
+                ProtoOAAccountsTokenInvalidatedEvent(
+                    ctidTraderAccountIds=[46736452], reason="token refreshed"
+                ),
+            ),
+        )
+        # The in-flight rotation keeps its own credentials: no sibling
+        # adoption, no teardown.
+        assert adapter.access_token != "sibling_access"
+        assert adapter._client is client
+        assert adapter._connected is True
+        auth_gate.set()
+        return await task
+
+    assert asyncio.run(_run()) == "order_response"
+    assert adapter.access_token != "sibling_access"
+    assert adapter._session_access_token == adapter.access_token
     assert adapter._session_access_token == "new_access"
 
 
