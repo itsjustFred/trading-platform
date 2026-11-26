@@ -595,3 +595,38 @@ class TestInvertedSizingStop:
         assert result.meta.data["inverted_stop_drops"] == 1
 
 
+
+
+class TestRiskMathContract:
+    """PM-2 viewer contract, asserted on real output instead of source text."""
+
+    def test_risk_math_keeps_both_position_pct_spellings_and_record_keys(
+        self, sizing_env
+    ):
+        from runner.engines.vectorbt_adapter import _SizeRecord
+
+        tmp_path, strategy_path = sizing_env
+        config = _config(
+            tmp_path,
+            risk_per_trade_pct=0.05,
+            max_position_pct=0.5,
+            max_leverage=2.0,
+        )
+        result = VectorbtAdapter().run(config, str(strategy_path))
+        assert result.trades, "fixture must produce trades"
+
+        renamed = {
+            "cap_notional": "max_position_notional",
+            "leverage_notional_limit": "max_leverage_notional",
+        }
+        record_keys = set(_SizeRecord.__annotations__) - {"qty"}
+        for trade in result.trades:
+            risk_math = trade.meta["risk_math"]
+            # Artifact-key stability: the legacy spelling stays alongside the
+            # canonical one, both carrying the configured value.
+            assert risk_math["max_position_pct"] == pytest.approx(0.5)
+            assert risk_math["max_position_exposure_pct"] == pytest.approx(0.5)
+            for key in record_keys:
+                assert renamed.get(key, key) in risk_math, (
+                    f"sizing record key {key!r} did not reach risk_math"
+                )
