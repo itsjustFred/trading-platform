@@ -1666,6 +1666,10 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         self._expired_stop_heal_last_run = float("-inf")
         self._expired_stop_heal_alerted: set[str] = set()
         self._heal_replaced_order_ids: set[str] = set()
+        # One maintenance pass at a time per adapter: the connect-time
+        # recovery and the daemon loop can overlap, and the dedupe/replaced
+        # sets are not safe to mutate from two interleaved passes.
+        self._protective_maintenance_running = False
 
         if not self.api_key or not self.secret_key:
             raise ValueError(
@@ -6480,11 +6484,19 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         book: dict[str, tuple[float, str]] = {}
         for position in positions:
             symbol = str(position.get("symbol") or "").strip().upper()
-            if not symbol or position.get("qty_unparseable"):
+            if not symbol:
+                continue
+            if position.get("qty_unparseable"):
+                self._expired_stop_heal_alert(
+                    symbol, "position_qty_unreadable", {}
+                )
                 continue
             try:
                 qty = _position_qty(position)
             except ValueError:
+                self._expired_stop_heal_alert(
+                    symbol, "position_qty_unreadable", {}
+                )
                 continue
             if _is_flat(qty):
                 continue
@@ -6598,8 +6610,19 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         order-placement lock (bounded wait) and ``_order_book_lock`` guard
         only the re-verify and the broker writes. The throttle timestamp is
         taken only AFTER the lock is held, so a lock-timeout skip never
-        consumes the interval and the next tick retries.
+        consumes the interval and the next tick retries. A second call while
+        a pass is in flight returns immediately - the running pass covers
+        the same ground.
         """
+        if self._protective_maintenance_running:
+            return
+        self._protective_maintenance_running = True
+        try:
+            await self._maintain_protective_stops_pass(force=force)
+        finally:
+            self._protective_maintenance_running = False
+
+    async def _maintain_protective_stops_pass(self, *, force: bool) -> None:
         now = time.monotonic()
         if (
             not force
