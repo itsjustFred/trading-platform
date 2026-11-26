@@ -523,7 +523,7 @@ def _check_git(argv: list[str], cwd: Path, main_ok: bool) -> str | None:
         return (
             "blocked: `git stash` is shared across worktrees and holds the "
             "maintainer's work. Commit on your branch or save `git diff > "
-            "/tmp/fix.patch` instead."
+            "\"$TMPDIR/fix.patch\"` instead."
         )
     if sub == "checkout":
         verdict = _check_git_checkout(rest, git_cwd)
