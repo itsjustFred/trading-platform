@@ -108,11 +108,18 @@ def test_absolute_paths_are_refused_unless_the_caller_opts_in(base: Path) -> Non
         safe_join(base, outside, allow_absolute=True)
 
 
+def _symlink_or_skip(link: Path, target: Path, *, target_is_directory: bool = False) -> None:
+    try:
+        link.symlink_to(target, target_is_directory=target_is_directory)
+    except (OSError, NotImplementedError) as exc:  # Windows without symlink privilege
+        pytest.skip(f"symlinks unavailable on this platform: {exc}")
+
+
 def test_symlink_pointing_outside_the_base_is_refused(base: Path, tmp_path: Path) -> None:
     outside = tmp_path / "secret.csv"
     outside.write_text("secret", encoding="utf-8")
-    (base / "escape.csv").symlink_to(outside)
-    (base / "escape-dir").symlink_to(tmp_path, target_is_directory=True)
+    _symlink_or_skip(base / "escape.csv", outside)
+    _symlink_or_skip(base / "escape-dir", tmp_path, target_is_directory=True)
 
     with pytest.raises(PathContainmentError):
         safe_join(base, "escape.csv")
@@ -121,7 +128,7 @@ def test_symlink_pointing_outside_the_base_is_refused(base: Path, tmp_path: Path
 
 
 def test_symlink_staying_inside_the_base_is_accepted(base: Path) -> None:
-    (base / "alias.csv").symlink_to(base / "sub" / "file.csv")
+    _symlink_or_skip(base / "alias.csv", base / "sub" / "file.csv")
 
     assert safe_join(base, "alias.csv") == (base / "sub" / "file.csv").resolve()
 
@@ -129,8 +136,8 @@ def test_symlink_staying_inside_the_base_is_accepted(base: Path) -> None:
 def test_refuse_symlinks_rejects_any_symlink_below_the_base(base: Path, tmp_path: Path) -> None:
     outside = tmp_path / "secret.csv"
     outside.write_text("secret", encoding="utf-8")
-    (base / "alias.csv").symlink_to(base / "sub" / "file.csv")
-    (base / "escape.csv").symlink_to(outside)
+    _symlink_or_skip(base / "alias.csv", base / "sub" / "file.csv")
+    _symlink_or_skip(base / "escape.csv", outside)
 
     with pytest.raises(PathContainmentError):
         safe_join(base, "alias.csv", refuse_symlinks=True)
@@ -147,7 +154,7 @@ def test_refuse_symlinks_rejects_a_symlinked_base(tmp_path: Path) -> None:
     real.mkdir()
     (real / "file.csv").write_text("x", encoding="utf-8")
     linked = tmp_path / "linked"
-    linked.symlink_to(real, target_is_directory=True)
+    _symlink_or_skip(linked, real, target_is_directory=True)
 
     # Default: a symlinked base is resolved, so the result is inside it.
     assert safe_join(linked, "file.csv") == (real / "file.csv").resolve()
@@ -160,7 +167,7 @@ def test_a_symlinked_base_compares_against_its_resolved_target(tmp_path: Path) -
     (real / "sub").mkdir(parents=True)
     (real / "sub" / "file.csv").write_text("x", encoding="utf-8")
     linked = tmp_path / "linked"
-    linked.symlink_to(real, target_is_directory=True)
+    _symlink_or_skip(linked, real, target_is_directory=True)
 
     assert safe_join(linked, "sub/file.csv") == (real / "sub" / "file.csv").resolve()
 
