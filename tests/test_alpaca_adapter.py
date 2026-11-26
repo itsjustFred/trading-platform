@@ -7144,7 +7144,7 @@ def test_maintain_protective_stops_lock_timeout_skips_without_throttle(
         asyncio.run(adapter.maintain_protective_stops(force=True))
 
     assert client.submitted == []
-    assert adapter._expired_stop_heal_last_run == 0.0
+    assert adapter._expired_stop_heal_last_run == float("-inf")
 
     # The throttle was not consumed: the very next pass scans and heals.
     monkeypatch.undo()

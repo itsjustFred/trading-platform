@@ -1648,7 +1648,11 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         # ``_heal_replaced_order_ids`` remembers stops this pass canceled
         # for aged-order replacement so their terminal ``canceled`` state
         # reads as heal-eligible, never as an operator cancel.
-        self._expired_stop_heal_last_run = 0.0
+        # ``-inf``, not ``0.0``: ``time.monotonic()`` counts from an arbitrary
+        # boot-relative origin, so on a machine up less than the interval a
+        # literal ``0.0`` would read as "just ran" and throttle the first
+        # periodic pass forever.
+        self._expired_stop_heal_last_run = float("-inf")
         self._expired_stop_heal_alerted: set[str] = set()
         self._heal_replaced_order_ids: set[str] = set()
 
