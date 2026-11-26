@@ -404,6 +404,16 @@ def effective_reconciliation_config(
     )
 
 
+def _positive_qty_metadata_value(raw: Any) -> float | None:
+    if raw is None or isinstance(raw, bool):
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) and value > 0 else None
+
+
 def _requested_qty(metadata: Mapping[str, Any]) -> float | None:
     """The qty the broker was asked for, from persisted signal metadata.
 
@@ -411,18 +421,28 @@ def _requested_qty(metadata: Mapping[str, Any]) -> float | None:
     ``explicit_qty`` (they are kept equal at write time - cTrader's
     volume-grid floor, Alpaca's whole-share bracket floor). ``explicit_qty``
     wins the lookup order for legacy rows that carry only one key; a row
-    whose two keys disagree is adapter corruption, not something to
-    reconcile around.
+    whose two keys disagree is adapter corruption, so it is logged and the
+    expectation is kept (``None``) rather than reconciled around a guessed
+    base - a missing working order is loud, a silently wrong remainder is
+    not.
     """
+    explicit = _positive_qty_metadata_value(metadata.get("explicit_qty"))
+    qty = _positive_qty_metadata_value(metadata.get("qty"))
+    if (
+        explicit is not None
+        and qty is not None
+        and not math.isclose(explicit, qty, rel_tol=1e-9, abs_tol=0.0)
+    ):
+        logger.warning(
+            "broker reconciliation: signal metadata qty keys disagree "
+            "(explicit_qty=%r, qty=%r); keeping the working-order expectation",
+            explicit,
+            qty,
+        )
+        return None
     for key in ("explicit_qty", "qty", "requested_qty"):
-        raw = metadata.get(key)
-        if raw is None or isinstance(raw, bool):
-            continue
-        try:
-            value = float(raw)
-        except (TypeError, ValueError):
-            continue
-        if math.isfinite(value) and value > 0:
+        value = _positive_qty_metadata_value(metadata.get(key))
+        if value is not None:
             return value
     return None
 

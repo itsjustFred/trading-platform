@@ -5640,9 +5640,10 @@ def test_ctrader_submit_refuses_a_normalized_qty_above_the_binding_qty(
     # EURUSD fallback scale: volume_per_qty 1000, so 2500 units is 2.5 qty -
     # well above the 2.0007 binding qty and far outside the noise band.
     monkeypatch.setattr(adapter, "_resolve_order_volume", lambda _signal: 2_500)
+    submit = adapter.submit_order(_ctrader_entry_signal(), qty=2.0007)
 
     with pytest.raises(ValueError, match="exceeds the binding qty") as excinfo:
-        asyncio.run(adapter.submit_order(_ctrader_entry_signal(), qty=2.0007))
+        asyncio.run(submit)
 
     assert is_order_not_submitted(excinfo.value)
     assert saved == []
@@ -5666,9 +5667,10 @@ def test_ctrader_submit_refuses_when_qty_normalization_is_not_idempotent(
         return 2_000 if resolutions["n"] == 1 else 2_001
 
     monkeypatch.setattr(adapter, "_resolve_order_volume", _resolve)
+    submit = adapter.submit_order(_ctrader_entry_signal(), qty=2.0007)
 
     with pytest.raises(RuntimeError, match="not idempotent") as excinfo:
-        asyncio.run(adapter.submit_order(_ctrader_entry_signal(), qty=2.0007))
+        asyncio.run(submit)
 
     assert is_order_not_submitted(excinfo.value)
     assert saved == []

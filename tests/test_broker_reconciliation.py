@@ -986,6 +986,51 @@ def test_nonpositive_or_nonfinite_step_keeps_the_expectation(
     assert "missing_working_order" in kinds
 
 
+def test_disagreeing_qty_keys_keep_the_expectation(isolated_db, tmp_path, caplog) -> None:
+    """``qty`` and ``explicit_qty`` disagreeing is adapter corruption: the
+    reconciler must not silently pick one - it logs and keeps the
+    working-order expectation (fail closed). Here either key alone would
+    have produced no expectation (5.0 is fully filled; 5.5 - 5.0 = 0.5 is
+    sub-step), so only the fail-closed path yields the finding."""
+    database, _engine, _data_dir = isolated_db
+    _seed_db(database)
+    signal_id, _ = save_live_signal(
+        LiveSignal(
+            id=uuid4(),
+            deployment_id=DEPLOYMENT_ID,
+            symbol="ETHUSD",
+            action="buy",
+            theoretical_price=100.0,
+            timestamp=datetime.now(timezone.utc),
+            metadata={
+                "broker_order_id": "ord-split",
+                "qty": 5.0,
+                "explicit_qty": 5.5,
+            },
+        )
+    )
+    _fill(signal_id, broker_order_id="ord-split", qty=5.0)
+
+    deployment = _deployment()
+    adapter = _SteppedAdapter(
+        1.0,
+        positions=[{"symbol": "ETHUSD", "qty": 5.0}],
+        stops=[
+            ProtectiveStop(
+                order_id="stop-1", symbol="ETHUSD", side="sell", stop_price=95.0
+            )
+        ],
+    )
+    manager = _manager(tmp_path, [])
+
+    with caplog.at_level("WARNING"):
+        report = _reconcile(manager, [deployment], {ACCOUNT_ID: adapter})
+
+    kinds = {finding.kind for finding in report[ACCOUNT_ID].findings}
+    assert "missing_working_order" in kinds
+    assert "qty keys disagree" in caplog.text
+
+
 def test_order_state_lookups_share_one_phase_deadline(tmp_path, monkeypatch) -> None:
     """Ten slow lookups must not serialize into a ten-minute stall (#303)."""
     import live_runner.broker_reconciliation as recon
