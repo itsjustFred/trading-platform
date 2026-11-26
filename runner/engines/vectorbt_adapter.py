@@ -33,12 +33,8 @@ from runner.engines._indicator_series import _build_indicator_series
 from runner.engines._shared import (
     resolve_ask_high_low,
     resolve_bar_spread,
-)
-from runner.engines._shared import (
-    resolve_max_leverage as _resolve_max_leverage,
-)
-from runner.engines._shared import (
-    resolve_max_position_exposure_pct as _resolve_max_position_exposure_pct,
+    resolve_max_leverage,
+    resolve_max_position_exposure_pct,
 )
 from runner.engines._shared import (
     serialize_meta_value as _shared_serialize_meta_value,
@@ -197,10 +193,10 @@ def _size_trade(
 
     if config.risk_per_trade_pct is not None and config.risk_per_trade_pct > 0:
         sizing_mode = "risk_pct"
-        max_position_exposure_pct = _resolve_max_position_exposure_pct(
+        max_position_exposure_pct = resolve_max_position_exposure_pct(
             config.max_position_exposure_pct, asset_class
         )
-        max_leverage = _resolve_max_leverage(config.max_leverage)
+        max_leverage = resolve_max_leverage(config.max_leverage)
         # D10/16-E (F7/F35): max_position_exposure_pct is the per-position
         # notional cap; it is an INDEPENDENT cap, not an implicit leverage
         # floor — a conservative max_leverage < max_position_exposure_pct is
@@ -810,7 +806,7 @@ def _process_symbol(
 def _frozen_signal_exit_fill(config: BacktestConfig) -> BacktestConfig:
     """Refuse the native-only ``next_open`` exit model on this frozen adapter.
 
-    ADR ``docs/adr/0001-native-single-strategy-engine.md``: frozen engines
+    ADR ``docs/adr/0002-native-single-strategy-engine.md``: frozen engines
     keep their existing semantics until removal and get fail-loud guards, not
     silent re-interpretation. ``next_open`` is the native default, so a
     ``BacktestConfig`` that never touched the field would otherwise simulate
@@ -1589,7 +1585,7 @@ def _resolve_exit_price(
     direction: str | None = None,
     gap_open: bool = False,
 ) -> float:
-    # Frozen engine (ADR 0001): signal exits stay on the trigger bar (see
+    # Frozen engine (ADR 0002): signal exits stay on the trigger bar (see
     # _prepare_next_open_execution_data) and fill at its close — the frozen
     # adapter refuses ``next_open`` upstream and the lookahead-prone ``open``
     # mode was removed (issue #153). Stop/TP
@@ -1998,15 +1994,15 @@ def _extract_trade_meta(
 
 
 def _resolve_max_position_pct(explicit: float | None, asset_class: str) -> float:
-    """Deprecated alias of :func:`_resolve_max_position_exposure_pct` (16-E rename)."""
+    """Deprecated alias of :func:`resolve_max_position_exposure_pct` (16-E rename)."""
     import warnings
 
     warnings.warn(
-        "_resolve_max_position_pct is deprecated; use _resolve_max_position_exposure_pct",
+        "_resolve_max_position_pct is deprecated; use resolve_max_position_exposure_pct",
         DeprecationWarning,
         stacklevel=2,
     )
-    return _resolve_max_position_exposure_pct(explicit, asset_class)
+    return resolve_max_position_exposure_pct(explicit, asset_class)
 
 
 def _serialize_meta_value(value: Any) -> Any | None:

@@ -205,10 +205,10 @@ def test_the_guard_compares_against_the_scripts_own_checkout() -> None:
     it is protecting.
 
     The derivation used to sit inline in every script; it now lives once in
-    ``scripts/_import_origin.py`` - the guarantee is unchanged, only its address - so this asserts
+    ``scripts/import_origin.py`` - the guarantee is unchanged, only its address - so this asserts
     against the module that carries it. The scripts still hold the marker and the call.
     """
-    helper = SCRIPTS_DIR / "_import_origin.py"
+    helper = SCRIPTS_DIR / "import_origin.py"
     assert helper.is_file(), f"the shared guard module is missing: {helper}"
     expected = 'Path(__file__).resolve().parent.parent / "shared"'
     assert expected in helper.read_text(encoding="utf-8"), (
@@ -218,7 +218,7 @@ def test_the_guard_compares_against_the_scripts_own_checkout() -> None:
     for script in _scripts_importing_shared():
         text = script.read_text(encoding="utf-8")
         block = text[text.index(GUARD_START):text.index(GUARD_END)]
-        assert "_import_origin" in block, (
+        assert "import import_origin" in block, (
             f"{script.name}: the guard block no longer reaches the shared guard module, so it has "
             "been reduced to a marker with nothing behind it"
         )
@@ -311,7 +311,7 @@ def test_a_direct_run_is_refused_even_when_the_installed_tree_is_this_checkout(
     Every `needs_divergent_tree` case skips here, because this venv's editable install points at the
     checkout. That means the *behaviour* - the exit code, the two named trees, the call to the
     shared guard module - went unexercised on exactly the machine the PR was written on, and the
-    extraction of the guard into `scripts/_import_origin.py` could have broken it while the suite
+    extraction of the guard into `scripts/import_origin.py` could have broken it while the suite
     stayed green. `PYTHONPATH` supplies a second `shared` tree so the divergence is real and the
     refusal is observable regardless of how the environment happens to be installed.
     """
@@ -363,5 +363,5 @@ def test_every_guarded_script_reaches_the_shared_guard_module(tmp_path: Path) ->
             offenders.append(f"{name} (rc={result.returncode})")
     assert not offenders, (
         "these scripts import `shared` but did not refuse a foreign tree when run directly, so "
-        f"their guard is not wired to scripts/_import_origin.py: {offenders}"
+        f"their guard is not wired to scripts/import_origin.py: {offenders}"
     )

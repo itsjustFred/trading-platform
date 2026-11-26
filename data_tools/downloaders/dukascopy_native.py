@@ -78,7 +78,7 @@ def _load_instrument_meta() -> dict[str, dict]:
     return _instrument_cache
 
 
-def _get_decimal_factor(instrument: str) -> int:
+def get_decimal_factor(instrument: str) -> int:
     meta = _load_instrument_meta()
     entry = meta.get(instrument.lower(), {})
     return int(entry.get("decimal_factor", 1))
@@ -910,7 +910,7 @@ async def download_minute_candles(
     module: the daily file for its date is fetched, and the caller truncates to
     the exact hour it wants.
     """
-    decimal_factor = _get_decimal_factor(instrument)
+    decimal_factor = get_decimal_factor(instrument)
     normalized_side = _normalize_offer_side(side)
     if normalized_side == "both":
         # The two sides live in different daily URLs (BID_/ASK_candles_min_1),
@@ -1015,7 +1015,7 @@ async def _download_and_assemble_merged_ticks(
     Dukascopy hourly tick files carry both sides per record, so each file is
     fetched once and the bid/ask columns are split out afterwards (DV-C2).
     """
-    decimal_factor = _get_decimal_factor(instrument)
+    decimal_factor = get_decimal_factor(instrument)
 
     urls = generate_tick_urls(instrument, start_dt, end_dt)
     _emit_log_message(
@@ -1177,7 +1177,7 @@ class DukascopyNativeDownloader(Downloader):
         start_dt = datetime.fromisoformat(requested_start).replace(tzinfo=timezone.utc)
         end_dt = _end_of_day_inclusive(datetime.fromisoformat(requested_end).replace(tzinfo=timezone.utc))
 
-        decimal_factor = _get_decimal_factor(instrument)
+        decimal_factor = get_decimal_factor(instrument)
         strategy = DOWNLOAD_STRATEGY[normalized_tf]
         if offer_side == "both" and strategy == "tick":
             merge_bid_ask = True

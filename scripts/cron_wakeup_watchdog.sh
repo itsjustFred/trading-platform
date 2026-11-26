@@ -21,7 +21,6 @@ while true; do
 
   cron_raw="$LOG_DIR/cron_wakeup_watchdog_cron.json"
   printf '%s\n' "$cron_json" > "$cron_raw"
-  # Use mktemp for safe temporary file
   failed_ids_file=$(mktemp)
   trap 'rm -f "$failed_ids_file"' EXIT
   if python3 - "$cron_raw" "$failed_ids_file" <<'PY'
