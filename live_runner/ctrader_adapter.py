@@ -1755,11 +1755,24 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         a latched ``_own_token_rotation_in_flight`` would let
         ``_token_invalidation_skip_reason`` treat a genuine invalidation as
         our own rotation echo and never tear the dead session down. The
-        skip-reason check also self-heals a latched flag on a dead session
-        as a backstop for any future path that forgets.
+        invalidation handler also self-heals a latched flag on a dead
+        session as a backstop for any future path that forgets.
         """
         self._session_access_token = ""
         self._own_token_rotation_in_flight = 0
+
+    def _self_heal_rotation_marker_on_dead_session(self) -> None:
+        """Clear a latched ``_own_token_rotation_in_flight`` on a dead session.
+
+        The counter only means something while a session is connected: no
+        live session can be mid-rotation, so a count still set here was left
+        behind by a session-death path and would make
+        ``_token_invalidation_skip_reason`` treat every later invalidation
+        event as our own rotation echo and never tear the session down.
+        Kept out of the skip-reason check itself so that check stays pure.
+        """
+        if self._own_token_rotation_in_flight and not self._connected:
+            self._own_token_rotation_in_flight = 0
 
     def _adopt_persisted_token_pair(self) -> bool:
         """Adopt the token pair persisted in the accounts env file when it differs.
@@ -1811,6 +1824,17 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         )
         return True
 
+    def _token_rotation_in_flight(self) -> bool:
+        """A token refresh or own rotation+re-auth is in flight here.
+
+        ``_refresh_lock`` covers the refresh itself; the lock is released
+        before the re-auth await, which ``_own_token_rotation_in_flight``
+        (a depth counter) spans instead.
+        """
+        return self._refresh_lock.locked() or bool(
+            self._own_token_rotation_in_flight
+        )
+
     def _token_invalidation_skip_reason(self) -> str | None:
         """Why a token-invalidation event must NOT tear down this session.
 
@@ -1839,19 +1863,13 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         rotation terminates every account session on the pair) and must be
         torn down so the next ``connect()`` re-authenticates.
         """
-        if self._refresh_lock.locked():
-            return "a token refresh is in flight on this adapter"
-        if self._own_token_rotation_in_flight:
-            if not self._connected:
-                # No live session can be mid-rotation: a count still set here
-                # was left behind by a session-death path and would suppress
-                # every later invalidation event. Clear it rather than skip.
-                self._own_token_rotation_in_flight = 0
-            else:
-                return (
-                    "this adapter's own token rotation is being "
-                    "re-authenticated"
-                )
+        if self._token_rotation_in_flight():
+            if self._refresh_lock.locked():
+                return "a token refresh is in flight on this adapter"
+            return (
+                "this adapter's own token rotation is being "
+                "re-authenticated"
+            )
         rotated_at = self._token_pair_rotated_at
         if (
             self._session_access_token
@@ -1874,16 +1892,29 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             )
             return False
         # Defensive: the adapter holds an access token the session never
-        # authenticated with and no own rotation is in flight - the session
-        # is dead (a sibling rotated the shared pair), not the token. The
-        # caller re-authenticates with the adopted pair; spending the shared
-        # single-use refresh token here would rotate the pair AGAIN and
-        # invalidate every sibling account on it.
+        # authenticated with and no OTHER own rotation is in flight - the
+        # session is dead (a sibling rotated the shared pair, or our own
+        # earlier rotation's re-auth failed after its refresh succeeded),
+        # not the token. The caller re-authenticates with the adopted pair;
+        # spending the shared single-use refresh token here would rotate
+        # the pair AGAIN and invalidate every sibling account on it.
+        # ``<= 1`` because the production caller
+        # (``_rotate_token_pair_and_reauthenticate``) increments
+        # ``_own_token_rotation_in_flight`` BEFORE calling this, so "no own
+        # rotation in flight" can only mean "no rotation but this one" -
+        # a plain truthiness check would make this guard dead on the real
+        # path. A count above 1 means a concurrent rotation is also in
+        # flight; it adopts-or-refreshes inside the lock below instead.
         if (
             self._session_access_token
             and self.access_token != self._session_access_token
-            and not self._own_token_rotation_in_flight
+            and self._own_token_rotation_in_flight <= 1
         ):
+            # Adopt before re-authenticating: a sibling may have persisted
+            # an even newer pair since this adapter's in-memory copy, and
+            # re-authenticating with a stale access token would just fail
+            # again. Read-only - no refresh token is spent either way.
+            self._adopt_persisted_token_pair()
             return True
         refresh_token_before_lock = self.refresh_token
         # All cTrader adapters share one persisted token pair and a cTrader
@@ -2257,10 +2288,8 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         # and the rotation the refresh is about to persist, and the event is
         # our own rotation echo anyway (``_token_invalidation_skip_reason``
         # skips it either way).
-        if (
-            not self._refresh_lock.locked()
-            and not self._own_token_rotation_in_flight
-        ):
+        self._self_heal_rotation_marker_on_dead_session()
+        if not self._token_rotation_in_flight():
             self._adopt_persisted_token_pair()
         skip_reason = self._token_invalidation_skip_reason()
         if skip_reason is not None:

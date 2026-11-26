@@ -1165,41 +1165,143 @@ def test_concurrent_rotations_keep_invalidation_skip_until_last_finishes(
     asyncio.run(_run())
 
 
-def test_refresh_returns_true_for_stale_session_pair_without_spending_refresh(
+def test_stale_session_request_reauthenticates_without_spending_refresh(
     tmp_path,
 ) -> None:
-    """Defensive: when the adapter holds a persisted pair the session never
-    authenticated with (``access_token != _session_access_token``) and no own
-    rotation is in flight, ``_refresh_access_token`` must NOT spend the
-    shared single-use refresh token - the caller re-authenticates with the
-    adopted access token instead."""
+    """Request path: the adapter holds a persisted pair the session never
+    authenticated with (``access_token != _session_access_token``) - e.g. our
+    own rotation's refresh succeeded but its re-auth failed, leaving the
+    session up on the old token. The next request's auth error must NOT send
+    a ``RefreshTokenReq``: the shared single-use refresh token would rotate
+    the pair AGAIN and invalidate every sibling session. Re-authentication
+    with the current pair is enough."""
     env_path = tmp_path / ".accounts.env"
     env_path.write_text(
-        "CTRADER_ACCESS_TOKEN=adopted_access\nCTRADER_REFRESH_TOKEN=adopted_refresh\n",
+        "CTRADER_ACCESS_TOKEN=cur_access\nCTRADER_REFRESH_TOKEN=cur_refresh\n",
         encoding="utf-8",
     )
     adapter = CTraderLiveAdapter(
         app_id="app",
         app_secret="secret",
-        access_token="adopted_access",
-        refresh_token="adopted_refresh",
+        access_token="cur_access",
+        refresh_token="cur_refresh",
         account_id="46736452",
         accounts_env_path=env_path,
     )
     adapter._session_access_token = "old_session_token"
-
-    async def _unexpected_send(*_args, **_kwargs):
-        raise AssertionError(
-            "refresh request sent although the session only needs re-auth"
-        )
-
+    adapter._connected = True
+    adapter._authenticated = True
     adapter._ProtoOARefreshTokenReq = _StubRefreshTokenReq
     adapter._ProtoOARefreshTokenRes = _StubRefreshTokenRes
-    adapter._send_request = _unexpected_send
+    adapter._ProtoOAAccountAuthReq = _StubAccountAuthReq
+    adapter._ProtoOAAccountAuthRes = _StubAccountAuthRes
+    sent: list[object] = []
+    calls = {"n": 0}
 
-    assert asyncio.run(adapter._refresh_access_token()) is True
-    assert adapter.access_token == "adopted_access"
-    assert adapter.refresh_token == "adopted_refresh"
+    class _Req:
+        pass
+
+    async def _send(request, **_kw):
+        sent.append(request)
+        if isinstance(request, _Req):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise CTraderApiError("ACCOUNT_NOT_AUTHORIZED", "not authorized")
+            return "ok"
+        if isinstance(request, _StubRefreshTokenReq):
+            return _StubRefreshTokenRes()
+        if isinstance(request, _StubAccountAuthReq):
+            return _StubAccountAuthRes()
+        raise AssertionError(type(request).__name__)
+
+    adapter._send_request = _send
+    assert (
+        asyncio.run(
+            adapter._send_request_with_refresh_retry(_Req(), timeout_seconds=1)
+        )
+        == "ok"
+    )
+    assert not any(isinstance(r, _StubRefreshTokenReq) for r in sent), sent
+    assert adapter._session_access_token == "cur_access"
+
+
+def test_rotation_reauth_notes_the_token_the_auth_request_carried(
+    tmp_path,
+) -> None:
+    """If a sibling adopts a newer persisted pair while our re-auth request
+    is in flight, ``_session_access_token`` must record the token the
+    ``AccountAuthReq`` actually carried - not whatever ``access_token``
+    happens to hold when the response lands. Recording the wrong token
+    would make the session look dead (or alive) to the invalidation
+    skip-reason for the wrong reason."""
+    env_path = tmp_path / ".accounts.env"
+    env_path.write_text(
+        "CTRADER_ACCESS_TOKEN=file_access\nCTRADER_REFRESH_TOKEN=file_refresh\n",
+        encoding="utf-8",
+    )
+    adapter = CTraderLiveAdapter(
+        app_id="app",
+        app_secret="secret",
+        access_token="old_access",
+        refresh_token="old_refresh",
+        account_id="46736452",
+        accounts_env_path=env_path,
+    )
+    adapter._session_access_token = "old_session_token"
+    adapter._ProtoOARefreshTokenReq = _StubRefreshTokenReq
+    adapter._ProtoOARefreshTokenRes = _StubRefreshTokenRes
+    adapter._ProtoOAAccountAuthReq = _StubAccountAuthReq
+    adapter._ProtoOAAccountAuthRes = _StubAccountAuthRes
+    auth_reqs: list[_StubAccountAuthReq] = []
+
+    async def _send(request, **_kw):
+        if isinstance(request, _StubAccountAuthReq):
+            auth_reqs.append(request)
+            # A sibling rotation lands mid-flight: the pair changes under
+            # the in-flight re-auth.
+            adapter.access_token = "sibling_access"
+            adapter.refresh_token = "sibling_refresh"
+            return _StubAccountAuthRes()
+        raise AssertionError(type(request).__name__)
+
+    adapter._send_request = _send
+    assert asyncio.run(adapter._rotate_token_pair_and_reauthenticate()) is True
+    assert len(auth_reqs) == 1
+    assert auth_reqs[0].accessToken == "file_access"
+    assert adapter._session_access_token == "file_access"
+
+
+def test_symbol_load_records_session_access_token_without_auth_res() -> None:
+    """The ALREADY_LOGGED_IN path never confirms an ``AccountAuthRes``, so
+    ``_load_symbols_into_cache`` is what records which access token the
+    session runs on. Without the note, a later sibling rotation would leave
+    ``_session_access_token`` empty and the invalidation skip-reason could
+    not tell a dead session from a live one."""
+    adapter = CTraderLiveAdapter(
+        app_id="app",
+        app_secret="secret",
+        access_token="session_access",
+        account_id="1",
+    )
+
+    class _SymbolsReq:
+        pass
+
+    class _SymbolsRes:
+        symbol: list[object] = []
+
+    adapter._ProtoOASymbolsListReq = _SymbolsReq
+    adapter._ProtoOASymbolsListRes = _SymbolsRes
+
+    async def _send(_request, **_kw):
+        return _SymbolsRes()
+
+    adapter._send_request_with_refresh_retry = _send
+
+    asyncio.run(adapter._load_symbols_into_cache())
+
+    assert adapter._authenticated is True
+    assert adapter._session_access_token == "session_access"
 
 
 def test_token_invalidation_for_current_token_without_recent_rotation_drops_session(
@@ -1403,13 +1505,14 @@ def test_every_session_death_path_clears_rotation_state() -> None:
     asyncio.run(_run())
 
 
-def test_token_invalidation_skip_reason_self_heals_latched_flag_on_dead_session() -> (
-    None
-):
+def test_token_invalidation_self_heals_latched_flag_on_dead_session() -> None:
     """``_own_token_rotation_in_flight`` only means something while a session
     is connected. If a session-death path ever leaves it latched, the
-    skip-reason check must clear it instead of letting it suppress every
-    later invalidation event forever."""
+    invalidation handler must clear it (via
+    ``_self_heal_rotation_marker_on_dead_session``) instead of letting it
+    suppress every later invalidation event forever. The skip-reason check
+    itself stays pure: it reports the latched counter rather than clearing
+    it."""
     adapter = CTraderLiveAdapter(
         app_id="app", app_secret="secret", access_token="token", account_id="1"
     )
@@ -1419,8 +1522,9 @@ def test_token_invalidation_skip_reason_self_heals_latched_flag_on_dead_session(
 
     adapter._connected = False
     adapter._own_token_rotation_in_flight = 1
-    assert adapter._token_invalidation_skip_reason() is None
+    adapter._self_heal_rotation_marker_on_dead_session()
     assert adapter._own_token_rotation_in_flight == 0
+    assert adapter._token_invalidation_skip_reason() is None
 
 
 def test_token_invalidation_own_rotation_grace_has_a_sane_floor() -> None:
@@ -1432,6 +1536,9 @@ def test_token_invalidation_own_rotation_grace_has_a_sane_floor() -> None:
     from live_runner import ctrader_adapter as module
 
     assert module._TOKEN_INVALIDATION_OWN_ROTATION_GRACE_SECONDS >= 30.0
+    # ...but bounded: an event for a genuinely revoked token must not be
+    # suppressed indefinitely by a stale ``_token_pair_rotated_at``.
+    assert module._TOKEN_INVALIDATION_OWN_ROTATION_GRACE_SECONDS <= 120.0
 
 
 def test_refresh_adopts_persisted_pair_without_spending_refresh_token(tmp_path) -> None:
@@ -1625,6 +1732,45 @@ def test_listener_reconnect_delay_after_teardown_is_bounded() -> None:
         time.monotonic() - module._LISTENER_RECONNECT_MIN_INTERVAL_SECONDS - 1.0
     )
     assert adapter._listener_reconnect_delay_seconds() == 0.0
+
+
+def test_listener_sleeps_reconnect_floor_before_connecting(monkeypatch) -> None:
+    """``listen_executions`` must actually SLEEP the remaining reconnect
+    floor before calling ``connect()`` - the delay helper being correct is
+    not enough if the loop never awaits it. A broker that keeps dropping
+    the session right after auth would otherwise spin
+    connect/auth/disconnect with no floor."""
+    from live_runner import ctrader_adapter as module
+
+    adapter = CTraderLiveAdapter(
+        app_id="app", app_secret="secret", access_token="token", account_id="1"
+    )
+    adapter._teardown_client()
+    expected_delay = adapter._listener_reconnect_delay_seconds()
+    assert expected_delay > 0.0
+
+    events: list[tuple[str, float]] = []
+    real_sleep = asyncio.sleep
+
+    async def _fake_sleep(delay, *args, **kwargs):
+        events.append(("sleep", delay))
+        await real_sleep(0)
+
+    async def _fake_connect():
+        events.append(("connect", 0.0))
+        # Terminal auth failure makes the listener return cleanly after
+        # the first reconnect attempt.
+        raise CTraderAuthTerminalError("terminal for test")
+
+    monkeypatch.setattr(asyncio, "sleep", _fake_sleep)
+    monkeypatch.setattr(adapter, "connect", _fake_connect)
+
+    asyncio.run(adapter.listen_executions())
+
+    assert [name for name, _ in events] == ["sleep", "connect"]
+    slept = events[0][1]
+    assert slept == pytest.approx(expected_delay, abs=0.5)
+    assert 0.0 < slept <= module._LISTENER_RECONNECT_MIN_INTERVAL_SECONDS
 
 
 def test_on_disconnected_errbacks_in_flight_request_deferreds() -> None:
@@ -1909,6 +2055,107 @@ def test_disconnect_with_pending_execution_work_flags_reconciliation() -> None:
         idle._reconciliation_required = False
         await idle.disconnect()
         assert idle._reconciliation_required is False
+
+    asyncio.run(_run())
+
+
+def test_disconnect_errbacks_in_flight_request_deferreds() -> None:
+    """``disconnect()`` must fail pending request deferreds with
+    ``CTraderConnectionLostError``: ``_on_disconnected`` cannot cover this
+    path because ``self._client`` is already None when it would run, so
+    without the explicit errback each caller would wait out its own
+    response timeout."""
+    from live_runner.ctrader_adapter import CTraderConnectionLostError
+
+    async def _run() -> None:
+        adapter = CTraderLiveAdapter(
+            app_id="app", app_secret="secret", access_token="token", account_id="1"
+        )
+
+        class _Deferred:
+            def __init__(self) -> None:
+                self.errbacks: list[BaseException] = []
+                self.called = False
+
+            def errback(self, exc: BaseException) -> None:
+                self.called = True
+                self.errbacks.append(exc)
+
+        deferred = _Deferred()
+        client = SimpleNamespace(
+            _responseDeferreds={"msg-1": deferred}, running=False
+        )
+        adapter._client = client
+
+        await adapter.disconnect()
+
+        assert len(deferred.errbacks) == 1
+        assert isinstance(deferred.errbacks[0], CTraderConnectionLostError)
+
+    asyncio.run(_run())
+
+
+def test_fail_in_flight_requests_skips_already_called_deferreds() -> None:
+    """A deferred that already resolved must not be errbacked: Twisted's
+    ``errback`` on a called Deferred raises ``AlreadyCalledError``. The
+    ``called`` check is what keeps teardown from churning through
+    resolved requests."""
+    adapter = CTraderLiveAdapter(
+        app_id="app", app_secret="secret", access_token="token", account_id="1"
+    )
+
+    class _Deferred:
+        def __init__(self, called: bool) -> None:
+            self.called = called
+            self.errbacks: list[BaseException] = []
+
+        def errback(self, exc: BaseException) -> None:
+            self.errbacks.append(exc)
+
+    resolved = _Deferred(called=True)
+    pending = _Deferred(called=False)
+    client = SimpleNamespace(
+        _responseDeferreds={"msg-1": resolved, "msg-2": pending}
+    )
+
+    adapter._fail_in_flight_requests(client)
+
+    assert resolved.errbacks == []
+    assert len(pending.errbacks) == 1
+
+
+def test_send_request_untracks_deferred_after_await_settles() -> None:
+    """``_in_flight_request_deferreds`` must not retain a deferred after its
+    await settles: a slow leak of resolved deferreds would grow the set
+    until the next teardown and make ``_fail_in_flight_requests`` errback
+    requests that already completed."""
+    async def _run():
+        adapter = CTraderLiveAdapter(
+            app_id="app",
+            app_secret="secret",
+            access_token="token",
+            account_id="1",
+        )
+        adapter._loop = asyncio.get_running_loop()
+        deferreds: list[object] = []
+
+        class _Deferred:
+            def asFuture(self, loop):
+                future = loop.create_future()
+                future.set_exception(RuntimeError("send failed"))
+                return future
+
+        class _Client:
+            def send(self, _request, **_kwargs):
+                deferred = _Deferred()
+                deferreds.append(deferred)
+                return deferred
+
+        adapter._client = _Client()
+        with pytest.raises(RuntimeError, match="send failed"):
+            await adapter._send_request(object(), timeout_seconds=15)
+        assert deferreds
+        assert adapter._in_flight_request_deferreds == set()
 
     asyncio.run(_run())
 
