@@ -49,6 +49,28 @@ def _broad_handlers(path: Path) -> list[ast.ExceptHandler]:
     ]
 
 
+def _handler_propagates(handler: ast.ExceptHandler) -> bool:
+    """A ``propagate`` marker must actually propagate.
+
+    Either the body raises, or it hands the caught exception object to the
+    caller (stores it, appends it to an error list, re-raises it later) —
+    i.e. the bound ``as`` name is loaded anywhere in the body. A
+    ``propagate``-marked ``pass`` or a body that drops the exception
+    silently is exactly the mislabel this check exists to catch.
+    """
+    for node in ast.walk(handler):
+        if isinstance(node, ast.Raise):
+            return True
+        if (
+            handler.name
+            and isinstance(node, ast.Name)
+            and node.id == handler.name
+            and isinstance(node.ctx, ast.Load)
+        ):
+            return True
+    return False
+
+
 def _violations(root: Path) -> tuple[list[str], list[str], list[str]]:
     """(missing markers, invalid kinds, stray markers) under ``root``."""
     missing: list[str] = []
@@ -67,8 +89,11 @@ def _violations(root: Path) -> tuple[list[str], list[str], list[str]]:
             if match is None:
                 missing.append(rel)
                 continue
-            if match.group(1) not in VALID_KINDS:
-                invalid.append(f"{rel} ({match.group(1)})")
+            kind = match.group(1)
+            if kind not in VALID_KINDS:
+                invalid.append(f"{rel} ({kind})")
+            elif kind == "propagate" and not _handler_propagates(node):
+                invalid.append(f"{rel} (propagate but body never raises or uses the exception)")
 
         for lineno, line in enumerate(lines, start=1):
             if "except-kind:" in line and lineno not in handler_lines:
@@ -134,6 +159,26 @@ def test_gate_accepts_a_classified_fixture(tmp_path: Path) -> None:
     )
     missing, invalid, stray = _violations(tmp_path)
     assert (missing, invalid, stray) == ([], [], [])
+
+
+def test_gate_flags_a_propagate_marker_that_swallows(tmp_path: Path) -> None:
+    """A `propagate` marker on a handler that drops the exception is a lie."""
+    pkg = tmp_path / "runner"
+    pkg.mkdir()
+    (pkg / "bad.py").write_text(
+        "def f():\n"
+        "    try:\n"
+        "        risky()\n"
+        "    except Exception as exc:  # except-kind: propagate - re-raised\n"
+        "        pass\n"
+        "    try:\n"
+        "        other()\n"
+        "    except Exception as exc:  # except-kind: propagate - stored for the caller\n"
+        "        errors.append(exc)\n",
+        encoding="utf-8",
+    )
+    _missing, invalid, _stray = _violations(tmp_path)
+    assert invalid == ["runner/bad.py:4 (propagate but body never raises or uses the exception)"]
 
 
 def test_gate_flags_invalid_kind_and_stray_marker(tmp_path: Path) -> None:
