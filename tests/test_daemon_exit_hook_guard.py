@@ -52,6 +52,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from tests.conftest import sandboxed_env
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 LIVE_RUNNER = REPO_ROOT / "live_runner"
 
@@ -307,10 +309,17 @@ def _is_first_party(rel: str) -> bool:
     inside the checkout, a stray ``venv/``, an editable install - is excluded,
     so third-party teardown hooks (Sentry's flush, certifi's temp files) are
     not policed here.
+
+    ``tests/`` is excluded as well: the probe below runs inside the suite's
+    sandbox, whose child shim imports ``tests/conftest.py`` before the daemon,
+    so the suite's own modules show up in the closure of a *test* child and
+    only there - a production daemon never imports them. Their teardown hooks
+    cannot break a process that does not load them.
     """
     parts = rel.split("/")
     return (
         parts[0] in _FIRST_PARTY_PACKAGES
+        and parts[0] != "tests"
         and "site-packages" not in parts
         and "__pycache__" not in parts
     )
@@ -344,6 +353,7 @@ def _daemon_process_modules() -> list[str]:
         capture_output=True,
         text=True,
         check=True,
+        env=sandboxed_env(),
     )
     return [p for p in json.loads(proc.stdout) if _is_first_party(p)]
 
