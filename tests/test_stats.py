@@ -1346,3 +1346,33 @@ def test_daily_returns_moments_need_four_observations_for_kurtosis():
     assert daily_returns_moments(curve([100.0, 101.0, 100.5, 102.0])) is None  # 3
     four = daily_returns_moments(curve([100.0, 101.0, 100.5, 102.0, 101.0]))
     assert four is not None and four["count"] == 4
+
+
+def test_one_sided_p_value_failure_is_logged_with_traceback(caplog):
+    """A p-value failure degrades to the conservative 1.0 but must not be silent."""
+    import logging
+
+    import runner.stats as stats_module
+
+    with caplog.at_level(logging.DEBUG, logger="runner.stats"):
+        result = stats_module._one_sided_p_value([object()])  # float(object()) raises
+    assert result == 1.0
+    record = next(r for r in caplog.records if "p-value" in r.getMessage())
+    assert record.exc_info is not None
+
+
+def test_safe_qs_failure_is_logged_with_traceback(caplog):
+    """A QuantStats failure degrades to 0.0 but must not be silent."""
+    import logging
+
+    import pandas as pd
+
+    import runner.stats as stats_module
+
+    def boom(returns, **kwargs):
+        raise RuntimeError("qs exploded")
+
+    with caplog.at_level(logging.DEBUG, logger="runner.stats"):
+        assert stats_module._safe_qs(boom, pd.Series([0.01, -0.02])) == 0.0
+    record = next(r for r in caplog.records if "QuantStats" in r.getMessage())
+    assert record.exc_info is not None
