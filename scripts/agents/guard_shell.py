@@ -136,11 +136,10 @@ def _path_in_main_checkout(path_str: str, cwd: Path) -> bool:
     p = Path(path_str)
     if not p.is_absolute():
         p = cwd / p
-    try:
-        p = p.resolve()
-    except OSError:
-        pass
-    return _is_main_checkout(p)
+    # normpath, NOT resolve(): a real venv's bin/python is a symlink to the
+    # system interpreter, and resolving it would escape the checkout. The
+    # kernel still resolves intermediate components when `.git` is probed.
+    return _is_main_checkout(Path(os.path.normpath(p)))
 
 
 # Flags that point an env-mutating command at a venv/checkout other than
@@ -164,6 +163,13 @@ def _env_targets_main_checkout(argv: list[str], cwd: Path) -> bool:
     (``uv --directory <main> sync``, ``npm --prefix <main> ci``).
     """
     bare = _strip_assignments(argv)[0]
+    assigns = argv[: len(argv) - len(bare)]
+    for assignment in assigns:
+        for var in ("VIRTUAL_ENV=", "UV_PROJECT_ENVIRONMENT="):
+            if assignment.startswith(var) and _path_in_main_checkout(
+                assignment[len(var) :], cwd
+            ):
+                return True
     if not bare:
         return False
     first = bare[0]
@@ -941,11 +947,13 @@ def _eval_argv(
         return None
     if depth > _MAX_DEPTH:
         return _TOO_COMPLEX
+    # Before _strip_assignments: leading VIRTUAL_ENV=/UV_PROJECT_ENVIRONMENT=
+    # assignments are part of the main-checkout signal.
+    env_main = env_main or _env_targets_main_checkout(argv, cwd)
     argv, seg_override = _strip_assignments(argv)
     main_ok = main_ok or seg_override
     if not argv:
         return None
-    env_main = env_main or _env_targets_main_checkout(argv, cwd)
     name = _basename(argv[0]).strip("`")
     args = argv[1:]
 

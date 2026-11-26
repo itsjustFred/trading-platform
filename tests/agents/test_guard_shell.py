@@ -59,6 +59,11 @@ def checkouts(tmp_path: Path) -> dict[str, Path]:
     (main / "README.md").write_text("hello\n", encoding="utf-8")
     (main / "src").mkdir()
     (main / "src" / "app.py").write_text("x = 1\n", encoding="utf-8")
+    # A real uv venv's bin/python is a symlink to the system interpreter;
+    # the guard must not resolve it out of the checkout.
+    venv_bin = main / ".venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    (venv_bin / "python").symlink_to(sys.executable)
     _git(main, "add", "README.md", "src/app.py")
     _git(main, "commit", "-m", "init")
     wt = tmp_path / "wt"
@@ -248,6 +253,8 @@ CASES: list[tuple[str, str, bool]] = [
     ("{main}/.venv/bin/pip install foo", "wt", True),
     ("{main}/.venv/bin/pip --version", "wt", False),
     ("{main}/.venv/bin/python -m pip install foo", "wt", True),
+    ("{main}/.venv/bin/python3 -m pip install -U foo", "wt", True),
+    ("{main}/.venv/bin/python -Im pip install foo", "wt", True),
     ("{main}/.venv/bin/python -m pytest tests/", "wt", False),
     ("{main}/.venv/bin/python -m ruff format src/app.py", "wt", False),
     ("uv --directory {main} sync", "wt", True),
@@ -256,6 +263,7 @@ CASES: list[tuple[str, str, bool]] = [
     ("uv --project {main} sync", "wt", True),
     ("uv -p {main}/.venv/bin/python sync", "wt", True),
     ("uv pip --python {main}/.venv/bin/python install foo", "wt", True),
+    ("uv pip install --python {main}/.venv/bin/python foo", "wt", True),
     ("uv pip --prefix {main}/.venv install foo", "wt", True),
     ("uv --directory {main} run pytest", "wt", True),
     ("uv run --project {main} pytest", "wt", True),
@@ -267,6 +275,10 @@ CASES: list[tuple[str, str, bool]] = [
     ("npm --prefix frontend ci", "wt", False),
     ("env FOO=1 {main}/.venv/bin/pip install foo", "wt", True),
     ("sudo {main}/.venv/bin/pip install foo", "wt", True),
+    ("VIRTUAL_ENV={main}/.venv uv pip install foo", "wt", True),
+    ("UV_PROJECT_ENVIRONMENT={main}/.venv uv sync", "wt", True),
+    ("VIRTUAL_ENV={main}/.venv pip install foo", "wt", True),
+    ("VIRTUAL_ENV=src/.venv uv pip install foo", "wt", False),
     # --- outside any checkout: only the global rules apply ----------------------
     ("git commit -m x", "plain", False),
     ("git pull", "plain", False),
