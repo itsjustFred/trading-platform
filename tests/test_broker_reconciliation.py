@@ -1036,6 +1036,37 @@ def test_disagreeing_qty_keys_keep_the_expectation(
     assert "qty keys disagree" in caplog.text
 
 
+def test_order_expectations_survives_a_raising_step_lookup() -> None:
+    """``step_for`` is the fail-closed seam inside ``_order_expectations``:
+    even a callable that raises keeps the working-order expectation instead
+    of aborting the account pass."""
+    import live_runner.broker_reconciliation as recon
+
+    row = {
+        "signal_id": "sig-1",
+        "broker_order_id": "ord-1",
+        "deployment_id": DEPLOYMENT_ID,
+        "symbol": "ETHUSD",
+        "action": "buy",
+        "timestamp": datetime.now(timezone.utc),
+        "metadata": {"qty": 5.5, "explicit_qty": 5.5},
+        "filled_qty": 5.0,
+    }
+
+    def _raise(_symbol: str) -> float:
+        raise RuntimeError("no instrument props")
+
+    expected, _tracked = recon._order_expectations(
+        [row],
+        lambda _symbol: 1e-9,
+        step_for=_raise,
+        expected_deployment_ids={DEPLOYMENT_ID},
+        now=datetime.now(timezone.utc),
+    )
+
+    assert [item["signal_id"] for item in expected] == ["sig-1"]
+
+
 def test_order_state_lookups_share_one_phase_deadline(tmp_path, monkeypatch) -> None:
     """Ten slow lookups must not serialize into a ten-minute stall (#303)."""
     import live_runner.broker_reconciliation as recon

@@ -424,7 +424,8 @@ def _requested_qty(metadata: Mapping[str, Any]) -> float | None:
     whose two keys disagree is adapter corruption, so it is logged and the
     expectation is kept (``None``) rather than reconciled around a guessed
     base - a missing working order is loud, a silently wrong remainder is
-    not.
+    not. The keys are written as the same float, so the agreement check is
+    exact equality on purpose: it must never be relaxed to a tolerance.
     """
     explicit = _positive_qty_metadata_value(metadata.get("explicit_qty"))
     qty = _positive_qty_metadata_value(metadata.get("qty"))
@@ -662,8 +663,24 @@ def _order_expectations(
         if remaining is not None and remaining <= tolerance:
             continue
         if remaining is not None and remaining > 0.0 and math.isfinite(remaining):
-            step = step_for(symbol) if symbol else None
-            if step is not None and floor_qty_to_step(remaining, step) <= 0.0:
+            try:
+                step = step_for(symbol) if symbol else None
+            except Exception as exc:  # except-kind: money-decision
+                # The step lookup must never abort the account pass, whoever
+                # supplies ``step_for``: an unusable step keeps the expectation.
+                # (asyncio.CancelledError is BaseException and still propagates.)
+                logger.warning(
+                    "broker reconciliation: step lookup failed for %s: %r",
+                    symbol,
+                    exc,
+                )
+                step = None
+            if (
+                step is not None
+                and math.isfinite(step)
+                and step > 0
+                and floor_qty_to_step(remaining, step) <= 0.0
+            ):
                 # A remainder below one broker volume step can never be a
                 # working order: the broker cannot represent it. Rows
                 # persisted before the adapters stamped the normalized
