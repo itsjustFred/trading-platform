@@ -878,6 +878,121 @@ class TestInstall:
         assert alerts._ALERT_HANDLER is None
 
 
+class _FakeDiscordTransport:
+    """Stands in for ``requests.post``: records every webhook payload Discord
+    would have received. Setting ``error`` makes the next call raise instead,
+    simulating a webhook outage; the failure is consumed once."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+        self.error: Exception | None = None
+
+    def post(self, url: str, **kwargs: Any) -> Any:
+        self.calls.append({"url": url, **kwargs})
+        if self.error is not None:
+            error, self.error = self.error, None
+            raise error
+
+        class _Response:
+            def raise_for_status(self) -> None:
+                return None
+
+        return _Response()
+
+    def wait_for(self, count: int, timeout: float = 5.0) -> None:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if len(self.calls) >= count:
+                return
+            time.sleep(0.01)
+        raise AssertionError(f"expected {count} webhook calls, got {len(self.calls)}")
+
+
+class TestDaemonAlertChain:
+    """G24 end-to-end: the daemon's real logging and alert install, the real
+    ``DiscordWebhookBackend`` formatting, and a real daemon code path raising -
+    only the HTTP transport is faked, so no test touches the network."""
+
+    @pytest.fixture
+    def discord(self, monkeypatch: pytest.MonkeyPatch) -> _FakeDiscordTransport:
+        transport = _FakeDiscordTransport()
+        monkeypatch.setattr("requests.post", transport.post)
+        return transport
+
+    def _install_daemon_chain(self):
+        """The same call ``run_daemon`` makes, with a webhook URL configured."""
+        import live_runner.daemon as daemon_module  # noqa: F401 - ensures the trading.live-runner logger exists
+
+        sink = install_alert_sink(
+            env={"OPS_ALERT_WEBHOOK_URL": "https://discord.example/hook"}
+        )
+        assert sink is not None
+        return daemon_module, sink
+
+    def test_error_with_exception_pages_once_with_redaction_and_dedup(
+        self, discord: _FakeDiscordTransport, monkeypatch: pytest.MonkeyPatch
+    ):
+        daemon_module, sink = self._install_daemon_chain()
+
+        def _boom(account_id: str):
+            raise RuntimeError("account store unreachable password=s3cr3t-value")
+
+        monkeypatch.setattr(daemon_module, "get_live_account", _boom)
+        # A real daemon code path: the broker-identity lookup logs
+        # logger.exception(...) on failure, which is an ERROR with exc_info.
+        assert daemon_module._live_account_broker_login("acct-1") == ""
+        discord.wait_for(1)
+        # The identical failure inside the dedupe window must not page twice.
+        assert daemon_module._live_account_broker_login("acct-1") == ""
+        _wait_stats(sink, lambda s: s["sent"] + s["suppressed"] == 2)
+        assert len(discord.calls) == 1
+
+        call = discord.calls[0]
+        assert call["url"] == "https://discord.example/hook"
+        assert call["params"] == {"wait": "true"}
+        payload = call["json"]
+        assert payload["allowed_mentions"] == {"parse": []}
+        content = payload["content"]
+        assert "[ERROR]" in content
+        assert "trading.live-runner" in content
+        assert "Could not resolve broker identity for account" in content
+        # The formatted traceback must reach the transport: ``data.error``
+        # alone only carries ``repr(exc)``, so "RuntimeError" alone would pass
+        # even if the exc_info payload were dropped.
+        assert "Traceback" in content
+        assert "RuntimeError" in content
+        # The exception text is redacted before it leaves the process.
+        assert "s3cr3t-value" not in content
+        assert "[Filtered]" in content
+
+    def test_plain_error_pages_warning_does_not_and_backend_failure_is_safe(
+        self, discord: _FakeDiscordTransport
+    ):
+        daemon_module, sink = self._install_daemon_chain()
+
+        daemon_module.logger.error("e2e plain failure %s", "detail")
+        discord.wait_for(1)
+        content = discord.calls[0]["json"]["content"]
+        assert "e2e plain failure detail" in content
+        assert "Traceback" not in content
+
+        # WARNING without an alert marker stays below the ERROR floor.
+        daemon_module.logger.warning("e2e routine warning")
+        time.sleep(0.4)
+        assert len(discord.calls) == 1
+
+        # A failing transport is counted and logged, never raised into the
+        # logging path, and does not mute a later distinct alert.
+        discord.error = RuntimeError("discord webhook 500")
+        daemon_module.logger.error("e2e transport failure probe")
+        _wait_stats(sink, lambda s: s["failed"] == 1)
+        daemon_module.logger.error("e2e after transport failure")
+        # calls[1] is the failed probe (recorded before the raise); the next
+        # distinct alert must still be delivered.
+        discord.wait_for(3)
+        assert "e2e after transport failure" in discord.calls[2]["json"]["content"]
+
+
 class TestFormatting:
     def test_format_includes_level_service_location_and_data(self):
         text = format_alert_text(
