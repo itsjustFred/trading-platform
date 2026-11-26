@@ -1702,11 +1702,15 @@ def _contained_client_data_file(
         return None
     base = base_dir or DATA_DIR
     try:
-        expanded = Path(normalized).expanduser()
+        # Resolved first so the value keeps its old meaning: a relative path is
+        # relative to the viewer's cwd (never inside DATA_DIR), and an absolute
+        # one with a ``..`` that lands inside the tree is accepted. Containment
+        # is safe_join's decision.
+        resolved = Path(normalized).expanduser().resolve()
     except (OSError, RuntimeError, ValueError):
         return None
     try:
-        candidate = safe_join(base, expanded, allow_absolute=True)
+        candidate = safe_join(base, resolved, allow_absolute=True)
     except PathContainmentError:
         return None
     if candidate.suffix.lower() != allowed_suffix.lower():
