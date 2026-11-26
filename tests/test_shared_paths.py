@@ -181,6 +181,54 @@ def test_refuse_symlinks_rejects_a_symlinked_directory_below_the_base(
         safe_join(base, "linked-inside/file.csv", refuse_symlinks=True)
 
 
+def test_refuse_symlinks_checks_an_absolute_path_below_the_base(
+    base: Path, tmp_path: Path
+) -> None:
+    """``allow_absolute`` + ``refuse_symlinks`` must inspect the real components.
+
+    The walk is lexical and has to map an absolute candidate onto the base
+    first; walking the candidate's anchor-relative parts from the base would
+    check a path that does not exist and miss a planted symlink.
+    """
+    outside = tmp_path / "secret.csv"
+    outside.write_text("secret", encoding="utf-8")
+    _symlink_or_skip(base / "escape.csv", outside)
+
+    with pytest.raises(PathContainmentError):
+        safe_join(base, base / "escape.csv", allow_absolute=True, refuse_symlinks=True)
+    assert safe_join(
+        base, base / "sub" / "file.csv", allow_absolute=True, refuse_symlinks=True
+    ) == (base / "sub" / "file.csv").resolve()
+
+
+def test_refuse_symlinks_maps_an_absolute_path_under_a_symlinked_base(
+    tmp_path: Path,
+) -> None:
+    real = tmp_path / "real"
+    (real / "sub").mkdir(parents=True)
+    (real / "sub" / "file.csv").write_text("x", encoding="utf-8")
+    outside_dir = tmp_path / "outside-dir"
+    outside_dir.mkdir()
+    _symlink_or_skip(real / "linked-dir", outside_dir, target_is_directory=True)
+    linked = tmp_path / "linked"
+    _symlink_or_skip(linked, real, target_is_directory=True)
+
+    # Spelled through the resolved base and through the base as given.
+    for candidate in (real / "sub" / "file.csv", linked / "sub" / "file.csv"):
+        assert safe_join(
+            linked, candidate, allow_absolute=True, refuse_symlinks=True
+        ) == (real / "sub" / "file.csv").resolve()
+
+    # And a symlink planted below the base is still caught for an absolute path.
+    with pytest.raises(PathContainmentError):
+        safe_join(
+            linked,
+            real / "linked-dir" / "file.csv",
+            allow_absolute=True,
+            refuse_symlinks=True,
+        )
+
+
 def test_a_symlinked_base_compares_against_its_resolved_target(tmp_path: Path) -> None:
     real = tmp_path / "real"
     (real / "sub").mkdir(parents=True)

@@ -56,10 +56,10 @@ class PathContainmentError(ValueError):
     """Raised when a caller-supplied path does not stay inside its base directory."""
 
 
-def _refuse_symlinked_components(base: Path, candidate: Path) -> None:
-    """Raise if any component of ``candidate`` below ``base`` is a symlink."""
+def _refuse_symlinked_components(base: Path, parts: tuple[str, ...]) -> None:
+    """Raise if any component of ``parts`` below ``base`` is a symlink."""
     current = base
-    for part in candidate.parts:
+    for part in parts:
         if part in {".", "..", ""}:
             continue
         current = current / part
@@ -67,6 +67,26 @@ def _refuse_symlinked_components(base: Path, candidate: Path) -> None:
             raise PathContainmentError(
                 f"refusing a path that runs through a symlink: {current}"
             )
+
+
+def _below_base_parts(base: Path, resolved_base: Path, candidate: Path) -> tuple[str, ...] | None:
+    """Components of ``candidate`` below the base, or None when it has none to walk.
+
+    Lexical by necessity: the walk has to happen before ``resolve()`` or every
+    symlink is already followed and the check sees nothing. A relative candidate
+    is entirely below the base. An absolute one is accepted when it is spelled
+    beneath the resolved base *or* beneath the base as given (a caller that
+    passes ``base / name`` verbatim); anything else is outside the base, and the
+    containment check refuses it without needing the walk.
+    """
+    if not candidate.is_absolute():
+        return candidate.parts
+    for root in (resolved_base, base):
+        try:
+            return candidate.relative_to(root).parts
+        except ValueError:
+            continue
+    return None
 
 
 def _validated_user_path(user_path: str | os.PathLike[str], *, allow_absolute: bool) -> Path:
@@ -130,19 +150,18 @@ def safe_join(
     joining again.
     """
     candidate = _validated_user_path(user_path, allow_absolute=allow_absolute)
-    resolved_base = Path(base).resolve()
+    base_path = Path(base)
+    resolved_base = base_path.resolve()
     if refuse_symlinks:
         # Only components *below* the resolved base are refused. The base
         # itself may be a symlink, and so may any of its ancestors: production
         # runs reach the data directory through one (``~/data`` -> another
         # mount), and resolving it first means that path is simply the base.
-        # An absolute candidate is already checked against ``resolved_base``
-        # below; walking its components from the anchor is what keeps the
-        # symlink refusal honest for it too.
-        walk = candidate
-        if candidate.is_absolute():
-            walk = candidate.relative_to(candidate.anchor)
-        _refuse_symlinked_components(resolved_base, walk)
+        # An absolute candidate is mapped onto the base first, so the walk
+        # inspects the components that will actually be traversed.
+        below = _below_base_parts(base_path, resolved_base, candidate)
+        if below is not None:
+            _refuse_symlinked_components(resolved_base, below)
 
     resolved = _resolved_candidate(resolved_base, candidate)
     if resolved == resolved_base and not allow_base:

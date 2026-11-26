@@ -244,6 +244,7 @@ MATRIX_GRID_OVERVIEW_FILE = "matrix-grid-overview.json"
 MATRIX_GRID_OVERVIEW_PATH = PROJECT_ROOT / "frontend" / "public" / MATRIX_GRID_OVERVIEW_FILE
 LIVE_DEPLOYMENTS_PATH = "/api/live/deployments"
 TASK_NOT_FOUND_DETAIL = "Task not found"
+INVALID_TASK_LOG_PATH_DETAIL = "Invalid task log path"
 PARQUET_SUFFIX = ".parquet"
 NOT_FOUND_DETAIL = "Not found"
 SAVED_TO_PREFIX = "saved to:"
@@ -1965,7 +1966,7 @@ def _validated_task_log_path(task_id: str) -> Path:
         # a swap between check and use must not redirect either.
         return safe_join(TASK_LOGS_DIR, f"task_{normalized}.log", refuse_symlinks=True)
     except PathContainmentError:
-        raise HTTPException(status_code=400, detail="Invalid task log path") from None
+        raise HTTPException(status_code=400, detail=INVALID_TASK_LOG_PATH_DETAIL) from None
 
 
 def _task_for_log_access(task_id: str) -> tuple[str, dict[str, Any], Path]:
@@ -1983,13 +1984,13 @@ def _task_for_log_access(task_id: str) -> tuple[str, dict[str, Any], Path]:
             configured_raw = Path(str(configured_log))
             configured_path = configured_raw.resolve()
         except (OSError, ValueError) as exc:
-            raise HTTPException(status_code=400, detail="Invalid task log path") from exc
+            raise HTTPException(status_code=400, detail=INVALID_TASK_LOG_PATH_DETAIL) from exc
         if (
             configured_raw.is_symlink()
             or configured_path != log_file
             or configured_path.is_symlink()
         ):
-            raise HTTPException(status_code=400, detail="Invalid task log path")
+            raise HTTPException(status_code=400, detail=INVALID_TASK_LOG_PATH_DETAIL)
     return normalized, task, log_file
 
 
@@ -16446,7 +16447,9 @@ async def get_log(
     else:
         # A NUL byte is an unparseable name rather than an escape: keep the
         # 400 this endpoint has always answered for it, and the 403 for a
-        # name that resolves outside the log directory.
+        # name that resolves outside the log directory. safe_join refuses both
+        # with PathContainmentError, which the branch below maps to 403, so
+        # this guard is what preserves the historical 400 for the NUL case.
         if "\x00" in log_name:
             raise HTTPException(status_code=400, detail="Invalid log path")
         try:
