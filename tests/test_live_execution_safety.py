@@ -4485,7 +4485,7 @@ def test_exit_only_orders_close_short_positions_with_a_buy(monkeypatch):
 def test_trade_signal_conversion_rejects_unknown_action_instead_of_selling():
     """The daemon-side conversion site must whitelist, not default: an action
     outside {buy, long, sell, short} is rejected rather than mapped to SELL."""
-    from live_runner.daemon import _trade_signal_to_live_signal
+    from live_runner.daemon import trade_signal_to_live_signal
 
     deployment = _deployment()
     base = TradeSignal(
@@ -4505,15 +4505,15 @@ def test_trade_signal_conversion_rejects_unknown_action_instead_of_selling():
         object.__setattr__(close, field_name, value)
 
     with pytest.raises(ValueError, match=r"Unsupported (signal )?action"):
-        _trade_signal_to_live_signal(close, deployment)
+        trade_signal_to_live_signal(close, deployment)
 
-    converted = _trade_signal_to_live_signal(base, deployment)
+    converted = trade_signal_to_live_signal(base, deployment)
     assert converted.action == "sell"
 
 
 def test_conversion_mints_key_only_with_producer_stamp():
     """CodeRabbit round: timestamp-less signals must not share a minted key."""
-    from live_runner.daemon import _trade_signal_to_live_signal
+    from live_runner.daemon import trade_signal_to_live_signal
 
     deployment = _deployment()
 
@@ -4528,13 +4528,13 @@ def test_conversion_mints_key_only_with_producer_stamp():
             metadata=metadata,
         )
 
-    naked = _trade_signal_to_live_signal(_signal({}), deployment)
+    naked = trade_signal_to_live_signal(_signal({}), deployment)
     assert "idempotency_key" not in naked.metadata
 
-    stamped = _trade_signal_to_live_signal(
+    stamped = trade_signal_to_live_signal(
         _signal({"signal_timestamp": "2026-07-15T10:00:00+00:00"}), deployment
     )
-    restamped = _trade_signal_to_live_signal(
+    restamped = trade_signal_to_live_signal(
         _signal({"signal_timestamp": "2026-07-15T10:00:00+00:00"}), deployment
     )
     assert stamped.metadata["idempotency_key"]

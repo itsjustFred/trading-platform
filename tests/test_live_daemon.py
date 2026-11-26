@@ -1312,7 +1312,7 @@ def test_a_paused_deployment_closes_a_plain_sell_that_cannot_be_a_short(
     """#126 review: the exit classification is per deployment, not per message.
 
     A plain SELL is a full exit on a deployment that cannot short and a short entry on
-    one that can, and which of the two is decided by `_trade_signal_to_live_signal` -
+    one that can, and which of the two is decided by `trade_signal_to_live_signal` -
     after the dispatch gates. Gate it from the raw message instead and the close on the
     can't-short deployment is dropped as an entry, leaving the position open.
     """

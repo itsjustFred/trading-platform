@@ -1,4 +1,4 @@
-# ADR 0001: Consolidate on the native engine as the single strategy engine
+# ADR 0002: Consolidate on the native engine as the single strategy engine
 
 - **Status:** Accepted
 - **Date:** 2026-11-21
