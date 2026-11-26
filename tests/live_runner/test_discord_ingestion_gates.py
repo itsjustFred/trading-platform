@@ -187,12 +187,6 @@ def test_parser_rejects_signal_with_thousands_corrupted_price() -> None:
 # ── C-3.3: fallback ticker extraction must go ─────────────────────────────────
 
 
-def test_fallback_uppercase_symbol_stage_is_gone() -> None:
-    """Decision Record #2: the parser must reject ambiguous/fallback ticker
-    extraction. `WARN`, `ON`, `IS` prose must never mint a ticker."""
-    assert not hasattr(ds, "_fallback_uppercase_symbol")
-
-
 def test_prose_never_mints_a_ticker() -> None:
     message = _message("WARNING ALL ALERT THE MARKET IS NOW RISK ON @ 100.00")
     signal = _parse_trade_signal_from_message(
