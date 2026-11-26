@@ -6151,6 +6151,9 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             try:
                 await self._cancel_order_id(order_id)
             except CTraderApiError as exc:
+                # Narrow on purpose, same as the other sweeps: an
+                # unclassifiable execution event raises RuntimeError, which
+                # must abort - the outcome is unknown, not failed.
                 self._raise_terminal_auth_from_api_error(exc)
                 failed.append(str(order_id))
                 continue

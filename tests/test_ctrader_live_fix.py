@@ -1648,6 +1648,51 @@ def test_an_unknown_flatten_outcome_aborts_the_sweep() -> None:
         _run(adapter.close_all_positions())
 
 
+def test_an_unknown_orphaned_protection_cancel_aborts_the_sweep() -> None:
+    """RuntimeError propagates here too - unknown is not a per-item failure."""
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOAOrderType
+
+    adapter = _control_adapter(
+        orders=[_order(899, ProtoOAOrderType.STOP_LOSS_TAKE_PROFIT, position_id=999)]
+    )
+
+    async def _unknown(order_id: int) -> None:
+        raise RuntimeError("cancel outcome is unknown")
+
+    adapter._cancel_order_id = _unknown
+
+    with pytest.raises(RuntimeError, match="unknown"):
+        _run(adapter.cancel_orphaned_protections())
+
+
+def test_an_execution_event_with_a_zero_type_is_unclassifiable_not_an_error() -> None:
+    """`executionType=0` is not None: the event still reaches the classifier.
+
+    With the error-event class unloaded, an `errorCode` + `executionType=0`
+    response is an execution event with an unreadable type -> RuntimeError,
+    never the definite-refusal branch (which requires executionType absent).
+    """
+    from types import SimpleNamespace
+
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOAOrderType
+
+    adapter = _control_adapter(
+        orders=[_order(893, ProtoOAOrderType.LIMIT)]
+    )
+    adapter._ProtoOAOrderErrorEvent = None
+    adapter._ProtoOAExecutionEvent = None
+    adapter._ProtoOAExecutionType = SimpleNamespace(
+        ORDER_REJECTED=7, ORDER_CANCEL_REJECTED=8, ORDER_FILLED=3
+    )
+    adapter.exec_event[893] = SimpleNamespace(
+        ctidTraderAccountId=46736452, executionType=0, errorCode="UNSET"
+    )
+
+    sweep = adapter.cancel_open_orders()
+    with pytest.raises(RuntimeError, match="could not be classified"):
+        _run(sweep)
+
+
 def test_an_execution_type_alias_with_an_unknown_name_is_unclassifiable() -> None:
     """A number shared by a known non-rejection and an unknown name fails closed.
 
