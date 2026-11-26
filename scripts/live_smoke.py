@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 import math
 import os
@@ -936,7 +937,7 @@ async def _alpaca_roundtrip_check(
         )
     except Exception as exc:
         if order_id:
-            with contextlib_suppress():
+            with contextlib.suppress(Exception):
                 client.cancel_order_by_id(order_id)
         return SmokeCheck(check_name, False, {"order_id": order_id}, _public_error(exc))
 
@@ -1697,14 +1698,6 @@ async def _live_stockkit_e2e(
         elif isinstance(result, BaseException):
             checks.append(SmokeCheck(name, False, error=_public_error(result)))
     return checks
-
-
-class contextlib_suppress:
-    def __enter__(self) -> None:
-        return None
-
-    def __exit__(self, *_exc: object) -> bool:
-        return True
 
 
 async def run_smoke(

@@ -19,7 +19,6 @@ import math
 import traceback
 from collections.abc import Mapping
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, TypedDict
@@ -830,9 +829,6 @@ def _frozen_signal_exit_fill(config: BacktestConfig) -> BacktestConfig:
             "signal_exit_fill='close' explicitly, or run the native engine"
         )
     return config
-
-
-@dataclass
 
 
 class VectorbtAdapter(EngineAdapter):

@@ -31,6 +31,7 @@ from runner.engines.base import (
 )
 from runner.engines import contract
 from shared.atomic_io import write_text_atomically
+from shared.constants import DATA_DIR
 from shared.models import BacktestResult
 
 logger = logging.getLogger(__name__)
@@ -38,7 +39,7 @@ logger = logging.getLogger(__name__)
 LEAN_PROJECT_DIR = Path(
     os.environ.get(
         "LEAN_PROJECT_DIR",
-        Path.home() / "Desktop" / "custom_lean_integration",
+        DATA_DIR / "lean_project",
     )
 )
 
