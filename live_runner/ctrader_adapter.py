@@ -586,11 +586,28 @@ def _present_proto_field(
                 return None
         except Exception:  # except-kind: money-decision
             # Presence is unanswerable: fail_closed callers get the sentinel,
-            # everyone else reads the field as absent - never as proof.
+            # everyone else reads the field as absent - never as proof. Logged
+            # because a swallowed HasField failure is otherwise invisible.
+            logger.warning(
+                "cTrader HasField(%s) failed; treating field presence as "
+                "unanswerable",
+                name,
+                exc_info=True,
+            )
             if fail_closed:
                 return _PRESENT_BUT_UNKNOWN
             return None
     return getattr(payload, name, None)
+
+
+def _present_proto_field_fail_closed(payload: Any, name: str) -> Any | None:
+    """``_present_proto_field`` for refusal classification.
+
+    Every field check on the order-refusal path MUST go through this wrapper:
+    an unanswerable ``HasField`` reads as present-but-unknown, never absent,
+    because "absent" is the direction that would release the submission lease.
+    """
+    return _present_proto_field(payload, name, fail_closed=True)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -3628,10 +3645,8 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             # for a new-order request a non-zero positionId is not provably
             # pre-position either. A close request echoes positionId, so only
             # its orderId decides.
-            order_id = _present_proto_field(response, "orderId", fail_closed=True)
-            position_id = _present_proto_field(
-                response, "positionId", fail_closed=True
-            )
+            order_id = _present_proto_field_fail_closed(response, "orderId")
+            position_id = _present_proto_field_fail_closed(response, "positionId")
             definitive_refusal = order_id in (None, 0) and (
                 self._is_close_position_request(request)
                 or position_id in (None, 0)
@@ -3645,10 +3660,10 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 error_code=str(getattr(response, "errorCode", "") or ""),
                 definitive=definitive_refusal,
             )
-        # Only ProtoOAExecutionEvent carries ``executionType``. When the proto
-        # class itself is not loaded, sniff the attribute instead of skipping:
-        # an unclassifiable event must fail closed below, never pass as
-        # submitted.
+        # Only ProtoOAExecutionEvent carries ``executionType`` in the proto
+        # schema, so this attribute sniff is a fallback for an unloaded class,
+        # not a general detector: an unclassifiable event must fail closed
+        # below, never pass as submitted.
         is_execution_event = (
             isinstance(response, self._ProtoOAExecutionEvent)
             if self._ProtoOAExecutionEvent is not None
@@ -3661,6 +3676,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 # loaded, or an unreadable executionType): it may be the
                 # ORDER_REJECTED refusal this path exists to catch, so it must
                 # not fall through and be reported as a submitted order.
+                # Removing this raise reopens #428.
                 raise RuntimeError(
                     "cTrader order response was an execution event whose "
                     "executionType could not be classified; the outcome is "
@@ -3727,7 +3743,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         the same rule the OrderErrorEvent path applies to ``positionId``.
         Unanswerable field presence fails closed to "unknown".
         """
-        order = _present_proto_field(event, "order", fail_closed=True)
+        order = _present_proto_field_fail_closed(event, "order")
         if order is _PRESENT_BUT_UNKNOWN or order is None:
             return False
         status_enum = getattr(self, "_ProtoOAOrderStatus", None)
@@ -3747,9 +3763,9 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         # ``is not None``, never truthiness: protobuf messages are falsy when
         # empty, and an attached-but-empty deal is still an execution record
         # whose presence cannot be proven harmless.
-        if _present_proto_field(event, "deal", fail_closed=True) is not None:
+        if _present_proto_field_fail_closed(event, "deal") is not None:
             return False
-        position = _present_proto_field(event, "position", fail_closed=True)
+        position = _present_proto_field_fail_closed(event, "position")
         if position is _PRESENT_BUT_UNKNOWN:
             return False
         if self._is_close_position_request(request):
