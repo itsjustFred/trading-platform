@@ -6726,10 +6726,37 @@ def _naked_position_client(
     )
 
 
+def _heal_lot(
+    *,
+    signal_id: str,
+    symbol: str = "NVDA",
+    qty: float = 135.0,
+    deployment_id: str = "dep-1",
+) -> dict:
+    return {
+        "deployment_id": deployment_id,
+        "symbol": symbol,
+        "signal_id": signal_id,
+        "qty": qty,
+        "action": "buy",
+        "timestamp": datetime.now(timezone.utc),
+        "broker_order_id": None,
+    }
+
+
 def _patch_heal_ledger(
-    monkeypatch, *, ledger_qty: float | None, entry_signal_id: str | None = None
-) -> list[dict]:
-    """Stub the ledger/metadata/audit reads the heal makes; returns audit rows."""
+    monkeypatch,
+    *,
+    ledger_qty: float | None,
+    entry_signal_id: str | None = None,
+    symbol: str = "NVDA",
+    open_lots: list[dict] | None = None,
+    pending_markers: list[dict] | None = None,
+    quote_bid: float = 149.0,
+    quote_ask: float = 149.5,
+    market_state: str = "open",
+) -> tuple[list[dict], AlpacaLiveAdapter]:
+    """Stub every read the maintenance pass makes; returns (audit rows, adapter)."""
     audits: list[dict] = []
     ledger_value = (
         {"dep-1": ledger_qty}
@@ -6756,12 +6783,46 @@ def _patch_heal_ledger(
         "earliest_live_signal_timestamp",
         lambda *_a, **_k: None,
     )
+    if open_lots is None:
+        open_lots = [
+            _heal_lot(
+                signal_id=entry_signal_id or str(uuid4()),
+                symbol=symbol,
+                qty=abs(ledger_qty or 1.0),
+            )
+        ]
+    monkeypatch.setattr(
+        alpaca_module,
+        "list_live_account_open_position_lots",
+        lambda _account: [dict(lot) for lot in open_lots],
+    )
+    monkeypatch.setattr(
+        alpaca_module,
+        "list_pending_exit_reprotections",
+        lambda _account, **_k: list(pending_markers or []),
+    )
     monkeypatch.setattr(
         alpaca_module,
         "record_live_control_audit",
         lambda **kwargs: audits.append(kwargs) or {},
     )
-    return audits
+    adapter = _adapter(_naked_position_client())
+    adapter.account_id = "heal-test-account"
+
+    async def _quote(_symbol: str):
+        return alpaca_module.LiveQuote(
+            bid=quote_bid,
+            ask=quote_ask,
+            timestamp=datetime.now(timezone.utc),
+        )
+
+    monkeypatch.setattr(adapter, "get_quote", _quote)
+    monkeypatch.setattr(adapter, "_heal_market_state", lambda _symbol: market_state)
+    return audits, adapter
+
+
+def _run_heal(adapter: AlpacaLiveAdapter) -> None:
+    asyncio.run(adapter.maintain_protective_stops(force=True))
 
 
 def _working_stop(symbol: str, side: str = "sell", qty: float = 135.0) -> _FakeOrder:
@@ -6783,11 +6844,14 @@ def test_expired_entry_stop_leg_is_replaced_with_gtc_stop(monkeypatch, caplog) -
     entry_id = str(uuid4())
     parent, _leg = _expired_entry_parent(entry_signal_id=entry_id)
     client = _naked_position_client(parents=[parent])
-    adapter = _adapter(client)
-    audits = _patch_heal_ledger(monkeypatch, ledger_qty=135.0, entry_signal_id=entry_id)
+    _audits, adapter = _patch_heal_ledger(
+        monkeypatch, ledger_qty=135.0, entry_signal_id=entry_id
+    )
+    adapter._trading_client = client
+    audits = _audits
 
     with caplog.at_level("ERROR"):
-        asyncio.run(adapter._heal_expired_entry_stops(client))
+        _run_heal(adapter)
 
     assert len(client.submitted) == 1
     request = client.submitted[0]
@@ -6809,7 +6873,7 @@ def test_expired_entry_stop_leg_is_replaced_with_gtc_stop(monkeypatch, caplog) -
     )
     assert any(
         record.message.startswith("ALERT:")
-        and "expired" in record.message
+        and "unprotected" in record.message
         for record in caplog.records
     )
     assert any(
@@ -6818,21 +6882,22 @@ def test_expired_entry_stop_leg_is_replaced_with_gtc_stop(monkeypatch, caplog) -
         for row in audits
     )
 
-    # A second pass finds the working GTC stop and places nothing.
-    asyncio.run(adapter._heal_expired_entry_stops(client))
+    # A second pass finds the working GTC stop - our own - and places nothing.
+    _run_heal(adapter)
     assert len(client.submitted) == 1
 
 
 def test_expired_stop_heal_ignores_non_expired_and_canceled_legs(monkeypatch) -> None:
-    """Only ``expired`` counts: a ``held`` leg is still protection and a
-    ``canceled`` leg was released deliberately."""
-    for leg_status in ("held", "canceled", "filled"):
+    """Only ``expired`` (or a proven aged cancel) counts: a ``held`` leg is
+    still protection, a ``filled`` leg already fired, and an unproven
+    ``canceled`` leg only alerts - it is never healed."""
+    for leg_status in ("held", "filled"):
         parent, _leg = _expired_entry_parent(leg_status=leg_status)
         client = _naked_position_client(parents=[parent])
-        adapter = _adapter(client)
-        _patch_heal_ledger(monkeypatch, ledger_qty=135.0)
+        _audits, adapter = _patch_heal_ledger(monkeypatch, ledger_qty=135.0)
+        adapter._trading_client = client
 
-        asyncio.run(adapter._heal_expired_entry_stops(client))
+        _run_heal(adapter)
 
         assert client.submitted == [], leg_status
 
@@ -6843,15 +6908,15 @@ def test_expired_stop_heal_two_candidate_legs_alerts_only(monkeypatch, caplog) -
     parent_a, _leg_a = _expired_entry_parent(stop_price=140.0)
     parent_b, _leg_b = _expired_entry_parent(stop_price=144.89)
     client = _naked_position_client(parents=[parent_a, parent_b])
-    adapter = _adapter(client)
-    _patch_heal_ledger(monkeypatch, ledger_qty=135.0)
+    _audits, adapter = _patch_heal_ledger(monkeypatch, ledger_qty=135.0)
+    adapter._trading_client = client
 
     with caplog.at_level("ERROR"):
-        asyncio.run(adapter._heal_expired_entry_stops(client))
+        _run_heal(adapter)
 
     assert client.submitted == []
     assert any(
-        "ambiguous_expired_stop_legs" in str(record.__dict__.get("data", {}))
+        "ambiguous_lost_stop_orders" in str(record.__dict__.get("data", {}))
         for record in caplog.records
     )
 
@@ -6861,15 +6926,68 @@ def test_expired_stop_heal_ledger_mismatch_alerts_only(monkeypatch, caplog) -> N
     re-protect; the broker reconciliation owns that finding."""
     parent, _leg = _expired_entry_parent()
     client = _naked_position_client(parents=[parent])
-    adapter = _adapter(client)
-    _patch_heal_ledger(monkeypatch, ledger_qty=140.0)
+    _audits, adapter = _patch_heal_ledger(monkeypatch, ledger_qty=140.0)
+    adapter._trading_client = client
 
     with caplog.at_level("ERROR"):
-        asyncio.run(adapter._heal_expired_entry_stops(client))
+        _run_heal(adapter)
 
     assert client.submitted == []
     assert any(
         "ledger_mismatch" in str(record.__dict__.get("data", {}))
+        for record in caplog.records
+    )
+
+
+def test_expired_stop_heal_multi_deployment_alerts_only(monkeypatch, caplog) -> None:
+    """Two deployments holding the symbol's ledger cannot prove which one
+    owns the broker position: alert, never heal (SF4)."""
+    parent, _leg = _expired_entry_parent()
+    client = _naked_position_client(parents=[parent])
+    audits: list[dict] = []
+    monkeypatch.setattr(
+        alpaca_module,
+        "get_account_net_filled_qty_by_deployment",
+        lambda _a, _s: {"dep-1": 70.0, "dep-2": 65.0},
+    )
+    monkeypatch.setattr(
+        alpaca_module, "get_live_signal_metadata", lambda _sid: {}
+    )
+    monkeypatch.setattr(
+        alpaca_module,
+        "earliest_live_open_lot_entry_timestamp",
+        lambda *_a, **_k: None,
+    )
+    monkeypatch.setattr(
+        alpaca_module,
+        "earliest_live_signal_timestamp",
+        lambda *_a, **_k: None,
+    )
+    monkeypatch.setattr(
+        alpaca_module, "list_pending_exit_reprotections", lambda *_a, **_k: []
+    )
+    monkeypatch.setattr(
+        alpaca_module,
+        "record_live_control_audit",
+        lambda **kwargs: audits.append(kwargs) or {},
+    )
+    adapter = _adapter(client)
+    adapter.account_id = "heal-test-account"
+
+    async def _quote(_symbol: str):
+        return alpaca_module.LiveQuote(
+            bid=149.0, ask=149.5, timestamp=datetime.now(timezone.utc)
+        )
+
+    monkeypatch.setattr(adapter, "get_quote", _quote)
+    monkeypatch.setattr(adapter, "_heal_market_state", lambda _s: "open")
+
+    with caplog.at_level("ERROR"):
+        _run_heal(adapter)
+
+    assert client.submitted == []
+    assert any(
+        "ledger_multi_deployment" in str(record.__dict__.get("data", {}))
         for record in caplog.records
     )
 
@@ -6881,31 +6999,498 @@ def test_expired_stop_heal_working_stop_alerts_only(monkeypatch, caplog) -> None
     client = _naked_position_client(
         parents=[parent], orders=[_working_stop("NVDA")]
     )
-    adapter = _adapter(client)
-    _patch_heal_ledger(monkeypatch, ledger_qty=135.0)
+    _audits, adapter = _patch_heal_ledger(monkeypatch, ledger_qty=135.0)
+    adapter._trading_client = client
 
     with caplog.at_level("ERROR"):
-        asyncio.run(adapter._heal_expired_entry_stops(client))
+        _run_heal(adapter)
 
     assert client.submitted == []
     assert any(
-        "expired_leg_but_stop_working" in str(record.__dict__.get("data", {}))
+        "stop_already_working" in str(record.__dict__.get("data", {}))
         for record in caplog.records
     )
 
 
-def test_expired_stop_heal_unattributed_leg_alerts_only(monkeypatch, caplog) -> None:
-    """An expired leg whose parent names no verifiable entry signal is never
-    guessed into a ledger."""
-    parent, _leg = _expired_entry_parent(entry_signal_id="not-a-signal-id")
-    client = _naked_position_client(parents=[parent])
-    adapter = _adapter(client)
-    _patch_heal_ledger(monkeypatch, ledger_qty=135.0)
+def test_expired_stop_heal_own_reprotect_stop_is_informational(
+    monkeypatch, caplog
+) -> None:
+    """A working stop carrying our own ``-reprotect`` client order id means
+    an earlier heal already covered the position: informational only - no
+    ERROR alert and no audit row (SF5)."""
+    entry_id = str(uuid4())
+    parent, _leg = _expired_entry_parent(entry_signal_id=entry_id)
+    own_stop = _working_stop("NVDA")
+    own_stop.client_order_id = f"{entry_id}-reprotect-earlier"
+    client = _naked_position_client(parents=[parent], orders=[own_stop])
+    audits, adapter = _patch_heal_ledger(
+        monkeypatch, ledger_qty=135.0, entry_signal_id=entry_id
+    )
+    adapter._trading_client = client
 
     with caplog.at_level("ERROR"):
-        asyncio.run(adapter._heal_expired_entry_stops(client))
+        _run_heal(adapter)
+
+    assert client.submitted == []
+    assert audits == []
+    assert not any(
+        record.message.startswith("ALERT:") for record in caplog.records
+    )
+
+
+def test_expired_stop_heal_unverifiable_entry_with_ambiguous_lots_alerts(
+    monkeypatch, caplog
+) -> None:
+    """An expired leg whose parent names no verifiable entry is healed only
+    when the ledger proves a single open lot; two open lots make the entry
+    ambiguous and nothing is placed (SF4)."""
+    parent, _leg = _expired_entry_parent(entry_signal_id="not-a-signal-id")
+    client = _naked_position_client(parents=[parent])
+    _audits, adapter = _patch_heal_ledger(
+        monkeypatch,
+        ledger_qty=135.0,
+        open_lots=[
+            _heal_lot(signal_id=str(uuid4())),
+            _heal_lot(signal_id=str(uuid4())),
+        ],
+    )
+    adapter._trading_client = client
+
+    with caplog.at_level("ERROR"):
+        _run_heal(adapter)
 
     assert client.submitted == []
     assert any(
-        "expired_leg_unattributed" in str(record.__dict__.get("data", {}))
+        "entry_ambiguous" in str(record.__dict__.get("data", {}))
         for record in caplog.records
+    )
+
+
+def test_expired_stop_heal_single_open_lot_attributes_to_it(
+    monkeypatch,
+) -> None:
+    """When the parent coid verifies nothing but the ledger proves exactly
+    one open lot on the one non-zero deployment, the heal attributes to
+    that lot's entry signal - the position is provably the platform's."""
+    entry_id = str(uuid4())
+    parent, _leg = _expired_entry_parent(entry_signal_id="not-a-signal-id")
+    client = _naked_position_client(parents=[parent])
+    audits, adapter = _patch_heal_ledger(
+        monkeypatch,
+        ledger_qty=135.0,
+        entry_signal_id=entry_id,
+        open_lots=[_heal_lot(signal_id=entry_id)],
+    )
+    adapter._trading_client = client
+
+    _run_heal(adapter)
+
+    assert len(client.submitted) == 1
+    assert str(getattr(client.submitted[0], "client_order_id", "")).startswith(
+        f"{entry_id}-reprotect-"
+    )
+    assert any(
+        row.get("detail", {}).get("entry_signal_id") == entry_id
+        for row in audits
+    )
+
+
+def test_maintain_protective_stops_throttles_periodic_scans(monkeypatch) -> None:
+    """The periodic path scans at most once per interval; ``force`` (the
+    connect-time recovery) always scans."""
+    parent, _leg = _expired_entry_parent()
+    client = _naked_position_client(parents=[parent])
+    _audits, adapter = _patch_heal_ledger(monkeypatch, ledger_qty=135.0)
+    adapter._trading_client = client
+
+    scans = _status_all_requests(client)
+    asyncio.run(adapter.maintain_protective_stops())
+    assert len(_status_all_requests(client)) > len(scans)
+    after_first = len(_status_all_requests(client))
+
+    # Inside the interval the pass returns before touching the broker.
+    asyncio.run(adapter.maintain_protective_stops())
+    assert len(_status_all_requests(client)) == after_first
+
+    # The connect-time path always scans.
+    asyncio.run(adapter.maintain_protective_stops(force=True))
+    assert len(_status_all_requests(client)) > after_first
+
+
+def test_maintain_protective_stops_lock_timeout_skips_without_throttle(
+    monkeypatch, caplog
+) -> None:
+    """A busy account order-placement lock skips the symbol's writes and
+    must NOT consume the throttle: the next pass retries the scan (N2)."""
+    entry_id = str(uuid4())
+    parent, _leg = _expired_entry_parent(entry_signal_id=entry_id)
+    client = _naked_position_client(parents=[parent])
+    _audits, adapter = _patch_heal_ledger(
+        monkeypatch, ledger_qty=135.0, entry_signal_id=entry_id
+    )
+    adapter._trading_client = client
+
+    class _BusyLock:
+        async def __aenter__(self):
+            raise alpaca_module.AccountOrderLockTimeoutError("busy")
+
+        async def __aexit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(
+        alpaca_module, "account_order_placement", lambda *_a, **_k: _BusyLock()
+    )
+    with caplog.at_level("WARNING"):
+        asyncio.run(adapter.maintain_protective_stops(force=True))
+
+    assert client.submitted == []
+    assert adapter._expired_stop_heal_last_run == 0.0
+
+    # The throttle was not consumed: the very next pass scans and heals.
+    monkeypatch.undo()
+    _audits2, adapter2 = _patch_heal_ledger(
+        monkeypatch, ledger_qty=135.0, entry_signal_id=entry_id
+    )
+    adapter2._trading_client = client
+    asyncio.run(adapter2.maintain_protective_stops())
+    assert len(client.submitted) == 1
+
+
+def test_protective_stop_near_aged_expiry_is_replaced(monkeypatch) -> None:
+    """Decision 3: a working GTC stop inside the lead window before its
+    ~90-day aged cancel is canceled and re-placed at the same level."""
+    entry_id = str(uuid4())
+    created = datetime.now(timezone.utc) - timedelta(days=86)
+    expiring = _working_stop("NVDA", qty=135.0)
+    expiring.id = "expiring-stop-1"
+    expiring.stop_price = 141.0
+    expiring.created_at = created
+    expiring.submitted_at = created
+    parent, _leg = _expired_entry_parent(
+        entry_signal_id=entry_id, leg_status="filled"
+    )
+    client = _naked_position_client(orders=[expiring], parents=[parent])
+    audits, adapter = _patch_heal_ledger(
+        monkeypatch, ledger_qty=135.0, entry_signal_id=entry_id
+    )
+    adapter._trading_client = client
+
+    _run_heal(adapter)
+
+    assert "expiring-stop-1" in client.cancelled
+    assert len(client.submitted) == 1
+    request = client.submitted[0]
+    assert _tif_text(request) == "gtc"
+    assert getattr(request, "stop_price", None) == pytest.approx(141.0)
+    assert str(getattr(request, "client_order_id", "")).startswith(
+        f"{entry_id}-reprotect-"
+    )
+    assert any(
+        row.get("detail", {}).get("outcome") == "stop_replaced_before_aged_cancel"
+        for row in audits
+    )
+
+
+def test_protective_stop_aged_policy_cancel_leg_heals(monkeypatch) -> None:
+    """Decision 3: a ``canceled`` leg whose ``canceled_at`` lands at its
+    computed expiry is the aged-order policy, not an operator - it heals."""
+    entry_id = str(uuid4())
+    created = datetime.now(timezone.utc) - timedelta(days=91)
+    expiry = created + timedelta(days=90)
+    canceled_at = expiry + timedelta(hours=1)
+    parent, leg = _expired_entry_parent(
+        entry_signal_id=entry_id, leg_status="canceled"
+    )
+    leg.created_at = created
+    leg.canceled_at = canceled_at
+    client = _naked_position_client(parents=[parent])
+    audits, adapter = _patch_heal_ledger(
+        monkeypatch, ledger_qty=135.0, entry_signal_id=entry_id
+    )
+    adapter._trading_client = client
+
+    _run_heal(adapter)
+
+    assert len(client.submitted) == 1
+    assert _tif_text(client.submitted[0]) == "gtc"
+    assert any(
+        row.get("detail", {}).get("outcome") == "stop_replaced"
+        for row in audits
+    )
+
+
+def test_protective_stop_unproven_canceled_leg_alerts_only(
+    monkeypatch, caplog
+) -> None:
+    """A ``canceled`` stop with no readable timestamps cannot be proven to
+    be the aged policy or ours: one alert, never a heal."""
+    parent, _leg = _expired_entry_parent(leg_status="canceled")
+    client = _naked_position_client(parents=[parent])
+    _audits, adapter = _patch_heal_ledger(monkeypatch, ledger_qty=135.0)
+    adapter._trading_client = client
+
+    with caplog.at_level("ERROR"):
+        _run_heal(adapter)
+
+    assert client.submitted == []
+    assert any(
+        "canceled_stop_unproven" in str(record.__dict__.get("data", {}))
+        for record in caplog.records
+    )
+
+
+def test_protective_stop_through_market_closes_at_market(
+    monkeypatch, caplog
+) -> None:
+    """Decision 2: a recorded stop already through the market closes the
+    position at market through the attributed ``-reprotect`` order id."""
+    entry_id = str(uuid4())
+    parent, _leg = _expired_entry_parent(
+        entry_signal_id=entry_id, stop_price=150.0
+    )
+    client = _naked_position_client(parents=[parent])
+    audits, adapter = _patch_heal_ledger(
+        monkeypatch,
+        ledger_qty=135.0,
+        entry_signal_id=entry_id,
+        quote_bid=149.0,
+        quote_ask=149.5,
+    )
+    adapter._trading_client = client
+
+    with caplog.at_level("ERROR"):
+        _run_heal(adapter)
+
+    assert len(client.submitted) == 1
+    request = client.submitted[0]
+    assert _type_text(request) == "market"
+    assert _side_text(request) == "sell"
+    assert _tif_text(request) == "day"
+    assert str(getattr(request, "client_order_id", "")).startswith(
+        f"{entry_id}-reprotect-"
+    )
+    # The fake fills the market order: the position is gone.
+    assert client.positions == []
+    assert any(
+        row.get("detail", {}).get("outcome") == "closed_at_market"
+        for row in audits
+    )
+
+
+def test_protective_stop_through_market_stale_quote_fails_closed(
+    monkeypatch, caplog
+) -> None:
+    """An unavailable or stale quote means no close AND no stop placement:
+    the heal fails closed and alerts (decision 2)."""
+    entry_id = str(uuid4())
+    parent, _leg = _expired_entry_parent(
+        entry_signal_id=entry_id, stop_price=150.0
+    )
+    client = _naked_position_client(parents=[parent])
+    _audits, adapter = _patch_heal_ledger(
+        monkeypatch,
+        ledger_qty=135.0,
+        entry_signal_id=entry_id,
+        quote_bid=149.0,
+        quote_ask=149.5,
+    )
+    adapter._trading_client = client
+
+    async def _stale_quote(_symbol: str):
+        return alpaca_module.LiveQuote(
+            bid=149.0,
+            ask=149.5,
+            timestamp=datetime.now(timezone.utc) - timedelta(seconds=120),
+        )
+
+    monkeypatch.setattr(adapter, "get_quote", _stale_quote)
+
+    with caplog.at_level("ERROR"):
+        _run_heal(adapter)
+
+    assert client.submitted == []
+    assert client.positions
+    assert any(
+        "heal_quote_unusable" in str(record.__dict__.get("data", {}))
+        for record in caplog.records
+    )
+
+
+def test_protective_stop_through_market_closed_session_retries(
+    monkeypatch, caplog
+) -> None:
+    """Through-market but the venue is closed: alert and wait for the next
+    pass - a market close cannot be sent into a closed session."""
+    entry_id = str(uuid4())
+    parent, _leg = _expired_entry_parent(
+        entry_signal_id=entry_id, stop_price=150.0
+    )
+    client = _naked_position_client(parents=[parent])
+    _audits, adapter = _patch_heal_ledger(
+        monkeypatch,
+        ledger_qty=135.0,
+        entry_signal_id=entry_id,
+        quote_bid=149.0,
+        quote_ask=149.5,
+        market_state="closed",
+    )
+    adapter._trading_client = client
+
+    with caplog.at_level("ERROR"):
+        _run_heal(adapter)
+
+    assert client.submitted == []
+    assert any(
+        "heal_market_closed" in str(record.__dict__.get("data", {}))
+        for record in caplog.records
+    )
+
+
+def test_protective_stop_exit_in_flight_blocks_heal(monkeypatch, caplog) -> None:
+    """SF3: a working reducing-side non-stop order (an exit already in
+    flight) means the heal must not race it."""
+    parent, _leg = _expired_entry_parent()
+    exit_order = _FakeOrder(
+        "exit-1", "NVDA", "sell", order_type="market", qty=135.0, status="new"
+    )
+    client = _naked_position_client(parents=[parent], orders=[exit_order])
+    _audits, adapter = _patch_heal_ledger(monkeypatch, ledger_qty=135.0)
+    adapter._trading_client = client
+
+    with caplog.at_level("ERROR"):
+        _run_heal(adapter)
+
+    assert client.submitted == []
+    assert any(
+        "exit_in_flight" in str(record.__dict__.get("data", {}))
+        for record in caplog.records
+    )
+
+
+def test_protective_stop_pending_marker_blocks_heal(monkeypatch, caplog) -> None:
+    """SF3: a pending ``exit_reprotection`` marker means the exit flow owns
+    this symbol's protection right now."""
+    parent, _leg = _expired_entry_parent()
+    client = _naked_position_client(parents=[parent])
+    _audits, adapter = _patch_heal_ledger(
+        monkeypatch,
+        ledger_qty=135.0,
+        pending_markers=[{"symbol": "NVDA", "signal_id": str(uuid4())}],
+    )
+    adapter._trading_client = client
+
+    with caplog.at_level("ERROR"):
+        _run_heal(adapter)
+
+    assert client.submitted == []
+    assert any(
+        "exit_reprotection_pending" in str(record.__dict__.get("data", {}))
+        for record in caplog.records
+    )
+
+
+def test_protective_stop_expired_leg_under_pending_entry_only_skipped_alert(
+    monkeypatch, caplog
+) -> None:
+    """N1: an expired stop leg under a NOT-yet-filled parent is surfaced as a
+    skipped finding, never silently dropped and never healed."""
+    entry_id = str(uuid4())
+    leg = _FakeOrder(
+        f"sl-{uuid4().hex[:8]}",
+        "",
+        "sell",
+        order_type="stop",
+        order_class="oto",
+        qty=135.0,
+        stop_price=144.89,
+        status="expired",
+    )
+    parent = _FakeOrder(
+        f"parent-{uuid4().hex[:8]}",
+        "NVDA",
+        "buy",
+        order_type="market",
+        order_class="oto",
+        qty=135.0,
+        status="new",
+        legs=[leg],
+        client_order_id=entry_id,
+    )
+    client = _naked_position_client(parents=[parent])
+    _audits, adapter = _patch_heal_ledger(monkeypatch, ledger_qty=135.0)
+    adapter._trading_client = client
+
+    with caplog.at_level("ERROR"):
+        _run_heal(adapter)
+
+    assert client.submitted == []
+    assert any(
+        "expired_leg_skipped" in str(record.__dict__.get("data", {}))
+        and "parent_unfilled" in str(record.__dict__.get("data", {}))
+        for record in caplog.records
+    )
+
+
+def test_connect_recovery_runs_protective_maintenance(monkeypatch) -> None:
+    """SF7: the connect-time trigger drives ``maintain_protective_stops``
+    with ``force=True`` after the recovery locks are released."""
+    adapter = _adapter(_FakeTradingClient())
+    adapter.account_id = "heal-test-account"
+    calls: list[bool] = []
+
+    async def _fake_maintain(*, force: bool = False) -> None:
+        calls.append(force)
+
+    async def _noop_recover() -> None:
+        return None
+
+    monkeypatch.setattr(adapter, "maintain_protective_stops", _fake_maintain)
+    monkeypatch.setattr(adapter, "_recover_exit_reprotections", _noop_recover)
+
+    asyncio.run(adapter._run_exit_reprotection_recovery())
+
+    assert calls == [True]
+
+
+def test_protective_stop_leg_on_entry_side_is_not_protection(monkeypatch) -> None:
+    """Pin: a stop order on the ENTRY side of a long position is an entry
+    intent, not protection - the heal must never touch it."""
+    entry_id = str(uuid4())
+    parent, leg = _expired_entry_parent(
+        entry_signal_id=entry_id, leg_status="expired"
+    )
+    leg.side = "buy"  # wrong side for the long NVDA position
+    client = _naked_position_client(parents=[parent])
+    _audits, adapter = _patch_heal_ledger(
+        monkeypatch, ledger_qty=135.0, entry_signal_id=entry_id
+    )
+    adapter._trading_client = client
+
+    _run_heal(adapter)
+
+    assert client.submitted == []
+
+
+def test_protective_stop_stop_limit_keeps_recorded_limit_price(
+    monkeypatch,
+) -> None:
+    """Pin: a ``stop_limit`` leg heals as a stop-limit at BOTH recorded
+    prices - dropping the limit price would turn protection into a
+    stop-market the strategy never had."""
+    entry_id = str(uuid4())
+    parent, leg = _expired_entry_parent(entry_signal_id=entry_id)
+    leg.order_type = "stop_limit"
+    leg.limit_price = 144.0
+    client = _naked_position_client(parents=[parent])
+    _audits, adapter = _patch_heal_ledger(
+        monkeypatch, ledger_qty=135.0, entry_signal_id=entry_id
+    )
+    adapter._trading_client = client
+
+    _run_heal(adapter)
+
+    assert len(client.submitted) == 1
+    request = client.submitted[0]
+    assert _tif_text(request) == "gtc"
+    assert getattr(request, "stop_price", None) == pytest.approx(144.89)
+    assert getattr(request, "limit_price", None) == pytest.approx(144.0)

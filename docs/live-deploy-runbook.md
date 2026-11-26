@@ -565,11 +565,25 @@ snapshot. For every account with an ACTIVE or PAUSED deployment it compares:
 
 Note the Alpaca aged-order policy: any GTC order - including the protective
 legs and restored stops the adapter submits `GTC` - is cancelled by Alpaca
-~90 days after creation, and nothing re-places a protective order lost that
-way yet. A position left without a working protective stop surfaces as the
-reconciler's `position_without_protective_stop` finding (entry halt after
-the consecutive-mismatch threshold), which is the safety net until aged-order
-re-placement is implemented.
+~90 days after creation. The adapter's protective-stop maintenance pass
+(`AlpacaLiveAdapter.maintain_protective_stops`, driven at connect by the
+exit re-protection recovery and by the daemon's
+`protective-stop-maintenance` loop under the broker mutation gate) re-places
+such orders before they age out (~3 trading days of lead, measured from
+`expires_at` or `created_at` + 90 days) and heals ones already lost - an
+`expired` leg, or a `canceled` order provably killed by the policy
+(`canceled_at` landing at the computed expiry; an operator or own cancel is
+alerted, never healed). A recorded stop already through the market closes
+the position at market instead of re-placing a stop that would fill
+instantly; a stale/missing quote or a closed session fails closed and
+retries next pass. Every heal event alerts once and writes a
+`alpaca_expired_entry_stop_heal` audit row; heals only run when the ledger
+proves the position is a single deployment's open lot matching the broker
+quantity, no exit is in flight, and no `exit_reprotection` marker is
+pending. A position left without a working protective stop for any other
+reason still surfaces as the reconciler's
+`position_without_protective_stop` finding (entry halt after the
+consecutive-mismatch threshold).
 
 Unreadable broker state is a mismatch (fail closed), but it must not flap: a
 deployment's entries are halted only after

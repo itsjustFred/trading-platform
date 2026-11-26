@@ -135,6 +135,9 @@ from live_runner.promotion import (
     enforce_promotion_gate,
     is_real_money,
 )
+from live_runner.protective_stop_maintenance import (
+    run_protective_stop_maintenance_loop,
+)
 from live_runner.service_discovery import discover_discord_bots_from_env
 from live_runner.shutdown import (
     DEFAULT_CLEANUP_TIMEOUT_SECONDS,
@@ -7903,6 +7906,16 @@ async def _run_daemon_locked(
                 ),
                 name="internal-strategy-loop",
             )
+            # Protective-stop maintenance (expired DAY legs, Alpaca's ~90-day
+            # aged-order cancels) can place, cancel and close orders, so it
+            # runs under the same mutation gate as the trailing loop.
+            protective_maintenance_task = asyncio.create_task(
+                run_protective_stop_maintenance_loop(
+                    lambda: _trailing_eligible_adapters(active_adapters),
+                    mutation_gate=_broker_mutation,
+                ),
+                name="protective-stop-maintenance",
+            )
             loop_tasks = (
                 sync_task,
                 service_sync_task,
@@ -7912,6 +7925,7 @@ async def _run_daemon_locked(
                 commission_task,
                 reconciliation_task,
                 internal_strategy_task,
+                protective_maintenance_task,
             )
             startup_phase = False
 
