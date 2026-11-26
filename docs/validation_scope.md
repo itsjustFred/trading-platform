@@ -19,7 +19,7 @@
 
 | Bereich | Beschreibung |
 |---------|--------------|
-| **Import & Normalisierung** | MT5-XLSX-Reports (primär) und MT5-HTML-Reports (Fallback) einlesen und in `ValidationReference` normalisieren. |
+| **Import & Normalisierung** | MT5-XLSX-Reports (einzige geparste MT5-Form; HTML-Reports bleiben Menschen-Artefakte) einlesen und in `ValidationReference` normalisieren. |
 | **Domänenmodell** | `ValidationReference` mit Pflichtfeldern: `strategy_name`, `source_framework`, `symbol`, `timeframe`, `settings`, `trades`, `stats`, `raw_metadata`. |
 | **Trade Matching** | Vergleich von Entry/Exit Time, Direction, Entry/Exit Price, Volume, Position Size, PnL, Stop Loss, Take Profit zwischen externer Referenz und internem `BacktestResult`. |
 | **Trade Anomalies** | Erkennung von Missing Trades, Extra Trades und Mismatches. |
@@ -47,7 +47,7 @@
 
 ## Annahmen
 
-1. MT5-Reports liegen als XLSX-Dateien vor; HTML ist Fallback.
+1. MT5-Reports liegen als XLSX-Dateien vor; HTML-Reports werden nicht geparst.
 2. XLSX-Reports enthalten mindestens Orders- und Trades/Deals-Tabellen mit den benötigten Spalten.
 3. Interne `BacktestResult`-Objekte können aus dem Vergleichs-Runner oder einer Datei geladen werden.
 4. Zeitzonen werden soweit möglich normalisiert (ISO 8601 UTC); bei fehlender Zeitzoneninfo wird Broker-Serverzeit angenommen.

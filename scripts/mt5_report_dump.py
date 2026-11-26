@@ -186,7 +186,9 @@ def _build_argument_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("report", type=Path, help="Path to the MT5 XLSX report.")
     parser.add_argument("--csv", type=Path, required=True, help="CSV output path.")
-    parser.add_argument("--json", dest="json_path", type=Path, required=True, help="JSON output path.")
+    parser.add_argument(
+        "--json", dest="json_path", type=Path, required=True, help="JSON output path."
+    )
     timezone_group = parser.add_mutually_exclusive_group()
     timezone_group.add_argument(
         "--source-timezone",
