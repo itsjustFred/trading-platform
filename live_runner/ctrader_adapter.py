@@ -996,6 +996,23 @@ def _payload_ctid_trader_account_id(payload: Any) -> int:
         return 0
 
 
+def _payload_ctid_trader_account_ids(payload: Any) -> tuple[int, ...]:
+    """``ctidTraderAccountIds`` on an inbound payload, ``()`` when unset.
+
+    ``ProtoOAAccountsTokenInvalidatedEvent`` carries a *repeated* account-id
+    field, so the singular ``_payload_ctid_trader_account_id`` helper cannot
+    read it. An empty tuple means the event names no account: it cannot be
+    proven foreign, so callers treat it like an own-account event.
+    """
+    try:
+        return tuple(
+            int(account_id)
+            for account_id in (getattr(payload, "ctidTraderAccountIds", None) or ())
+        )
+    except (TypeError, ValueError):
+        return ()
+
+
 _CTRADER_AUTH_FAILURE_FALLBACK = "cTrader account authorization failed"
 
 #: ``ProtoOAAccountType`` numbers -> lowercase names. Mirrored here so the
@@ -1396,6 +1413,8 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._ProtoOAExecutionEvent: Any = None
         self._ProtoOAOrderErrorEvent: Any = None
         self._ProtoOAErrorRes: Any = None
+        self._ProtoOAAccountDisconnectEvent: Any = None
+        self._ProtoOAAccountsTokenInvalidatedEvent: Any = None
         self._ProtoOATraderReq: Any = None
         self._ProtoOATraderRes: Any = None
         self._ProtoOAOrderDetailsReq: Any = None
@@ -1435,6 +1454,8 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._execution_payload_type: int | None = None
         self._error_payload_type: int | None = None
         self._order_error_payload_type: int | None = None
+        self._account_disconnect_payload_type: int | None = None
+        self._accounts_token_invalidated_payload_type: int | None = None
 
     def _load_openapi_types(self) -> None:
         if self._client_class is not None:
@@ -1447,6 +1468,8 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             from ctrader_open_api.messages.OpenApiMessages_pb2 import (
                 ProtoOAAccountAuthReq,
                 ProtoOAAccountAuthRes,
+                ProtoOAAccountDisconnectEvent,
+                ProtoOAAccountsTokenInvalidatedEvent,
                 ProtoOAAmendPositionSLTPReq,
                 ProtoOAApplicationAuthReq,
                 ProtoOAApplicationAuthRes,
@@ -1514,6 +1537,8 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._ProtoOAExecutionEvent = ProtoOAExecutionEvent
         self._ProtoOAOrderErrorEvent = ProtoOAOrderErrorEvent
         self._ProtoOAErrorRes = ProtoOAErrorRes
+        self._ProtoOAAccountDisconnectEvent = ProtoOAAccountDisconnectEvent
+        self._ProtoOAAccountsTokenInvalidatedEvent = ProtoOAAccountsTokenInvalidatedEvent
         self._ProtoOATraderReq = ProtoOATraderReq
         self._ProtoOATraderRes = ProtoOATraderRes
         self._ProtoOAOrderDetailsReq = ProtoOAOrderDetailsReq
@@ -1552,6 +1577,10 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._execution_payload_type = ProtoOAExecutionEvent().payloadType
         self._error_payload_type = ProtoOAErrorRes().payloadType
         self._order_error_payload_type = ProtoOAOrderErrorEvent().payloadType
+        self._account_disconnect_payload_type = ProtoOAAccountDisconnectEvent().payloadType
+        self._accounts_token_invalidated_payload_type = (
+            ProtoOAAccountsTokenInvalidatedEvent().payloadType
+        )
 
     def _raise_if_terminal_auth_failed(self) -> None:
         if not self._terminal_auth_failure_reason:
@@ -1734,6 +1763,24 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 )
                 return
 
+        # Server-initiated lifecycle events are not in
+        # ``_account_scoped_payload_types``: they do their own account check
+        # (the invalidation event carries a repeated id list) and log foreign
+        # events at DEBUG rather than the WARNING drop path.
+        if (
+            self._account_disconnect_payload_type is not None
+            and payload_type == self._account_disconnect_payload_type
+        ):
+            self._handle_account_disconnect_event(payload)
+            return
+
+        if (
+            self._accounts_token_invalidated_payload_type is not None
+            and payload_type == self._accounts_token_invalidated_payload_type
+        ):
+            self._handle_accounts_token_invalidated_event(payload)
+            return
+
         if self._spot_payload_type is not None and payload_type == self._spot_payload_type:
             self._handle_spot_event(payload)
             return
@@ -1812,14 +1859,93 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             },
         )
 
+    def _handle_account_disconnect_event(self, payload: Any) -> None:
+        """Server ended this account's session (``ProtoOAAccountDisconnectEvent``).
+
+        Transient by contract: the event carries no terminal reason, so the
+        session state is dropped and the ordinary ``connect()`` path - with
+        its existing retry backoff - re-authenticates on next use. No
+        terminal auth latch is set. Foreign-account events are ignored at
+        DEBUG: a lifecycle event for another account says nothing about this
+        session.
+        """
+        payload_account_id = _payload_ctid_trader_account_id(payload)
+        if payload_account_id and payload_account_id != self.ctid_trader_account_id:
+            logger.debug(
+                "Ignoring cTrader account-disconnect event for a different account",
+                extra={
+                    "data": {
+                        "account_id": self.ctid_trader_account_id,
+                        "payload_account_id": payload_account_id,
+                    }
+                },
+            )
+            return
+        logger.warning(
+            "cTrader account disconnect event: the broker ended this account's "
+            "session; re-authenticating on the next connect",
+            extra={
+                "data": {
+                    "account_id": self.ctid_trader_account_id,
+                    "account_config_id": self.account_config_id,
+                    "payload_account_id": payload_account_id,
+                }
+            },
+        )
+        self._teardown_client()
+
+    def _handle_accounts_token_invalidated_event(self, payload: Any) -> None:
+        """Server invalidated this account's access token
+        (``ProtoOAAccountsTokenInvalidatedEvent``).
+
+        The dead token must never carry another order, so the whole session
+        is torn down: the next ``connect()`` re-authenticates, and the
+        account-auth failure it hits drives the existing
+        ``_refresh_access_token`` flow (which persists rotated tokens to the
+        accounts env file exactly as before). If the refresh cannot produce
+        usable credentials the existing terminal-auth path latches, and any
+        submit in between fails closed inside ``order_not_submitted`` -
+        provably before a request is written, never an unknown outcome.
+        """
+        account_ids = _payload_ctid_trader_account_ids(payload)
+        if account_ids and self.ctid_trader_account_id not in account_ids:
+            logger.debug(
+                "Ignoring cTrader token-invalidation event for different accounts",
+                extra={
+                    "data": {
+                        "account_id": self.ctid_trader_account_id,
+                        "payload_account_ids": list(account_ids),
+                    }
+                },
+            )
+            return
+        reason = str(getattr(payload, "reason", "") or "").strip()
+        logger.warning(
+            "cTrader accounts token invalidated event (reason: %s); "
+            "dropping the session so the next connect refreshes the token "
+            "and re-authenticates",
+            reason or "not given",
+            extra={
+                "data": {
+                    "account_id": self.ctid_trader_account_id,
+                    "account_config_id": self.account_config_id,
+                    "reason": reason,
+                    "payload_account_ids": list(account_ids),
+                }
+            },
+        )
+        self._teardown_client()
+
     def _account_scoped_payload_types(self) -> frozenset[int]:
         """Inbound payload types that name a ``ctidTraderAccountId``.
 
-        These are the only payloads ``_on_message`` acts on (spot quotes,
-        executions, order errors, error responses); a payload of any other
-        type is ignored here anyway, so the foreign-account guard only needs
-        to cover this set. Computed per message because tests bind the
-        ``_*_payload_type`` attributes directly without ``_load_openapi_types``.
+        These are the payloads the foreign-account drop guard in
+        ``_on_message`` covers (spot quotes, executions, order errors, error
+        responses); the server lifecycle events do their own account check
+        with DEBUG-level foreign logging. A payload of any other type is
+        ignored here anyway. Computed per message because tests bind the
+        ``_*_payload_type`` attributes directly without
+        ``_load_openapi_types``.
         """
         return frozenset(
             payload_type

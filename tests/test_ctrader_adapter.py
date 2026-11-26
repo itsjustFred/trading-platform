@@ -325,6 +325,330 @@ def test_on_message_accepts_error_res_without_account_id(caplog) -> None:
     assert not any("different account" in record.getMessage() for record in caplog.records)
 
 
+def _lifecycle_event_adapter(account_id: int = 46736452):
+    """Adapter wired for the server lifecycle events with real proto classes."""
+    from ctrader_open_api.messages.OpenApiMessages_pb2 import (
+        ProtoOAAccountDisconnectEvent,
+        ProtoOAAccountsTokenInvalidatedEvent,
+    )
+
+    adapter, client, ProtoMessage = _real_proto_message_adapter(account_id)
+    adapter._account_disconnect_payload_type = ProtoOAAccountDisconnectEvent().payloadType
+    adapter._accounts_token_invalidated_payload_type = (
+        ProtoOAAccountsTokenInvalidatedEvent().payloadType
+    )
+    adapter._connected = True
+    adapter._authenticated = True
+    adapter._connected_event.set()
+    return adapter, client, ProtoMessage
+
+
+def _assert_session_dropped_for_reconnect(adapter) -> None:
+    """Both lifecycle events must leave nothing that can submit on the dead session."""
+    assert adapter._client is None
+    assert adapter._connected is False
+    assert adapter._authenticated is False
+    assert adapter._connected_event.is_set() is False
+    assert adapter._terminal_auth_failure_reason == ""
+    assert adapter._terminal_auth_failure_code == ""
+
+
+def test_on_message_account_disconnect_event_drops_session_for_reconnect(caplog) -> None:
+    """A server-side account disconnect is transient: the session state is
+    dropped so the next ``connect()`` re-authenticates, and no terminal auth
+    latch is set."""
+    import logging
+
+    from ctrader_open_api.messages.OpenApiMessages_pb2 import (
+        ProtoOAAccountDisconnectEvent,
+    )
+
+    adapter, client, ProtoMessage = _lifecycle_event_adapter()
+
+    with caplog.at_level(logging.WARNING, logger="trading.live-runner"):
+        adapter._on_message(
+            client,
+            _wire_payload(
+                ProtoMessage,
+                ProtoOAAccountDisconnectEvent(ctidTraderAccountId=46736452),
+            ),
+        )
+
+    _assert_session_dropped_for_reconnect(adapter)
+    assert any(
+        "disconnect" in record.getMessage().lower() for record in caplog.records
+    )
+
+
+def test_on_message_account_disconnect_event_ignores_foreign_account(caplog) -> None:
+    """A disconnect event naming another account must not touch this session."""
+    import logging
+
+    from ctrader_open_api.messages.OpenApiMessages_pb2 import (
+        ProtoOAAccountDisconnectEvent,
+    )
+
+    adapter, client, ProtoMessage = _lifecycle_event_adapter()
+
+    with caplog.at_level(logging.DEBUG, logger="trading.live-runner"):
+        adapter._on_message(
+            client,
+            _wire_payload(
+                ProtoMessage,
+                ProtoOAAccountDisconnectEvent(ctidTraderAccountId=11111111),
+            ),
+        )
+
+    assert adapter._client is client
+    assert adapter._connected is True
+    assert adapter._authenticated is True
+    assert any(
+        record.levelname == "DEBUG" and "different account" in record.getMessage()
+        for record in caplog.records
+    )
+    assert not any(
+        record.levelname == "WARNING" and "disconnect" in record.getMessage().lower()
+        for record in caplog.records
+    )
+
+
+def test_on_message_accounts_token_invalidated_event_drops_session(caplog) -> None:
+    """A server-side token invalidation drops the authenticated session so the
+    next connect re-auths through the existing refresh flow."""
+    import logging
+
+    from ctrader_open_api.messages.OpenApiMessages_pb2 import (
+        ProtoOAAccountsTokenInvalidatedEvent,
+    )
+
+    adapter, client, ProtoMessage = _lifecycle_event_adapter()
+
+    with caplog.at_level(logging.WARNING, logger="trading.live-runner"):
+        adapter._on_message(
+            client,
+            _wire_payload(
+                ProtoMessage,
+                ProtoOAAccountsTokenInvalidatedEvent(
+                    ctidTraderAccountIds=[46736452],
+                    reason="token revoked",
+                ),
+            ),
+        )
+
+    _assert_session_dropped_for_reconnect(adapter)
+    assert any(
+        "token revoked" in record.getMessage() for record in caplog.records
+    )
+
+
+def test_on_message_accounts_token_invalidated_event_ignores_foreign_accounts(
+    caplog,
+) -> None:
+    """A token-invalidation event that does not name this account is ignored."""
+    import logging
+
+    from ctrader_open_api.messages.OpenApiMessages_pb2 import (
+        ProtoOAAccountsTokenInvalidatedEvent,
+    )
+
+    adapter, client, ProtoMessage = _lifecycle_event_adapter()
+
+    with caplog.at_level(logging.DEBUG, logger="trading.live-runner"):
+        adapter._on_message(
+            client,
+            _wire_payload(
+                ProtoMessage,
+                ProtoOAAccountsTokenInvalidatedEvent(
+                    ctidTraderAccountIds=[11111111, 22222222],
+                    reason="token revoked",
+                ),
+            ),
+        )
+
+    assert adapter._client is client
+    assert adapter._connected is True
+    assert adapter._authenticated is True
+    assert any(
+        record.levelname == "DEBUG" and "different account" in record.getMessage()
+        for record in caplog.records
+    )
+    assert not any(
+        record.levelname == "WARNING" and "invalidated" in record.getMessage().lower()
+        for record in caplog.records
+    )
+
+
+def test_on_message_accounts_token_invalidated_event_without_account_ids_fails_closed(
+    caplog,
+) -> None:
+    """An invalidation event that names no account cannot be proven foreign;
+    the safe direction is to drop the session and re-auth."""
+    import logging
+
+    from ctrader_open_api.messages.OpenApiMessages_pb2 import (
+        ProtoOAAccountsTokenInvalidatedEvent,
+    )
+
+    adapter, client, ProtoMessage = _lifecycle_event_adapter()
+
+    with caplog.at_level(logging.WARNING, logger="trading.live-runner"):
+        adapter._on_message(
+            client,
+            _wire_payload(
+                ProtoMessage,
+                ProtoOAAccountsTokenInvalidatedEvent(reason="token revoked"),
+            ),
+        )
+
+    _assert_session_dropped_for_reconnect(adapter)
+
+
+def _stub_successful_reconnect(adapter, monkeypatch) -> list[str]:
+    """Wire ``connect()`` to a fake transport that authenticates immediately."""
+    calls: list[str] = []
+
+    client = SimpleNamespace(running=False)
+
+    def start_service() -> None:
+        client.running = True
+        adapter._on_connected(client)
+
+    client.startService = start_service
+
+    async def authenticate() -> None:
+        calls.append("authenticate")
+        adapter._authenticated = True
+        adapter._symbol_name_to_id = {"EURUSD": 1}
+
+    async def reconcile(*, max_signals: int = 200) -> int:
+        calls.append("reconcile")
+        return 0
+
+    monkeypatch.setattr(adapter, "_load_openapi_types", lambda: None)
+    monkeypatch.setattr(adapter, "_create_client", lambda: client)
+    monkeypatch.setattr(adapter, "_authenticate", authenticate)
+    monkeypatch.setattr(adapter, "reconcile_executions", reconcile)
+    return calls
+
+
+def test_connect_after_disconnect_event_reauthenticates(monkeypatch) -> None:
+    """The transient disconnect must be recovered by the ordinary connect
+    path: fresh transport, ``_authenticate`` re-run, session restored."""
+    from ctrader_open_api.messages.OpenApiMessages_pb2 import (
+        ProtoOAAccountDisconnectEvent,
+    )
+
+    adapter, client, ProtoMessage = _lifecycle_event_adapter()
+    calls = _stub_successful_reconnect(adapter, monkeypatch)
+
+    adapter._on_message(
+        client,
+        _wire_payload(
+            ProtoMessage,
+            ProtoOAAccountDisconnectEvent(ctidTraderAccountId=46736452),
+        ),
+    )
+    _assert_session_dropped_for_reconnect(adapter)
+
+    asyncio.run(adapter.connect())
+
+    assert calls == ["authenticate", "reconcile"]
+    assert adapter._authenticated is True
+    assert adapter._connected is True
+    assert adapter._client is not None
+
+
+def test_connect_after_token_invalidation_reauthenticates(monkeypatch) -> None:
+    """After a token-invalidation event the next connect() re-auths through
+    the same path; the refresh itself happens inside account-auth recovery."""
+    from ctrader_open_api.messages.OpenApiMessages_pb2 import (
+        ProtoOAAccountsTokenInvalidatedEvent,
+    )
+
+    adapter, client, ProtoMessage = _lifecycle_event_adapter()
+    calls = _stub_successful_reconnect(adapter, monkeypatch)
+
+    adapter._on_message(
+        client,
+        _wire_payload(
+            ProtoMessage,
+            ProtoOAAccountsTokenInvalidatedEvent(
+                ctidTraderAccountIds=[46736452], reason="token revoked"
+            ),
+        ),
+    )
+    _assert_session_dropped_for_reconnect(adapter)
+
+    asyncio.run(adapter.connect())
+
+    assert calls == ["authenticate", "reconcile"]
+    assert adapter._authenticated is True
+
+
+def test_submit_order_after_token_invalidation_fails_closed_before_sending(
+    monkeypatch,
+) -> None:
+    """An order submitted after a token-invalidation event must never reach
+    the dead session: the refusal is provably pre-request, so the caller does
+    not have to treat the outcome as unknown."""
+    import uuid
+    from datetime import datetime, timezone
+
+    from ctrader_open_api.messages.OpenApiMessages_pb2 import (
+        ProtoOAAccountsTokenInvalidatedEvent,
+    )
+
+    from live_runner import ctrader_adapter as module
+    from live_runner.base_adapter import is_order_not_submitted
+    from shared.models import LiveSignal
+
+    adapter, client, ProtoMessage = _lifecycle_event_adapter()
+    adapter._symbol_name_to_id = {"EURUSD": 1}
+
+    adapter._on_message(
+        client,
+        _wire_payload(
+            ProtoMessage,
+            ProtoOAAccountsTokenInvalidatedEvent(
+                ctidTraderAccountIds=[46736452], reason="token revoked"
+            ),
+        ),
+    )
+    assert adapter._authenticated is False
+    assert adapter._client is None
+
+    monkeypatch.setattr(module, "get_live_signal_broker_order_id", lambda _sid: "")
+
+    async def _fail_connect() -> None:
+        raise CTraderAuthTerminalError(
+            "cTrader token refresh failed", error_code="INVALID_TOKEN"
+        )
+
+    adapter.connect = _fail_connect
+
+    async def _unexpected_send(*_args, **_kwargs):
+        raise AssertionError(
+            "order request reached the broker after a token-invalidation event"
+        )
+
+    adapter._send_request_with_refresh_retry = _unexpected_send
+
+    signal = LiveSignal(
+        id=uuid.uuid4(),
+        deployment_id="dep-1",
+        symbol="EURUSD",
+        action="buy",
+        theoretical_price=1.1,
+        timestamp=datetime(2026, 11, 26, tzinfo=timezone.utc),
+        metadata={"qty": 1.0},
+    )
+
+    with pytest.raises(CTraderAuthTerminalError) as excinfo:
+        asyncio.run(adapter.submit_order(signal, qty=1.0))
+
+    assert is_order_not_submitted(excinfo.value)
+
+
 def test_send_request_stamps_client_msg_id_and_failed_await() -> None:
     """The clientMsgId on the wire is account-scoped, process-unique and
     names the request type, and a failed await is stamped so the NO RESPONSE
