@@ -627,6 +627,38 @@ async def _clear_exit_reprotection_marker(
         )
 
 
+async def _reread_exit_order_until_terminal(
+    get_order: Any, order_id: str, *, sleep: Any
+) -> tuple[Any, bool]:
+    """Re-read ``order_id`` until it reads terminal, bounded.
+
+    Up to ``_EXIT_MARKER_REREAD_ATTEMPTS`` reads
+    ``_EXIT_MARKER_REREAD_INTERVAL_SECONDS`` apart, only while the status is
+    non-terminal; a terminal status or a failed read ends the loop early.
+    Returns ``(fresh, terminal)`` - ``terminal`` is True only when the last
+    read proved a terminal status, so a still-working order, an exhausted
+    retry budget and an unknown outcome are all indistinguishable to the
+    caller: the marker stays.
+    """
+    fresh: Any = None
+    for attempt in range(_EXIT_MARKER_REREAD_ATTEMPTS):
+        try:
+            fresh = await asyncio.to_thread(get_order, order_id)
+        except Exception as exc:  # except-kind: money-decision
+            logger.debug(
+                "Alpaca exit order %s could not be re-read after "
+                "re-protect; the marker stays pending: %r",
+                order_id,
+                exc,
+            )
+            return fresh, False
+        if _order_status(fresh) in _TERMINAL_ORDER_STATUSES:
+            return fresh, True
+        if attempt + 1 < _EXIT_MARKER_REREAD_ATTEMPTS:
+            await sleep(_EXIT_MARKER_REREAD_INTERVAL_SECONDS)
+    return fresh, False
+
+
 def _is_definite_broker_rejection(exc: BaseException) -> bool:
     """Whether ``exc`` proves the broker answered and refused the order.
 
@@ -4033,11 +4065,15 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         terminal and its ``filled_qty`` must cover the requested exit
         quantity. The re-read is a short bounded retry - a market exit is
         usually still ``new`` on the first read right after the re-place, so
-        a single read would strand the marker until the next connect. Up to
-        ``_EXIT_MARKER_REREAD_ATTEMPTS`` reads ``_EXIT_MARKER_REREAD_INTERVAL_SECONDS``
-        apart, only while the status is non-terminal; a terminal status or a
-        failed read ends the loop. The caller holds the account order lock,
-        so the sleeps total well under the ~1.5 s budget. A still-working
+        a single read would strand the marker until the next connect. The
+        retry loop lives in ``_reread_exit_order_until_terminal``: up to
+        ``_EXIT_MARKER_REREAD_ATTEMPTS`` reads
+        ``_EXIT_MARKER_REREAD_INTERVAL_SECONDS`` apart, only while the
+        status is non-terminal; a terminal status or a failed read ends it.
+        The caller holds the account order lock AND ``_order_book_lock``
+        (inside ``_submit_exit_releasing_protection``), so the ~1 s of
+        sleeps also blocks flatten sweeps and trailing replaces on this
+        adapter - the budget stays well under ~1.5 s. A still-working
         order, a short fill, an unknown status or a failed re-read all keep
         the marker - the connect replay is the backstop; the stream only
         alerts (#350 review).
@@ -4046,24 +4082,9 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         get_order = getattr(client, "get_order_by_id", None)
         if order_id is None or not callable(get_order):
             return
-        fresh: Any = None
-        terminal = False
-        for attempt in range(_EXIT_MARKER_REREAD_ATTEMPTS):
-            try:
-                fresh = await asyncio.to_thread(get_order, order_id)
-            except Exception as exc:  # except-kind: money-decision
-                logger.debug(
-                    "Alpaca exit order %s could not be re-read after "
-                    "re-protect; the marker stays pending: %r",
-                    order_id,
-                    exc,
-                )
-                return
-            if _order_status(fresh) in _TERMINAL_ORDER_STATUSES:
-                terminal = True
-                break
-            if attempt + 1 < _EXIT_MARKER_REREAD_ATTEMPTS:
-                await sleep(_EXIT_MARKER_REREAD_INTERVAL_SECONDS)
+        fresh, terminal = await _reread_exit_order_until_terminal(
+            get_order, order_id, sleep=sleep
+        )
         if not terminal or fresh is None:
             return
         exit_qty = plan.get("exit_qty")
@@ -4141,6 +4162,26 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             # otherwise leave the uncovered shares naked forever (#350 review).
             return "pending"
         candidates = await self._exit_protection_candidates(client, symbol, side)
+        if any(candidate.get("qty") is None for candidate in candidates):
+            # An unreadable quantity can be neither counted as covered nor
+            # safely excluded from the top-up: treating it as 0 inflates
+            # ``uncovered`` and over-protects shares already covered. Fail
+            # closed - alert and keep the marker pending (#350 review).
+            logger.error(
+                "ALERT: Alpaca exit re-protection for %s found working "
+                "protection whose quantity is unreadable; coverage can be "
+                "neither verified nor safely topped up - the marker stays "
+                "pending. Reconcile manually",
+                symbol,
+                extra={
+                    "data": {
+                        "signal_id": signal_id,
+                        "symbol": symbol,
+                        "marker": dict(marker),
+                    }
+                },
+            )
+            return "pending"
         kinds = {_exit_protection_kind(c) for c in candidates}
         uncovered = abs(position_qty) - _covered_exit_protection_qty(candidates)
         if candidates and uncovered > self.position_qty_tolerance(symbol):
