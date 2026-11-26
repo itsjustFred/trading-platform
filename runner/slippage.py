@@ -653,7 +653,7 @@ def _slippage_params_declare_cost(params: dict[str, Any]) -> bool:
             try:
                 if describe().get("model") == "none":
                     return False
-            except Exception:
+            except Exception:  # except-kind: best-effort - undescribable model treated as cost-declaring
                 pass
         return True
     if isinstance(explicit, str):
