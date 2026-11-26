@@ -3640,6 +3640,11 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         return symbol_id
 
     def _build_close_position_request(self, *, position_id: int, volume: int) -> Any:
+        """Build the position-addressed close for an already-resolved *volume*.
+
+        ``submit_order`` resolves the volume exactly once and passes it here,
+        exactly as it does for the entry request.
+        """
         if self._ProtoOAClosePositionReq is None:
             raise RuntimeError("cTrader close-position request type is unavailable.")
         if isinstance(position_id, bool):
