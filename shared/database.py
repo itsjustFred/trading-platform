@@ -4716,7 +4716,7 @@ def list_live_deployment_unfilled_entry_order_refs(
             continue
         metadata_dict = metadata if isinstance(metadata, dict) else {}
         is_close = (
-            _is_exit_only_signal_metadata(metadata_dict)
+            is_exit_only_signal_metadata(metadata_dict)
             or str(source or "") == BROKER_CLOSE_SIGNAL_SOURCE
         )
         if is_close:
@@ -4891,7 +4891,7 @@ def _position_lot_entries(
     for signal_id, sig_symbol, timestamp, action, broker_order_id, source, metadata in signal_rows:
         metadata_dict = metadata if isinstance(metadata, dict) else {}
         is_close = (
-            _is_exit_only_signal_metadata(metadata_dict)
+            is_exit_only_signal_metadata(metadata_dict)
             or str(source or "") == BROKER_CLOSE_SIGNAL_SOURCE
         )
         if is_close:
@@ -5805,8 +5805,23 @@ def get_live_signal_metadata(signal_id: str) -> dict[str, Any] | None:
 _ENTRY_SIGNAL_SCAN_PAGE_SIZE = 25
 
 
-def _is_exit_only_signal_metadata(metadata: Mapping[str, Any]) -> bool:
-    return bool(metadata.get("exit_only")) or (
+def is_exit_only_signal_metadata(metadata: Mapping[str, Any]) -> bool:
+    """Whether signal metadata marks a ledger-reducing (exit-only) signal.
+
+    This is THE exit predicate: ``_position_lot_entries`` and the open-entry
+    counts treat exactly these signals as closes, so any other consumer that
+    needs "would the ledger count this fill as reducing" - the cTrader
+    close-fill attribution and the close-attribution repair script - must use
+    this same test or the two sides can disagree about which side of the
+    ledger a fill lands on.
+    """
+    exit_only = metadata.get("exit_only")
+    if isinstance(exit_only, str):
+        # JSON metadata can carry "false" as a string, which bool() would
+        # count as an exit; normalise against the same truthy tokens the
+        # rest of the codebase accepts for boolean config.
+        exit_only = exit_only.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return bool(exit_only) or (
         str(metadata.get("risk_sizing_mode") or "").strip().lower() == "exit_only"
     )
 
@@ -5880,7 +5895,7 @@ def _newest_filled_entry_signal(
         rows = session.exec(statement.offset(offset).limit(_ENTRY_SIGNAL_SCAN_PAGE_SIZE)).all()
         for row in rows:
             metadata = dict(row.metadata_json or {})
-            if _is_exit_only_signal_metadata(metadata):
+            if is_exit_only_signal_metadata(metadata):
                 continue
             timestamp = row.timestamp
             if timestamp.tzinfo is None:
@@ -6036,16 +6051,26 @@ def get_live_signal_timestamp(signal_id: str) -> datetime | None:
     return timestamp.astimezone(timezone.utc)
 
 
-def find_live_signal_id_by_broker_order_id(
+def find_live_signal_ids_by_broker_order_id(
     account_id: str, broker_order_id: str
-) -> str | None:
+) -> list[str]:
+    """All signal ids owning this broker order id on the account, newest first.
+
+    ``broker_order_id`` is indexed but not unique, so several rows on one
+    account can share an id (a recovered duplicate, a broker-side id reuse).
+    Callers that must distinguish "one owner" from "ambiguous" need the raw
+    matches - the list is deliberately uncapped so a three-way share cannot
+    truncate into a false single-owner answer;
+    :func:`find_live_signal_id_by_broker_order_id` is the fail-closed
+    single-owner projection of this list.
+    """
     normalized_account_id = str(account_id or "").strip()
     normalized_order_id = str(broker_order_id or "").strip()
     if not normalized_account_id or not normalized_order_id:
-        return None
+        return []
     init_db()
     with get_session() as session:
-        row = session.exec(
+        rows = session.exec(
             select(LiveSignalModel)
             .join(
                 LiveDeploymentModel,
@@ -6054,9 +6079,22 @@ def find_live_signal_id_by_broker_order_id(
             .where(LiveDeploymentModel.account_id == normalized_account_id)
             .where(LiveSignalModel.broker_order_id == normalized_order_id)
             .order_by(LiveSignalModel.timestamp.desc())
-            .limit(1)
-        ).first()
-    return str(row.id) if row is not None else None
+        ).all()
+    return [str(row.id) for row in rows]
+
+
+def find_live_signal_id_by_broker_order_id(
+    account_id: str, broker_order_id: str
+) -> str | None:
+    """The signal owning this broker order id, or ``None`` when unknown.
+
+    Picking the newest of several matches would attribute a fill to a
+    possibly-wrong signal, so an ambiguous match fails closed to ``None`` -
+    callers then take their unresolved/flagged path instead of mis-booking
+    the fill.
+    """
+    owner_ids = find_live_signal_ids_by_broker_order_id(account_id, broker_order_id)
+    return owner_ids[0] if len(owner_ids) == 1 else None
 
 
 def get_live_signal_reconciliation_cursor(signal_id: str) -> tuple[datetime, str] | None:
@@ -8859,7 +8897,7 @@ def _live_slippage_decomposition(
     quote_price = _usable_quote_price(signal.entry_quote_price)
     has_snapshot = bid is not None and ask is not None and quote_price is not None
     metadata = signal.metadata_json or {}
-    is_exit = _is_exit_only_signal_metadata(metadata) or str(
+    is_exit = is_exit_only_signal_metadata(metadata) or str(
         metadata.get("signal_intent") or ""
     ) == "exit"
     result: dict[str, Any] = {

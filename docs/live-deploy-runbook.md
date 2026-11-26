@@ -602,7 +602,17 @@ order ~90 days after creation and nothing re-places a protective order lost
 that way yet - the reconciler's `position_without_protective_stop` finding
 is what catches it), so an older
 unfilled row is a cancelled/expired/rejected historical order, not a working
-one. A younger order missing from the broker's working list is not trusted on
+one. The expected quantity is the one the broker was actually asked for:
+adapters persist the normalized submitted qty in the signal metadata (the
+cTrader volume-grid floor and the Alpaca whole-share bracket floor), so a
+filled order never leaves a phantom remainder. Rows persisted before that
+normalization still carry the unrounded sized qty; for those, a remainder
+below the instrument's broker volume step (`exit_qty_step` - a property of
+the instrument, not the order side) is never expected either, because no
+broker can work an order smaller than its own step. A remainder of one step
+or more still expects a working order, and an adapter that cannot name the
+step keeps the expectation (fail closed). A younger order missing from the
+broker's working list is not trusted on
 the age bound alone: the reconciler asks the adapter for that order's state
 (`get_order_state`, bounded lookups per pass), and only a proven `terminal`
 state clears the finding - IOC remainders, cancelled orders and rejected
@@ -1572,6 +1582,92 @@ so a trimming that hides an older conflict cannot happen there.
    repeat steps 3-5.
 
 `live_executions.commission` is a positive cost for every broker; a broker rebate cannot be stored as a negative cost, so the cTrader adapter stores it as `NULL` (fee unknown) and logs an ERROR — the fill is kept and net PnL stays flagged incomplete (#285). The first `init_db` of a build with this change converts existing cTrader rows once (`abs` of the stored value, recorded in `schema_data_migrations`). Stop the daemon (and any process on the same SQLite file) before starting the new build: an old build that still writes cTrader fills after the marker is recorded stores a raw negative charge that violates the positive-cost convention and is never converted (the marker is already recorded, and new-convention rebates are stored as NULL, so the stray negative is at least distinguishable). Roll out as stop, deploy, start; do not run old and new builds side by side.
+
+## cTrader close fills attributed by broker order id
+
+An internal strategy's exit on cTrader is sent as `ProtoOAClosePositionReq`,
+which carries **no `clientOrderId` field** (payload type, account id,
+position id, volume only). The fill's execution event therefore arrives with
+an SDK-assigned client order id that parses as no signal of ours. Before the
+fix such a fill was booked through `record_live_broker_side_close_fill` as a
+synthetic `broker_close` signal — while the exit signal that actually owns
+the broker order id looked unfilled, and every restart's
+`reconcile_executions` re-fetched the deal, hit the dedupe key already owned
+by the synthetic signal, and logged `ERROR` "Dedupe key collision across
+signals ... the fill is NOT stored".
+
+The adapter now attributes a fill whose `clientOrderId` names no signal by
+its **broker order id** instead: the in-memory order→signal map first, then
+the `broker_order_id` persisted on the signal row — and only when that
+signal's metadata marks it as an exit **the way the ledger defines one**
+(`exit_only` or `risk_sizing_mode=exit_only` — `shared.database.
+is_exit_only_signal_metadata`, the same predicate `_position_lot_entries`
+uses, so a fill can never be attributed onto a signal the ledger would count
+as an entry). A fill arriving while its close submit is
+still in flight (order id not yet persisted) is retained for reconciliation
+rather than booked as a broker-side close; the pending mark expires after
+`_PENDING_CLOSE_POSITION_TTL_SECONDS` (1 h) so a stuck submit cannot hold a
+genuine broker close forever. An order id no exit signal owns still takes
+the ordinary broker-side close path.
+
+**Repairing rows written before the fix.** Fills already booked as synthetic
+`broker_close` signals whose executions carry a `broker_order_id` owned by
+exactly one exit signal on the same deployment are moved onto that signal by
+`scripts/repair_ctrader_close_attribution.py`. The ledger stays identical —
+the moved fill keeps quantity, price, timestamp and broker order id, and a
+`parent_signal_id` stamp is written on the owner only when it is needed to
+keep crediting the same entry; anything ambiguous (no unique owner, a
+non-exit owner, an action/symbol/attribution conflict, an owner that already
+carries fills the stamp would re-attribute) is refused and reported, never
+guessed. A `broker_close` signal emptied by the repair is deleted — its id
+is deterministic, so a genuine broker-side close recreates it on demand.
+Every applied repair writes a `live_control_audit` row
+(`action=broker_close_attribution_repair`).
+
+```bash
+# Report only - writes no data (init_db can still apply pending schema
+# migrations, so run it on a quiesced daemon like any other process start):
+uv run python -m scripts.repair_ctrader_close_attribution
+
+# Apply the moves, stamps, deletions and audit rows in one transaction:
+uv run python -m scripts.repair_ctrader_close_attribution --apply
+```
+
+**Operator steps, in order:**
+
+1. **Deploy this build and restart the daemon FIRST.** An old build keeps
+   mis-booking every new cTrader close as it arrives; repairing before the
+   new attribution code is live just refills the same hole. Until the
+   repair runs, the restarted daemon keeps logging the "Dedupe key
+   collision" ERROR for the already-mis-booked rows on every reconcile -
+   that is expected and harmless; `--apply` is what stops it.
+2. **Stop the daemon** before touching the database.
+3. Take a `.backup` of `backtests.db` while it is stopped (the script's own
+   snapshot discipline applies: copy, dry-run, review, apply).
+4. Run the dry-run and review the report (see below), then
+   `uv run python -m scripts.repair_ctrader_close_attribution --apply`.
+   The report is printed as JSON on **stdout**; log lines go to **stderr**,
+   so `... | jq` works.
+5. **Start the daemon** and re-run the dry-run afterwards: an applied
+   repair reports zero moves.
+
+`moves` keeps growing until step 1's deploy lands - the running old build
+mis-books each new cTrader close as it arrives (11 moves on the
+2026-11-26 database copy). Expect the count to be at least that, and check
+that every row has the same shape: an exit-only `sell` owner and a
+`parent_signal_id` stamp equal to the synthetic close's parent.
+
+Review the dry-run report first: `moves` lists each fill that would change
+owner, `metadata_updates` each `parent_signal_id` stamp, `deleted_signals`
+each emptied synthetic signal, and `refusals`/`unmatched` the rows left
+untouched with their reasons (`ambiguous_owner`, `owner_not_exit_signal`,
+`action_mismatch`, `symbol_mismatch`, `attribution_conflict`,
+`conflicting_parents`, `owner_has_other_fills`,
+`would_be_attributed_by_repair`, `no_same_deployment_owner`,
+`empty_broker_order_id`). `no_same_deployment_owner` rows are usually
+genuine broker-side closes (SL/TP, flatten, manual) and need no action;
+the other refused and unmatched rows need a human decision. The script is
+safe to re-run — an applied repair is a no-op the second time.
 
 ## Release / rollback
 
