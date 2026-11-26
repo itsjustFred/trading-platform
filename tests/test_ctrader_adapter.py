@@ -1539,6 +1539,54 @@ def test_fail_in_flight_requests_tolerates_unexpected_response_deferreds(
     asyncio.run(_run())
 
 
+def test_on_disconnected_flags_reconciliation_and_wakes_listener() -> None:
+    """A plain transport loss can hide missed executions exactly like a
+    session teardown: the listener must be woken and broker reconciliation
+    flagged now, not after its 30 s queue timeout."""
+    from live_runner.ctrader_adapter import _EXECUTION_RECONCILE_WAKE
+
+    adapter = CTraderLiveAdapter(
+        app_id="app", app_secret="secret", access_token="token", account_id="1"
+    )
+    adapter._connected = True
+    adapter._authenticated = True
+    client = object()
+    adapter._client = client
+    adapter._reconciliation_required = False
+
+    adapter._on_disconnected(client, "connection lost")
+
+    assert adapter._reconciliation_required is True
+    assert adapter._execution_queue.get_nowait() is _EXECUTION_RECONCILE_WAKE
+
+
+def test_disconnect_with_pending_execution_work_flags_reconciliation() -> None:
+    """``disconnect()`` swaps in a fresh execution queue and clears the
+    unresolved-event store; any work that was pending must not be lost
+    silently - broker reconciliation is flagged for the next listener run."""
+
+    async def _run() -> None:
+        adapter = CTraderLiveAdapter(
+            app_id="app", app_secret="secret", access_token="token", account_id="1"
+        )
+        adapter._execution_queue.put_nowait(object())
+        adapter._reconciliation_required = False
+
+        await adapter.disconnect()
+
+        assert adapter._reconciliation_required is True
+        assert adapter._reconciliation_retry_at == 0.0
+
+        idle = CTraderLiveAdapter(
+            app_id="app", app_secret="secret", access_token="token", account_id="1"
+        )
+        idle._reconciliation_required = False
+        await idle.disconnect()
+        assert idle._reconciliation_required is False
+
+    asyncio.run(_run())
+
+
 def test_submit_awaiting_when_disconnect_event_arrives_ends_unknown(
     tmp_path, monkeypatch
 ) -> None:

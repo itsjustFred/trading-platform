@@ -2010,6 +2010,10 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         # the error is a connection-lost, which every caller classifies as
         # an UNKNOWN outcome - never as not-submitted.
         self._fail_in_flight_requests()
+        # Executions may have been missed while the transport was down; flag
+        # broker reconciliation and wake the listener now rather than after
+        # its 30 s queue timeout, same as a session teardown.
+        self._flag_reconciliation_and_wake_listener()
         logger.warning(
             "cTrader transport disconnected",
             extra={
@@ -3322,19 +3326,25 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             self._connected_event.clear()
         except Exception:  # except-kind: loop-survival
             pass
-        # Wake ``listen_executions`` so the teardown is noticed now - the
-        # listener would otherwise sleep out its 30 s ``queue.get`` timeout
-        # before reconnecting and reconciling the gap. If the queue is full
-        # the wake is dropped, so flag reconciliation explicitly. Clear any
-        # stale retry backoff too, or the flagged reconcile would wait out a
-        # prior failure's ``_reconciliation_retry_at``.
+        self._flag_reconciliation_and_wake_listener()
+
+    def _flag_reconciliation_and_wake_listener(self) -> None:
+        """Flag broker reconciliation and wake ``listen_executions`` now.
+
+        The teardown/disconnect wakes the listener so the gap is reconciled
+        immediately - it would otherwise sleep out its 30 s ``queue.get``
+        timeout before reconnecting and reconciling. If the queue is full
+        the wake is dropped, so reconciliation is flagged explicitly. Any
+        stale retry backoff is cleared too, or the flagged reconcile would
+        wait out a prior failure's ``_reconciliation_retry_at``.
+        """
         self._reconciliation_required = True
         self._reconciliation_retry_at = 0.0
         try:
             self._execution_queue.put_nowait(_EXECUTION_RECONCILE_WAKE)
         except asyncio.QueueFull:
             logger.warning(
-                "cTrader execution queue full during teardown; "
+                "cTrader execution queue full on session loss; "
                 "listener wake dropped, reconciliation already flagged",
                 extra={"data": {"account_id": self.ctid_trader_account_id}},
             )
@@ -3772,9 +3782,20 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             self._asset_names_task.cancel()
             self._asset_names_task = None
         self._order_id_to_symbol.clear()
+        # The queue swap and clears below discard unprocessed execution
+        # events, stored unresolved events and any pending reconcile wake;
+        # if any existed, flag broker reconciliation so the next listener
+        # run reconciles the gap instead of losing the fills silently.
+        had_pending_execution_work = (
+            not self._execution_queue.empty()
+            or bool(self._unresolved_execution_events)
+        )
         self._execution_queue = asyncio.Queue(maxsize=5000)
         self._execution_retry_counts.clear()
         self._unresolved_execution_events.clear()
+        if had_pending_execution_work:
+            self._reconciliation_required = True
+            self._reconciliation_retry_at = 0.0
         self._terminal_auth_failure_reason = ""
         self._terminal_auth_failure_code = ""
         # A deliberate disconnect leaves the same in-flight requests pending
