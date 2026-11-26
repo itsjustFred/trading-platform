@@ -15,6 +15,7 @@ side effects.
 from __future__ import annotations
 
 import ast
+import os
 from pathlib import Path
 
 import pytest
@@ -94,6 +95,26 @@ ALLOWED_UPWARD_EDGES: frozenset[tuple[str, str]] = frozenset(
     }
 )
 
+# Top-level directories that contain .py files but are deliberately not part
+# of the layered package graph: the test suite itself and one-off strategy
+# comparison/audit scripts (not importable packages, not platform code).
+NON_PACKAGE_DIRS = frozenset({"tests", "strategy-comparisons"})
+
+_PRUNE_DIRS = frozenset({"node_modules", "__pycache__", ".venv"})
+
+
+def _top_level_dirs_with_python() -> set[str]:
+    found = set()
+    for entry in REPO_ROOT.iterdir():
+        if not entry.is_dir() or entry.name.startswith("."):
+            continue
+        for _dirpath, dirnames, filenames in os.walk(entry):
+            dirnames[:] = [d for d in dirnames if d not in _PRUNE_DIRS]
+            if any(name.endswith(".py") for name in filenames):
+                found.add(entry.name)
+                break
+    return found
+
 
 def _repo_modules() -> dict[str, Path]:
     """Map dotted module name -> file for every .py under the layered packages."""
@@ -134,22 +155,50 @@ def _import_targets(
     return [mod] + [f"{mod}.{alias.name}" for alias in node.names]
 
 
+def _dynamic_import_target(node: ast.AST) -> str | None:
+    """Module-name literal in ``importlib.import_module("x")`` /
+    ``__import__("x")`` calls, else ``None``. Only absolute string literals
+    can be resolved statically; relative or computed names are skipped."""
+    if not isinstance(node, ast.Call):
+        return None
+    func = node.func
+    is_dynamic = (
+        isinstance(func, ast.Name) and func.id in {"import_module", "__import__"}
+    ) or (
+        isinstance(func, ast.Attribute) and func.attr in {"import_module", "__import__"}
+    )
+    if not is_dynamic:
+        return None
+    if node.args:
+        arg = node.args[0]
+    else:
+        arg = next((kw.value for kw in node.keywords if kw.arg == "name"), None)
+    if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+        return arg.value
+    return None
+
+
 def _cross_package_edges() -> list[tuple[str, str, Path, int]]:
     """All (importer module, imported module, file, line) edges between
-    different top-level packages."""
+    different top-level packages. Static ``import`` statements and dynamic
+    ``import_module``/``__import__`` calls with a literal module name both
+    count; a file that does not parse fails the guard rather than being
+    silently skipped."""
     modules = _repo_modules()
     edges: set[tuple[str, str, Path, int]] = set()
     for module, path in modules.items():
-        try:
-            tree = ast.parse(path.read_text(encoding="utf-8"))
-        except SyntaxError:
-            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         is_init = path.name == "__init__.py"
+        src_package = module.split(".")[0]
         for node in ast.walk(tree):
-            if not isinstance(node, (ast.Import, ast.ImportFrom)):
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                targets = _import_targets(node, module, is_init)
+            elif isinstance(node, ast.Call):
+                target = _dynamic_import_target(node)
+                targets = [target] if target is not None else []
+            else:
                 continue
-            src_package = module.split(".")[0]
-            for target in _import_targets(node, module, is_init):
+            for target in targets:
                 resolved = _resolve(target, modules)
                 if resolved is None or resolved == module:
                     continue
@@ -182,6 +231,23 @@ def test_no_new_upward_import_edges() -> None:
             "Lower layers must not import higher layers; move the shared code "
             "down or invert the dependency instead:\n" + "\n".join(lines)
         )
+
+
+def test_layers_cover_all_top_level_packages() -> None:
+    """LAYERS is hand-maintained: every top-level directory containing .py
+    files must be classified, so a new package cannot bypass the guard."""
+    found = _top_level_dirs_with_python()
+    unclassified = found - set(LAYERS) - NON_PACKAGE_DIRS
+    assert not unclassified, (
+        "Top-level directories with .py files are not classified: "
+        f"{sorted(unclassified)}. Add each to LAYERS with a justified layer "
+        "position, or to NON_PACKAGE_DIRS if it is not platform code."
+    )
+    top_level_dirs = {
+        entry.name for entry in REPO_ROOT.iterdir() if entry.is_dir()
+    }
+    missing = set(LAYERS) - top_level_dirs
+    assert not missing, f"LAYERS entries without a top-level directory: {sorted(missing)}"
 
 
 def test_allowlist_edges_still_exist() -> None:
