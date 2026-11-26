@@ -177,7 +177,7 @@ def _run_coroutine(coro: Any, *, timeout_seconds: float) -> Any:
         def _runner() -> None:
             try:
                 result["value"] = asyncio.run(asyncio.wait_for(coro, timeout=timeout_seconds))
-            except BaseException as exc:  # except-kind: propagate - pragma: no cover - active-loop defensive bridge
+            except BaseException as exc:  # except-kind: propagate - bridge stores the error for the caller to re-raise  # pragma: no cover
                 error["value"] = exc
             finally:
                 done.set()

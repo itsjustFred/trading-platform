@@ -1,11 +1,13 @@
-# Live broad-exception classification
+# Broad-exception classification
 
-Every `except Exception`, bare `except`, and `except BaseException` in `live_runner/` must carry a trailing `# except-kind:` marker so reviewers can see whether the handler is allowed to keep the process alive or must fail closed around a money decision.
+Every `except Exception`, bare `except`, and `except BaseException` in `live_runner/`, `runner/` (including `runner/engines/`) and `risk/` must carry a trailing `# except-kind:` marker so reviewers can see whether the handler is allowed to keep the process alive or must fail closed around a money decision.
 
-- `loop-survival`: log and continue/retry; used for transport, listener, cleanup, and snapshot paths where the next pass is safe.
+- `loop-survival`: log and continue/retry; used for transport, listener, cleanup, batch fan-out, and snapshot paths where the next pass is safe.
 - `money-decision`: the handler touches order submission, cancellation, flatten/restore, reconciliation, sizing, or fill persistence; unknown state must not produce a success-shaped continuation.
+- `best-effort`: an optional enrichment or persistence whose failure degrades to a documented default (stats fallbacks, SQLite persist, catalog/meta reads).
+- `propagate`: the handler classifies, records or enriches the error and always re-raises; nothing is swallowed.
 
-`tests/live_runner/test_except_classification.py` fails when a broad handler in `live_runner/` lacks a valid marker.
+`tests/test_except_kind_gate.py` fails when a broad handler in a gated package lacks a valid marker.
 
 Handlers in files owned by open PRs #192, #271, #272, #274, #277, #313, #316, and #323 are classified here but intentionally left unchanged; the `Current behavior` column marks them `no — after PR #N` (#274, #277).
 
@@ -118,7 +120,7 @@ Total: 88 broad handlers.
 
 ## Handlers added after this table was generated
 
-These broad handlers landed on main while this classification was in review, and are classified by the same rule (a handler that only keeps the loop alive and logs is `loop-survival`; one whose failure changes whether an order/stop/position action happens is `money-decision` and fails closed). Their line numbers move; the marker in the source and `tests/live_runner/test_except_classification.py` are authoritative.
+These broad handlers landed on main while this classification was in review, and are classified by the same rule (a handler that only keeps the loop alive and logs is `loop-survival`; one whose failure changes whether an order/stop/position action happens is `money-decision` and fails closed). Their line numbers move; the marker in the source and `tests/test_except_kind_gate.py` are authoritative.
 
 | File | Handler | Kind | Why |
 |---|---|---|---|
@@ -151,3 +153,23 @@ These broad handlers landed on main while this classification was in review, and
 | `daemon.py` | startup failure in `_run_daemon_locked` (logs and re-raises) | money-decision | ERROR record for the alert sink, exception propagates |
 | `daemon.py` | crash handler in `_run_daemon_locked` (logs, captures, re-raises) | money-decision | ERROR record + Sentry capture, exception propagates |
 | `daemon.py` | signal-archive close in the `_run_daemon_locked` shutdown `finally` | loop-survival | WARNING logged during shutdown, nothing trades after |
+
+## `runner/` and `risk/` handlers
+
+`risk/` currently has no broad handlers; it is gated so future ones must be classified. The `runner/` handlers (batch backtests, stats, engines, CLI, LLM providers) are classified as `loop-survival` (one cell/strategy/symbol failure is recorded and the batch continues), `best-effort` (optional enrichment or persistence degrades to a documented default) or `propagate` (the handler enriches and always re-raises). Line numbers move; the marker in the source is authoritative.
+
+| File | Kind | Why |
+|---|---|---|
+| `runner/agent_backtest_target.py` | best-effort | corrupt `catalog.json` falls back to the OHLCV directory scan (debug-logged) |
+| `runner/backtest_grid.py` | loop-survival / best-effort | cell failures become `failed` rows with traceback; SQLite persist is secondary to the saved JSON (warning + traceback) |
+| `runner/backtest_matrix.py` | loop-survival | per-cell and per-strategy failures are logged and recorded as error/failed rows; unloadable strategy meta becomes `skipped_unavailable` |
+| `runner/cli.py` | loop-survival / best-effort | an unreadable OHLCV file is logged with traceback and the all-symbols check refuses to fabricate a date range; SQLite persist is secondary to the saved JSON |
+| `runner/engines/base.py` | best-effort | strategy-meta read failure falls back to overrides only (warning + traceback; flagged for maintainer review — failing closed would change runs) |
+| `runner/engines/native_adapter.py` | best-effort | unparseable config dates degrade to `duration_days=0` in run meta |
+| `runner/engines/vectorbt_adapter.py` | propagate | per-symbol failures are collected and re-raised as one aggregate `RuntimeError` with per-symbol tracebacks |
+| `runner/grid_tester.py` | loop-survival | a failing grid cell returns an `error` row; the grid continues |
+| `runner/llm_providers/copilot_sdk_provider.py` | propagate | auth/model errors are classified and re-raised wrapped; the thread bridge stores the error for the caller to re-raise |
+| `runner/llm_providers/nim_provider.py` | propagate | error metadata is recorded, then the exception re-raises |
+| `runner/portfolio_optimizer.py` | propagate | equity-curve load failure is wrapped in `ValueError` naming the backtest id |
+| `runner/slippage.py` | best-effort | an undescribable slippage model is treated as cost-declaring (conservative) |
+| `runner/stats.py` | best-effort | metric fallbacks degrade to documented sentinels (`None`, `0.0`, `1.0`) with debug-level tracebacks; the plausible-number defaults (`_safe_qs` → `0.0`, `_one_sided_p_value` → `1.0`) are flagged for maintainer review |
