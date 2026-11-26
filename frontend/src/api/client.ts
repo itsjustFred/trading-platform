@@ -151,7 +151,6 @@ export const renameStrategy = (name: string, displayName: string) =>
   });
 
 // Backtests
-/** Renders an unknown error-detail value as a human-readable string. */
 function describeErrorDetail(detail: unknown): string {
   if (typeof detail === "string") {
     return detail;
@@ -168,7 +167,6 @@ function describeErrorDetail(detail: unknown): string {
   return "";
 }
 
-/** Appends a query string to a path only when one is present. */
 function withQuery(path: string, query: string): string {
   return query ? `${path}?${query}` : path;
 }
@@ -281,8 +279,6 @@ export function deduplicateBacktests(
     body: JSON.stringify(payload),
   });
 }
-// Two-phase bulk delete: a dry run returns the exact candidate list and
-// deletes nothing; the confirm call deletes only the ids it is given.
 export function removeEmptyBacktests(
   payload: BulkDeleteDryRunRequest,
 ): Promise<BacktestsRemoveEmptyDryRunResponse>;
@@ -554,8 +550,6 @@ export const deletePortfoliosBulk = (ids: string[]) =>
   });
 export const getPortfolioDuplicates = () =>
   fetchJSON<PortfoliosDuplicatesResponse>("/portfolios/duplicates");
-// Two-phase bulk delete: a dry run returns the exact candidate list and
-// deletes nothing; the confirm call deletes only the ids it is given.
 export function deduplicatePortfolios(
   payload: BulkDeleteDryRunRequest,
 ): Promise<PortfoliosDeduplicateDryRunResponse>;
@@ -570,8 +564,6 @@ export function deduplicatePortfolios(
     body: JSON.stringify(payload),
   });
 }
-// Two-phase bulk delete: a dry run returns the exact candidate list and
-// deletes nothing; the confirm call deletes only the ids it is given.
 export function removeEmptyPortfolios(
   payload: BulkDeleteDryRunRequest,
 ): Promise<PortfoliosRemoveEmptyDryRunResponse>;

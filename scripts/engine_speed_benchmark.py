@@ -2,7 +2,7 @@
 """Speed benchmark: native vs the vectorbt adapter on an optimizer-like workload.
 
 Phase-S deliverable for issue #318 (see
-``docs/adr/0001-native-single-strategy-engine.md``): times both engines over a
+``docs/adr/0002-native-single-strategy-engine.md``): times both engines over a
 grid of strategy-parameter cells — the shape of an optimizer sweep — and writes
 a JSON report. **Report only**: it asserts nothing about which engine is
 faster and changes no defaults; the numbers inform the phase-M go/no-go.

@@ -809,7 +809,7 @@ def _process_symbol(
 def _frozen_signal_exit_fill(config: BacktestConfig) -> BacktestConfig:
     """Refuse the native-only ``next_open`` exit model on this frozen adapter.
 
-    ADR ``docs/adr/0001-native-single-strategy-engine.md``: frozen engines
+    ADR ``docs/adr/0002-native-single-strategy-engine.md``: frozen engines
     keep their existing semantics until removal and get fail-loud guards, not
     silent re-interpretation. ``next_open`` is the native default, so a
     ``BacktestConfig`` that never touched the field would otherwise simulate
@@ -1585,7 +1585,7 @@ def _resolve_exit_price(
     direction: str | None = None,
     gap_open: bool = False,
 ) -> float:
-    # Frozen engine (ADR 0001): signal exits stay on the trigger bar (see
+    # Frozen engine (ADR 0002): signal exits stay on the trigger bar (see
     # _prepare_next_open_execution_data) and fill at its close — the frozen
     # adapter refuses ``next_open`` upstream and the lookahead-prone ``open``
     # mode was removed (issue #153). Stop/TP
