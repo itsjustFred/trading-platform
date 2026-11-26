@@ -601,6 +601,11 @@ class TradeEngine:
                     else order.stop_price
                 )
                 if trigger_price is not None:
+                    # Deliberately not ``RiskEngine.fallback_stop``: this is an
+                    # exposure ESTIMATE from the order's own trigger level, not
+                    # a protective stop. The percent rule only applies when the
+                    # trigger sits at the reference price (kept as its own
+                    # behaviour; see improvement-run G03).
                     direction_sign = 1.0 if order.direction == "LONG" else -1.0
                     risk_distance = abs(float(reference_price) - float(trigger_price))
                     if risk_distance <= 0:
@@ -1169,13 +1174,12 @@ class TradeEngine:
         size_from_stop = stop_loss if stop_loss is not None else sizing_only_stop
         exposure_stop = size_from_stop
         if exposure_stop is None and self._risk_enabled and self.config.allow_fallback_stop:
-            direction_sign = 1.0 if direction == "LONG" else -1.0
-            fallback_distance = (
-                float(stop_distance)
-                if stop_distance is not None and stop_distance > 0
-                else entry_price * self._risk_engine.config.fallback_stop_pct
+            # One fallback-stop computation for the whole engine path (G03).
+            exposure_stop = self._risk_engine.fallback_stop(
+                action=direction,
+                entry_price=entry_price,
+                stop_distance=stop_distance,
             )
-            exposure_stop = entry_price - direction_sign * fallback_distance
         qty = self._calculate_position_size(
             entry_price=entry_price,
             stop_loss_price=size_from_stop,
@@ -1498,14 +1502,12 @@ class TradeEngine:
                 # bar's close, so re-derive it here from the actual fill
                 # (contract §4: "2% of entry").
                 if order.stop_loss is None and not getattr(order, "_sizing_only_stop", False):
-                    direction_sign = 1.0 if order.direction == "LONG" else -1.0
-                    fallback_distance = (
-                        float(order.stop_distance)
-                        if order.stop_distance is not None and order.stop_distance > 0
-                        else float(fill_price) * self._risk_engine.config.fallback_stop_pct
-                    )
-                    order._sizing_stop_loss = (
-                        float(fill_price) - direction_sign * fallback_distance
+                    # Same fallback arithmetic as the creation-time estimate
+                    # and the sizing engine (G03), re-derived from the fill.
+                    order._sizing_stop_loss = self._risk_engine.fallback_stop(
+                        action=order.direction,
+                        entry_price=float(fill_price),
+                        stop_distance=order.stop_distance,
                     )
                 if (
                     order.order_type == OrderType.MARKET

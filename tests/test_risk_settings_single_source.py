@@ -437,3 +437,43 @@ def test_sizing_on_an_explicit_stop_leaves_the_stop_alone() -> None:
     assert sized.decision.metadata["stop_source"] == "signal"
     assert signal.stop_loss == pytest.approx(255.0)
     assert "resolved_stop_loss" not in signal.metadata
+
+
+# ---------------------------------------------------------------------------
+# 5. The shared fallback-stop computation
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("action", "entry_price", "kwargs", "expected"),
+    [
+        ("buy", 100.0, {}, 98.0),
+        ("long", 100.0, {}, 98.0),
+        ("sell", 100.0, {}, 102.0),
+        ("short", 250.5, {}, 250.5 + 250.5 * 0.02),
+        ("LONG", 100.0, {"stop_distance": 7.5}, 92.5),
+        ("SHORT", 100.0, {"stop_distance": 7.5}, 107.5),
+        # An explicit non-positive distance falls back to the percent rule,
+        # exactly like every call site did before the unify.
+        ("LONG", 100.0, {"stop_distance": 0.0}, 98.0),
+        ("LONG", 100.0, {"stop_distance": None}, 98.0),
+        ("sell", 100.0, {"atr": 1.5}, 103.0),
+        # An explicit distance wins over ATR.
+        ("sell", 100.0, {"atr": 1.5, "stop_distance": 4.0}, 104.0),
+    ],
+)
+def test_risk_engine_fallback_stop(
+    action: str, entry_price: float, kwargs: dict, expected: float
+) -> None:
+    engine = RiskEngine(RiskConfig(fallback_stop_pct=0.02, default_sl_atr_multiplier=2.0))
+
+    assert engine.fallback_stop(
+        action=action, entry_price=entry_price, **kwargs
+    ) == pytest.approx(expected)
+
+
+@pytest.mark.parametrize("atr", ["abc", float("nan"), float("inf"), 0.0, -1.0])
+def test_risk_engine_fallback_stop_rejects_unusable_atr(atr) -> None:
+    engine = RiskEngine()
+    with pytest.raises(ValueError, match="ATR value"):
+        engine.fallback_stop(action="buy", entry_price=100.0, atr=atr)

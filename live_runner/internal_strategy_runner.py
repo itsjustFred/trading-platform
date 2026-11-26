@@ -1487,12 +1487,11 @@ class InternalStrategyRunner:
                     # Maintainer decision (a): a strategy without a stop gets
                     # a broker stop at the engine's fallback distance —
                     # fallback_stop_pct of the entry price, the same fallback
-                    # the engine uses for sizing. Live never runs unprotected.
-                    direction_sign = 1.0 if direction == "LONG" else -1.0
-                    fallback_pct = float(
-                        bundle.engine._risk_engine.config.fallback_stop_pct
+                    # the engine uses for sizing (one implementation, G03).
+                    # Live never runs unprotected.
+                    stop_loss = bundle.engine._risk_engine.fallback_stop(
+                        action=direction, entry_price=close_price
                     )
-                    stop_loss = close_price - direction_sign * close_price * fallback_pct
                     fallback_stop = True
                 symbol_key = symbol.upper()
                 open_count = int(open_entries.get(symbol_key, 0))

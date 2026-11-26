@@ -24,10 +24,34 @@ class RiskEngine:
     def __init__(self, config: RiskConfig | None = None):
         self.config = config or RiskConfig()
 
-    def _fallback_stop_loss(self, signal: TradeSignal) -> float:
+    @staticmethod
+    def _place_stop(*, action: str, entry_price: float, distance: float) -> float:
+        """``distance`` away from ``entry_price``: below a long, above a short."""
+        entry = float(entry_price)
+        if str(action).strip().lower() in {"buy", "long"}:
+            return entry - distance
+        return entry + distance
+
+    def _fallback_stop_distance(
+        self,
+        *,
+        entry_price: float,
+        atr: object = None,
+        stop_distance: float | None = None,
+    ) -> float:
+        """The distance a fallback stop is placed at.
+
+        A caller-supplied positive ``stop_distance`` (the strategy's own
+        ATR/point distance) wins; otherwise an ``atr`` metadata value scales by
+        ``default_sl_atr_multiplier``; otherwise ``fallback_stop_pct`` of the
+        entry price. An absolute (pip-based) percent substitute would
+        under-scale on high-priced assets and produce drastically oversized
+        positions.
+        """
+        if stop_distance is not None and float(stop_distance) > 0:
+            return float(stop_distance)
         # C1: finite-guard ATR — NaN/negative/garbage values are rejected,
         # never silently healed (abs() + 0.02 fallback hid bad inputs).
-        atr = signal.metadata.get("atr")
         if atr is not None:
             try:
                 atr_value = float(atr)
@@ -41,19 +65,48 @@ class RiskEngine:
                     f"ATR value {atr!r} is not finite and positive; refusing "
                     "to size on an uninterpretable stop distance."
                 )
-            distance = atr_value * self.config.default_sl_atr_multiplier
-        else:
-            # Percent-of-price fallback. An absolute (pip-based) distance under-scales
-            # on high-priced assets and produces drastically oversized positions.
-            distance = signal.entry_price * self.config.fallback_stop_pct
+            return atr_value * self.config.default_sl_atr_multiplier
+        return float(entry_price) * self.config.fallback_stop_pct
+
+    def fallback_stop(
+        self,
+        *,
+        action: str,
+        entry_price: float,
+        atr: object = None,
+        stop_distance: float | None = None,
+    ) -> float:
+        """The protective stop used when a signal carries none.
+
+        The one fallback-stop computation (improvement-run G03): the sizing
+        engine, the native backtest's creation-time and fill-time entries, its
+        pending-order exposure estimate and the live internal-strategy entry all
+        call this. The stop sits ``fallback_stop_pct`` of the price below the
+        entry for a long and above it for a short; a positive ``stop_distance``
+        (the strategy's own distance) or an ``atr`` value replaces the percent
+        distance. This helper does not validate the resulting price — the
+        sizing path validates the signal's entry price and stop.
+        """
+        distance = self._fallback_stop_distance(
+            entry_price=entry_price, atr=atr, stop_distance=stop_distance
+        )
+        return self._place_stop(
+            action=action, entry_price=entry_price, distance=distance
+        )
+
+    def _fallback_stop_loss(self, signal: TradeSignal) -> float:
+        distance = self._fallback_stop_distance(
+            entry_price=signal.entry_price, atr=signal.metadata.get("atr")
+        )
         if distance <= 0 or not math.isfinite(distance):
             raise ValueError(
                 "Fallback stop distance is not finite and positive "
                 f"(got {distance!r}); refusing to size on it."
             )
-        if signal.action in {"buy", "long"}:
-            return signal.entry_price - distance
-        return signal.entry_price + distance
+        return self._place_stop(
+            action=signal.action, entry_price=signal.entry_price, distance=distance
+        )
+
 
     @staticmethod
     def _risk_reward_ratio(signal: TradeSignal, stop_loss: float) -> float | None:
