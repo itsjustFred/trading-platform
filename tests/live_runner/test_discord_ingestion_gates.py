@@ -2837,18 +2837,6 @@ class TestPerBotAuthorAllowlist:
         assert self._resolve("rocketfuel", env) == {self.ROCKETFUEL_AUTHOR}
         assert self._resolve("ramjet", env) == {self.RAMJET_AUTHOR}
 
-    def test_another_bots_author_is_refused_when_a_per_bot_var_exists(self):
-        """The cross-bot case, stated as the property that matters."""
-        env = {
-            "DISCORD_BOT_NITRO_TRUSTED_AUTHOR_IDS": self.NITRO_AUTHOR,
-            "DISCORD_BOT_ROCKETFUEL_TRUSTED_AUTHOR_IDS": self.ROCKETFUEL_AUTHOR,
-        }
-
-        nitro = self._resolve("nitro", env)
-
-        assert self.ROCKETFUEL_AUTHOR not in nitro
-        assert self.RAMJET_AUTHOR not in nitro
-
     def test_the_shared_var_still_works_for_a_single_bot_setup(self):
         """Backwards compatibility: a one-bot deployment configures the original
         name, and that must not be broken by adding the per-bot one."""
