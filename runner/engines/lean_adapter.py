@@ -23,13 +23,13 @@ from pathlib import Path
 from runner.agent_process import build_backtest_child_env
 from runner.approval_gate import require_generated_strategy_approval
 from runner.converters.lean_converter import convert_lean_result
+from runner.engines import contract
 from runner.engines.base import (
     BacktestConfig,
     EngineAdapter,
     ProgressCallback,
     warn_if_engine_frozen,
 )
-from runner.engines import contract
 from shared.atomic_io import write_text_atomically
 from shared.constants import DATA_DIR
 from shared.models import BacktestResult
