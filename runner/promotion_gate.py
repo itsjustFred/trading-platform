@@ -53,7 +53,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Literal, Mapping
 
-from runner.approval_gate import _atomic_write_json, _relative_name, _sha256_of
+from runner.approval_gate import _atomic_write_json, _relative_name, sha256_of
 
 LEDGER_SUFFIX = ".promoted.json"
 LEDGER_VERSION = 1
@@ -633,7 +633,7 @@ def out_of_sample_evidence_from_result(result_path: Path | str) -> OutOfSampleEv
             "optimization_id": str(payload.get("id") or path.stem),
             "result_file": path.name,
             "result_path": recorded_evidence_path(path),
-            "result_sha256": _sha256_of(path),
+            "result_sha256": sha256_of(path),
             # Only the file name: results record an absolute path of the
             # machine that ran them. Both separators are handled by hand so a
             # result written on Windows reads the same on POSIX.
@@ -688,7 +688,7 @@ def _evidence_file_problem(label: str, recorded_path: str, expected_sha256: str)
     try:
         if not path.is_file():
             return f"{label}: the evidence file {recorded_path} is missing or unreadable"
-        actual = _sha256_of(path)
+        actual = sha256_of(path)
     except (OSError, ValueError) as exc:
         return (
             f"{label}: the evidence file {recorded_path} is missing or unreadable "
@@ -704,7 +704,7 @@ def report_reference(report_path: Path | str) -> tuple[str, str, str]:
     path = Path(report_path)
     if not path.is_file():
         raise InvalidPromotionError(f"evidence report not found: {path}")
-    return path.name, recorded_evidence_path(path), _sha256_of(path)
+    return path.name, recorded_evidence_path(path), sha256_of(path)
 
 
 # --------------------------------------------------------------------------- #
@@ -833,7 +833,7 @@ def promotion_status(
     try:
         if not target.is_file():
             return _experimental(f"the file does not exist: {target.name}")
-        file_sha256 = _sha256_of(target)
+        file_sha256 = sha256_of(target)
     except OSError as exc:
         return _experimental(f"the file is unreadable ({type(exc).__name__})")
     try:
@@ -932,7 +932,7 @@ def promote(
     active_thresholds = thresholds or load_promotion_thresholds()
     moment = _utc_now(now)
 
-    file_sha256 = _sha256_of(target)
+    file_sha256 = sha256_of(target)
     bound_parameters = canonical_parameters(parameters)
     bound_parameters_sha256 = parameters_hash(bound_parameters)
     # Round-trip through the ledger form so exactly what is written is checked.

@@ -48,7 +48,7 @@ def approve_strategy(
     if not reviewer or reviewer.casefold() == "unspecified":
         raise ValueError("approved_by must identify the human reviewer")
 
-    digest = _sha256_of(path)
+    digest = sha256_of(path)
     generated = _has_generated_provenance(path, strategies_root)
     if generated and not _valid_generated_marker(path, strategies_root):
         raise StrategyNotApprovedError(
@@ -318,12 +318,12 @@ def _matching_record(
     if str(record.get("file") or "") != _relative_name(path, strategies_root):
         return None
 
-    if str(record.get("sha256") or "") != _sha256_of(path):
+    if str(record.get("sha256") or "") != sha256_of(path):
         return None
     return record
 
 
-def _sha256_of(path: Path) -> str:
+def sha256_of(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
