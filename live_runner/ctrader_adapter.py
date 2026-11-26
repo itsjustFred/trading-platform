@@ -3285,7 +3285,16 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         if client is not None:
             try:
                 deferreds = getattr(client, "_responseDeferreds", None)
-                if deferreds:
+                if deferreds is None:
+                    # The attribute itself is gone (ctrader-open-api bump):
+                    # adapter-tracked deferreds are still errbacked below,
+                    # but the miss must not be silent.
+                    logger.warning(
+                        "cTrader client exposes no _responseDeferreds; "
+                        "only adapter-tracked in-flight requests are failed",
+                        extra={"data": {"account_id": self.ctid_trader_account_id}},
+                    )
+                elif deferreds:
                     # Tolerate a non-mapping shape (list/set) in case a
                     # ctrader-open-api bump changes the container type.
                     values = (
