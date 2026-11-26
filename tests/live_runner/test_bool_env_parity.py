@@ -98,12 +98,6 @@ SHARED_PARSERS = [
         _canonical_error,
     ),
     BoolParser(
-        "preflight._parse_bool_env",
-        "CTRADER_DEMO",
-        lambda name, raw, default: preflight._parse_bool_env(name, raw, default=default),  # noqa: SLF001
-        _canonical_error,
-    ),
-    BoolParser(
         "alpaca_adapter._parse_bool_env",
         "ALPACA_PAPER",
         lambda name, raw, default: alpaca_adapter._parse_bool_env(  # noqa: SLF001
