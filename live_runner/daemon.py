@@ -626,6 +626,12 @@ def _coerce_live_float(
     field_name: str,
     minimum: float | None = None,
 ) -> float:
+    """Coerce a live setting that is not part of ``RiskConfig``.
+
+    Deployment risk settings go through ``RiskConfig.from_settings`` (one
+    mapping, improvement-run G03); this helper is for the remaining live
+    values such as broker pip data.
+    """
     if isinstance(value, bool):
         raise ValueError(f"Invalid {field_name}: {value!r}")
     try:
@@ -660,49 +666,10 @@ def _coerce_live_int(
 
 
 def _risk_config_for_deployment(deployment: LiveDeploymentConfig) -> RiskConfig:
-    settings = deployment.settings or {}
-    risk_per_trade_raw = settings.get(
-        "max_risk_per_trade",
-        settings.get("risk_per_trade_pct", 0.01),
-    )
-    max_total_exposure_raw = settings.get("max_total_exposure", 0.05)
-    max_positions_raw = settings.get("max_positions", 5)
-    sl_multiplier_raw = settings.get("default_sl_atr_multiplier", 2.0)
-    fallback_stop_pct_raw = settings.get("fallback_stop_pct", 0.02)
-    max_notional_raw = settings.get("max_notional_per_trade", 0.20)
-    allow_fallback_raw = settings.get("allow_fallback_stop", True)
-    reject_missing_raw = settings.get("reject_missing_stop", False)
-
-    return RiskConfig(
-        max_risk_per_trade=_coerce_live_float(
-            risk_per_trade_raw,
-            field_name="max_risk_per_trade",
-            minimum=0.0,
-        ),
-        max_total_exposure=_coerce_live_float(
-            max_total_exposure_raw,
-            field_name="max_total_exposure",
-            minimum=0.0,
-        ),
-        max_positions=_coerce_live_int(max_positions_raw, field_name="max_positions", minimum=1),
-        default_sl_atr_multiplier=_coerce_live_float(
-            sl_multiplier_raw,
-            field_name="default_sl_atr_multiplier",
-            minimum=0.0,
-        ),
-        fallback_stop_pct=_coerce_live_float(
-            fallback_stop_pct_raw,
-            field_name="fallback_stop_pct",
-            minimum=0.0,
-        ),
-        max_notional_per_trade=_coerce_live_float(
-            max_notional_raw,
-            field_name="max_notional_per_trade",
-            minimum=0.0,
-        ),
-        allow_fallback_stop=allow_fallback_raw,
-        reject_missing_stop=reject_missing_raw,
-    )
+    # Improvement-run G03: the settings -> RiskConfig mapping lives in
+    # ``RiskConfig.from_settings``, so the live defaults are the dataclass
+    # fields instead of a second copy of the literals here.
+    return RiskConfig.from_settings(deployment.settings)
 
 
 def _deployment_allows_short(deployment: LiveDeploymentConfig) -> bool:
