@@ -272,33 +272,37 @@ def test_risk_engine_atr_fallback_stop_price(action: str, expected: float) -> No
 # ---------------------------------------------------------------------------
 
 
-def _signal_bar(close: float = 100.0) -> pd.Series:
-    return pd.Series(
-        {
-            "timestamp": pd.Timestamp("2024-01-01T00:00:00Z"),
-            "open": close,
-            "high": close + 1.0,
-            "low": close - 1.0,
-            "close": close,
-            "volume": 1000.0,
-        }
-    )
+def _signal_bar(close: float = 100.0, stop_distance: float | None = None) -> pd.Series:
+    values: dict[str, object] = {
+        "timestamp": pd.Timestamp("2024-01-01T00:00:00Z"),
+        "open": close,
+        "high": close + 1.0,
+        "low": close - 1.0,
+        "close": close,
+        "volume": 1000.0,
+    }
+    if stop_distance is not None:
+        values["stop_distance"] = stop_distance
+    return pd.Series(values)
 
 
 @pytest.mark.parametrize(
-    ("direction", "close", "expected"),
+    ("direction", "close", "stop_distance", "expected"),
     [
-        ("LONG", 100.0, 98.0),
-        ("SHORT", 100.0, 102.0),
-        ("LONG", 250.5, 250.5 - 250.5 * 0.02),
-        ("SHORT", 250.5, 250.5 + 250.5 * 0.02),
+        ("LONG", 100.0, None, 98.0),
+        ("SHORT", 100.0, None, 102.0),
+        ("LONG", 250.5, None, 250.5 - 250.5 * 0.02),
+        ("SHORT", 250.5, None, 250.5 + 250.5 * 0.02),
+        # A strategy's own stop distance wins over the percent rule.
+        ("LONG", 100.0, 7.5, 92.5),
+        ("SHORT", 100.0, 7.5, 107.5),
     ],
 )
 def test_native_engine_creation_time_fallback_exposure_stop(
-    direction: str, close: float, expected: float
+    direction: str, close: float, stop_distance: float | None, expected: float
 ) -> None:
     engine = _engine()
-    engine._create_order(_signal_bar(close), 0, direction)
+    engine._create_order(_signal_bar(close, stop_distance), 0, direction)
 
     assert len(engine.pending_orders) == 1
     assert engine.pending_orders[0].stop_loss is None
@@ -365,6 +369,23 @@ def _short_no_stop_strategy(df: pd.DataFrame, params: dict):
     return entries, exits, {"direction": direction}, []
 
 
+def _stop_distance_strategy(df: pd.DataFrame, params: dict):
+    """No stop level, but the strategy's own stop distance."""
+    entries = pd.Series([True, False, False], index=df.index)
+    exits = pd.Series([False, False, True], index=df.index)
+    direction = pd.Series(["LONG", None, None], index=df.index, dtype=object)
+    stop_distance = pd.Series([7.5, None, None], index=df.index)
+    return entries, exits, {"direction": direction, "stop_distance": stop_distance}, []
+
+
+def _short_stop_distance_strategy(df: pd.DataFrame, params: dict):
+    entries = pd.Series([True, False, False], index=df.index)
+    exits = pd.Series([False, False, True], index=df.index)
+    direction = pd.Series(["SHORT", None, None], index=df.index, dtype=object)
+    stop_distance = pd.Series([7.5, None, None], index=df.index)
+    return entries, exits, {"direction": direction, "stop_distance": stop_distance}, []
+
+
 @pytest.mark.parametrize(
     ("fill_open", "strategy", "expected"),
     [
@@ -372,6 +393,11 @@ def _short_no_stop_strategy(df: pd.DataFrame, params: dict):
         (85.0, _no_stop_strategy, 85.0 * 0.98),
         (120.0, _short_no_stop_strategy, 120.0 * 1.02),
         (85.0, _short_no_stop_strategy, 85.0 * 1.02),
+        # The strategy's own stop distance wins and is re-derived from the fill.
+        (120.0, _stop_distance_strategy, 120.0 - 7.5),
+        (85.0, _stop_distance_strategy, 85.0 - 7.5),
+        (120.0, _short_stop_distance_strategy, 120.0 + 7.5),
+        (85.0, _short_stop_distance_strategy, 85.0 + 7.5),
     ],
 )
 def test_native_engine_fill_time_fallback_stop_re_derives_from_fill(
