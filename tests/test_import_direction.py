@@ -203,10 +203,24 @@ def _cross_package_edges() -> tuple[tuple[str, str, Path, int], ...]:
                 targets = [target] if target is not None else []
             else:
                 continue
-            for target in targets:
-                resolved = _resolve(target, modules)
-                if resolved is None or resolved == module:
-                    continue
+            resolved_targets = {
+                resolved
+                for target in targets
+                if (resolved := _resolve(target, modules)) is not None
+                and resolved != module
+            }
+            # ``from pkg import mod`` yields both ``pkg`` and ``pkg.mod``;
+            # keep only the longest resolution so each edge names the real
+            # target module rather than its parent package as well.
+            resolved_targets = {
+                resolved
+                for resolved in resolved_targets
+                if not any(
+                    other != resolved and other.startswith(f"{resolved}.")
+                    for other in resolved_targets
+                )
+            }
+            for resolved in resolved_targets:
                 dst_package = resolved.split(".")[0]
                 if dst_package == src_package or dst_package not in LAYERS:
                     continue
