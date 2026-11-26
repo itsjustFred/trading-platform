@@ -26,6 +26,7 @@ cp .env.example .env
 cd frontend && npm install && npm run build && cd ..
 python -m uvicorn viewer.main:app --host 0.0.0.0 --port 5556 --no-access-log
 # Open http://localhost:5556
+# (without a frontend build the viewer answers non-API paths with 503 "frontend not built")
 
 # Development (two terminals; Vite on :3000 proxies /api to backend on :5556)
 # Terminal 1:
@@ -56,6 +57,11 @@ opens weekly grouped PRs for GitHub Actions and uv, and a weekly workflow
 fails on high-severity `pip-audit`/`npm audit` findings. See
 [docs/dependency-security.md](docs/dependency-security.md) for the policy
 and the accepted-risk pins.
+
+Pull requests and pushes to `main` are also scanned for committed secrets
+with gitleaks (`.github/workflows/secret-scan.yml`, config `.gitleaks.toml`);
+run the same check locally with
+`gitleaks git --log-opts="origin/main..HEAD" --redact .` (adjust base)
 
 ## Data Directory
 

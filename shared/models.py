@@ -451,8 +451,9 @@ class LiveExecution(BaseModel):
     # The fill's fee in account currency (USD), or ``None`` when it is not known (#124).
     #
     # ``0.0`` is a *known* zero (Alpaca equities are commission-free) and ``None`` is "the broker
-    # has not told us yet": Alpaca posts crypto fees end of day as ``CFEE`` account activities, so
-    # at fill time the fee is unknown and a later backfill fills it in. The field is required on
+    # has not told us yet": Alpaca reports crypto fees only as ``CFEE`` account activities
+    # posted in batches after the fill, so at fill time the fee is unknown and a later
+    # backfill fills it in. The field is required on
     # purpose - an adapter must decide which of the two it has, rather than inherit a default
     # zero that silently overstates net PnL. Readers treat ``None`` as "net PnL incomplete".
     #

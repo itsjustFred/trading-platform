@@ -1866,3 +1866,40 @@ def test_get_order_state_reads_working_filled_and_terminal_orders(tmp_path: Path
     # An order id the broker does not know reads as unknown, never terminal.
     assert asyncio.run(adapter.get_order_state("999")) is None
     assert asyncio.run(adapter.get_order_state("not-a-number")) is None
+
+
+def test_get_order_details_returns_raw_response_for_verification(tmp_path: Path) -> None:
+    """The public seam ``scripts/verify_ctrader_order.py`` uses must carry the
+    account id and order id on the wire and hand back the raw response."""
+    from ctrader_open_api.messages.OpenApiMessages_pb2 import (
+        ProtoOAOrderDetailsReq,
+        ProtoOAOrderDetailsRes,
+    )
+
+    from live_runner.ctrader_adapter import CTraderLiveAdapter
+
+    adapter = CTraderLiveAdapter(
+        app_id="app", app_secret="secret", access_token="token", account_id="123",
+        accounts_env_path=tmp_path / ".accounts.env",
+    )
+    adapter._ProtoOAOrderDetailsReq = ProtoOAOrderDetailsReq
+
+    sent: list[Any] = []
+
+    async def _fake_send(request, **_kwargs):
+        sent.append(request)
+        res = ProtoOAOrderDetailsRes()
+        res.deal.add(dealId=42, filledVolume=1000)
+        return res
+
+    adapter._send_request_with_refresh_retry = _fake_send  # type: ignore[method-assign]
+
+    response = asyncio.run(adapter.get_order_details(777))
+
+    assert isinstance(response, ProtoOAOrderDetailsRes)
+    assert len(response.deal) == 1
+    assert response.deal[0].dealId == 42
+    assert len(sent) == 1
+    assert isinstance(sent[0], ProtoOAOrderDetailsReq)
+    assert sent[0].ctidTraderAccountId == adapter.ctid_trader_account_id
+    assert sent[0].orderId == 777

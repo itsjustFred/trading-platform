@@ -101,7 +101,7 @@ def test_native_adapter_output_is_json_serializable(tmp_path, monkeypatch):
     )
 
     frame = _frame()
-    monkeypatch.setattr(native_adapter, "_load_ohlcv", lambda *_a, **_k: frame)
+    monkeypatch.setattr(native_adapter, "load_ohlcv", lambda *_a, **_k: frame)
 
     config = BacktestConfig(
         strategy_name="native-drawings",

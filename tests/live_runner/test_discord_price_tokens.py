@@ -18,7 +18,7 @@ def _parse(content: str):
         author=SimpleNamespace(id="bot-121", bot=True),
         created_at=datetime.now(timezone.utc),
     )
-    return ds._parse_trade_signal_from_message(message, default_timeframe="1h")
+    return ds.parse_trade_signal_from_message(message, default_timeframe="1h")
 
 
 def test_a_comma_after_the_price_is_a_separator_not_a_thousands_group() -> None:

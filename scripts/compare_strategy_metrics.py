@@ -11,7 +11,7 @@ from pathlib import Path
 
 # --- import-origin guard ---
 # `shared` must resolve to this checkout, not the installed package. The mechanism lives in
-# scripts/_import_origin.py; only the invocation is per script. scripts/ goes on sys.path - never
+# scripts/import_origin.py; only the invocation is per script. scripts/ goes on sys.path - never
 # the repo root, which would repair `import shared` and defeat the guard - so a direct run is
 # refused (exit 2) instead of mutating another tree's schema. See
 # tests/test_script_import_origin.py; run as:
@@ -22,7 +22,7 @@ from pathlib import Path as _path
 _scripts_dir = str(_path(__file__).resolve().parent)
 if _scripts_dir not in _sys.path:
     _sys.path.insert(0, _scripts_dir)
-import _import_origin as _guard
+import import_origin as _guard
 
 _guard.ensure_own_checkout("compare_strategy_metrics")
 # --- end import-origin guard ---
@@ -31,7 +31,7 @@ _guard.ensure_own_checkout("compare_strategy_metrics")
 # that must carry the guard. Kept deliberately, and silenced rather than removed: dropping it would
 # take this script off the roster and out of the gate that keeps the guard alive.
 import shared  # noqa: F401
-from scripts._safe_path import under_root
+from scripts.safe_path import under_root
 from shared.atomic_io import write_text_atomically
 from validation.statistics.cross_platform import build_comparison_matrix
 
