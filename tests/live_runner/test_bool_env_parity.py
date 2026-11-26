@@ -215,7 +215,7 @@ def _ctrader_adapter_constructor() -> None:
 
 
 def _alpaca_default_credentials() -> None:
-    alpaca_adapter._default_alpaca_credentials(  # noqa: SLF001
+    alpaca_adapter.default_alpaca_credentials(
         {
             "ALPACA_API_KEY": "key",
             "ALPACA_SECRET_KEY": "secret",
@@ -225,7 +225,7 @@ def _alpaca_default_credentials() -> None:
 
 
 def _alpaca_credential_block() -> None:
-    alpaca_adapter._alpaca_credential_block(  # noqa: SLF001
+    alpaca_adapter.alpaca_credential_block(
         {
             "ALPACA_API_KEY_ACC1": "key",
             "ALPACA_SECRET_KEY_ACC1": "secret",
