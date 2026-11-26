@@ -102,3 +102,27 @@ def test_gate_refusal_ends_the_loop() -> None:
 
     _run_coro(_drive())
     assert adapter.calls == 0
+
+
+def test_trailing_eligible_adapters_hard_block_real_money() -> None:
+    """The maintenance loop's adapter filter must keep excluding
+    real-money adapters: the heal places, cancels and closes orders, so
+    the demo/paper bar is the deliberate hard block, not a convenience."""
+    from live_runner.daemon import _trailing_eligible_adapters
+
+    class _Stub:
+        def __init__(self, **flags) -> None:
+            self._connected = True
+            self._authenticated = True
+            for key, value in flags.items():
+                setattr(self, key, value)
+
+    demo = _Stub(paper=True)
+    live = _Stub(paper=False)
+    unknown = _Stub()
+
+    eligible = _trailing_eligible_adapters(
+        {"demo": demo, "live": live, "unknown": unknown}
+    )
+
+    assert eligible == {"demo": demo}

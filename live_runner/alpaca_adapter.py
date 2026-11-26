@@ -165,10 +165,11 @@ _EXPIRED_STOP_HEAL_AUDIT_ACTION = "alpaca_expired_entry_stop_heal"
 #: next process heals it instead of reading an unproven operator cancel.
 _EXPIRED_STOP_REPLACE_CANCEL_ACTION = "alpaca_expired_stop_replace_cancel"
 #: How long a replace-cancel intent stays heal-eligible proof. The cancel
-#: and the replacement are seconds apart; a day covers clock skew and a
-#: slow replacement pass without letting a stale intent bless an operator
-#: cancel weeks later.
-_EXPIRED_STOP_REPLACE_CANCEL_INTENT_TTL = timedelta(hours=24)
+#: and the replacement are seconds apart, but the intent must outlive any
+#: plausible restart gap - a week covers outages and long weekends. It
+#: cannot bless a different order: broker order ids are unique, and the
+#: order it names is already terminal, so it cannot be canceled twice.
+_EXPIRED_STOP_REPLACE_CANCEL_INTENT_TTL = timedelta(days=7)
 #: Alpaca's aged-order policy cancels a GTC order ~90 days after creation;
 #: ``expires_at`` is the broker's own schedule when it reports one.
 _PROTECTIVE_ORDER_AGED_TTL = timedelta(days=90)
