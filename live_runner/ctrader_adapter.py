@@ -3097,7 +3097,10 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             deferreds = getattr(client, "_responseDeferreds", None)
             if not deferreds:
                 return
-            pending = list(deferreds.values())
+            # Tolerate a non-mapping shape (list/set) in case a ctrader-open-api
+            # bump changes the container type.
+            values = deferreds.values() if hasattr(deferreds, "values") else deferreds
+            pending = list(values)
         except Exception as exc:  # except-kind: loop-survival
             # A ctrader-open-api bump that renames or reshapes
             # ``_responseDeferreds`` must not abort the rest of teardown
