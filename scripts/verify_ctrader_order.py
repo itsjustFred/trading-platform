@@ -97,10 +97,7 @@ def _resolve_ids(args: argparse.Namespace) -> tuple[int, int]:
 async def verify_once(adapter: Any, order_id: int) -> dict[str, Any]:
     try:
         await adapter.connect()
-        request = adapter._ProtoOAOrderDetailsReq()
-        request.ctidTraderAccountId = adapter.ctid_trader_account_id
-        request.orderId = order_id
-        response = await adapter._send_request_with_refresh_retry(request, timeout_seconds=20)
+        response = await adapter.get_order_details(order_id)
         deals = getattr(response, "deal", [])
         output: dict[str, Any] = {"order_id": order_id, "deals": []}
         for deal in deals:
