@@ -4,7 +4,7 @@
 Runs every strategy-registry entry through ``NativeAdapter`` and
 ``VectorbtAdapter`` on the *same* configuration and writes a per-strategy
 trade/stat diff report. This is the phase-S evidence for the phase-M default
-flips described in ``docs/adr/0001-native-single-strategy-engine.md``: the
+flips described in ``docs/adr/0002-native-single-strategy-engine.md``: the
 gate changes no defaults and asserts nothing — per-strategy differences are
 *reported* so each can be explained before any flip.
 

@@ -50,9 +50,6 @@ name: Agent Code Review
 #   same-repo PRs. Fork PRs and drafts are skipped - a draft is reviewed when
 #   it is marked ready for review (`ready_for_review` is a trigger type).
 #
-# A run that failed for a transient reason (e.g. a model rate limit) is
-# restarted with "Re-run jobs" on the run page or `gh run rerun <run-id>`.
-#
 # Configuration (Settings -> Secrets and variables -> Actions -> Variables):
 #   REVIEW_MODEL    opencode model, provider/model (default: opencode/inkling-2-small-free)
 #   REVIEW_VARIANT  reasoning variant offered by that model, e.g. low/high/max (default: max)
@@ -483,8 +480,8 @@ jobs:
           drop_retry_lines() {
             grep -v 'retrying (attempt' "$1" > "$1.final" || true
           }
-          # The agent has a shell and its stdout becomes a public PR comment (and, for the
-          # pre-mortem, an artifact). An `nvidia/...` run holds the key in this step's env,
+          # The agent has a shell and its stdout becomes a public PR comment and a
+          # workflow artifact. An `nvidia/...` run holds the key in this step's env,
           # so before anything is kept the captured streams are checked for it: a stream
           # that carries the key fails the step, which uploads and posts nothing (the later
           # steps only run on success), and the files are removed besides. Actions masks

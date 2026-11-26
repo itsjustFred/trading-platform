@@ -1055,9 +1055,10 @@ def _resolve_fill_price(
 def _known_commission(order: Any) -> float | None:
     """``0.0`` for an equity order (commission-free on Alpaca), ``None`` (unknown) otherwise.
 
-    Alpaca reports no commission on the order or the trade update. Crypto fees are posted end of day
-    as ``CFEE`` activities and priced later by `AlpacaLiveAdapter.backfill_commissions`; options and
-    an unreadable asset class are unknown too. Maintainer decision on #124: ``0.0`` only for a known
+    Alpaca reports no commission on the order or the trade update. Crypto fees appear only as
+    ``CFEE`` account activities, posted in batches well after the fill (a ~51 h posting delay was
+    observed), and are priced later by `AlpacaLiveAdapter.backfill_commissions`; options and an
+    unreadable asset class are unknown too. Maintainer decision on #124: ``0.0`` only for a known
     zero, NULL for everything else.
     """
     raw = _order_attr(order, "asset_class", None)
@@ -7158,8 +7159,9 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
 
             event_filled_qty = parse_optional(filled_qty_value)
             filled_qty = 0.0 if event_filled_qty is None else event_filled_qty
-            # alpaca-py has no commission field on TradeUpdate or Order; a crypto fee is posted end
-            # of day and backfilled, so here it is unknown unless it is a known zero (#124).
+            # alpaca-py has no commission field on TradeUpdate or Order; a crypto fee is only
+            # known once its ``CFEE`` activity posts (in delayed batches) and is backfilled,
+            # so here it is unknown unless it is a known zero (#124).
             commission = _known_commission(order)
             raw_fill_ts = getattr(data, "timestamp", None)
             fill_ts = _broker_fill_timestamp(
