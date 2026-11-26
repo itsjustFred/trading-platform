@@ -667,6 +667,24 @@ class _SpotWaiter:
 # so an unanswerable ``HasField`` must read as "present / unknown" instead.
 _PRESENT_BUT_UNKNOWN = object()
 
+#: ``ProtoOAExecutionType`` members that are never a refusal. The classifier
+#: in ``_execution_event_rejection`` accepts a member as a non-rejection only
+#: when its name is in this set or contains ``REJECT``; anything else fails
+#: closed to unclassifiable so a future enum member cannot pass as success.
+_NON_REJECTION_EXECUTION_TYPES = frozenset(
+    {
+        "ORDER_ACCEPTED",
+        "ORDER_FILLED",
+        "ORDER_REPLACED",
+        "ORDER_CANCELLED",
+        "ORDER_EXPIRED",
+        "ORDER_PARTIAL_FILL",
+        "SWAP",
+        "DEPOSIT_WITHDRAW",
+        "BONUS_DEPOSIT_WITHDRAW",
+    }
+)
+
 
 def _present_proto_field(
     payload: Any, name: str, *, fail_closed: bool = False
@@ -4576,13 +4594,19 @@ class CTraderLiveAdapter(BaseLiveAdapter):
 
         The real ``ProtoOAExecutionType`` is an ``EnumTypeWrapper`` with a
         ``DESCRIPTOR``; test doubles are plain namespaces, where ``dir``
-        yields the members. Anything unreadable is skipped - an empty result
-        makes the caller fail closed.
+        yields the members. Anything unreadable fails closed to an empty
+        list, which makes the caller treat the event as unclassifiable.
         """
-        descriptor = getattr(enum, "DESCRIPTOR", None)
-        values = getattr(descriptor, "values_by_name", None)
-        if values is not None:
-            return [(name, int(member.number)) for name, member in values.items()]
+        try:
+            descriptor = getattr(enum, "DESCRIPTOR", None)
+            values = getattr(descriptor, "values_by_name", None)
+            if values is not None:
+                return [
+                    (name, int(member.number))
+                    for name, member in values.items()
+                ]
+        except Exception:  # except-kind: money-decision
+            return []
         members: list[tuple[str, int]] = []
         for name in dir(enum):
             if name.startswith("_"):
@@ -4626,10 +4650,16 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         known = {number for _, number in members}
         if value not in known:
             return None, True
-        for name, number in members:
-            if number == value and "REJECT" in name:
-                return name, False
-        return None, False
+        matched = [name for name, number in members if number == value]
+        # Any member named *REJECT* is a refusal; anything else must be a
+        # known non-rejection outcome. A member that is neither - a future
+        # rejection type named without "REJECT", or an unknown outcome -
+        # fails closed to unclassifiable rather than passing as success.
+        if any("REJECT" in name for name in matched):
+            return next(name for name in matched if "REJECT" in name), False
+        if all(name in _NON_REJECTION_EXECUTION_TYPES for name in matched):
+            return None, False
+        return None, True
 
     def _execution_rejection_is_definitive(self, event: Any, request: Any) -> bool:
         """Whether an ORDER_REJECTED execution event proves nothing was opened.
