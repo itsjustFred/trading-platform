@@ -6491,3 +6491,96 @@ def test_close_all_positions_attributes_a_crypto_flatten_fill(
         "could not be attributed" in record.message
         for record in caplog.records
     )
+
+
+# ─── 2026-11-25 soak: entry/restore time-in-force ────────────────────────────
+#
+# A DAY bracket/OTO stop leg expired at the session close and left the filled
+# position naked overnight. Entries and restored stops now submit GTC so the
+# protective legs survive sessions; a bare exit-only market order keeps DAY.
+
+
+def _tif_text(order_data: object) -> str:
+    raw = getattr(order_data, "time_in_force", "")
+    return str(getattr(raw, "value", raw) or "").strip().lower()
+
+
+def _unbounded_entry_signal() -> LiveSignal:
+    return LiveSignal(
+        deployment_id="11111111-1111-1111-1111-111111111111",
+        symbol="NVDA",
+        action="buy",
+        theoretical_price=150.0,
+        timestamp=datetime.now(timezone.utc),
+        metadata={
+            "stop_loss": 144.0,
+            "take_profit_policy": "unbounded_exit_on_opposite_signal",
+        },
+    )
+
+
+def test_bracket_entry_request_is_gtc(monkeypatch) -> None:
+    """The SL/TP legs must outlive the session: DAY expired the stop at the
+    close and left the filled position naked overnight (2026-11-25 soak)."""
+    client = _FakeTradingClient()
+    adapter = _adapter(client)
+    _patched_signal_store(monkeypatch, [])
+
+    asyncio.run(adapter.submit_order(_entry_signal(), qty=10.0))
+
+    request = client.submitted[0]
+    assert _class_text(request) == "bracket"
+    assert _tif_text(request) == "gtc"
+    assert getattr(request, "extended_hours", None) in (False, None)
+
+
+def test_oto_entry_request_is_gtc(monkeypatch) -> None:
+    """The unbounded-TP OTO entry keeps its stop leg across sessions too."""
+    client = _FakeTradingClient()
+    adapter = _adapter(client)
+    _patched_signal_store(monkeypatch, [])
+
+    asyncio.run(adapter.submit_order(_unbounded_entry_signal(), qty=10.0))
+
+    request = client.submitted[0]
+    assert _class_text(request) == "oto"
+    assert _tif_text(request) == "gtc"
+
+
+def test_exit_only_market_order_stays_day(monkeypatch) -> None:
+    """A bare exit-only market order carries no resting leg to protect, so it
+    keeps DAY: it is meant to fill in the session it was submitted, and a DAY
+    expiry surfaces an unfilled exit through terminal-order reconciliation
+    rather than silently carrying a stale exit into a later session."""
+    client = _FakeTradingClient(positions=[_FakePosition("AAPL", 10.0)])
+    adapter = _adapter(client)
+    _patched_signal_store(monkeypatch, [])
+
+    asyncio.run(adapter.submit_order(_exit_signal_full(), qty=10.0))
+
+    request = client.submitted[0]
+    assert _class_text(request) == "simple"
+    assert _tif_text(request) == "day"
+
+
+def test_restored_stop_is_gtc() -> None:
+    """The stop re-placed after a refused close must survive the next close
+    too - a DAY restore expired at 21:00 UTC in the soak."""
+    client = _FakeTradingClient(
+        orders=[
+            _FakeOrder(
+                "sl-1", "AAPL", "sell", order_type="stop", qty=10.0, stop_price=190.0
+            )
+        ],
+        positions=[_FakePosition("AAPL", 10.0)],
+        close_error=RuntimeError("broker refused to close"),
+    )
+
+    outcome = asyncio.run(_adapter(client).close_all_positions())
+
+    assert outcome.complete is False
+    restored = [
+        order for order in client.submitted if getattr(order, "stop_price", None) == 190.0
+    ]
+    assert len(restored) == 1
+    assert _tif_text(restored[0]) == "gtc"
