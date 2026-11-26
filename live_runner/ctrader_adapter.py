@@ -47,6 +47,7 @@ from shared.database import (
     BROKER_CLOSE_REASON_CTRADER_POSITION_CLOSE,
     broker_close_signal_id,
     find_live_signal_id_by_broker_order_id,
+    find_live_signal_ids_by_broker_order_id,
     flag_live_ledger_reconciliation,
     get_live_adapter_state,
     get_live_signal_account_id,
@@ -3015,9 +3016,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
 
     async def _persisted_exit_position_id(self, signal_id: str) -> int | None:
         metadata = await asyncio.to_thread(get_live_signal_metadata, signal_id)
-        if not metadata:
-            return None
-        if str(metadata.get("risk_sizing_mode") or "") != EXIT_ONLY_RISK_SIZING_MODE:
+        if not metadata or not is_exit_only_signal_metadata(metadata):
             return None
         return self._requested_exit_position_id(metadata)
 
@@ -6743,15 +6742,44 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             # A deal our own order made is the per-signal reconcile's job, not
             # this pass's: booking it here too would close the ledger twice.
             if order_id not in own_order_cache:
-                own_order_cache[order_id] = bool(
-                    self._order_id_to_signal_id.get(order_id)
-                ) or bool(
-                    await asyncio.to_thread(
-                        find_live_signal_id_by_broker_order_id,
+                own_order_cache[order_id] = (
+                    self._order_id_to_signal_id.get(order_id) is not None
+                )
+                if not own_order_cache[order_id]:
+                    owner_ids = await asyncio.to_thread(
+                        find_live_signal_ids_by_broker_order_id,
                         self.account_config_id,
                         str(order_id),
                     )
-                )
+                    if len(owner_ids) > 1:
+                        # Ambiguous ownership - broker_order_id is indexed,
+                        # not unique, so recovered duplicates can share one.
+                        # The deal may be ours or a broker-side close and
+                        # booking either way risks the wrong ledger side:
+                        # flag it for an operator instead of guessing.
+                        self._flag_ledger_reconciliation(
+                            self._fill_symbol_name(
+                                order_id=order_id, order=None, deal=deal
+                            )
+                            or "",
+                            "ambiguous_broker_order_id",
+                            {
+                                "position_id": position_id,
+                                "deal_id": deal_id,
+                                "order_id": str(order_id),
+                                "owner_signal_ids": owner_ids,
+                                "deal_timestamp_ms": (
+                                    self._resolve_execution_timestamp_ms(
+                                        order=None, deal=deal
+                                    )
+                                ),
+                                "source": "reconcile",
+                            },
+                            flagged_ids=flagged_deal_ids,
+                        )
+                        own_order_cache[order_id] = True
+                        return 0
+                    own_order_cache[order_id] = bool(owner_ids)
             if own_order_cache[order_id]:
                 return 0
         if self._pending_close_position_active(position_id):

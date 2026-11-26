@@ -6045,21 +6045,21 @@ def get_live_signal_timestamp(signal_id: str) -> datetime | None:
     return timestamp.astimezone(timezone.utc)
 
 
-def find_live_signal_id_by_broker_order_id(
+def find_live_signal_ids_by_broker_order_id(
     account_id: str, broker_order_id: str
-) -> str | None:
-    """The signal owning this broker order id, or ``None`` when unknown.
+) -> list[str]:
+    """Up to two signal ids owning this broker order id on the account.
 
     ``broker_order_id`` is indexed but not unique, so two rows on one account
-    can share an id (a recovered duplicate, a broker-side id reuse). Picking
-    the newest would attribute a fill to a possibly-wrong signal, so an
-    ambiguous match fails closed to ``None`` - callers then take their
-    unresolved/flagged path instead of mis-booking the fill.
+    can share an id (a recovered duplicate, a broker-side id reuse). Callers
+    that must distinguish "one owner" from "ambiguous" need the raw matches;
+    :func:`find_live_signal_id_by_broker_order_id` is the fail-closed
+    single-owner projection of this list.
     """
     normalized_account_id = str(account_id or "").strip()
     normalized_order_id = str(broker_order_id or "").strip()
     if not normalized_account_id or not normalized_order_id:
-        return None
+        return []
     init_db()
     with get_session() as session:
         rows = session.exec(
@@ -6073,9 +6073,21 @@ def find_live_signal_id_by_broker_order_id(
             .order_by(LiveSignalModel.timestamp.desc())
             .limit(2)
         ).all()
-    if len(rows) != 1:
-        return None
-    return str(rows[0].id)
+    return [str(row.id) for row in rows]
+
+
+def find_live_signal_id_by_broker_order_id(
+    account_id: str, broker_order_id: str
+) -> str | None:
+    """The signal owning this broker order id, or ``None`` when unknown.
+
+    Picking the newest of several matches would attribute a fill to a
+    possibly-wrong signal, so an ambiguous match fails closed to ``None`` -
+    callers then take their unresolved/flagged path instead of mis-booking
+    the fill.
+    """
+    owner_ids = find_live_signal_ids_by_broker_order_id(account_id, broker_order_id)
+    return owner_ids[0] if len(owner_ids) == 1 else None
 
 
 def get_live_signal_reconciliation_cursor(signal_id: str) -> tuple[datetime, str] | None:

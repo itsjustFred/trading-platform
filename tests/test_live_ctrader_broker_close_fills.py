@@ -1085,6 +1085,64 @@ def test_a_duplicate_signal_with_persisted_order_id_clears_the_pending_mark(
     assert adapter._order_id_to_signal_id[CLOSE_ORDER_ID] == exit_id
 
 
+def test_an_exit_only_signal_without_risk_sizing_mode_still_lifts_the_mark(
+    database,
+) -> None:
+    """Pre-mortem: ``_persisted_exit_position_id`` must use the ledger's exit
+    predicate, not only ``risk_sizing_mode=exit_only`` - an ``exit_only``
+    signal with different sizing metadata is still a close the ledger
+    counts, so its pending mark must lift on order-id recovery."""
+    exit_id = _persist_exit_signal(
+        database,
+        order_id=CLOSE_ORDER_ID,
+        metadata_extra={
+            "risk_sizing_mode": "sized",
+            "position_id": POSITION_ID,
+        },
+    )
+    adapter = _adapter(database)
+    adapter._pending_close_positions[POSITION_ID] = {exit_id: time.monotonic()}
+
+    recovered = asyncio.run(adapter._recover_duplicate_signal_order_id(exit_id))
+
+    assert recovered == str(CLOSE_ORDER_ID)
+    assert POSITION_ID not in adapter._pending_close_positions
+
+
+def test_deal_list_reconcile_flags_an_ambiguous_broker_order_id(
+    database,
+) -> None:
+    """Pre-mortem BLOCK: ``broker_order_id`` is indexed, not unique - two
+    signals on the account can share one. The deal may be ours or a
+    broker-side close, so the pass must flag it for an operator rather than
+    book it against the wrong ledger side (or silently skip it as "ours")."""
+    entry_id = _persist_entry(database, qty=10.0)
+    first_exit = _persist_exit_signal(
+        database,
+        order_id=CLOSE_ORDER_ID,
+        metadata_extra={"position_id": POSITION_ID},
+    )
+    second_exit = _persist_exit_signal(
+        database,
+        order_id=CLOSE_ORDER_ID,
+        metadata_extra={"position_id": POSITION_ID},
+    )
+    assert first_exit != second_exit
+    adapter = _reconcilable_adapter(
+        database,
+        position_orders={POSITION_ID: [_entry_order(entry_id)]},
+        deal_list=[_close_deal()],
+    )
+
+    asyncio.run(adapter.reconcile_executions())
+
+    flags = _reconciliation_flags(database)
+    assert len(flags) == 1
+    assert flags[0]["detail"]["cause"] == "ambiguous_broker_order_id"
+    # The close was NOT booked: the entry stays open on the ledger.
+    assert _ledger(database) == pytest.approx(10.0)
+
+
 # ─── the reconciliation backfill ──────────────────────────────────────────────────────────────
 
 
