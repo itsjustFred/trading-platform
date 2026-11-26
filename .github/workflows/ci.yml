@@ -67,7 +67,7 @@ jobs:
         # `tests/test_lint_family_ratchet.py` test asserts the two agree.
         run: >-
           uv run --no-sync --no-build ruff check --select
-          B,DTZ,PERF,PLE,PLW0120,PLW0602,PLW1510,RUF005,RUF006,RUF007,RUF012,RUF013,RUF015,RUF019,RUF021,RUF023,RUF036,RUF043,RUF046,RUF059,S307 .
+          B,DTZ,PERF,PLE,PLW0120,PLW0602,PLW1510,RUF005,RUF006,RUF007,RUF012,RUF013,RUF015,RUF019,RUF021,RUF023,RUF036,RUF043,RUF046,RUF059,S307,PLC2701 .
       - name: Type check (mypy)
         # mypy is a dev dependency (`uv sync` installs it) and pinned there to
         # 2.4.1, so this is the same interpreter the developer gets from

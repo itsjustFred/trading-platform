@@ -911,7 +911,7 @@ def test_claim_path_cap_refusal_releases_the_lease_and_never_submits(monkeypatch
         timeframe="1h",
         metadata={"received_at": datetime.now(timezone.utc).isoformat()},
     )
-    live_signal = daemon._trade_signal_to_live_signal(trade_signal, deployment)
+    live_signal = daemon.trade_signal_to_live_signal(trade_signal, deployment)
 
     released: list[str] = []
     monkeypatch.setattr(daemon, "claim_live_deployment_submission", lambda *a, **k: True)
@@ -959,7 +959,7 @@ def test_claim_path_submits_the_clamped_qty(monkeypatch):
         timeframe="1h",
         metadata={"received_at": datetime.now(timezone.utc).isoformat()},
     )
-    live_signal = daemon._trade_signal_to_live_signal(trade_signal, deployment)
+    live_signal = daemon.trade_signal_to_live_signal(trade_signal, deployment)
     prepared_signal = _signal(
         deployment,
         metadata={"entry_price": 100.0, "stop_loss": 99.9, "take_profit": 105.0},

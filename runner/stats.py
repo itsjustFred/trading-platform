@@ -399,7 +399,7 @@ def compute_stats(
     ).to_dict()
 
 
-def _book_asset_class(
+def book_asset_class(
     meta_data: dict[str, Any],
     execution_context: dict[str, Any],
     symbols: list[str],
@@ -487,7 +487,7 @@ def _result_venue_context(result: BacktestResult) -> dict[str, Any]:
     return {
         "symbols": symbol_list or None,
         "data_source": data_source,
-        "asset_class": _book_asset_class(
+        "asset_class": book_asset_class(
             meta_data, execution_context, symbol_list, data_source, data_dir
         ),
         "data_dir": data_dir,
