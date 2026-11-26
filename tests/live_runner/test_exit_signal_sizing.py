@@ -229,10 +229,7 @@ def test_ledger_reports_a_short_as_negative(isolated_db) -> None:
 # ─── Through the daemon ──────────────────────────────────────────────────────
 
 
-def _deployment(*, allow_short: bool = False, processor: str | None = None) -> LiveDeploymentConfig:
-    signal_config: dict[str, object] = {"channel_id": "100000000000000121"}
-    if processor:
-        signal_config["signal_processor"] = processor
+def _deployment(*, allow_short: bool = False) -> LiveDeploymentConfig:
     return LiveDeploymentConfig(
         id=str(uuid.uuid4()),
         strategy_name="discord::121",
@@ -240,9 +237,9 @@ def _deployment(*, allow_short: bool = False, processor: str | None = None) -> L
         symbols=["AAPL"],
         timeframe="1h",
         status="ACTIVE",
-        signal_source="discord",
-        signal_source_type="discord",
-        signal_config=signal_config,
+        signal_source="internal",
+        signal_source_type="internal",
+        signal_config={},
         settings={"allow_short": allow_short},
     )
 
@@ -444,31 +441,15 @@ def test_prepare_partial_exit(monkeypatch) -> None:
 def _run_submit(adapter, deployment, trade_signal) -> None:
     import live_runner.daemon as daemon
 
-    async def _no_wait(_signal, _timeframe):
-        return None
-
-    original_wait = daemon.wait_for_candle_close
-    original_can_dispatch = daemon._deployment_can_dispatch
     original_claim = daemon.claim_live_deployment_submission
     original_release = daemon.release_live_deployment_submission
-    daemon.wait_for_candle_close = _no_wait
-    daemon._deployment_can_dispatch = lambda _deployment, **_kwargs: True
     daemon.claim_live_deployment_submission = lambda *_a, **_k: True
     daemon.release_live_deployment_submission = lambda *_a, **_k: True
     try:
         asyncio.run(
-            daemon._submit_normalized_discord_signal(
-                deployment.account_id,
-                adapter,
-                deployment,
-                trade_signal,
-                signal_timeframe="1h",
-                wait_enabled=False,
-            )
+            daemon._submit_internal_strategy_signal(adapter, deployment, trade_signal)
         )
     finally:
-        daemon.wait_for_candle_close = original_wait
-        daemon._deployment_can_dispatch = original_can_dispatch
         daemon.claim_live_deployment_submission = original_claim
         daemon.release_live_deployment_submission = original_release
 
@@ -481,10 +462,8 @@ def _run_internal_submit(adapter, deployment, trade_signal) -> str:
     """
     import live_runner.daemon as daemon
 
-    original_can_dispatch = daemon._deployment_can_dispatch
     original_claim = daemon.claim_live_deployment_submission
     original_release = daemon.release_live_deployment_submission
-    daemon._deployment_can_dispatch = lambda _deployment, **_kwargs: True
     daemon.claim_live_deployment_submission = lambda *_a, **_k: True
     daemon.release_live_deployment_submission = lambda *_a, **_k: True
     try:
@@ -492,7 +471,6 @@ def _run_internal_submit(adapter, deployment, trade_signal) -> str:
             daemon._submit_internal_strategy_signal(adapter, deployment, trade_signal)
         )
     finally:
-        daemon._deployment_can_dispatch = original_can_dispatch
         daemon.claim_live_deployment_submission = original_claim
         daemon.release_live_deployment_submission = original_release
 
@@ -614,11 +592,9 @@ def _run_internal_submit_with_lease(adapter, deployment, trade_signal):
     """``_run_internal_submit`` that also reports the released lease tokens."""
     import live_runner.daemon as daemon
 
-    original_can_dispatch = daemon._deployment_can_dispatch
     original_claim = daemon.claim_live_deployment_submission
     original_release = daemon.release_live_deployment_submission
     released: list[str] = []
-    daemon._deployment_can_dispatch = lambda _deployment, **_kwargs: True
     daemon.claim_live_deployment_submission = lambda *_a, **_k: True
     daemon.release_live_deployment_submission = lambda token, *_a, **_k: (
         released.append(str(token)) or True
@@ -628,7 +604,6 @@ def _run_internal_submit_with_lease(adapter, deployment, trade_signal):
             daemon._submit_internal_strategy_signal(adapter, deployment, trade_signal)
         )
     finally:
-        daemon._deployment_can_dispatch = original_can_dispatch
         daemon.claim_live_deployment_submission = original_claim
         daemon.release_live_deployment_submission = original_release
     return outcome, released
@@ -911,60 +886,6 @@ def test_exit_with_a_position_is_submitted_as_exit_only(monkeypatch) -> None:
     assert signal.action == "sell"
     assert qty == pytest.approx(10.0)
     assert signal.metadata["risk_sizing_mode"] == "exit_only"
-
-
-def test_exit_bypasses_the_entry_signal_processor(monkeypatch) -> None:
-    """Nitro's processor is BUY-only and needs market data: running an exit
-    through it would silently drop every close on a Nitro deployment."""
-    import live_runner.daemon as daemon
-
-    def _processor_must_not_run(*_args, **_kwargs):
-        raise AssertionError("an exit must not be run through an entry processor")
-
-    monkeypatch.setattr(daemon, "get_signal_processor", _processor_must_not_run)
-    deployment = _deployment(processor="nitro")
-    _patch_ledger(monkeypatch, deployment, 10.0)
-    adapter = _Adapter([{"symbol": "AAPL", "qty": 10.0}])
-
-    _run_submit(adapter, deployment, _exit_trade_signal())
-
-    assert len(adapter.submitted) == 1
-
-
-def test_parsed_exit_message_end_to_end(monkeypatch) -> None:
-    """The issue's first row, from Discord text to the broker call."""
-    from types import SimpleNamespace
-
-    from live_runner.signal_sources.discord_source import _parse_trade_signal_from_message
-
-    message = SimpleNamespace(
-        id="900000000000000122",
-        content="Exit long AAPL @ 100",
-        channel=SimpleNamespace(id="100000000000000121"),
-        author=SimpleNamespace(id="bot-121", bot=True),
-        created_at=datetime.now(timezone.utc),
-    )
-    trade_signal = _parse_trade_signal_from_message(message, default_timeframe="1h")
-    assert trade_signal is not None
-
-    deployment = _deployment(allow_short=True)
-    _patch_ledger(monkeypatch, deployment, 3.0)
-    adapter = _Adapter([{"symbol": "AAPL", "qty": 3.0}])
-
-    _run_submit(adapter, deployment, trade_signal)
-
-    assert len(adapter.submitted) == 1
-    signal, qty = adapter.submitted[0]
-    assert signal.action == "sell", "an exit of a long must sell, never buy"
-    assert qty == pytest.approx(3.0)
-
-
-# ─── Plain and momentum-reversal SELLs are exits too ─────────────────────────
-#
-# Follow-up decision on #121: *every* exit closes only the deployment's own
-# quantity, not just parsed exit/close messages. A plain SELL or a RocketFuel
-# momentum-reversal SELL on a deployment that cannot short used to flatten the
-# whole netted broker position, closing other deployments' shares with it.
 
 
 def _sell_trade_signal(**extra_metadata: object) -> TradeSignal:
@@ -1285,7 +1206,7 @@ def test_a_refused_entry_is_still_only_a_warning(monkeypatch, caplog) -> None:
 
     assert len(adapter.submitted) == 1
     assert _records_at(
-        caplog, logging.WARNING, "Discord signal was refused before the broker request"
+        caplog, logging.WARNING, "Trade signal was refused before the broker request"
     )
     assert not [record for record in caplog.records if record.levelno >= logging.ERROR]
 
@@ -2090,21 +2011,14 @@ def test_concurrent_exits_of_two_deployments_are_sized_one_after_the_other(
     async def _no_wait(_signal, _timeframe):
         return None
 
-    monkeypatch.setattr(daemon, "wait_for_candle_close", _no_wait)
-    monkeypatch.setattr(daemon, "_deployment_can_dispatch", lambda _d, **_k: True)
     monkeypatch.setattr(daemon, "claim_live_deployment_submission", lambda *_a, **_k: True)
     monkeypatch.setattr(daemon, "release_live_deployment_submission", lambda *_a, **_k: True)
 
     async def _both() -> None:
         tasks = [
             asyncio.create_task(
-                daemon._submit_normalized_discord_signal(
-                    deployment.account_id,
-                    adapter,
-                    deployment,
-                    _exit_trade_signal(),
-                    signal_timeframe="1h",
-                    wait_enabled=False,
+                daemon._submit_internal_strategy_signal(
+                    adapter, deployment, _exit_trade_signal()
                 )
             )
             for deployment in (first, second)
@@ -2223,49 +2137,48 @@ def test_the_submitted_log_records_the_order_actually_sent(monkeypatch, caplog) 
         _run_submit(adapter, deployment, _exit_trade_signal(side="short"))
 
     assert adapter.submitted[0][0].action == "buy"
-    submitted = _records_at(caplog, logging.INFO, "Discord signal submitted")
+    submitted = _records_at(caplog, logging.INFO, "Trade signal submitted")
     assert len(submitted) == 1
     assert submitted[0].data["action"] == "buy"
     assert submitted[0].data["exit"] is True
 
 
-@pytest.mark.parametrize("exit_signal", [True, False], ids=["exit", "entry"])
-def test_a_stale_exit_is_logged_at_warning_an_entry_at_info(caplog, exit_signal) -> None:
-    from datetime import datetime, timedelta, timezone
 
-    import live_runner.daemon as daemon
-
-    signal = _exit_trade_signal() if exit_signal else _sell_trade_signal()
-    stale_at = (datetime.now(timezone.utc) - timedelta(hours=3)).isoformat()
-    signal = dataclasses.replace(
-        signal,
-        action="sell" if exit_signal else "buy",
-        metadata={**signal.metadata, "received_at": stale_at},
-    )
-
-    with caplog.at_level(logging.INFO):
-        prepared = asyncio.run(
-            daemon._prepare_discord_signal_for_submission(
-                "acc", _deployment(allow_short=False), signal,
-                signal_timeframe="1h", wait_enabled=False,
-            )
-        )
-
-    assert prepared is None
-    level = logging.WARNING if exit_signal else logging.INFO
-    assert _records_at(caplog, level, "stale discord signal")
-    assert not _records_at(caplog, logging.INFO if exit_signal else logging.WARNING, "stale")
 
 
 def test_entries_are_skipped_while_the_reconciliation_halt_is_set(
     monkeypatch, caplog
 ) -> None:
-    """#303: the entry-only halt blocks new entries but never exits."""
+    """#303: the entry-only halt blocks new entries but never exits.
+
+    The halt is enforced inside the atomic submission claim
+    (``refuse_entries_halt``), so the stub mirrors that fact: entries lose the
+    claim while halted, exits are claimed normally.
+    """
     import live_runner.daemon as daemon
 
     deployment = _deployment(allow_short=True)
     adapter = _Adapter([])
-    monkeypatch.setattr(daemon, "live_deployment_entries_halted", lambda _id: True)
+    adapter.demo = True  # skip the promotion gate; the halt is the point
+
+    async def _quote(_symbol: str):
+        from live_runner.base_adapter import LiveQuote
+
+        return LiveQuote(
+            bid=100.0,
+            ask=100.0,
+            timestamp=datetime.now(timezone.utc),
+            source="test",
+            timestamp_source="broker",
+        )
+
+    adapter.get_quote = _quote  # entries need a fresh quote for the deviation gate
+    original_claim = daemon.claim_live_deployment_submission
+    original_release = daemon.release_live_deployment_submission
+    daemon.claim_live_deployment_submission = lambda _did, _token, **kw: not kw.get(
+        "refuse_entries_halt"
+    )
+    daemon.release_live_deployment_submission = lambda *_a, **_k: True
     entry = TradeSignal(
         action="buy",
         symbol="AAPL",
@@ -2276,17 +2189,27 @@ def test_entries_are_skipped_while_the_reconciliation_halt_is_set(
         metadata=dict(_sell_trade_signal().metadata),
     )
 
-    with caplog.at_level(logging.WARNING):
-        _run_submit(adapter, deployment, entry)
+    try:
+        with caplog.at_level(logging.INFO):
+            asyncio.run(
+                daemon._submit_internal_strategy_signal(adapter, deployment, entry)
+            )
 
-    assert adapter.submitted == []
-    assert any(
-        "entries are halted by broker reconciliation" in record.getMessage()
-        for record in caplog.records
-    )
+        assert adapter.submitted == []
+        assert any(
+            "no longer ACTIVE at submission claim" in record.getMessage()
+            for record in caplog.records
+        )
 
-    # An exit on the same halted deployment still reaches the broker.
-    _patch_ledger(monkeypatch, deployment, 10.0)
-    adapter.positions = [{"symbol": "AAPL", "qty": 10.0}]
-    _run_submit(adapter, deployment, _exit_trade_signal())
+        # An exit on the same halted deployment still reaches the broker.
+        _patch_ledger(monkeypatch, deployment, 10.0)
+        adapter.positions = [{"symbol": "AAPL", "qty": 10.0}]
+        asyncio.run(
+            daemon._submit_internal_strategy_signal(
+                adapter, deployment, _exit_trade_signal()
+            )
+        )
+    finally:
+        daemon.claim_live_deployment_submission = original_claim
+        daemon.release_live_deployment_submission = original_release
     assert len(adapter.submitted) == 1

@@ -52,8 +52,18 @@ _YAML_ONE = """
 """
 
 
+def _config(*, discord_stored: bool = False, **fields) -> LiveDeploymentConfig:
+    """Build a config; discord sources only exist on stored rows now."""
+    if discord_stored:
+        from shared.models import STORED_ROW_CONTEXT
+
+        return LiveDeploymentConfig.model_validate(fields, context={STORED_ROW_CONTEXT: True})
+    return LiveDeploymentConfig(**fields)
+
+
 def _yaml_one(signal_source: str = "internal", signal_source_id: str = "") -> LiveDeploymentConfig:
-    return LiveDeploymentConfig(
+    return _config(
+        discord_stored=signal_source == "discord",
         strategy_name="equity_momentum",
         account_id="alpaca-paper",
         symbols=["AAPL"],
@@ -85,7 +95,8 @@ def _seed(
 ) -> str:
     database.ensure_live_account(account_id, "alpaca", name=account_id)
     created = database.create_live_deployment(
-        LiveDeploymentConfig(
+        _config(
+            discord_stored=signal_source == "discord",
             strategy_name=strategy,
             account_id=account_id,
             symbols=list(symbols),
@@ -741,7 +752,8 @@ def test_padded_stored_signal_source_is_an_error_not_a_clean_match(isolated_db) 
 
     report = run_db_preflight(
         [
-            LiveDeploymentConfig(
+            _config(
+                discord_stored=True,
                 strategy_name="equity_momentum",
                 account_id="alpaca-paper",
                 symbols=["AAPL"],
@@ -840,7 +852,7 @@ def test_active_internal_db_row_without_yaml_twin_warns_no_runner(isolated_db) -
 
     report = run_db_preflight([], db_path=_db_path(database))
 
-    assert any("no live strategy runner" in w for w in report.warnings), report.warnings
+    assert any("will never trade" in w for w in report.warnings), report.warnings
 
 
 def test_active_discord_db_row_does_not_warn_no_runner(isolated_db) -> None:
@@ -849,7 +861,8 @@ def test_active_discord_db_row_does_not_warn_no_runner(isolated_db) -> None:
 
     report = run_db_preflight(
         [
-            LiveDeploymentConfig(
+            _config(
+                discord_stored=True,
                 strategy_name="equity_momentum",
                 account_id="alpaca-paper",
                 symbols=["AAPL"],
@@ -862,7 +875,7 @@ def test_active_discord_db_row_does_not_warn_no_runner(isolated_db) -> None:
         db_path=_db_path(database),
     )
 
-    assert not any("no live strategy runner" in w for w in report.warnings), report.warnings
+    assert not any("will never trade" in w for w in report.warnings), report.warnings
 
 
 def test_internal_db_row_with_yaml_twin_is_not_double_warned(isolated_db) -> None:
@@ -872,25 +885,22 @@ def test_internal_db_row_with_yaml_twin_is_not_double_warned(isolated_db) -> Non
 
     report = run_db_preflight([_yaml_one()], db_path=_db_path(database))
 
-    assert not any("no live strategy runner" in w for w in report.warnings), report.warnings
+    assert not any("will never trade" in w for w in report.warnings), report.warnings
 
 
-def test_internal_db_row_with_a_tradeable_yaml_twin_warns(isolated_db) -> None:
-    """The row is missed by both preflights unless the DB side reports it.
-
-    ``_validate_deployments`` warns for an ACTIVE non-Discord *YAML* deployment,
-    so a Discord twin it is silent about, and the DB diff used to skip the warning
-    whenever a twin existed at all: the DB row's own value went unreported except
-    as ``signal_source`` drift, which is a comparison, not a warning.
-    """
+def test_internal_db_row_with_an_untradeable_yaml_twin_is_not_double_warned(
+    isolated_db,
+) -> None:
+    """A discord twin is itself untradeable now, so the YAML preflight reports the
+    row and the DB diff does not repeat it; the source drift is still named."""
     database = isolated_db[0]
     _seed(database)
 
     report = run_db_preflight([_yaml_one("discord", "news-svc")], db_path=_db_path(database))
 
-    warnings = [warning for warning in report.warnings if "no live strategy runner" in warning]
-    assert len(warnings) == 1, report.warnings
-    assert "equity_momentum" in warnings[0]
+    warnings = [warning for warning in report.warnings if "will never trade" in warning]
+    assert warnings == [], report.warnings
+    assert any("signal_source differs" in w for w in report.warnings), report.warnings
 
 
 def test_a_discord_db_row_with_a_discord_yaml_twin_stays_quiet(isolated_db) -> None:

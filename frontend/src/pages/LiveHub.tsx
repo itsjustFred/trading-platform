@@ -14,7 +14,6 @@ import {
   getSignalProcessors,
   getLiveStats,
   getLiveTrades,
-  getServices,
   getStrategies,
   runBacktestSignals,
   updateLiveDeploymentStatus,
@@ -36,7 +35,6 @@ import type {
   LiveDeploymentStatus,
   LiveTradeSlippage,
   SignalProcessorOption,
-  Service,
   StrategyMeta,
 } from "../api/types";
 import { useToast } from "../components/toastContext";
@@ -72,8 +70,7 @@ type CreateDeploymentForm = {
   account_id: string;
   symbols_input: string;
   timeframe: string;
-  signal_source: "internal" | "discord";
-  signal_source_id: string;
+  signal_source: "internal";
   signal_processor: string;
   settings_json: string;
 };
@@ -96,36 +93,28 @@ type LiveHubAccountStats = {
 };
 
 
-/** Symbol list for a new deployment: explicit filter, wildcard for Discord. */
+/** Symbol list for a new deployment: the explicit symbol filter, if any. */
 function resolveCreateSymbols(
-  form: CreateDeploymentForm,
+  _form: CreateDeploymentForm,
   symbolFilter: string[],
 ): string[] {
-  if (symbolFilter.length > 0) {
-    return symbolFilter;
-  }
-  return form.signal_source === "discord" ? ["*"] : [];
+  return symbolFilter;
 }
 
 /** First validation problem for the create-deployment form, if any. */
 function validateCreateDeploymentForm(
-  source: CreateDeploymentForm["signal_source"],
   strategyName: string,
   accountId: string,
   symbols: string[],
-  sourceId: string,
 ): string | null {
-  if (source === "internal" && !strategyName) {
+  if (!strategyName) {
     return "Please enter a strategy name.";
   }
   if (!accountId) {
     return "Please choose an account.";
   }
-  if (source === "internal" && symbols.length === 0) {
+  if (symbols.length === 0) {
     return "Please provide at least one symbol.";
-  }
-  if (source === "discord" && !sourceId) {
-    return "Please select a Discord bot service.";
   }
   return null;
 }
@@ -237,20 +226,10 @@ const LiveDeploymentCard = memo(function LiveDeploymentCard({
         {card.timeframe} · {card.symbols.join(", ")}
       </div>
       <div style={{ color: "var(--color-text-muted)", fontSize: "0.76rem", marginBottom: "8px" }}>
-        Source: {card.signal_source === "discord" ? "Discord Bot" : "Internal Strategy"}
+        Source:{" "}
         {card.signal_source === "discord"
-          ? ` · ${discordSourceLabel(card)}`
-          : ""}
-        {(() => {
-          if (card.signal_source !== "discord" || !card.signal_config) {
-            return "";
-          }
-          const waitValue = card.signal_config["wait_candle_close"];
-          if (typeof waitValue !== "boolean") {
-            return "";
-          }
-          return ` · Wait Candle Close: ${waitValue ? "On" : "Off"}`;
-        })()}
+          ? `Discord Bot (retired) · ${discordSourceLabel(card)}`
+          : "Internal Strategy"}
       </div>
       <div style={{ display: "flex", gap: "8px", position: "relative", zIndex: 2 }}>
         {card.status === "PAUSED" && (
@@ -327,8 +306,6 @@ export function LiveHubPage() {
   const [isCreating, setIsCreating] = useState(false);
   const [isStartingReplay, setIsStartingReplay] = useState(false);
   const [strategiesLoading, setStrategiesLoading] = useState(false);
-  const [servicesLoading, setServicesLoading] = useState(false);
-  const [discordServices, setDiscordServices] = useState<Service[]>([]);
   const [signalProcessors, setSignalProcessors] = useState<SignalProcessorOption[]>([]);
   const [signalProcessorsLoading, setSignalProcessorsLoading] = useState(false);
   const [createForm, setCreateForm] = useState<CreateDeploymentForm>({
@@ -337,7 +314,6 @@ export function LiveHubPage() {
     symbols_input: "",
     timeframe: DEFAULT_TIMEFRAME,
     signal_source: "internal",
-    signal_source_id: "",
     signal_processor: "",
     settings_json: "{}",
   });
@@ -443,22 +419,6 @@ export function LiveHubPage() {
     }
   }, [showToast, strategiesLoading]);
 
-  const refreshDiscordServices = useCallback(async () => {
-    if (servicesLoading) {
-      return;
-    }
-    setServicesLoading(true);
-    try {
-      const payload = await getServices("discord_bot");
-      setDiscordServices(payload);
-    } catch {
-      setDiscordServices([]);
-      showToast("Could not load Discord bot services.", "warning");
-    } finally {
-      setServicesLoading(false);
-    }
-  }, [servicesLoading, showToast]);
-
   const refreshSignalProcessors = useCallback(async () => {
     if (signalProcessorsLoading) {
       return;
@@ -481,16 +441,6 @@ export function LiveHubPage() {
     }
     setCreateForm((current) => ({ ...current, account_id: accounts[0].id }));
   }, [accounts, createForm.account_id]);
-
-  useEffect(() => {
-    if (createForm.signal_source !== "discord" || createForm.signal_source_id) {
-      return;
-    }
-    if (discordServices.length === 0) {
-      return;
-    }
-    setCreateForm((current) => ({ ...current, signal_source_id: discordServices[0].name }));
-  }, [createForm.signal_source, createForm.signal_source_id, discordServices]);
 
   useEffect(() => {
     void refreshDeployments(false);
@@ -654,15 +604,12 @@ export function LiveHubPage() {
       .split(",")
       .map((item) => item.trim().toUpperCase())
       .filter(Boolean);
-    const sourceId = createForm.signal_source_id.trim();
     const selectedProcessor = createForm.signal_processor.trim().toLowerCase();
     const symbols = resolveCreateSymbols(createForm, symbolFilter);
     const validationError = validateCreateDeploymentForm(
-      createForm.signal_source,
       strategyName,
       accountId,
       symbols,
-      sourceId,
     );
     if (validationError) {
       showToast(validationError, "warning");
@@ -684,14 +631,9 @@ export function LiveHubPage() {
         symbols,
         timeframe,
         signal_source_type: createForm.signal_source,
-        signal_source_id: createForm.signal_source === "discord" ? sourceId : undefined,
         symbol_filter: symbolFilter,
         signal_source: createForm.signal_source,
-        signal_config: buildSignalConfig(
-          createForm.signal_source,
-          sourceId,
-          selectedProcessor,
-        ),
+        signal_config: buildSignalConfig(selectedProcessor),
         settings: settingsPayload,
       });
       setCreateOpenAccountId("");
@@ -701,13 +643,12 @@ export function LiveHubPage() {
         symbols_input: "",
         timeframe: DEFAULT_TIMEFRAME,
         signal_source: "internal",
-        signal_source_id: "",
         signal_processor: "",
         settings_json: "{}",
       }));
       await refreshDeployments(true);
       showToast(
-        `Created deployment for ${createForm.signal_source === "discord" ? sourceId : strategyName}.`,
+        `Created deployment for ${strategyName}.`,
         "success",
       );
     } catch (error_: unknown) {
@@ -727,13 +668,11 @@ export function LiveHubPage() {
       symbols_input: "",
       timeframe: DEFAULT_TIMEFRAME,
       signal_source: "internal",
-      signal_source_id: "",
       signal_processor: "",
       settings_json: "{}",
     });
     setCreateOpenAccountId(account?.id ?? accountId);
     void refreshStrategies();
-    void refreshDiscordServices();
     void refreshSignalProcessors();
   };
 
@@ -887,8 +826,7 @@ export function LiveHubPage() {
                 }))
               }
               style={fieldInputStyle}
-              required={createForm.signal_source === "internal"}
-              disabled={createForm.signal_source === "discord"}
+              required
             >
               <option value="">
                 {strategiesLoading ? "Loading strategies..." : "Select strategy"}
@@ -917,59 +855,14 @@ export function LiveHubPage() {
                 <input
                   type="radio"
                   name="signal_source"
-                  checked={createForm.signal_source === "discord"}
-                  onChange={() =>
-                    setCreateForm((current) => ({
-                      ...current,
-                      signal_source: "discord",
-                      signal_source_id: current.signal_source_id || discordServices[0]?.name || "",
-                    }))
-                  }
-                />{" "}
-                Discord Bot
-              </label>
-              <label style={{ display: "flex", alignItems: "center", gap: "8px", cursor: "pointer" }}>
-                <input
-                  type="radio"
-                  name="signal_source"
-                  checked={createForm.signal_source === "internal"}
-                  onChange={() =>
-                    setCreateForm((current) => ({
-                      ...current,
-                      signal_source: "internal",
-                    }))
-                  }
+                  checked
+                  readOnly
                 />{" "}
                 Internal Strategy
               </label>
             </div>
           </div>
 
-          {createForm.signal_source === "discord" ? (
-            <label style={fieldLabelStyle}>
-              Discord Bot{" "}
-              <select
-                value={createForm.signal_source_id}
-                onChange={(event) =>
-                  setCreateForm((current) => ({
-                    ...current,
-                    signal_source_id: event.target.value,
-                  }))
-                }
-                style={fieldInputStyle}
-                required
-              >
-                <option value="">
-                  {servicesLoading ? "Loading Discord bots..." : "Select Discord bot"}
-                </option>
-                {discordServices.map((service) => (
-                  <option key={service.id} value={service.name}>
-                    {service.name}
-                  </option>
-                ))}
-              </select>
-            </label>
-          ) : null}
 
           <label style={fieldLabelStyle}>
             Signal Processor (optional){" "}
@@ -1683,16 +1576,11 @@ const WIN_RATE_TONES = {
 
 type SignalConfigPayload = Record<string, string>;
 
-/** Builds the per-source signal config for a new deployment. */
+/** Builds the signal config for a new deployment. */
 function buildSignalConfig(
-  source: string,
-  sourceId: string,
   selectedProcessor: string,
 ): SignalConfigPayload {
   const config: SignalConfigPayload = {};
-  if (source === "discord") {
-    config.service_name = sourceId;
-  }
   if (selectedProcessor) {
     config.signal_processor = selectedProcessor;
   }

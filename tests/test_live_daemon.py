@@ -1,20 +1,12 @@
 import asyncio
-import contextlib
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 import live_runner.daemon as daemon
-import live_runner.signal_sources.discord_source as discord_source_module
 from live_runner.ctrader_adapter import CTraderAuthTerminalError
-from live_runner.signal_sources.discord_source import (
-    DiscordAuthenticationError,
-    DiscordSignalSource,
-    _is_discord_auth_error,
-)
 from shared.models import LiveAccountConfig, LiveDeploymentConfig
 
 
@@ -238,18 +230,6 @@ def test_refresh_ctrader_blocked_state_survives_invalid_bool_config() -> None:
         daemon._CTRADER_ACCOUNT_CREDENTIAL_SIGNATURES.clear()
 
 
-def test_wait_for_candle_close_defaults_true_when_env_is_missing() -> None:
-    deployment = LiveDeploymentConfig(
-        strategy_name="fx_breakout",
-        account_id="ctrader-demo",
-        symbols=["EURUSD"],
-        timeframe="15m",
-        signal_source="discord",
-        signal_config={},
-    )
-
-    assert daemon._deployment_wait_for_candle_close(deployment, {}) is True
-
 def _deployment_with_signal_config(
     signal_config: dict[str, object],
     *,
@@ -260,46 +240,10 @@ def _deployment_with_signal_config(
         account_id="ctrader-demo",
         symbols=["EURUSD"],
         timeframe="15m",
-        signal_source="discord",
+        signal_source="internal",
         signal_config=signal_config,
         settings=settings or {},
     )
-
-def test_wait_for_candle_close_typo_raises_instead_of_silently_disabling() -> None:
-    """A typo'd boolean must not silently disable candle-close waiting (which
-    forces immediate market orders); the strict parser rejects it."""
-    deployment = _deployment_with_signal_config({"wait_candle_close": "ture"})
-
-    with pytest.raises(ValueError, match="wait_candle_close"):
-        daemon._deployment_wait_for_candle_close(deployment, {})
-
-    deployment = _deployment_with_signal_config({"wait_for_candle_close": "eanbled"})
-
-    with pytest.raises(ValueError, match="wait_for_candle_close"):
-        daemon._deployment_wait_for_candle_close(deployment, {})
-
-def test_wait_for_candle_close_env_typo_raises() -> None:
-    deployment = _deployment_with_signal_config({})
-
-    with pytest.raises(ValueError, match="DISCORD_WAIT_FOR_CANDLE_CLOSE"):
-        daemon._deployment_wait_for_candle_close(
-            deployment, {"DISCORD_WAIT_FOR_CANDLE_CLOSE": "yess"}
-        )
-
-def test_wait_for_candle_close_env_value_with_whitespace_is_recognized() -> None:
-    deployment = _deployment_with_signal_config({})
-
-    assert (
-        daemon._deployment_wait_for_candle_close(
-            deployment, {"DISCORD_WAIT_FOR_CANDLE_CLOSE": " false "}
-        )
-        is False
-    )
-
-def test_wait_for_candle_close_accepts_recognized_tokens() -> None:
-    for raw, expected in (("true", True), ("0", False), ("Yes", True), ("off", False)):
-        deployment = _deployment_with_signal_config({"wait_candle_close": raw})
-        assert daemon._deployment_wait_for_candle_close(deployment, {}) is expected
 
 def test_allow_short_typo_raises_instead_of_silently_disabling() -> None:
     """A typo'd allow_short must not silently turn shorts into exit-only."""
@@ -377,119 +321,6 @@ def test_ctrader_blocked_state_refresh_survives_demo_bool_typo() -> None:
     assert "acc-ctrader" in daemon._CTRADER_ACCOUNT_CREDENTIAL_SIGNATURES
 
 
-def _signal_with_metadata(metadata: dict[str, object] | None = None):
-    from risk import TradeSignal
-
-    return TradeSignal(
-        action="buy",
-        symbol="EURUSD",
-        entry_price=1.1,
-        stop_loss=None,
-        take_profit=None,
-        timeframe="15m",
-        metadata=metadata or {},
-    )
-
-
-def test_dispatch_drops_signal_when_matched_deployment_has_typo_bool(monkeypatch) -> None:
-    """A typo'd wait boolean drops the signal for the matched deployment. It must
-    NOT fall through to a sibling deployment on the same channel: that would leak
-    one strategy's signal into another strategy. Fail-closed beats fail-over."""
-    submitted: list[str] = []
-    bad = _deployment_with_signal_config({"wait_candle_close": "ture"})
-    good = _deployment_with_signal_config(
-        {"wait_candle_close": "true"},
-        settings={"signal_processor": "other"},
-    )
-
-    async def _record_submit(
-        account_id, adapter, deployment, *, trade_signal, signal_timeframe, wait_enabled
-    ):
-        submitted.append(deployment.strategy_name)
-
-    monkeypatch.setattr(daemon, "_submit_normalized_discord_signal", _record_submit)
-
-    asyncio.run(
-        daemon._dispatch_discord_trade_signal(
-            "acc-1",
-            adapter=object(),
-            deployments_for_channel=[bad, good],
-            trade_signal=_signal_with_metadata({"discord_channel_id": "chan"}),
-            accounts_env_values={},
-        )
-    )
-
-    assert submitted == []
-
-
-def test_dispatch_typo_bool_does_not_raise_to_listener_loop(monkeypatch) -> None:
-    bad = _deployment_with_signal_config({"wait_candle_close": "ture"})
-
-    async def _fail_submit(*args, **kwargs):
-        raise AssertionError("submission must never be attempted for a bad config")
-
-    monkeypatch.setattr(daemon, "_submit_normalized_discord_signal", _fail_submit)
-
-    # Must not raise; the listener loop keeps running.
-    asyncio.run(
-        daemon._dispatch_discord_trade_signal(
-            "acc-1",
-            adapter=object(),
-            deployments_for_channel=[bad],
-            trade_signal=_signal_with_metadata({}),
-            accounts_env_values={},
-        )
-    )
-
-
-def test_submit_skips_deployment_with_typo_allow_short(monkeypatch) -> None:
-    """A typo'd allow_short skips the deployment at signal-conversion time."""
-    deployment = _deployment_with_signal_config(
-        {"allow_short": "eanbled"},
-        settings={"allow_short": True},
-    )
-
-    class _NoSubmitAdapter:
-        async def get_positions(self):
-            raise AssertionError("must not be reached")
-
-        async def get_balance(self):
-            raise AssertionError("must not be reached")
-
-    from risk import TradeSignal
-
-    trade_signal = TradeSignal(
-        action="short",
-        symbol="EURUSD",
-        entry_price=1.1,
-        stop_loss=None,
-        take_profit=None,
-        timeframe="15m",
-        metadata={},
-    )
-
-    submitted: list[object] = []
-
-    def _fail_submit_with_risk(adapter, deployment_arg, live_signal):
-        submitted.append(live_signal)
-        raise AssertionError("submission must never be attempted for a bad config")
-
-    monkeypatch.setattr(daemon, "submit_order_with_risk", _fail_submit_with_risk)
-
-    asyncio.run(
-        daemon._submit_normalized_discord_signal(
-            "acc-1",
-            _NoSubmitAdapter(),
-            deployment,
-            trade_signal,
-            signal_timeframe="15m",
-            wait_enabled=False,
-        )
-    )
-
-    assert submitted == []
-
-
 def test_ctrader_auth_block_clears_for_all_accounts_when_shared_credentials_change() -> None:
     accounts = [
         LiveAccountConfig(id="acc-1", broker="ctrader", name="Broker One"),
@@ -543,25 +374,20 @@ def test_rotate_changed_ctrader_adapters_disconnects_and_cancels_tasks() -> None
     async def _run() -> None:
         adapter = _TrackingAdapter()
         sleeper = asyncio.create_task(asyncio.sleep(60))
-        discord_sleeper = asyncio.create_task(asyncio.sleep(60))
         active_adapters = {"acc-1": adapter}
         active_tasks = {"acc-1": sleeper}
-        active_discord_tasks = {"acc-1": discord_sleeper}
 
         await daemon._rotate_changed_ctrader_adapters(
             {"acc-1"},
             active_adapters,
             active_tasks,
-            active_discord_tasks,
         )
         await asyncio.sleep(0)
 
         assert active_adapters == {}
         assert active_tasks == {}
-        assert active_discord_tasks == {}
         assert adapter.disconnect_calls == 1
         assert sleeper.cancelled()
-        assert discord_sleeper.cancelled()
 
     asyncio.run(_run())
 
@@ -595,7 +421,6 @@ def test_rotate_changed_ctrader_adapters_awaits_listener_cancellation_cleanup() 
                 {"acc-1"},
                 {"acc-1": _BarrierAdapter()},
                 {"acc-1": listener},
-                {},
             )
         )
 
@@ -640,173 +465,6 @@ def test_connect_active_accounts_runs_concurrently(monkeypatch) -> None:
     assert set(started) == {"slow", "fast"}
 
 
-def test_a_paused_account_still_gets_a_discord_listener_for_its_exits(
-    monkeypatch,
-) -> None:
-    """#126 decision, the layer the signal gates live on top of.
-
-    The account's adapter and its Discord listener were ACTIVE-only, so an account whose
-    deployments were all paused lost both and every exit on it was dropped at the task
-    level - the position a conflict-forced pause must not leave open. An entry is still
-    refused at the signal gates, and the per-account trading task stays off, so nothing
-    trades from here.
-    """
-    account_id = "acc-1"
-    account = LiveAccountConfig(id=account_id, broker="alpaca", name="paused account")
-    deployment = _discord_deployment("PAUSED")
-    active_adapters: dict[str, object] = {}
-    active_discord_tasks: dict[str, asyncio.Task[None]] = {}
-    listener_accounts: list[str] = []
-
-    async def _load_state():
-        return [account], [deployment]
-
-    monkeypatch.setattr(daemon, "_load_db_accounts_and_deployments", _load_state)
-    monkeypatch.setattr(daemon, "_create_adapter_for_account", lambda _a, **_k: None)
-
-    async def _connect_stub(connected_id, *_args, **_kwargs):
-        adapter = _TrackingAdapter()
-        active_adapters[connected_id] = adapter
-        return adapter
-
-    monkeypatch.setattr(daemon, "_ensure_adapter_for_active_account", _connect_stub)
-
-    async def _listener_stub(listener_id, *_args, **_kwargs):
-        listener_accounts.append(listener_id)
-        await asyncio.sleep(3600)
-
-    monkeypatch.setattr(daemon, "_run_discord_listener_with_retries", _listener_stub)
-
-    async def _stop_after_iteration(_seconds: float) -> None:
-        raise asyncio.CancelledError
-
-    monkeypatch.setattr(daemon.asyncio, "sleep", _stop_after_iteration)
-
-    with pytest.raises(asyncio.CancelledError):
-        asyncio.run(
-            daemon.sync_deployments_loop(
-                active_adapters,
-                {},
-                active_discord_tasks,
-                accounts_env=Path("/nonexistent/accounts.env"),
-                interval_seconds=0,
-            )
-        )
-    started_tasks = list(active_discord_tasks.values())
-    for task in started_tasks:
-        task.cancel()
-    with contextlib.suppress(asyncio.CancelledError):
-        asyncio.gather(*started_tasks)
-
-    assert account_id in active_adapters, "a paused account has no adapter to close with"
-    assert account_id in active_discord_tasks
-    assert listener_accounts == [account_id]
-
-
-def test_discord_auth_error_detector_matches_improper_token_message() -> None:
-    assert _is_discord_auth_error(RuntimeError("Improper token has been passed"))
-
-
-def test_ctrader_pending_deferred_error_detector() -> None:
-    assert daemon._is_ctrader_pending_deferred_error(RuntimeError("(15, 'Deferred')"))
-    assert not daemon._is_ctrader_pending_deferred_error(RuntimeError("Connection timeout"))
-
-
-def test_discord_listener_retries_stop_on_auth_error(monkeypatch) -> None:
-    async def _raise_auth_error(*_args, **_kwargs):
-        raise DiscordAuthenticationError("Discord bot TEST auth failed: Invalid token")
-
-    monkeypatch.setattr(
-        daemon,
-        "_run_discord_signal_listener_for_account",
-        _raise_auth_error,
-    )
-    daemon._DISCORD_AUTH_BLOCKED_ACCOUNTS.clear()
-    daemon._DISCORD_AUTH_BLOCKED_REASONS.clear()
-
-    asyncio.run(
-        daemon._run_discord_listener_with_retries(
-            "acc-1",
-            object(),
-            {},
-            accounts_env_values={},
-        )
-    )
-
-    assert "acc-1" in daemon._DISCORD_AUTH_BLOCKED_ACCOUNTS
-    assert "Invalid token" in daemon._DISCORD_AUTH_BLOCKED_REASONS["acc-1"]
-
-
-def test_discord_listener_retries_stop_on_missing_token(monkeypatch) -> None:
-    async def _raise_missing_token(*_args, **_kwargs):
-        raise ValueError("Missing DISCORD_BOT_TOKEN")
-
-    monkeypatch.setattr(
-        daemon,
-        "_run_discord_signal_listener_for_account",
-        _raise_missing_token,
-    )
-    daemon._DISCORD_AUTH_BLOCKED_ACCOUNTS.clear()
-    daemon._DISCORD_AUTH_BLOCKED_REASONS.clear()
-
-    asyncio.run(
-        daemon._run_discord_listener_with_retries(
-            "acc-2",
-            object(),
-            {},
-            accounts_env_values={},
-        )
-    )
-
-    assert "acc-2" in daemon._DISCORD_AUTH_BLOCKED_ACCOUNTS
-    assert "Missing DISCORD_BOT_TOKEN" in daemon._DISCORD_AUTH_BLOCKED_REASONS["acc-2"]
-
-
-def test_discord_bot_listener_stops_on_terminal_auth_message(monkeypatch) -> None:
-    class _InvalidTokenSource:
-        is_paused = False
-
-        async def listen_signals(self):
-            if False:
-                yield None
-            raise RuntimeError("Improper token has been passed.")
-
-    updates: list[tuple[str, object]] = []
-    daemon._DISCORD_SERVICE_AUTH_BLOCKED_IDS.clear()
-    daemon._DISCORD_SERVICE_AUTH_BLOCKED_REASONS.clear()
-
-    def _capture_update(service_id: str, status: object, **_kwargs) -> None:
-        updates.append((service_id, status))
-
-    monkeypatch.setattr(daemon, "update_service_status", _capture_update)
-
-    service = SimpleNamespace(id="service-1", name="TEST_BOT")
-    asyncio.run(daemon._run_discord_bot_service_listener(service, _InvalidTokenSource()))
-
-    assert updates
-    assert updates[-1] == ("service-1", daemon.ServiceStatus.FAILED)
-    assert "service-1" in daemon._DISCORD_SERVICE_AUTH_BLOCKED_IDS
-    assert "improper token" in daemon._DISCORD_SERVICE_AUTH_BLOCKED_REASONS["service-1"].lower()
-
-
-def test_start_missing_discord_tasks_skips_blocked_accounts() -> None:
-    daemon._DISCORD_AUTH_BLOCKED_ACCOUNTS.clear()
-    daemon._DISCORD_AUTH_BLOCKED_REASONS.clear()
-    daemon._DISCORD_AUTH_BLOCKED_ACCOUNTS.add("blocked-acc")
-    daemon._DISCORD_AUTH_BLOCKED_REASONS["blocked-acc"] = "auth failed"
-
-    discord_tasks: dict[str, asyncio.Task[None]] = {}
-    daemon._start_missing_discord_tasks(
-        adapters={"blocked-acc": object()},
-        discord_tasks=discord_tasks,
-        active_discord_account_ids={"blocked-acc"},
-        deployments_by_account={},
-        accounts_env_values={},
-    )
-
-    assert discord_tasks == {}
-
-
 def test_start_missing_tasks_skips_ctrader_auth_blocked_accounts() -> None:
     daemon._CTRADER_AUTH_BLOCKED_ACCOUNTS.clear()
     daemon._CTRADER_AUTH_BLOCKED_REASONS.clear()
@@ -821,728 +479,6 @@ def test_start_missing_tasks_skips_ctrader_auth_blocked_accounts() -> None:
     )
 
     assert active_tasks == {}
-
-
-def test_discord_poll_does_not_claim_live_signal_before_deployment_routing(monkeypatch):
-    """The execution adapter is the sole authority for the persisted order intent.
-
-    Persisting at the source layer creates a canonical Discord signal with an empty
-    deployment id. The cTrader adapter then mistakes the first routed delivery for
-    crash recovery and fail-closes instead of submitting the first broker order.
-    """
-    source = DiscordSignalSource(
-        bot_name="ramjet",
-        token="test-token",
-        channel_ids={"channel-1"},
-        timeframe="1h",
-        trusted_author_ids={"author-1"},
-    )
-    message = {
-        "id": "discord-123",
-        "channel_id": "channel-1",
-        "timestamp": "2026-07-15T10:00:00Z",
-        "content": "RAM JET BUY AAPL @ 200.00",
-        "author": {"id": "author-1", "bot": True},
-    }
-
-    async def _fetch(_channel_id):
-        return [message]
-
-    def _forbid_source_persistence(*_args, **_kwargs):
-        pytest.fail("Discord source must not persist an execution intent before routing")
-
-    # Keep the guard effective if a future regression restores the former
-    # module-level import used by the removed source persistence helper.
-    monkeypatch.setattr(
-        discord_source_module,
-        "save_live_signal",
-        _forbid_source_persistence,
-        raising=False,
-    )
-    source._fetch_messages = _fetch
-
-    asyncio.run(source._poll_once("channel-1"))
-
-    queued = source._queue.get_nowait()
-    assert queued.metadata["discord_message_id"] == "discord-123"
-
-
-def test_stockkit_route_guard_rejects_mismatched_signal_metadata() -> None:
-    deployment = LiveDeploymentConfig(
-        strategy_name="discord::ramjet",
-        account_id="PA3T0MQAGQ51",
-        symbols=["AAPL"],
-        timeframe="1h",
-        status="ACTIVE",
-        signal_source="discord",
-        signal_source_type="discord",
-        signal_source_id="RAMJET",
-        signal_config={"signal_processor": "ramjet"},
-    )
-
-    # The broker-reported account number is what routing compares against; the
-    # local account id is a different identifier space and must not be used.
-    # Passing it here is what the daemon now does at dispatch time.
-    assert daemon._deployment_matches_stockkit_route(
-        deployment,
-        {"discord_bot_name": "RAMJET"},
-        account_broker_login="PA3T0MQAGQ51",
-    )
-    assert not daemon._deployment_matches_stockkit_route(
-        deployment,
-        {"discord_bot_name": "NITRO"},
-        account_broker_login="PA3T0MQAGQ51",
-    )
-    # Without a broker identity the check fails closed rather than comparing the
-    # local id, which could never match a broker account number.
-    assert not daemon._deployment_matches_stockkit_route(
-        deployment,
-        {"discord_bot_name": "RAMJET"},
-    )
-
-
-# ── Cleanup 15-A: PAUSE must stop live trading from stale snapshots ───────────
-
-
-class _SignalSubmittingAdapter:
-    # A double has to prove it is a demo account (`_adapter_is_demo`); without
-    # the flag it is real money and the promotion gate (#165) refuses entries.
-    demo = True
-
-    def __init__(self) -> None:
-        self.submitted: list[object] = []
-
-    async def connect(self) -> None:
-        return None
-
-    async def submit_order(self, signal, *, qty: float | None = None) -> str:
-        self.submitted.append(signal)
-        return "order-1"
-
-    async def get_balance(self):
-        return 100_000.0, 100_000.0
-
-    async def get_equity(self):
-        return 100_000.0
-
-    async def get_positions(self):
-        return []
-
-    async def get_used_margin(self):
-        return 0.0
-
-    async def get_pip_value(self, symbol):
-        # #146: a USD-quoted share in a USD account moves 1.0 per 1.0.
-        from live_runner.base_adapter import LivePipValue
-
-        return LivePipValue(
-            value=1.0, units_per_qty=1.0, conversion_rate=1.0,
-            quote_asset="USD", account_asset="USD", source="test",
-        )
-
-    async def get_quote(self, symbol):
-        # #125 entry-deviation gate: a quote at the signal entry passes.
-        from live_runner.base_adapter import LiveQuote
-
-        return LiveQuote(bid=200.0, ask=200.0, timestamp=datetime.now(timezone.utc), source="test")
-
-
-DEPLOYMENT_ID = "11111111-1111-1111-1111-111111111111"
-#: A second deployment on the same channel: the one carrying a config error the other
-#: deployments on the channel must not pay for.
-BROKEN_DEPLOYMENT_ID = "33333333-3333-3333-3333-333333333333"
-
-
-def _discord_deployment(
-    status: str = "ACTIVE",
-    *,
-    deployment_id: str = DEPLOYMENT_ID,
-    symbols: list[str] | None = None,
-) -> LiveDeploymentConfig:
-    return LiveDeploymentConfig(
-        id=deployment_id,
-        strategy_name="discord::ramjet",
-        account_id="acc-1",
-        symbols=list(symbols) if symbols else ["AAPL"],
-        timeframe="1h",
-        status=status,
-        signal_source="discord",
-        signal_source_type="discord",
-        # A deployment without its own allowlist trusts nobody and never trades.
-        signal_config={"channel_id": "channel-1", "trusted_author_ids": ["bot-1"]},
-    )
-
-
-def test_dispatchable_discord_deployments_keep_paused_drop_stopped() -> None:
-    """#126 decision: a PAUSED deployment still answers an exit message.
-
-    The listener's channel fan-out has to carry it for that to be possible: dropping
-    PAUSED here would drop every exit on it, leaving the position open until its stop -
-    which is precisely the exposure a conflict-forced pause cannot explain.
-    """
-    deployments = [
-        _discord_deployment("ACTIVE"),
-        _discord_deployment("PAUSED"),
-        _discord_deployment("STOPPED"),
-    ]
-
-    dispatchable = daemon._dispatchable_discord_deployments_for_account("acc-1", deployments)
-
-    assert [deployment.status for deployment in dispatchable] == ["ACTIVE", "PAUSED"]
-
-
-def _trade_signal() -> object:
-    from risk import TradeSignal
-
-    return TradeSignal(
-        action="buy",
-        symbol="AAPL",
-        entry_price=200.0,
-        stop_loss=195.0,
-        take_profit=210.0,
-        timeframe="1h",
-        metadata={
-            "discord_channel_id": "channel-1",
-            # Fail-closed freshness (B2): real ingestion always stamps
-            # received_at; fixtures must carry a fresh stamp to dispatch.
-            "received_at": datetime.now(timezone.utc).isoformat(),
-        },
-    )
-
-
-def _exit_signal() -> object:
-    """A parsed exit/close message (#121): the production exit shape, not a fake one."""
-    from live_runner.exit_signals import FULL_EXIT, exit_intent_metadata
-    from risk import TradeSignal
-
-    return TradeSignal(
-        action="sell",
-        symbol="AAPL",
-        entry_price=200.0,
-        stop_loss=None,
-        take_profit=None,
-        timeframe="1h",
-        metadata={
-            "discord_channel_id": "channel-1",
-            "received_at": datetime.now(timezone.utc).isoformat(),
-            **exit_intent_metadata(FULL_EXIT),
-        },
-    )
-
-
-def test_paused_deployment_snapshot_is_rejected_at_dispatch(monkeypatch) -> None:
-    """A stale snapshot must not trade: PAUSE is checked against the DB at dispatch."""
-    adapter = _SignalSubmittingAdapter()
-    stale = _discord_deployment("PAUSED")
-
-    def _forbid_refresh(_deployment_id: str):
-        pytest.fail("paused deployment must be rejected before any DB refresh")
-
-    monkeypatch.setattr(daemon, "get_live_deployment", _forbid_refresh)
-    consulted: list[str] = []
-    monkeypatch.setattr(
-        daemon,
-        "_deployment_can_dispatch",
-        lambda deployment, **_kwargs: consulted.append(str(deployment.id)) or False,
-    )
-
-    async def _no_wait(_signal, _timeframe):
-        return None
-
-    monkeypatch.setattr(daemon, "wait_for_candle_close", _no_wait)
-
-    asyncio.run(
-        daemon._dispatch_discord_trade_signal(
-            "acc-1",
-            adapter,
-            [stale],
-            _trade_signal(),
-            accounts_env_values={},
-        )
-    )
-
-    assert adapter.submitted == []
-    assert consulted == [str(stale.id)]
-
-
-def test_active_deployment_trades_after_status_recheck(monkeypatch) -> None:
-    adapter = _SignalSubmittingAdapter()
-    deployment = _discord_deployment("ACTIVE")
-
-    monkeypatch.setattr(
-        daemon,
-        "get_live_deployment",
-        lambda deployment_id: _discord_deployment("ACTIVE"),
-    )
-    # This test is about the status re-check, not the claim. The claim needs a
-    # real deployment row, which this unit-level fixture does not create.
-    monkeypatch.setattr(
-        daemon, "claim_live_deployment_submission", lambda *args, **kwargs: True
-    )
-    monkeypatch.setattr(
-        daemon, "release_live_deployment_submission", lambda *args, **kwargs: True
-    )
-
-    async def _no_wait(_signal, _timeframe):
-        return None
-
-    monkeypatch.setattr(daemon, "wait_for_candle_close", _no_wait)
-
-    asyncio.run(
-        daemon._dispatch_discord_trade_signal(
-            "acc-1",
-            adapter,
-            [deployment],
-            _trade_signal(),
-            accounts_env_values={},
-        )
-    )
-
-    assert len(adapter.submitted) == 1
-
-
-def test_deployment_paused_between_snapshot_and_dispatch_is_not_traded(
-    monkeypatch,
-) -> None:
-    """Snapshot says ACTIVE but the DB now says PAUSED: refuse to trade."""
-    adapter = _SignalSubmittingAdapter()
-    deployment = _discord_deployment("ACTIVE")
-
-    monkeypatch.setattr(
-        daemon,
-        "get_live_deployment",
-        lambda deployment_id: _discord_deployment("PAUSED"),
-    )
-
-    async def _no_wait(_signal, _timeframe):
-        return None
-
-    monkeypatch.setattr(daemon, "wait_for_candle_close", _no_wait)
-
-    asyncio.run(
-        daemon._dispatch_discord_trade_signal(
-            "acc-1",
-            adapter,
-            [deployment],
-            _trade_signal(),
-            accounts_env_values={},
-        )
-    )
-
-    assert adapter.submitted == []
-
-
-def test_stale_deployment_removed_from_db_is_not_traded(monkeypatch) -> None:
-    adapter = _SignalSubmittingAdapter()
-    deployment = _discord_deployment("ACTIVE")
-
-    monkeypatch.setattr(daemon, "get_live_deployment", lambda _deployment_id: None)
-
-    async def _no_wait(_signal, _timeframe):
-        return None
-
-    monkeypatch.setattr(daemon, "wait_for_candle_close", _no_wait)
-
-    asyncio.run(
-        daemon._dispatch_discord_trade_signal(
-            "acc-1",
-            adapter,
-            [deployment],
-            _trade_signal(),
-            accounts_env_values={},
-        )
-    )
-
-    assert adapter.submitted == []
-
-
-def test_deployment_with_unknown_status_is_not_traded(monkeypatch) -> None:
-    """Deny-by-default: a status outside ACTIVE/PAUSED/STOPPED must not trade.
-
-    Pins that _normalize_deployment_status's UNKNOWN fallback keeps
-    _deployment_can_dispatch fail-closed when a new status value
-    appears upstream before live_runner learns about it - for an entry and
-    for an exit alike.
-    """
-    adapter = _SignalSubmittingAdapter()
-    deployment = _discord_deployment("ACTIVE")
-
-    monkeypatch.setattr(
-        daemon,
-        "get_live_deployment",
-        lambda deployment_id: _discord_deployment("MAINTENANCE"),
-    )
-
-    async def _no_wait(_signal, _timeframe):
-        return None
-
-    monkeypatch.setattr(daemon, "wait_for_candle_close", _no_wait)
-
-    asyncio.run(
-        daemon._dispatch_discord_trade_signal(
-            "acc-1",
-            adapter,
-            [deployment],
-            _trade_signal(),
-            accounts_env_values={},
-        )
-    )
-
-    assert adapter.submitted == []
-
-
-def test_deployment_paused_during_candle_close_wait_is_not_traded(monkeypatch) -> None:
-    """The pre-wait recheck passes, the deployment is paused during the
-    candle-close wait, and the post-wait recheck must refuse to trade."""
-    adapter = _SignalSubmittingAdapter()
-    deployment = _discord_deployment("ACTIVE")
-    statuses = iter(["ACTIVE", "PAUSED"])
-
-    def _status_after_each_recheck(_deployment_id):
-        return _discord_deployment(next(statuses))
-
-    monkeypatch.setattr(daemon, "get_live_deployment", _status_after_each_recheck)
-
-    async def _no_wait(_signal, _timeframe):
-        return None
-
-    monkeypatch.setattr(daemon, "wait_for_candle_close", _no_wait)
-
-    asyncio.run(
-        daemon._dispatch_discord_trade_signal(
-            "acc-1",
-            adapter,
-            [deployment],
-            _trade_signal(),
-            accounts_env_values={},
-        )
-    )
-
-    assert adapter.submitted == []
-
-
-def _patch_dispatch_scaffolding(monkeypatch, claims) -> None:
-    """Stub what a dispatch touches outside the status gates under test."""
-    monkeypatch.setattr(daemon, "wait_for_candle_close", _no_wait_signal)
-
-    def _claim(deployment_id, token, **kwargs):
-        claims.append(
-            {
-                "deployment_id": deployment_id,
-                "allow_paused": bool(kwargs.get("allow_paused")),
-            }
-        )
-        return True
-
-    monkeypatch.setattr(daemon, "claim_live_deployment_submission", _claim)
-    monkeypatch.setattr(daemon, "release_live_deployment_submission", lambda *a, **k: True)
-
-
-async def _no_wait_signal(_signal, _timeframe):
-    return None
-
-
-class _ExitSubmittingAdapter(_SignalSubmittingAdapter):
-    """An adapter that reports one open position, so an exit has something to close."""
-
-    async def get_positions(self):
-        return [{"symbol": "AAPL", "qty": 10.0}]
-
-
-def test_paused_deployment_rejects_an_entry(monkeypatch) -> None:
-    """#126: the pause is an entry gate. A PAUSE in the DB blocks a new position."""
-    adapter = _SignalSubmittingAdapter()
-    claims: list[dict[str, object]] = []
-    _patch_dispatch_scaffolding(monkeypatch, claims)
-    monkeypatch.setattr(
-        daemon, "get_live_deployment", lambda _deployment_id: _discord_deployment("PAUSED")
-    )
-
-    asyncio.run(
-        daemon._dispatch_discord_trade_signal(
-            "acc-1",
-            adapter,
-            [_discord_deployment("ACTIVE")],
-            _trade_signal(),
-            accounts_env_values={},
-        )
-    )
-
-    assert adapter.submitted == []
-    assert claims == []
-
-
-def test_paused_deployment_executes_an_exit_only_signal(monkeypatch, isolated_db) -> None:
-    """#126 decision: PAUSED blocks entries and still dispatches a close.
-
-    The exit reaches the broker through the normal path (sizing, claim, adapter), and
-    the claim is taken with the widened status gate - the one atomic fact that keeps an
-    operator's PAUSE racing an exit from opening something.
-    """
-    asyncio.run(asyncio.to_thread(_seed_exit_ledger, isolated_db))
-    adapter = _ExitSubmittingAdapter()
-    claims: list[dict[str, object]] = []
-    _patch_dispatch_scaffolding(monkeypatch, claims)
-    monkeypatch.setattr(
-        daemon, "get_live_deployment", lambda _deployment_id: _discord_deployment("PAUSED")
-    )
-
-    asyncio.run(
-        daemon._dispatch_discord_trade_signal(
-            "acc-1",
-            adapter,
-            [_discord_deployment("PAUSED")],
-            _exit_signal(),
-            accounts_env_values={},
-        )
-    )
-
-    assert len(adapter.submitted) == 1
-    submitted = adapter.submitted[0]
-    assert submitted.action == "sell"
-    assert submitted.metadata["qty"] == pytest.approx(10.0)
-    assert claims == [
-        {"deployment_id": DEPLOYMENT_ID, "allow_paused": True}
-    ]
-
-
-def test_a_paused_deployment_closes_a_plain_sell_that_cannot_be_a_short(
-    monkeypatch,
-) -> None:
-    """#126 review: the exit classification is per deployment, not per message.
-
-    A plain SELL is a full exit on a deployment that cannot short and a short entry on
-    one that can, and which of the two is decided by `_trade_signal_to_live_signal` -
-    after the dispatch gates. Gate it from the raw message instead and the close on the
-    can't-short deployment is dropped as an entry, leaving the position open.
-    """
-    deployment = _discord_deployment("PAUSED")
-    deployment.settings = {"allow_short": False}
-
-    assert daemon._signal_is_exit("sell", {}, deployment) is True
-    entry_deployment = _discord_deployment("PAUSED")
-    entry_deployment.settings = {"allow_short": True}
-    assert daemon._signal_is_exit("sell", {}, entry_deployment) is False
-    # A parsed exit instruction is reduce-only whatever the deployment allows (#121).
-    parsed = _exit_signal().metadata
-    assert daemon._signal_is_exit("sell", dict(parsed), entry_deployment) is True
-    assert daemon._signal_is_exit("buy", dict(parsed), deployment) is True
-
-
-def _plain_sell_signal() -> object:
-    """A bare SELL message: an exit on a deployment that cannot short, an entry on one that can."""
-    from risk import TradeSignal
-
-    return TradeSignal(
-        action="sell",
-        symbol="AAPL",
-        entry_price=200.0,
-        stop_loss=195.0,
-        take_profit=210.0,
-        timeframe="1h",
-        metadata={
-            "discord_channel_id": "channel-1",
-            "received_at": datetime.now(timezone.utc).isoformat(),
-        },
-    )
-
-
-def test_a_bad_allow_short_never_reaches_the_dispatch_gate(monkeypatch) -> None:
-    """The classification reads a strict boolean: one it cannot parse skips the signal.
-
-    The dispatch half has to carry a *sell*: a buy never asks the deployment what it
-    allows shorting, so a buy would pass this gate whether or not the config error is
-    handled.
-    """
-    deployment = _discord_deployment("ACTIVE")
-    deployment.settings = {"allow_short": "eanbled"}
-
-    with pytest.raises(ValueError, match="Invalid boolean value for allow_short"):
-        daemon._signal_is_exit("sell", {}, deployment)
-
-    adapter = _SignalSubmittingAdapter()
-    claims: list[dict[str, object]] = []
-    _patch_dispatch_scaffolding(monkeypatch, claims)
-
-    asyncio.run(
-        daemon._dispatch_discord_trade_signal(
-            "acc-1",
-            adapter,
-            [deployment],
-            _plain_sell_signal(),
-            accounts_env_values={},
-        )
-    )
-
-    assert adapter.submitted == []
-    assert claims == []
-
-
-def test_an_unparseable_allow_short_costs_only_the_deployment_that_carries_it(
-    monkeypatch, isolated_db
-) -> None:
-    """One deployment's unreadable config must not take the channel down with it.
-
-    The classification reads `allow_short` per deployment, and an `except ValueError`
-    that *returned* aborted the fan-out for every deployment on the channel: a valid
-    deployment's close - the one signal the exit widening exists for - was dropped by a
-    typo on a deployment that is not even on this signal's symbol.
-    """
-    asyncio.run(asyncio.to_thread(_seed_exit_ledger, isolated_db))
-    adapter = _ExitSubmittingAdapter()
-    claims: list[dict[str, object]] = []
-    _patch_dispatch_scaffolding(monkeypatch, claims)
-    monkeypatch.setattr(
-        daemon, "get_live_deployment", lambda _deployment_id: _discord_deployment("ACTIVE")
-    )
-
-    broken = _discord_deployment(
-        "ACTIVE", deployment_id=BROKEN_DEPLOYMENT_ID, symbols=["TSLA"]
-    )
-    broken.settings = {"allow_short": "eanbled"}
-    valid = _discord_deployment("ACTIVE")
-    valid.settings = {"allow_short": False}
-
-    asyncio.run(
-        daemon._dispatch_discord_trade_signal(
-            "acc-1",
-            adapter,
-            [broken, valid],
-            _plain_sell_signal(),
-            accounts_env_values={},
-        )
-    )
-
-    assert len(adapter.submitted) == 1
-    assert adapter.submitted[0].symbol == "AAPL"
-    # A plain SELL on a deployment that cannot short is a close, so the claim is the
-    # widened exit one - the same call that keeps a PAUSED deployment able to close.
-    assert claims == [{"deployment_id": DEPLOYMENT_ID, "allow_paused": True}]
-
-
-def test_an_unparseable_allow_short_on_the_same_channel_skips_only_that_deployment(
-    monkeypatch, isolated_db
-) -> None:
-    """Same channel, same symbol: the deployment with the bad config is the only loss."""
-    asyncio.run(asyncio.to_thread(_seed_exit_ledger, isolated_db))
-    adapter = _ExitSubmittingAdapter()
-    claims: list[dict[str, object]] = []
-    _patch_dispatch_scaffolding(monkeypatch, claims)
-    monkeypatch.setattr(
-        daemon, "get_live_deployment", lambda _deployment_id: _discord_deployment("ACTIVE")
-    )
-
-    broken = _discord_deployment("ACTIVE", deployment_id=BROKEN_DEPLOYMENT_ID)
-    broken.settings = {"allow_short": "eanbled"}
-    valid = _discord_deployment("ACTIVE")
-    valid.settings = {"allow_short": False}
-
-    asyncio.run(
-        daemon._dispatch_discord_trade_signal(
-            "acc-1",
-            adapter,
-            [broken, valid],
-            _plain_sell_signal(),
-            accounts_env_values={},
-        )
-    )
-
-    assert len(adapter.submitted) == 1
-    assert claims == [{"deployment_id": DEPLOYMENT_ID, "allow_paused": True}]
-
-
-def test_an_unparseable_wait_boolean_skips_only_that_deployment(
-    monkeypatch, isolated_db
-) -> None:
-    """The wait-boolean refusal has the same shape, on the same fan-out (#311 review).
-
-    Its comment already said "skip the deployment, not ... other deployments", and it
-    returned: a typo'd `wait_candle_close` on one deployment took the whole channel's
-    signal with it.
-    """
-    asyncio.run(asyncio.to_thread(_seed_exit_ledger, isolated_db))
-    adapter = _ExitSubmittingAdapter()
-    claims: list[dict[str, object]] = []
-    _patch_dispatch_scaffolding(monkeypatch, claims)
-    monkeypatch.setattr(
-        daemon, "get_live_deployment", lambda _deployment_id: _discord_deployment("ACTIVE")
-    )
-
-    broken = _discord_deployment("ACTIVE", deployment_id=BROKEN_DEPLOYMENT_ID)
-    broken.signal_config["wait_candle_close"] = "sooon"
-    valid = _discord_deployment("ACTIVE")
-    valid.settings = {"allow_short": False}
-
-    asyncio.run(
-        daemon._dispatch_discord_trade_signal(
-            "acc-1",
-            adapter,
-            [broken, valid],
-            _plain_sell_signal(),
-            accounts_env_values={},
-        )
-    )
-
-    assert len(adapter.submitted) == 1
-    assert claims == [{"deployment_id": DEPLOYMENT_ID, "allow_paused": True}]
-
-
-def test_stopped_deployment_does_not_dispatch_an_exit(monkeypatch) -> None:
-    """STOPPED stays out: its exposure is closed by the cancel/flatten sweeps."""
-    adapter = _ExitSubmittingAdapter()
-    claims: list[dict[str, object]] = []
-    _patch_dispatch_scaffolding(monkeypatch, claims)
-    monkeypatch.setattr(
-        daemon, "get_live_deployment", lambda _deployment_id: _discord_deployment("STOPPED")
-    )
-
-    asyncio.run(
-        daemon._dispatch_discord_trade_signal(
-            "acc-1",
-            adapter,
-            [_discord_deployment("STOPPED")],
-            _exit_signal(),
-            accounts_env_values={},
-        )
-    )
-
-    assert adapter.submitted == []
-    assert claims == []
-
-
-def _seed_exit_ledger(isolated_db) -> None:
-    """Give the fixture deployment a net filled position, so an exit has a size."""
-    database = isolated_db[0]
-    from shared.database import save_live_execution, save_live_signal
-    from shared.models import LiveExecution, LiveSignal
-    from tests.conftest import seed_live_deployments
-
-    # The fixture deployment and its account have to exist as rows: the ledger is read
-    # by account id, and `live_signals.deployment_id` carries a foreign key.
-    seed_live_deployments(database, [DEPLOYMENT_ID], account_id="acc-1")
-    signal_id = "22222222-2222-2222-2222-222222222222"
-    save_live_signal(
-        LiveSignal(
-            id=signal_id,
-            deployment_id=DEPLOYMENT_ID,
-            symbol="AAPL",
-            action="buy",
-            theoretical_price=200.0,
-            timestamp=datetime.now(timezone.utc),
-            metadata={"broker_order_id": "BRK-1"},
-        )
-    )
-    save_live_execution(
-        LiveExecution(
-            signal_id=signal_id,
-            broker_order_id="BRK-1",
-            filled_qty=10.0,
-            actual_price=200.0,
-            # A known zero, not unknown: the ledger reads the fill, not the fee.
-            commission=0.0,
-            timestamp=datetime.now(timezone.utc),
-        )
-    )
 
 
 def test_balance_polling_fans_out_across_accounts(monkeypatch) -> None:
@@ -1617,6 +553,32 @@ def _internal_deployment(
     )
 
 
+def _stored_discord_deployment(status: str = "ACTIVE") -> LiveDeploymentConfig:
+    """A discord deployment as the DB read path rehydrates it.
+
+    Discord signal ingestion was removed, so the model refuses the source on a
+    NEW deployment; stored rows still carry it and load through
+    ``STORED_ROW_CONTEXT`` - the daemon then skips them with a retired-source
+    warning.
+    """
+    from shared.models import STORED_ROW_CONTEXT
+
+    return LiveDeploymentConfig.model_validate(
+        {
+            "id": "33333333-3333-3333-3333-333333333333",
+            "strategy_name": "discord::nitro",
+            "account_id": "acc-1",
+            "symbols": ["AAPL"],
+            "timeframe": "1h",
+            "status": status,
+            "signal_source": "discord",
+            "signal_source_type": "discord",
+            "signal_config": {"channel_id": "channel-1"},
+        },
+        context={STORED_ROW_CONTEXT: True},
+    )
+
+
 def test_active_internal_deployment_logs_error_naming_it(monkeypatch) -> None:
     errors: list[tuple] = []
     monkeypatch.setattr(
@@ -1686,8 +648,8 @@ def test_active_internal_deployment_opted_in_with_unresolvable_strategy_warns(
 def test_active_internal_source_with_non_internal_source_type_warns(
     monkeypatch,
 ) -> None:
-    """signal_source 'internal' + signal_source_type 'discord' is inert: neither
-    the Discord listener nor the internal runner evaluates it."""
+    """signal_source 'internal' + signal_source_type 'discord' is inert: the row
+    matches no runner, so the untradeable warning names the mismatch."""
     errors: list[tuple] = []
     monkeypatch.setattr(
         daemon,
@@ -1707,6 +669,8 @@ def test_active_internal_source_with_non_internal_source_type_warns(
 
 
 def test_active_discord_and_non_active_deployments_are_not_warned(monkeypatch) -> None:
+    """Discord rows are owned by the retired-source warning, not the
+    untradeable-active alert, so this loop stays silent for them."""
     errors: list[tuple] = []
     monkeypatch.setattr(
         daemon,
@@ -1718,7 +682,7 @@ def test_active_discord_and_non_active_deployments_are_not_warned(monkeypatch) -
         [
             _internal_deployment("PAUSED"),
             _internal_deployment("STOPPED"),
-            _discord_deployment("ACTIVE"),
+            _stored_discord_deployment("ACTIVE"),
         ]
     )
 
@@ -1852,7 +816,6 @@ def _run_ticks(deployments, ticks: int):
                 daemon.sync_deployments_loop(
                     {},
                     {},
-                    {},
                     accounts_env=Path("/nonexistent/accounts.env"),
                     interval_seconds=0,
                 )
@@ -1903,7 +866,7 @@ def test_a_stopped_or_paused_row_is_not_alerted() -> None:
 
 
 def test_a_tradeable_row_is_not_alerted() -> None:
-    assert _untradeable_alerts(_run_ticks([_discord_deployment()], ticks=2)) == []
+    assert _untradeable_alerts(_run_ticks([_stored_discord_deployment()], ticks=2)) == []
 
 
 def test_an_opted_in_internal_deployment_with_a_resolvable_strategy_is_not_alerted() -> None:

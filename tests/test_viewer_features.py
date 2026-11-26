@@ -3375,6 +3375,7 @@ def test_backtest_run_signals_registers_task_manager_progress(viewer_client, mon
         lambda: [
             SimpleNamespace(
                 id="dep-1",
+                # A stored discord row: replay-from-archive still reads these.
                 signal_source="discord",
                 account_id="acct-1",
             )

@@ -267,7 +267,6 @@ def test_the_resolver_defaults_are_not_frozen_at_the_repo_path() -> None:
     for module, function_name, parameter in (
         (account_discovery, "discover_configured_accounts", "accounts_env"),
         (preflight, "run_live_preflight", "accounts_env_path"),
-        (daemon, "sync_services_loop", "accounts_env"),
         (daemon, "sync_deployments_loop", "accounts_env"),
         (daemon, "run_daemon", "accounts_env"),
     ):
@@ -361,12 +360,9 @@ def test_the_sandbox_accounts_env_carries_no_credentials() -> None:
     the file does not define from the process environment, which is not the checkout's.
     """
     from live_runner.credential_env import load_accounts_env_values, read_accounts_env_file
-    from live_runner.service_discovery import discover_discord_bots_from_env
 
     assert read_accounts_env_file(ISOLATED_ACCOUNTS_ENV) == {}
     assert load_accounts_env_values(ISOLATED_ACCOUNTS_ENV, environ={}) == {}
-    # Discovery reads the patched constant, so it sees no bot the checkout could have configured.
-    assert discover_discord_bots_from_env() == []
 
 
 def test_no_imported_module_still_resolves_the_real_accounts_env() -> None:
@@ -756,81 +752,6 @@ def test_dukascopy_native_fetch_is_stubbed_in_tests(request) -> None:
 
     (hit,) = _consume_stub_hits("dukascopy_native._fetch_one", request.node.nodeid)
     assert request.node.nodeid in hit
-
-
-def test_every_daemon_discovery_call_names_the_resolved_accounts_env() -> None:
-    """The file the daemon resolved must reach every discovery call.
-
-    ``run_daemon`` and the credential-reload loop each dispatch discovery on a worker thread. A
-    dispatch that omits the file falls back to the module default, which an operator who redirected
-    the accounts env has already said is not the file to use. Read from the AST because
-    ``run_daemon`` is an unbounded loop: its first statement cannot be driven and then stopped.
-    """
-    tree = ast.parse((_PROJECT_ROOT / "live_runner" / "daemon.py").read_text(encoding="utf-8"))
-    dispatches = [
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call) and _called_name(node) == "to_thread"
-    ]
-    discovery = [
-        call
-        for call in dispatches
-        if any(
-            ast.unparse(argument) == "_discover_and_register_discord_services"
-            for argument in call.args
-        )
-    ]
-    assert discovery, "live_runner/daemon.py never dispatches Discord service discovery"
-    for call in discovery:
-        arguments = [ast.unparse(argument) for argument in call.args]
-        position = arguments.index("_discover_and_register_discord_services")
-        following = arguments[position + 1 :]
-        assert following, f"{ast.unparse(call)} names no accounts env"
-        assert following[0] == "accounts_env", ast.unparse(call)
-
-
-def test_the_daemon_discovers_bots_from_the_file_it_was_given(tmp_path, monkeypatch) -> None:
-    """Discovery must not read the module default when the daemon resolved another file.
-
-    Otherwise an operator who redirected the accounts env (or named one on the command line) still
-    gets bots from the checkout's default, which is the file they said not to use.
-    """
-    import live_runner.daemon as daemon
-    import live_runner.service_discovery as service_discovery
-
-    accounts_env = tmp_path / ".accounts.env"
-    accounts_env.write_text(
-        "DISCORD_BOT_RAMJET_TOKEN=token\nDISCORD_BOT_RAMJET_CHANNEL_ID=1431465140905185452\n",
-        encoding="utf-8",
-    )
-    # The daemon hands the file it resolved to discovery, rather than letting discovery pick its
-    # own. Patched in the daemon's namespace, where the name is imported, so this asserts the call
-    # and not the reader.
-    monkeypatch.setattr(daemon, "list_services", lambda *args, **kwargs: [])
-    monkeypatch.setattr(daemon, "create_service", lambda service: service)
-    seen: list[Path | None] = []
-
-    def _discover(accounts_env=None):
-        seen.append(Path(accounts_env) if accounts_env is not None else None)
-        return []
-
-    monkeypatch.setattr(daemon, "discover_discord_bots_from_env", _discover)
-    daemon._discover_and_register_discord_services(accounts_env)
-    assert seen == [accounts_env]
-
-    # ... and the reader itself uses the file it is handed, not the module default. The real
-    # function is called, so a discovery that ignored its argument reads the (empty) sandbox path.
-    monkeypatch.undo()
-    discovered = service_discovery.discover_discord_bots_from_env(accounts_env)
-    assert discovered == [
-        {
-            "name": "RAMJET",
-            "token_env_key": "DISCORD_BOT_RAMJET_TOKEN",
-            "channel_id": "1431465140905185452",
-        }
-    ]
-    # The same call through the module default finds nothing: that path is the session sandbox.
-    assert service_discovery.discover_discord_bots_from_env() == []
 
 
 def test_sessionfinish_fails_the_run_when_the_network_was_reached(monkeypatch, capsys) -> None:

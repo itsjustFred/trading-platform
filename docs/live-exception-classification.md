@@ -64,7 +64,6 @@ Handlers in files owned by open PRs #192, #271, #272, #274, #277, #313, #316, an
 | `live_runner/ctrader_adapter.py` | 3878 | `listen_executions` | money decision (must fail closed) | yes — requeue or raise |
 | `live_runner/ctrader_adapter.py` | 3908 | `_run_pending_reconciliation` | money decision (must fail closed) | yes — retry scheduled, flag kept |
 | `live_runner/daemon.py` | 615 | `_live_account_broker_login` | money decision (must fail closed) | yes — returns empty broker login |
-| `live_runner/daemon.py` | 708 | `_mark_discord_deployment_service_unhealthy` | loop survival (log and continue) | yes — refusal already happened |
 | `live_runner/daemon.py` | 1145 | `_check_entry_deviation` | money decision (must fail closed) | yes — raises, entry refused |
 | `live_runner/daemon.py` | 1291 | `_resolve_live_pip_value` | money decision (must fail closed) | yes — raises, entry refused |
 | `live_runner/daemon.py` | 1364 | `_position_qty_tolerance` | money decision (must fail closed) | yes — strict default |
@@ -78,10 +77,6 @@ Handlers in files owned by open PRs #192, #271, #272, #274, #277, #313, #316, an
 | `live_runner/daemon.py` | 3297 | `_create_adapter_for_account` | money decision (must fail closed) | yes — no adapter |
 | `live_runner/daemon.py` | 3325 | `_create_adapter_for_account` | money decision (must fail closed) | yes — no adapter |
 | `live_runner/daemon.py` | 3365 | `_disconnect_adapter` | loop survival (log and continue) | yes — disconnect cleanup |
-| `live_runner/daemon.py` | 3425 | `_run_discord_listener_with_retries` | loop survival (log and continue) | yes — listener retry/terminal block |
-| `live_runner/daemon.py` | 3481 | `_run_discord_bot_service_listener` | loop survival (log and continue) | yes — listener retry/terminal block |
-| `live_runner/daemon.py` | 3638 | `_reconnect_discord_bot_source` | loop survival (log and continue) | yes — reconnect backoff/terminal block |
-| `live_runner/daemon.py` | 3881 | `_sync_discord_bot_services` | loop survival (log and continue) | yes — sibling services continue |
 | `live_runner/daemon.py` | 3936 | `sync_services_loop` | loop survival (log and continue) | yes — next tick retries |
 | `live_runner/daemon.py` | 4008 | `_poll_adapter_balance` | loop survival (log and continue) | yes — snapshot only, terminal auth handled |
 | `live_runner/daemon.py` | 4105 | `_backfill_one` | money decision (must fail closed) | yes — stays unknown, next pass retries |
@@ -103,10 +98,6 @@ Handlers in files owned by open PRs #192, #271, #272, #274, #277, #313, #316, an
 | `live_runner/preflight.py` | 737 | `_crash_redaction` | money decision (must fail closed) | yes — type-only crash message |
 | `live_runner/preflight.py` | 813 | `main` | money decision (must fail closed) | yes — failed result, exit 1 |
 | `live_runner/promotion.py` | 291 | `strategy_target` | money decision (must fail closed) | yes — PromotionTargetError |
-| `live_runner/signal_sources/discord_source.py` | 1606 | `_set_service_status` | loop survival (log and continue) | yes — status write best-effort |
-| `live_runner/signal_sources/discord_source.py` | 2053 | `_prime_cursors` | loop survival (log and continue) | yes — per-channel continue |
-| `live_runner/signal_sources/discord_source.py` | 2112 | `_poll_loop` | loop survival (log and continue) | yes — per-channel continue |
-| `live_runner/signal_sources/discord_source.py` | 2166 | `connect` | loop survival (log and continue) | yes — background loop + FAILED status |
 | `live_runner/trailing_stops.py` | 111 | `adapter_live_trailing_modes` | money decision (must fail closed) | yes — none only |
 | `live_runner/trailing_stops.py` | 129 | `adapter_live_trailing_timeframes` | money decision (must fail closed) | yes — empty set |
 | `live_runner/trailing_stops.py` | 296 | `run_once` | money decision (must fail closed) | yes — outage recorded, stops unchanged |
@@ -134,7 +125,6 @@ These broad handlers landed on main while this classification was in review, and
 | `daemon.py` | trailing-mode check at deployment load | loop-survival | signal-time gates still refuse |
 | `daemon.py` | submission-lease release in a refusal path | loop-survival | the lease expires on its own |
 | `kill_switch.py` | halt-state read; order-cancel, flatten and protection sweeps | money-decision | entries refused / sweep retried next tick, nothing liquidated on an error |
-| `signal_archive.py`, `signal_sources/discord_source.py` | archive enqueue/serialize/write/record, outcome sink, per-message emission failure | loop-survival | archive is observational; a dropped message trades nothing |
 | `daemon.py` | loss-breaker equity read in the balance poll | loop-survival | observation skipped, the entry gate still fails closed |
 | `daemon.py` | account equity read in the loss-breaker entry gate | money-decision | raises `LossBreakerBreachError`, entry refused |
 | `loss_breaker.py` | breach-latch write, state read, deployment pip-value/quote/flows reads | money-decision | unmeasurable loss = entries refused |
@@ -151,3 +141,4 @@ These broad handlers landed on main while this classification was in review, and
 | `daemon.py` | startup failure in `_run_daemon_locked` (logs and re-raises) | money-decision | ERROR record for the alert sink, exception propagates |
 | `daemon.py` | crash handler in `_run_daemon_locked` (logs, captures, re-raises) | money-decision | ERROR record + Sentry capture, exception propagates |
 | `daemon.py` | signal-archive close in the `_run_daemon_locked` shutdown `finally` | loop-survival | WARNING logged during shutdown, nothing trades after |
+| `signal_archive.py` | archive enqueue/serialize/write/record, outcome sink | loop-survival | archive is observational; a dropped record trades nothing |

@@ -209,6 +209,16 @@ def strategy_deployment(name: str = STRATEGY_NAME, **overrides: Any) -> LiveDepl
         "settings": {"risk_per_trade_pct": 0.01},
     }
     values.update(overrides)
+    sources = {str(values.get("signal_source") or "").lower(),
+               str(values.get("signal_source_type") or "").lower()}
+    if "discord" in sources:
+        # Discord ingestion is retired: the source only exists on stored rows,
+        # which load through the stored-row path the DB read uses.
+        from shared.models import STORED_ROW_CONTEXT
+
+        return LiveDeploymentConfig.model_validate(
+            values, context={STORED_ROW_CONTEXT: True}
+        )
     return LiveDeploymentConfig(**values)
 
 
@@ -938,13 +948,14 @@ def test_editing_a_processor_parent_package_init_makes_the_bot_experimental(
         enforce_promotion_gate(ramjet_deployment(), real_money=True)
 
 
-def test_the_daemon_and_the_gate_resolve_the_same_processor() -> None:
-    from live_runner.daemon import _deployment_signal_processor_name
+def test_the_gate_and_the_model_resolve_the_same_processor() -> None:
+    """The promotion gate and the deployment model share one processor resolver:
+    the daemon's Discord dispatch that used to hold a second copy is gone."""
     from live_runner.promotion import deployment_signal_processor_name
 
     deployment = strategy_deployment(settings={"signal_processor": " RamJet "})
-    assert _deployment_signal_processor_name(deployment) == "ramjet"
     assert deployment_signal_processor_name(deployment) == "ramjet"
+    assert deployment.signal_processor_name == "ramjet"
 
 
 # --------------------------------------------------------------------------- #

@@ -210,9 +210,6 @@ def _drain(
         daemon._shutdown_cleanup(
             loop_tasks=loop_tasks,
             active_listener_tasks={},
-            active_discord_tasks={},
-            active_discord_bot_tasks={},
-            active_discord_bots={},
             active_adapters={},
             scheduler=_RecordingScheduler(),  # type: ignore[arg-type]
             shutdown=coordinator,
@@ -793,42 +790,6 @@ def test_recover_failed_services_does_not_resurrect_a_paused_bot(
     daemon._recover_failed_services()
 
     assert database.get_service(str(service.id)).status == ServiceStatus.PAUSED
-    assert str(service.id) not in daemon._DISCORD_SERVICE_RECONNECT_RETRY_NOT_BEFORE
-
-
-def test_sync_running_discord_bot_rechecks_the_pause(
-    isolated_db_sandbox, monkeypatch
-) -> None:
-    database, _, _ = isolated_db_sandbox
-    service = database.create_service(
-        Service(name="bot", type=ServiceType.DISCORD_BOT, status=ServiceStatus.RUNNING)
-    )
-    update_service_status(str(service.id), ServiceStatus.PAUSED)
-    started: list[str] = []
-
-    async def _ensure(*args, **kwargs):
-        started.append("started")
-
-    monkeypatch.setattr(daemon, "_ensure_discord_bot_source", _ensure)
-    monkeypatch.setattr(
-        daemon,
-        "_resolve_discord_bot_runtime",
-        lambda *args, **kwargs: ("KEY", "token", "channel"),
-    )
-    monkeypatch.setattr(
-        daemon, "_resolve_discord_service_trusted_author_ids", lambda *a, **k: {"1"}
-    )
-
-    asyncio.run(
-        daemon._sync_running_discord_bot(
-            service.model_copy(update={"status": ServiceStatus.RUNNING}),
-            active_discord_bots={},
-            active_discord_bot_tasks={},
-            accounts_env_values={},
-        )
-    )
-
-    assert started == []
 
 
 def _trade_signal() -> object:
@@ -850,13 +811,10 @@ def _trade_signal() -> object:
 
 def _submit(database, adapter: _ControlAdapter) -> None:
     asyncio.run(
-        daemon._submit_normalized_discord_signal(
-            ACCOUNT_ID,
+        daemon._submit_internal_strategy_signal(
             adapter,
             _deployment(database),
             _trade_signal(),
-            signal_timeframe="1h",
-            wait_enabled=False,
         )
     )
 
@@ -964,13 +922,10 @@ def test_exit_claim_is_not_gated_by_the_entries_halt(
     exit_signal.action = "sell"
     exit_signal.metadata = {**dict(exit_signal.metadata), "exit_only": True}
     asyncio.run(
-        daemon._submit_normalized_discord_signal(
-            ACCOUNT_ID,
+        daemon._submit_internal_strategy_signal(
             adapter,
             _deployment(database),
             exit_signal,
-            signal_timeframe="1h",
-            wait_enabled=False,
         )
     )
 
@@ -1274,60 +1229,6 @@ def test_automated_writers_never_overwrite_operator_intent(
         str(service.id), ServiceStatus.RUNNING, respect_operator_intent=False
     )
     assert database.get_service(str(service.id)).status == ServiceStatus.RUNNING
-
-
-@pytest.mark.parametrize("operator_status", [ServiceStatus.PAUSED, ServiceStatus.STOPPED])
-def test_discord_reconnect_does_not_mark_an_operator_paused_or_stopped_bot_running(
-    isolated_db_sandbox, operator_status
-) -> None:
-    database, _, _ = isolated_db_sandbox
-    service = database.create_service(
-        Service(name="bot", type=ServiceType.DISCORD_BOT, status=ServiceStatus.FAILED)
-    )
-    update_service_status(
-        str(service.id), operator_status, respect_operator_intent=False
-    )  # the operator establishes the pause/stop
-    service_id = str(service.id)
-
-    class _Source:
-        is_connected = False
-
-        async def reconnect(self) -> None:
-            return None
-
-    daemon._DISCORD_SERVICE_RECONNECT_RETRY_NOT_BEFORE.pop(service_id, None)
-    asyncio.run(
-        daemon._reconnect_discord_bot_source(
-            service, _Source(), service_id, running_task=None
-        )
-    )
-
-    assert database.get_service(service_id).status == operator_status
-
-
-@pytest.mark.parametrize("operator_status", [ServiceStatus.PAUSED, ServiceStatus.STOPPED])
-def test_discord_terminal_listener_failure_does_not_overwrite_operator_intent(
-    isolated_db_sandbox, operator_status
-) -> None:
-    database, _, _ = isolated_db_sandbox
-    service = database.create_service(
-        Service(name="bot", type=ServiceType.DISCORD_BOT, status=ServiceStatus.RUNNING)
-    )
-    update_service_status(
-        str(service.id), operator_status, respect_operator_intent=False
-    )  # the operator establishes the pause/stop
-
-    class _Source:
-        is_paused = False
-
-        async def listen_signals(self):
-            raise RuntimeError("401 Unauthorized: improper token")
-            yield  # pragma: no cover
-
-    assert daemon._is_terminal_discord_runtime_error(RuntimeError("401 Unauthorized"))
-    asyncio.run(daemon._run_discord_bot_service_listener(service, _Source()))
-
-    assert database.get_service(str(service.id)).status == operator_status
 
 
 def test_resumed_and_restopped_deployment_with_a_stale_ledger_still_needs_enforcement(

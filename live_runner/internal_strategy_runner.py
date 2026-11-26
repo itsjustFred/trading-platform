@@ -294,13 +294,17 @@ def internal_runner_untradeable_reason(
     if not _deployment_is_active_internal(deployment):
         return (
             "signal source 'internal' without signal_source_type 'internal' "
-            "is evaluated by neither the Discord listener nor the internal "
-            "strategy runner"
+            "is evaluated by no runner"
         )
     if not _internal_runner_opted_in(deployment):
         return (
             "the internal strategy runner is not enabled for this deployment; "
             f"set settings.{INTERNAL_RUNNER_ENABLED_KEY}=true to opt in"
+        )
+    if deployment_signal_processor_name(deployment):
+        return (
+            "signal_processor configuration is not applied by the internal "
+            "strategy runner; remove it from signal_config"
         )
     try:
         load_target(deployment.strategy_name)
@@ -1640,8 +1644,7 @@ class InternalStrategyRunner:
                 if deployment_signal_processor_name(deployment):
                     raise ValueError(
                         "signal_processor configuration is not applied by the "
-                        "internal strategy runner; remove it or use a Discord "
-                        "signal-source deployment"
+                        "internal strategy runner; remove it from signal_config"
                     )
                 timeframe = normalize_timeframe(deployment.timeframe)
                 if timeframe not in VALID_TIMEFRAMES:

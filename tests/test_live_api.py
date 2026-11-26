@@ -238,10 +238,10 @@ def test_live_deployments_crud_endpoints(monkeypatch, isolated_db):
         "symbol_filter": ["AAPL", "MSFT"],
         "timeframe": "1h",
         "status": "ACTIVE",
-        "signal_source_type": "discord",
+        "signal_source_type": "internal",
         "signal_source_id": "RAMJET",
-        "signal_source": "discord",
-        "signal_config": {"channel_id": "1431465140905185452", "wait_candle_close": True},
+        "signal_source": "internal",
+        "signal_config": {"wait_candle_close": True},
     }
 
     monkeypatch.setattr(viewer_main_module, "_seed_default_live_accounts", lambda: None)
@@ -349,11 +349,11 @@ def test_live_deployments_crud_endpoints(monkeypatch, isolated_db):
             "account_id": account_id,
             "symbols": ["AAPL", "MSFT"],
             "timeframe": "1h",
-            "signal_source_type": "discord",
+            "signal_source_type": "internal",
             "signal_source_id": "RAMJET",
             "symbol_filter": ["AAPL", "MSFT"],
-            "signal_source": "discord",
-            "signal_config": {"channel_id": "1431465140905185452", "wait_candle_close": True},
+            "signal_source": "internal",
+            "signal_config": {"wait_candle_close": True},
             "settings": {"risk_per_trade_pct": 0.01},
         },
     )
@@ -361,11 +361,10 @@ def test_live_deployments_crud_endpoints(monkeypatch, isolated_db):
     created = create_resp.json()
     assert created["id"] == deployment_id
     assert created["status"] == "ACTIVE"
-    assert created["signal_source_type"] == "discord"
-    assert created["signal_source_id"] == "RAMJET"
-    assert created["symbol_filter"] == ["AAPL", "MSFT"]
-    assert created["signal_source"] == "discord"
-    assert created["signal_config"]["channel_id"] == "1431465140905185452"
+    assert created["signal_source_type"] == "internal"
+    # symbol_filter was a Discord dispatch concept; internal deployments carry none.
+    assert created["symbol_filter"] == []
+    assert created["signal_source"] == "internal"
     assert created["settings"]["risk_per_trade_pct"] == 0.01
 
     update_resp = client.put(
@@ -601,14 +600,15 @@ def test_arming_a_deployment_with_an_unresolved_conflict_is_refused(
     database_module.create_live_deployment(
         database_module.LiveDeploymentConfig(
             id=_uuid.UUID(deployment_id),
-            strategy_name="trend_following/trend_following.py",
             account_id="acc-conflict",
             symbols=["EURUSD"],
             timeframe="M15",
             # A fresh deployment is created PAUSED, so this is the state a conflict
-            # halt is imposed on.
+            # halt is imposed on. Internal + opted in + a resolvable strategy is
+            # the only armable shape left now that Discord ingestion is retired.
             status="PAUSED",
-            signal_source_type="discord",
+            strategy_name="example_sma",
+            settings={"internal_runner_enabled": True},
         )
     )
 
@@ -1066,51 +1066,6 @@ def test_ctrader_top5_endpoint_dry_run(monkeypatch):
     assert payload["deployments"][0]["account_id"] == "ct-1"
     assert payload["deployments"][0]["signal_config"]["source_backtest_id"] == "bt-1"
 
-
-def test_discord_stockkit_deployment_rejects_wrong_account(monkeypatch):
-    import viewer.main as viewer_main_module
-
-    monkeypatch.setattr(viewer_main_module, "_seed_default_live_accounts", lambda: None)
-    monkeypatch.setattr(
-        viewer_main_module,
-        "list_services",
-        lambda *args, **kwargs: [
-            Service(
-                id="88888888-8888-8888-8888-888888888888",
-                name="RAMJET",
-                type=ServiceType.DISCORD_BOT,
-                status=ServiceStatus.RUNNING,
-                config={
-                    "token_env_key": "DISCORD_BOT_RAMJET_TOKEN",
-                    "channel_id": "1431465140905185452",
-                },
-                created_at=datetime.now(timezone.utc),
-            )
-        ],
-    )
-    monkeypatch.setattr(
-        viewer_main_module,
-        "_ensure_live_account_for_deployment",
-        lambda _account_id: {"id": _account_id, "broker": "alpaca", "name": "Wrong"},
-    )
-
-    client = TestClient(viewer_main_module.app)
-    response = client.post(
-        "/api/live/deployments",
-        json={
-            "strategy_name": "my_live_strategy",
-            "account_id": "wrong-account",
-            "symbols": ["AAPL"],
-            "timeframe": "1h",
-            "signal_source_type": "discord",
-            "signal_source_id": "RAMJET",
-            "signal_source": "discord",
-            "signal_config": {"channel_id": "1431465140905185452", "signal_processor": "ramjet"},
-        },
-    )
-
-    assert response.status_code == 400
-    assert "PA3T0MQAGQ51" in response.json()["detail"]
 
 
 def test_services_crud_and_logs_endpoints(monkeypatch):
@@ -1582,16 +1537,19 @@ def test_live_signals_endpoint_returns_signal_log(monkeypatch):
         "list_live_deployments_for_account",
         lambda _account_id: (
             [
-                LiveDeploymentConfig(
-                    id=deployment_id,
-                    strategy_name="discord_scalper",
-                    account_id=account_id,
-                    symbols=["AAPL"],
-                    timeframe="1m",
-                    status="ACTIVE",
-                    signal_source="discord",
-                    signal_config={"wait_candle_close": True},
-                    settings={},
+                LiveDeploymentConfig.model_validate(
+                    {
+                        "id": deployment_id,
+                        "strategy_name": "discord_scalper",
+                        "account_id": account_id,
+                        "symbols": ["AAPL"],
+                        "timeframe": "1m",
+                        "status": "ACTIVE",
+                        "signal_source": "discord",
+                        "signal_config": {"wait_candle_close": True},
+                        "settings": {},
+                    },
+                    context={"stored_row": True},
                 )
             ]
             if _account_id == account_id
@@ -2146,7 +2104,7 @@ def test_arming_an_internal_source_deployment_is_refused_by_the_api(
     assert response.status_code == 409
     detail = response.json()["detail"]
     assert "internal" in detail
-    assert "no live evaluator" in detail
+    assert "internal_runner_enabled" in detail
     # The broker was never contacted: the refusal is not a broker problem.
     assert broker_calls == []
     # And the row is untouched.
@@ -2200,7 +2158,6 @@ def test_a_submission_claim_expires_while_the_first_submit_is_still_running(
             symbols=["EURUSD"],
             timeframe="M15",
             status="ACTIVE",
-            signal_source_type="discord",
         )
     )
     assert created.status == "ACTIVE", (
@@ -2733,7 +2690,6 @@ def test_the_migrations_apply_to_a_population_shaped_like_production(isolated_db
             symbols=["EURUSD"],
             timeframe="M15",
             status="STOPPED",
-            signal_source_type="discord",
         )
     )
 
@@ -2990,7 +2946,6 @@ def _deployment_config(deployment_id: str, status: str):
         symbols=["AAPL"],
         timeframe="1h",
         status=status,
-        signal_source_type="discord",
         signal_source_id="RAMJET",
     )
 
@@ -3021,7 +2976,6 @@ def test_deleting_a_deployment_with_history_is_a_conflict_and_restores_the_statu
             symbols=["EURUSD"],
             timeframe="1h",
             status="ACTIVE",
-            signal_source_type="discord",
         )
     )
     with database_module.get_session() as session:
@@ -3086,7 +3040,6 @@ def test_a_refused_delete_keeps_the_stop_enforcement_stamp(
             symbols=["EURUSD"],
             timeframe="1h",
             status="STOPPED",
-            signal_source_type="discord",
         )
     )
     with database_module.get_session() as session:
@@ -3188,7 +3141,6 @@ def _repoint_fixture(database_module, *, status: str = "PAUSED"):
             symbols=["EURUSD"],
             timeframe="M15",
             status=status,
-            signal_source_type="discord",
         )
     )
     return deployment_id, TestClient(viewer_main_module.app), viewer_main_module
@@ -3367,92 +3319,6 @@ def test_an_acknowledged_expired_lease_allows_the_repoint_and_is_audited(
     assert entries[0]["detail"].get("unreconciled_submissions_acknowledged") == 1
 
 
-def test_discord_deployment_routing_uses_the_configured_account_label(monkeypatch):
-    """The viewer must resolve the route's account number from `.accounts.env`.
-
-    `.accounts.env` is never installed into the process environment, so a
-    resolver left to `os.environ` falls back to the static table. That table goes
-    stale whenever a paper account is re-created, and the endpoint then rejects
-    correctly routed deployments with a 400.
-    """
-    import live_runner.credential_env as credential_env
-    import viewer.main as viewer_main_module
-
-    monkeypatch.setattr(viewer_main_module, "_seed_default_live_accounts", lambda: None)
-    # The promotion gate (#165) treats an account whose type discovery does not
-    # report as real money. This test is about a demo/paper account, so
-    # discovery says so.
-    monkeypatch.setattr(
-        viewer_main_module,
-        "_cached_live_accounts_payload",
-        lambda *args, **kwargs: [
-            {"id": "acc-1", "broker": "alpaca", "is_demo": True, "is_demo_asserted": True}
-        ],
-    )
-    monkeypatch.setattr(
-        viewer_main_module,
-        "list_services",
-        lambda *args, **kwargs: [
-            Service(
-                id="88888888-8888-8888-8888-888888888888",
-                name="RAMJET",
-                type=ServiceType.DISCORD_BOT,
-                status=ServiceStatus.RUNNING,
-                config={
-                    "token_env_key": "DISCORD_BOT_RAMJET_TOKEN",
-                    "channel_id": "100000000000000002",
-                },
-                created_at=datetime.now(timezone.utc),
-            )
-        ],
-    )
-    monkeypatch.setattr(
-        viewer_main_module,
-        "_ensure_live_account_for_deployment",
-        lambda account_id: {
-            "id": account_id,
-            "broker": "alpaca",
-            "name": "Labelled paper account",
-            "broker_login": "PA-LABELLED-RAMJET",
-        },
-    )
-    monkeypatch.setattr(
-        viewer_main_module,
-        "create_live_deployment",
-        lambda deployment: deployment,
-    )
-
-    client = TestClient(viewer_main_module.app)
-    payload = {
-        "strategy_name": "discord::ramjet",
-        "account_id": "acc-1",
-        "symbols": ["AAPL"],
-        "timeframe": "1h",
-        "signal_source_type": "discord",
-        "signal_source_id": "RAMJET",
-        "signal_source": "discord",
-        "signal_config": {"channel_id": "100000000000000002"},
-    }
-
-    monkeypatch.setattr(
-        credential_env,
-        "load_accounts_env_values",
-        lambda *_args, **_kwargs: {
-            "ALPACA_ACCOUNT_NAME_ACC1": "RamJet",
-            "ALPACA_ACCOUNT_NUMBER_ACC1": "PA-LABELLED-RAMJET",
-        },
-    )
-    assert client.post("/api/live/deployments", json=payload).status_code == 201
-
-    # Without the accounts-env the configured label is invisible and the stale
-    # static table rejects the same deployment.
-    monkeypatch.setattr(
-        credential_env, "load_accounts_env_values", lambda *_args, **_kwargs: {}
-    )
-    response = client.post("/api/live/deployments", json=payload)
-    assert response.status_code == 400
-    assert "must route to Alpaca account" in response.json()["detail"]
-
 
 def test_create_rejects_unsupported_trailing_override_with_400(monkeypatch):
     """#150 nit: the write-path trailing check must surface as a 400, not a 500."""
@@ -3495,15 +3361,12 @@ def test_create_rejects_unsupported_trailing_override_with_400(monkeypatch):
 
     client = TestClient(viewer_main_module.app)
     payload = {
-        "strategy_name": "discord::ramjet",
+        "strategy_name": "internal_strategy",
         "account_id": "acc-1",
         "symbols": ["AAPL"],
         "timeframe": "1h",
-        "signal_source_type": "discord",
-        "signal_source_id": "RAMJET",
-        "signal_source": "discord",
+        "signal_source": "internal",
         "signal_config": {
-            "channel_id": "100000000000000002",
             "signal_processor_config": {"trailing_mode": "supertrend_flip"},
         },
     }

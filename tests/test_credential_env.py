@@ -167,35 +167,6 @@ def test_accounts_env_mtime_changes_on_write(tmp_path: Path) -> None:
     assert accounts_env_mtime(env_file) != before
 
 
-def test_service_discovery_prefers_file_over_environ(tmp_path: Path, monkeypatch) -> None:
-    """B-9: discovery must resolve the file first, not let os.environ win."""
-    import live_runner.service_discovery as service_discovery
-
-    env_file = _write_env(
-        tmp_path / ".accounts.env",
-        "DISCORD_BOT_ALPHA_TOKEN=file-token\nDISCORD_BOT_ALPHA_CHANNEL_ID=file-channel\n",
-    )
-    monkeypatch.setattr(service_discovery, "DEFAULT_ACCOUNTS_ENV", env_file)
-    monkeypatch.setattr(
-        os,
-        "environ",
-        {
-            "DISCORD_BOT_ALPHA_TOKEN": "os-token",
-            "DISCORD_BOT_ALPHA_CHANNEL_ID": "os-channel",
-        },
-    )
-
-    discovered = service_discovery.discover_discord_bots_from_env()
-
-    assert discovered == [
-        {
-            "name": "ALPHA",
-            "token_env_key": "DISCORD_BOT_ALPHA_TOKEN",
-            "channel_id": "file-channel",
-        }
-    ]
-
-
 def test_daemon_load_accounts_env_values_is_file_first(tmp_path: Path, monkeypatch) -> None:
     """daemon._load_accounts_env_values delegates to the shared file-first resolver."""
     import live_runner.daemon as daemon

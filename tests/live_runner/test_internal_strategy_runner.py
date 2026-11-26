@@ -90,18 +90,28 @@ def _deployment(
     opted_in: bool = True,
 ) -> LiveDeploymentConfig:
     merged_settings = {"internal_runner_enabled": opted_in, **(settings or {})}
-    return LiveDeploymentConfig(
-        id=uuid.uuid4(),
-        strategy_name="fake_strategy",
-        account_id="acct-1",
-        symbols=symbols if symbols is not None else ["AAPL"],
-        timeframe=timeframe,
-        status=status,  # type: ignore[arg-type]
-        signal_source_type=source_type,  # type: ignore[arg-type]
-        signal_source=source,  # type: ignore[arg-type]
-        settings=merged_settings,
-        signal_config=signal_config or {},
-    )
+    fields = {
+        "id": uuid.uuid4(),
+        "strategy_name": "fake_strategy",
+        "account_id": "acct-1",
+        "symbols": symbols if symbols is not None else ["AAPL"],
+        "timeframe": timeframe,
+        "status": status,
+        "signal_source_type": source_type,
+        "signal_source": source,
+        "settings": merged_settings,
+        "signal_config": signal_config or {},
+    }
+    if "discord" in {str(source).lower(), str(source_type).lower()}:
+        # Discord ingestion is retired: the model refuses the source on a new
+        # deployment, but stored rows still carry it - load through the
+        # stored-row path the DB read uses.
+        from shared.models import STORED_ROW_CONTEXT
+
+        return LiveDeploymentConfig.model_validate(
+            fields, context={STORED_ROW_CONTEXT: True}
+        )
+    return LiveDeploymentConfig(**fields)  # type: ignore[arg-type]
 
 
 def _strategy_file(tmp_path: Path, body: str) -> Path:
@@ -2029,7 +2039,7 @@ def test_run_daemon_creates_and_cancels_internal_strategy_task(
             raise
 
     monkeypatch.setattr(
-        daemon, "_discover_and_register_discord_services", lambda *_a, **_k: []
+        daemon, "_recover_failed_services", lambda *_a, **_k: []
     )
     monkeypatch.setattr(daemon, "_recover_failed_services", lambda: [])
     monkeypatch.setattr(daemon, "ServiceScheduler", lambda: _Scheduler())

@@ -989,20 +989,12 @@ def test_discord_path_rejects_deviation_before_claiming(monkeypatch, caplog):
         lambda deployment_id, token, **_kwargs: claims.append(token) or True,
     )
     monkeypatch.setattr(daemon, "release_live_deployment_submission", lambda token: None)
-    monkeypatch.setattr(daemon, "_deployment_can_dispatch", lambda deployment, **_k: True)
     deployment = _deployment()
     adapter = _GateAdapter(quote=_quote(bid=97.9, ask=98.0))
 
     with caplog.at_level(logging.WARNING, logger="live-runner"):
         asyncio.run(
-            daemon._submit_normalized_discord_signal(
-                "acc-1",
-                adapter,
-                deployment,
-                _discord_trade_signal(),
-                signal_timeframe="1h",
-                wait_enabled=False,
-            )
+            daemon._submit_internal_strategy_signal(adapter, deployment, _discord_trade_signal())
         )
 
     assert adapter.submitted == []
@@ -1017,19 +1009,11 @@ def test_discord_path_submits_when_quote_is_close(monkeypatch):
         lambda deployment_id, token, **_kwargs: True,
     )
     monkeypatch.setattr(daemon, "release_live_deployment_submission", lambda token: None)
-    monkeypatch.setattr(daemon, "_deployment_can_dispatch", lambda deployment, **_k: True)
     deployment = _deployment()
     adapter = _GateAdapter(quote=_quote(bid=99.8, ask=99.9))
 
     asyncio.run(
-        daemon._submit_normalized_discord_signal(
-            "acc-1",
-            adapter,
-            deployment,
-            _discord_trade_signal(),
-            signal_timeframe="1h",
-            wait_enabled=False,
-        )
+        daemon._submit_internal_strategy_signal(adapter, deployment, _discord_trade_signal())
     )
 
     assert len(adapter.submitted) == 1

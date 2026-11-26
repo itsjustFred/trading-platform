@@ -182,11 +182,6 @@ def test_a_service_sync_tick_repauses_a_resumed_conflicted_deployment(
         async def sync_services(self, _services) -> None:
             raise RuntimeError("a service row is unreadable")
 
-    async def _no_discord_services(**_kwargs) -> None:
-        return None
-
-    monkeypatch.setattr(daemon, "_sync_discord_bot_services", _no_discord_services)
-
     async def _stop_after_iteration(_seconds: float) -> None:
         raise asyncio.CancelledError
 
@@ -195,10 +190,7 @@ def test_a_service_sync_tick_repauses_a_resumed_conflicted_deployment(
     with pytest.raises(asyncio.CancelledError):
         asyncio.run(
             daemon.sync_services_loop(
-                {},
-                {},
                 _Scheduler(),
-                accounts_env=Path("/nonexistent/accounts.env"),
                 interval_seconds=0,
             )
         )
@@ -225,11 +217,6 @@ def test_the_halt_enforcement_failure_is_loud_and_does_not_stop_the_tick(
         async def sync_services(self, services) -> None:
             synced.append(services)
 
-    async def _services_raise(_services) -> None:
-        raise AssertionError("the tick stopped at the failed enforcement")
-
-    monkeypatch.setattr(daemon, "_sync_discord_bot_services", _services_raise)
-
     async def _stop_after_iteration(_seconds: float) -> None:
         raise asyncio.CancelledError
 
@@ -238,10 +225,7 @@ def test_the_halt_enforcement_failure_is_loud_and_does_not_stop_the_tick(
     with pytest.raises(asyncio.CancelledError):
         asyncio.run(
             daemon.sync_services_loop(
-                {},
-                {},
                 _Scheduler(),
-                accounts_env=Path("/nonexistent/accounts.env"),
                 interval_seconds=0,
             )
         )

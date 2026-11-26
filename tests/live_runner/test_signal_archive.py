@@ -22,7 +22,6 @@ from live_runner.signal_archive import (
     received_record,
     record_signal_decision,
 )
-from live_runner.signal_sources.discord_source import DiscordSignalSource
 from risk import TradeSignal
 from shared.models import LiveDeploymentConfig, LiveSignal
 
@@ -575,9 +574,6 @@ def test_run_daemon_shutdown_flushes_signal_archive(
     async def _noop_loop(*_args, **_kwargs) -> None:
         return None
 
-    monkeypatch.setattr(
-        daemon, "_discover_and_register_discord_services", lambda *_args, **_kwargs: []
-    )
     monkeypatch.setattr(daemon, "_recover_failed_services", lambda: [])
     monkeypatch.setattr(daemon, "ServiceScheduler", _Scheduler)
     monkeypatch.setattr(daemon, "LiveTrailingStopManager", lambda **_kwargs: object())
@@ -603,142 +599,6 @@ def test_run_daemon_shutdown_flushes_signal_archive(
     assert len(records) == 1
 
 
-# -- discord_source integration -------------------------------------------------
-
-
-def _rest_message(
-    content: str,
-    *,
-    author_id: str = "bot-1",
-    message_id: str = "m1",
-    channel_id: str = "channel-1",
-    timestamp: str | None = "2026-11-21T14:30:00+00:00",
-    username: str = "ramjet_bot",
-    is_bot: bool = True,
-) -> dict:
-    return {
-        "id": message_id,
-        "content": content,
-        "timestamp": timestamp,
-        "channel_id": channel_id,
-        "type": 0,
-        "author": {"id": author_id, "username": username, "bot": is_bot},
-    }
-
-
-def _poll(source: DiscordSignalSource, messages: list[dict]) -> None:
-    async def _fetch(channel_id, **_kwargs):
-        return list(messages)
-
-    source._fetch_messages = _fetch
-    asyncio.run(source._poll_once("channel-1"))
-
-
-def _source(**kwargs) -> DiscordSignalSource:
-    options = {
-        "bot_name": "ramjet",
-        "token": "test-token",
-        "channel_ids": {"channel-1"},
-        "timeframe": "1h",
-        "trusted_author_ids": {"bot-1"},
-        "account_id": "acc-1",
-    }
-    options.update(kwargs)
-    return DiscordSignalSource(**options)
-
-
-def test_polled_parsed_signal_is_archived(archive_env: SignalArchive) -> None:
-    source = _source()
-    _poll(
-        source,
-        [
-            _rest_message(
-                "**$AAPL** is now oversold — buy signal\nPrice: $190.50",
-                message_id="m-parsed",
-            )
-        ],
-    )
-    archive_env.flush(timeout=5.0)
-    records = [r for r in _all_records() if r["type"] == "discord_signal_received"]
-    assert len(records) == 1
-    record = records[0]
-    assert record["discord_message_id"] == "m-parsed"
-    assert record["discord_author_id"] == "bot-1"
-    assert record["author_username"] == "ramjet_bot"
-    assert record["author_trusted"] is True
-    assert record["schema_version"] == 1
-    assert record["account_id"] == "acc-1"
-    assert record["bot_name"] == "ramjet"
-    assert record["parse_status"] == "parsed"
-    assert record["signal"]["symbol"] == "AAPL"
-    assert record["signal"]["action"] == "buy"
-    assert "Price" not in record["signal"]
-    assert "190.5" in record["content"]
-
-
-def test_polled_refused_signal_is_archived_with_reason(archive_env: SignalArchive) -> None:
-    source = _source()
-    _poll(
-        source,
-        [
-            _rest_message(
-                "Took profit on long AAPL",
-                message_id="m-refused",
-            )
-        ],
-    )
-    archive_env.flush(timeout=5.0)
-    records = [r for r in _all_records() if r["type"] == "discord_signal_received"]
-    assert len(records) == 1
-    record = records[0]
-    assert record["discord_message_id"] == "m-refused"
-    assert record["parse_status"] == "rejected"
-    assert record["refusal_reason"] == "non_entry_rejection"
-    assert record["signal"] is None
-
-
-def test_polled_untrusted_author_is_archived_as_rejected(archive_env: SignalArchive) -> None:
-    source = _source()
-    _poll(
-        source,
-        [
-            _rest_message(
-                "**$AAPL** is now oversold — buy signal\nPrice: $190.50",
-                author_id="impostor",
-                message_id="m-impostor",
-            )
-        ],
-    )
-    archive_env.flush(timeout=5.0)
-    records = [r for r in _all_records() if r["type"] == "discord_signal_received"]
-    assert len(records) == 1
-    assert records[0]["refusal_reason"] == "untrusted_author"
-    assert records[0]["parse_status"] == "rejected"
-    # Kept for impostor auditing, but marked so offline consumers can filter.
-    assert records[0]["author_trusted"] is False
-
-
-def test_non_emitting_poll_archives_nothing(archive_env: SignalArchive) -> None:
-    source = _source()
-    _poll(source, [_rest_message("**$AAPL** buy signal\nPrice: $190.50", message_id="m-skip")])
-    archive_env.flush(timeout=5.0)
-    before = len(_all_records())
-
-    # A FRESH message id: dedup alone must not be what keeps the count flat —
-    # emit=False has to skip the archive for a message never seen before.
-    async def _fetch(channel_id, **_kwargs):
-        return [
-            _rest_message(
-                "**$AAPL** buy signal\nPrice: $190.50", message_id="m-skip-fresh"
-            )
-        ]
-
-    source._fetch_messages = _fetch
-    asyncio.run(source._poll_once("channel-1", emit=False))
-    archive_env.flush(timeout=5.0)
-    assert len(_all_records()) == before
-
-
 # -- daemon decision integration -----------------------------------------------
 
 
@@ -748,7 +608,7 @@ def _live_deployment(**overrides) -> LiveDeploymentConfig:
         "account_id": "acc-1",
         "symbols": ["EURUSD"],
         "timeframe": "15m",
-        "signal_source": "discord",
+        "signal_source": "internal",
         "signal_config": {},
         "settings": {},
     }
@@ -782,67 +642,6 @@ def _trade_signal(
     )
 
 
-def _exit_trade_signal() -> TradeSignal:
-    from live_runner.exit_signals import FULL_EXIT, exit_intent_metadata
-
-    return _trade_signal(
-        action="sell",
-        metadata=exit_intent_metadata(FULL_EXIT),
-    )
-
-
-def _dispatch_deployment(
-    *,
-    status: str = "ACTIVE",
-    signal_config: dict[str, object] | None = None,
-) -> LiveDeploymentConfig:
-    config = {
-        "trusted_author_ids": ["bot-1"],
-    }
-    config.update(signal_config or {})
-    return _live_deployment(
-        status=status,
-        symbols=["AAPL"],
-        signal_config=config,
-    )
-
-
-def _patch_dispatch_db(monkeypatch, deployments: list[LiveDeploymentConfig]) -> None:
-    current = {str(deployment.id): deployment for deployment in deployments}
-    monkeypatch.setattr(
-        daemon,
-        "get_live_deployment",
-        lambda deployment_id: current.get(str(deployment_id)),
-    )
-    monkeypatch.setattr(daemon, "_live_account_broker_login", lambda _account_id: "")
-
-
-def _record_submissions(monkeypatch) -> list[dict[str, object]]:
-    submissions: list[dict[str, object]] = []
-
-    async def _submit(
-        account_id,
-        adapter,
-        deployment,
-        trade_signal,
-        *,
-        signal_timeframe,
-        wait_enabled,
-    ):
-        submissions.append(
-            {
-                "account_id": account_id,
-                "adapter": adapter,
-                "deployment_id": str(deployment.id),
-                "signal": trade_signal,
-                "signal_timeframe": signal_timeframe,
-                "wait_enabled": wait_enabled,
-            }
-        )
-
-    monkeypatch.setattr(daemon, "_submit_normalized_discord_signal", _submit)
-    return submissions
-
 
 def _decision_records() -> list[dict]:
     return [
@@ -850,151 +649,6 @@ def _decision_records() -> list[dict]:
         for record in _all_records()
         if record.get("type") == "discord_signal_decision"
     ]
-
-
-def test_dispatch_symbol_gate_refusal_is_archived(
-    archive_env: SignalArchive, monkeypatch
-) -> None:
-    deployment = _live_deployment()
-    monkeypatch.setattr(daemon, "_live_account_broker_login", lambda _a: "")
-    asyncio.run(
-        daemon._dispatch_discord_trade_signal(
-            "acc-1",
-            adapter=object(),
-            deployments_for_channel=[deployment],
-            trade_signal=_trade_signal(symbol="AAPL"),
-            accounts_env_values={},
-        )
-    )
-    archive_env.flush(timeout=5.0)
-    records = [r for r in _all_records() if r["type"] == "discord_signal_decision"]
-    assert len(records) == 1
-    assert records[0]["outcome"] == "refused"
-    assert records[0]["reason"] == "symbol_not_covered"
-    assert records[0]["deployment_id"] == str(deployment.id)
-    assert records[0]["discord_message_id"] == "m-1"
-
-
-def test_paused_deployment_entry_records_deployment_not_active(
-    archive_env: SignalArchive, monkeypatch
-) -> None:
-    deployment = _dispatch_deployment(status="PAUSED")
-    submissions = _record_submissions(monkeypatch)
-    _patch_dispatch_db(monkeypatch, [deployment])
-
-    asyncio.run(
-        daemon._dispatch_discord_trade_signal(
-            "acc-1",
-            adapter=object(),
-            deployments_for_channel=[deployment],
-            trade_signal=_trade_signal(),
-            accounts_env_values={},
-        )
-    )
-    archive_env.flush(timeout=5.0)
-
-    records = _decision_records()
-    assert len(records) == 1
-    assert records[0]["outcome"] == "refused"
-    assert records[0]["reason"] == "deployment_not_active"
-    assert records[0]["deployment_id"] == str(deployment.id)
-    assert submissions == []
-
-
-def test_paused_deployment_exit_dispatches_without_not_active_record(
-    archive_env: SignalArchive, monkeypatch
-) -> None:
-    deployment = _dispatch_deployment(status="PAUSED")
-    submissions = _record_submissions(monkeypatch)
-    _patch_dispatch_db(monkeypatch, [deployment])
-
-    asyncio.run(
-        daemon._dispatch_discord_trade_signal(
-            "acc-1",
-            adapter=object(),
-            deployments_for_channel=[deployment],
-            trade_signal=_exit_trade_signal(),
-            accounts_env_values={},
-        )
-    )
-    archive_env.flush(timeout=5.0)
-
-    assert [submission["deployment_id"] for submission in submissions] == [
-        str(deployment.id)
-    ]
-    assert all(
-        record.get("reason") != "deployment_not_active"
-        for record in _decision_records()
-    )
-
-
-def test_invalid_wait_config_skips_only_that_deployment(
-    archive_env: SignalArchive, monkeypatch
-) -> None:
-    broken = _dispatch_deployment(signal_config={"wait_candle_close": "sooon"})
-    valid = _dispatch_deployment(signal_config={"wait_candle_close": False})
-    submissions = _record_submissions(monkeypatch)
-    _patch_dispatch_db(monkeypatch, [broken, valid])
-
-    asyncio.run(
-        daemon._dispatch_discord_trade_signal(
-            "acc-1",
-            adapter=object(),
-            deployments_for_channel=[broken, valid],
-            trade_signal=_trade_signal(),
-            accounts_env_values={},
-        )
-    )
-    archive_env.flush(timeout=5.0)
-
-    records = _decision_records()
-    assert len(records) == 1
-    assert records[0]["outcome"] == "refused"
-    assert records[0]["reason"] == "invalid_deployment_config"
-    assert records[0]["deployment_id"] == str(broken.id)
-    assert [submission["deployment_id"] for submission in submissions] == [
-        str(valid.id)
-    ]
-    assert submissions[0]["wait_enabled"] is False
-
-
-def test_prepare_stale_signal_records_refusal(
-    archive_env: SignalArchive,
-) -> None:
-    stale = (datetime.now(timezone.utc) - timedelta(hours=3)).isoformat()
-    signal = TradeSignal(
-        action="buy",
-        symbol="AAPL",
-        entry_price=190.5,
-        stop_loss=185.0,
-        take_profit=200.0,
-        timeframe="1h",
-        metadata={
-            "discord_message_id": "m-stale",
-            "discord_channel_id": "channel-1",
-            "received_at": stale,
-        },
-    )
-    deployment = _live_deployment()
-    decision = SignalDecisionRecorder(
-        trade_signal=signal, account_id="acc-1", deployment=deployment, archive=archive_env
-    )
-    prepared = asyncio.run(
-        daemon._prepare_discord_signal_for_submission(
-            "acc-1",
-            deployment,
-            signal,
-            signal_timeframe="1h",
-            wait_enabled=False,
-            decision=decision,
-        )
-    )
-    assert prepared is None
-    archive_env.flush(timeout=5.0)
-    records = [r for r in _all_records() if r["type"] == "discord_signal_decision"]
-    assert len(records) == 1
-    assert records[0]["outcome"] == "refused"
-    assert records[0]["reason"] == "stale_signal"
 
 
 def test_claim_and_submit_success_records_traded(
@@ -1139,30 +793,3 @@ def test_claim_and_submit_nothing_to_exit_records_ignored(
     assert records[0]["reason"] == "nothing_to_exit"
 
 
-def test_submit_unexpected_error_records_unknown(
-    archive_env: SignalArchive, monkeypatch
-) -> None:
-    """An exception on the dispatch path must still leave a decision record."""
-    deployment = _live_deployment()
-
-    async def _boom(*_args, **_kwargs):
-        raise RuntimeError("kaboom")
-
-    monkeypatch.setattr(daemon, "_prepare_discord_signal_for_submission", _boom)
-    with pytest.raises(RuntimeError, match="kaboom"):
-        asyncio.run(
-            daemon._submit_normalized_discord_signal(
-                "acc-1",
-                object(),
-                deployment,
-                _trade_signal(),
-                signal_timeframe="1h",
-                wait_enabled=False,
-            )
-        )
-    archive_env.flush(timeout=5.0)
-    records = [r for r in _all_records() if r["type"] == "discord_signal_decision"]
-    assert len(records) == 1
-    assert records[0]["outcome"] == "unknown"
-    assert records[0]["reason"] == "unhandled_error"
-    assert "kaboom" in records[0]["detail"]

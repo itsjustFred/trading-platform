@@ -1,5 +1,14 @@
 # Signal Bots
 
+> **Status 2026-11-26:** Die Discord-Signal-Ingestion wurde entfernt
+> (Maintainer-Entscheidung, W07/#168). `DiscordSignalSource`, Bot-Discovery
+> und die Live-Listener existieren nicht mehr; die Abschnitte unten, die die
+> Live-Ingestion beschreiben, sind historisch. Die Processor (`signal_bots/`)
+> bleiben für die Archiv-Replay- und Promotion-Pfade bestehen, und das
+> Raw-Signal-Archiv (`live_runner/signal_archive.py`) bleibt für die
+> Backtest-from-archived-signals-Funktion erhalten. Discord selbst bleibt als
+> Ops-Alert-Webhook (`OPS_ALERT_WEBHOOK_URL`) im Einsatz.
+
 ## Processor-Contract
 
 Jeder Processor implementiert:

@@ -326,13 +326,11 @@ dotenv.load_dotenv = _redirected_load_dotenv
 
 
 # ``DEFAULT_ACCOUNTS_ENV`` is the path of the checkout's real credential file, and it is a module
-# constant in six modules plus a name imported from them in two more. A copy in a test
-# (``from live_runner.service_discovery import DEFAULT_ACCOUNTS_ENV``) binds the value the module
-# held at import time, so every copy is pointed at the session sandbox here, before collection:
-# patching one module's attribute leaves the others reading the real file.
+# constant in several modules plus a name imported from them in more. A copy in a test binds the
+# value the module held at import time, so every copy is pointed at the session sandbox here,
+# before collection: patching one module's attribute leaves the others reading the real file.
 _ACCOUNTS_ENV_DEFINERS: tuple[tuple[str, str], ...] = (
     ("live_runner.credential_env", "DEFAULT_ACCOUNTS_ENV"),
-    ("live_runner.service_discovery", "DEFAULT_ACCOUNTS_ENV"),
     ("live_runner.account_discovery", "DEFAULT_ACCOUNTS_ENV"),
     ("live_runner.ctrader_adapter", "DEFAULT_ACCOUNTS_ENV"),
     ("live_runner.daemon", "DEFAULT_ACCOUNTS_ENV"),
@@ -346,7 +344,6 @@ _ACCOUNTS_ENV_DEFINERS: tuple[tuple[str, str], ...] = (
 # have been patched: that is the only moment the frozen copy can be given the sandbox path.
 _ACCOUNTS_ENV_IMPORTERS: tuple[tuple[str, str], ...] = (
     ("live_runner.preflight", "DEFAULT_ACCOUNTS_ENV"),
-    ("scripts.discover_discord_authors", "DEFAULT_ACCOUNTS_ENV"),
 )
 ACCOUNTS_ENV_MODULES = _ACCOUNTS_ENV_DEFINERS + _ACCOUNTS_ENV_IMPORTERS
 

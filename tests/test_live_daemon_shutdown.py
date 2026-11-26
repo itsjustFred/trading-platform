@@ -256,14 +256,11 @@ def _trade_signal() -> TradeSignal:
     )
 
 
-def _submit(adapter: _GateAdapter, deployment: LiveDeploymentConfig) -> Any:
-    return daemon._submit_normalized_discord_signal(
-        ACCOUNT_ID,
+async def _submit(adapter: _GateAdapter, deployment: LiveDeploymentConfig) -> Any:
+    return await daemon._submit_internal_strategy_signal(
         adapter,  # type: ignore[arg-type]
         deployment,
         _trade_signal(),
-        signal_timeframe="1h",
-        wait_enabled=False,
     )
 
 
@@ -935,9 +932,6 @@ def test_the_drain_runs_before_the_listener_tasks_are_cancelled(
             daemon._shutdown_cleanup(
                 loop_tasks=(),
                 active_listener_tasks={ACCOUNT_ID: listener},
-                active_discord_tasks={},
-                active_discord_bot_tasks={},
-                active_discord_bots={},
                 active_adapters={ACCOUNT_ID: adapter},
                 scheduler=_RecordingScheduler(),  # type: ignore[arg-type]
                 shutdown=coordinator,
@@ -1025,9 +1019,6 @@ def test_a_kill_switch_sweep_in_flight_is_drained_not_cancelled(
             daemon._shutdown_cleanup(
                 loop_tasks=(),
                 active_listener_tasks={},
-                active_discord_tasks={},
-                active_discord_bot_tasks={},
-                active_discord_bots={},
                 active_adapters={ACCOUNT_ID: adapter},
                 scheduler=_RecordingScheduler(),  # type: ignore[arg-type]
                 shutdown=coordinator,
@@ -1124,9 +1115,6 @@ def test_the_sync_loop_starts_no_new_work_once_shutdown_is_requested(
     monkeypatch.setattr(daemon, "_enforce_stopped_deployments", _spy_enforce)
     monkeypatch.setattr(daemon, "enforce_live_kill_switch", _spy_kill_switch)
     monkeypatch.setattr(daemon, "_run_adapter", _spy_listener)
-    monkeypatch.setattr(
-        daemon, "_run_discord_listener_with_retries", _spy_listener
-    )
 
     async def _stop_after_iteration(_seconds: float) -> None:
         raise asyncio.CancelledError
@@ -1138,7 +1126,6 @@ def test_the_sync_loop_starts_no_new_work_once_shutdown_is_requested(
         coordinator.request("SIGTERM")
         with pytest.raises(asyncio.CancelledError):
             await daemon.sync_deployments_loop(
-                {},
                 {},
                 {},
                 accounts_env=Path("/nonexistent/accounts.env"),
@@ -1226,9 +1213,6 @@ def test_one_hung_adapter_disconnect_does_not_leave_the_others_connected() -> No
         ok = await daemon._shutdown_cleanup(
             loop_tasks=(),
             active_listener_tasks={},
-            active_discord_tasks={},
-            active_discord_bot_tasks={},
-            active_discord_bots={},
             active_adapters=active,
             scheduler=_RecordingScheduler(),  # type: ignore[arg-type]
             shutdown=coordinator,
@@ -1254,9 +1238,6 @@ def test_a_failed_adapter_disconnect_is_a_failed_phase() -> None:
         return await daemon._shutdown_cleanup(
             loop_tasks=(),
             active_listener_tasks={},
-            active_discord_tasks={},
-            active_discord_bot_tasks={},
-            active_discord_bots={},
             active_adapters={"acc-1": adapter},
             scheduler=_RecordingScheduler(),  # type: ignore[arg-type]
             shutdown=coordinator,
@@ -1293,9 +1274,6 @@ def test_cleanup_closes_connections_and_never_touches_broker_orders(
         ok = await daemon._shutdown_cleanup(
             loop_tasks=(),
             active_listener_tasks={ACCOUNT_ID: listener},
-            active_discord_tasks={},
-            active_discord_bot_tasks={},
-            active_discord_bots={},
             active_adapters=active_adapters,
             scheduler=scheduler,  # type: ignore[arg-type]
             shutdown=coordinator,
@@ -1361,9 +1339,6 @@ def test_cleanup_reports_a_phase_that_fails_but_still_runs_the_rest() -> None:
         return await daemon._shutdown_cleanup(
             loop_tasks=(),
             active_listener_tasks={},
-            active_discord_tasks={},
-            active_discord_bot_tasks={},
-            active_discord_bots={},
             active_adapters={ACCOUNT_ID: adapter},
             scheduler=_BrokenScheduler(),  # type: ignore[arg-type]
             shutdown=coordinator,
@@ -2160,9 +2135,6 @@ def test_a_loop_task_that_ignores_its_cancel_cannot_hold_the_shutdown(
         ok = await daemon._shutdown_cleanup(
             loop_tasks=(loop_task,),
             active_listener_tasks={},
-            active_discord_tasks={},
-            active_discord_bot_tasks={},
-            active_discord_bots={},
             active_adapters={},
             scheduler=_RecordingScheduler(),  # type: ignore[arg-type]
             shutdown=coordinator,
@@ -2287,9 +2259,6 @@ def test_a_reactor_release_that_never_returns_cannot_hold_the_shutdown(
         ok = await daemon._shutdown_cleanup(
             loop_tasks=(),
             active_listener_tasks={},
-            active_discord_tasks={},
-            active_discord_bot_tasks={},
-            active_discord_bots={},
             active_adapters={},
             scheduler=_RecordingScheduler(),  # type: ignore[arg-type]
             shutdown=coordinator,
