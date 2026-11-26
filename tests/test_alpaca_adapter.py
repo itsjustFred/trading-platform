@@ -8,9 +8,11 @@ a failed flatten must not leave a naked position.
 from __future__ import annotations
 
 import asyncio
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+from typing import Any
 from uuid import uuid4
 
 import pytest
@@ -21,6 +23,7 @@ from live_runner.alpaca_adapter import (
     _RESTING_LEG_STATUSES,
     AlpacaLiveAdapter,
     _alpaca_market_data_start,
+    _covered_exit_protection_qty,
     _order_legs,
 )
 from live_runner.base_adapter import is_order_not_submitted
@@ -37,6 +40,7 @@ class _FakeOrder:
     order_class: str = "simple"
     qty: float = 0.0
     stop_price: float | None = None
+    limit_price: float | None = None
     status: object = "new"
     legs: list["_FakeOrder"] = field(default_factory=list)
     submitted_at: datetime | None = None
@@ -45,6 +49,7 @@ class _FakeOrder:
     #: that never filled reads as zero, and a broker that cannot be asked says
     #: something that is not a number).
     filled_qty: object = 0.0
+    client_order_id: str = ""
 
 
 @dataclass
@@ -54,6 +59,29 @@ class _FakePosition:
     avg_entry_price: float = 1.0
     current_price: float = 1.0
     unrealized_pl: float = 0.0
+
+
+_TERMINAL_ORDER_STATUSES = {"filled", "canceled", "expired", "rejected", "done_for_day", "replaced"}
+
+
+def _status_text(order: object) -> str:
+    raw = getattr(order, "status", "")
+    return str(getattr(raw, "value", raw) or "").strip().lower()
+
+
+def _side_text(order_data: object) -> str:
+    raw = getattr(order_data, "side", "")
+    return str(getattr(raw, "value", raw) or "").strip().lower()
+
+
+def _class_text(order_data: object) -> str:
+    raw = getattr(order_data, "order_class", "")
+    return str(getattr(raw, "value", raw) or "").strip().lower()
+
+
+def _type_text(order_data: object) -> str:
+    raw = getattr(order_data, "type", "")
+    return str(getattr(raw, "value", raw) or "").strip().lower()
 
 
 class _FakeTradingClient:
@@ -102,12 +130,42 @@ class _FakeTradingClient:
         limit = getattr(filter, "limit", None) or 50
         self.last_order_filter = filter
         self.order_filters.append(filter)
-        status = str(getattr(getattr(filter, "status", None), "value", "open")).lower()
-        if status != "open":
+        status = str(getattr(getattr(filter, "status", None), "value", "") or "").lower()
+        symbols = getattr(filter, "symbols", None)
+        if status == "all":
             # ``status=all``: filled parents come back with their legs nested.
-            return (list(self.orders) + list(self.parents))[:limit]
-        # ``status=open``: top-level working orders only, legs never included.
-        return list(self.orders)[:limit]
+            result = list(self.orders) + list(self.parents)
+        else:
+            # ``status=open``: top-level working orders only, legs never included.
+            result = [
+                order
+                for order in self.orders
+                if _status_text(order) not in _TERMINAL_ORDER_STATUSES
+            ]
+        if symbols:
+            wanted = {str(symbol).strip().upper() for symbol in symbols}
+            result = [
+                order
+                for order in result
+                if str(getattr(order, "symbol", "") or "").strip().upper() in wanted
+            ]
+        until = getattr(filter, "until", None)
+        after = getattr(filter, "after", None)
+        if until is not None:
+            result = [
+                order
+                for order in result
+                if getattr(order, "submitted_at", None) is None
+                or order.submitted_at <= until
+            ]
+        if after is not None:
+            result = [
+                order
+                for order in result
+                if getattr(order, "submitted_at", None) is None
+                or order.submitted_at >= after
+            ]
+        return result[:limit]
 
     def get_order_by_id(self, order_id: str):
         for order in (*self.orders, *self.parents, *self.history.values()):
@@ -122,14 +180,39 @@ class _FakeTradingClient:
     def get_all_positions(self):
         return list(self.positions)
 
+    def _mark_cancelled(self, order: _FakeOrder) -> None:
+        if self.cancel_settles:
+            self.orders = [item for item in self.orders if item is not order]
+            return
+        order.status = "pending_cancel"
+
+    def _cancel_nested(self, order_id: str) -> bool:
+        for order in self.orders:
+            for leg in order.legs:
+                if leg.id == order_id:
+                    if self.cancel_settles:
+                        leg.status = "canceled"
+                    else:
+                        leg.status = "pending_cancel"
+                    return True
+        return False
+
     def cancel_order_by_id(self, order_id: str) -> None:
         self.cancelled.append(order_id)
-        if self.cancel_settles:
-            self.orders = [order for order in self.orders if order.id != order_id]
-            return
         for order in self.orders:
             if order.id == order_id:
-                order.status = "pending_cancel"
+                self._mark_cancelled(order)
+                return
+        if self._cancel_nested(order_id):
+            return
+        raise RuntimeError(f"order {order_id} not found")
+
+    def _working_orders(self, symbol: str) -> list[_FakeOrder]:
+        return [
+            order
+            for order in self.orders
+            if order.symbol == symbol and _status_text(order) not in _TERMINAL_ORDER_STATUSES
+        ]
 
     def _reserved_qty(self, symbol: str) -> float:
         position = next((item for item in self.positions if item.symbol == symbol), None)
@@ -138,14 +221,26 @@ class _FakeTradingClient:
         side = "sell" if position.qty > 0 else "buy"
         reserved = sum(
             abs(order.qty)
-            for order in self.orders
-            if order.symbol == symbol and order.side == side
+            for order in self._working_orders(symbol)
+            if order.side == side and "market" not in order.order_type
         )
-        # A bracket leg the broker lists only under its filled parent reserves
-        # quantity too: that is what refuses a close_position on the bracket. Only
-        # while it rests - a filled or settled leg reserves nothing. A leg can arrive
-        # without its own symbol, and the parent it rests under is what places it:
-        # the reservation is on the position's symbol either way.
+        # A bracket's held stop leg reserves the same shares its take-profit
+        # sibling does (OCO): count it once via the parent, not twice. The leg
+        # can sit under a filled order in ``orders`` or under a filled parent in
+        # ``parents``; only while it rests - a filled or settled leg reserves
+        # nothing. A leg can arrive without its own symbol, and the parent it
+        # rests under is what places it: the reservation is on the position's
+        # symbol either way.
+        for order in self.orders:
+            if _status_text(order) != "filled" or order.symbol != symbol:
+                continue
+            for leg in order.legs:
+                if (
+                    _status_text(leg) == "held"
+                    and leg.side == side
+                    and "market" not in leg.order_type
+                ):
+                    reserved += abs(leg.qty)
         for parent in self.parents:
             if str(getattr(parent, "status", "new")).lower() != "filled":
                 continue
@@ -165,23 +260,124 @@ class _FakeTradingClient:
         if self._reserved_qty(symbol) > 0:
             raise RuntimeError("insufficient qty available for order to be filled")
         self.positions = [item for item in self.positions if item.symbol != symbol]
-        return SimpleNamespace(id=f"close-{symbol}", symbol=symbol)
+        return SimpleNamespace(id=str(uuid4()), symbol=symbol)
+
+    def _fill_market_order(self, order_data: object) -> None:
+        """A market order fills at once in the double; reduce the position."""
+        symbol = str(order_data.symbol)
+        side = _side_text(order_data)
+        qty = abs(float(order_data.qty))
+        for index, position in enumerate(self.positions):
+            if position.symbol != symbol:
+                continue
+            if side == "sell" and position.qty > 0:
+                position.qty = max(position.qty - qty, 0.0)
+            elif side == "buy" and position.qty < 0:
+                position.qty = min(position.qty + qty, 0.0)
+            if abs(position.qty) <= 1e-9:
+                self.positions.pop(index)
 
     def submit_order(self, order_data):
         if self.submit_error is not None:
             raise self.submit_error
         self.submitted.append(order_data)
-        side = str(getattr(order_data.side, "value", order_data.side))
+        order_class = _class_text(order_data)
+        order_type = _type_text(order_data)
+        side = _side_text(order_data)
+        symbol = str(order_data.symbol)
+        qty = abs(float(order_data.qty))
+        if order_class == "oco":
+            take_profit = getattr(order_data, "take_profit", None)
+            stop_loss = getattr(order_data, "stop_loss", None)
+            tp_price = (
+                float(take_profit.limit_price)
+                if take_profit is not None and take_profit.limit_price is not None
+                else None
+            )
+            sl_price = (
+                float(stop_loss.stop_price)
+                if stop_loss is not None and stop_loss.stop_price is not None
+                else None
+            )
+            sl_limit = (
+                float(stop_loss.limit_price)
+                if stop_loss is not None and getattr(stop_loss, "limit_price", None) is not None
+                else None
+            )
+            # Alpaca's real OCO shape: the parent IS the take-profit order
+            # (a limit order carrying limit_price); the stop-loss is its only
+            # leg, with a broker-assigned client order id of its own.
+            parent = _FakeOrder(
+                id=str(uuid4()),
+                symbol=symbol,
+                side=side,
+                order_type="limit",
+                order_class="oco",
+                qty=qty,
+                limit_price=tp_price,
+                status="new",
+                legs=[
+                    _FakeOrder(
+                        id=str(uuid4()),
+                        symbol=symbol,
+                        side=side,
+                        order_type="stop_limit" if sl_limit is not None else "stop",
+                        order_class="oco",
+                        qty=qty,
+                        stop_price=sl_price,
+                        limit_price=sl_limit,
+                        status="held",
+                    ),
+                ],
+            )
+            self.orders.append(parent)
+            return SimpleNamespace(id=parent.id, symbol=symbol, status="new")
+        if order_type == "market":
+            position = next(
+                (item for item in self.positions if item.symbol == symbol), None
+            )
+            if position is not None:
+                reducing = (side == "sell" and position.qty > 0) or (
+                    side == "buy" and position.qty < 0
+                )
+                if reducing:
+                    available = abs(position.qty) - self._reserved_qty(symbol)
+                    if qty > available + 1e-9:
+                        self.submitted.pop()
+                        raise RuntimeError(
+                            "insufficient qty available for order to be filled"
+                        )
+            order = _FakeOrder(
+                id=str(uuid4()),
+                symbol=symbol,
+                side=side,
+                order_type="market",
+                qty=qty,
+                status="filled",
+                filled_qty=qty,
+            )
+            self.orders.append(order)
+            self._fill_market_order(order_data)
+            return SimpleNamespace(id=order.id, symbol=symbol, status="filled")
         order = _FakeOrder(
-            id=f"restored-{len(self.submitted)}",
-            symbol=str(order_data.symbol),
+            id=str(uuid4()),
+            symbol=symbol,
             side=side,
-            order_type="stop",
-            qty=float(order_data.qty),
-            stop_price=float(order_data.stop_price),
+            order_type="stop" if order_type == "stop" else "limit",
+            qty=qty,
+            stop_price=(
+                float(order_data.stop_price)
+                if getattr(order_data, "stop_price", None) is not None
+                else None
+            ),
+            limit_price=(
+                float(order_data.limit_price)
+                if getattr(order_data, "limit_price", None) is not None
+                else None
+            ),
         )
         self.orders.append(order)
-        return SimpleNamespace(id=order.id, symbol=order.symbol)
+        return SimpleNamespace(id=order.id, symbol=order.symbol, status="new")
 
 
 class _BracketPositionClient(_FakeTradingClient):
@@ -215,6 +411,7 @@ class _BracketPositionClient(_FakeTradingClient):
             "AAPL",
             "sell",
             order_type="stop",
+            order_class="bracket",
             qty=qty,
             status="held",
             stop_price=stop_price,
@@ -224,6 +421,7 @@ class _BracketPositionClient(_FakeTradingClient):
             "AAPL",
             "sell",
             order_type="limit",
+            order_class="bracket",
             qty=qty,
             status="filled" if take_profit_filled else "new",
         )
@@ -746,7 +944,7 @@ def test_close_all_positions_reports_a_partial_flatten() -> None:
     # the outcome incomplete instead of trusting the acknowledgement.
     def _acknowledge_only(symbol: str, close_options=None):
         client.close_calls.append(symbol)
-        return SimpleNamespace(id=f"close-{symbol}", symbol=symbol)
+        return SimpleNamespace(id=str(uuid4()), symbol=symbol)
 
     client.close_position = _acknowledge_only  # type: ignore[method-assign]
 
@@ -2049,6 +2247,2248 @@ def test_alpaca_exit_qty_step_is_one_fractional_share_step() -> None:
     assert adapter.exit_qty_step("AAPL") == pytest.approx(1e-9)
 
 
+# ─── #145: exits on bracketed positions must free the reserved shares ────────
+
+
+def _filled_bracket(symbol: str = "AAPL", qty: float = 10.0) -> list[_FakeOrder]:
+    """A filled bracket as Alpaca paper showed it (runbook 2026-11-16).
+
+    The take-profit leg is a working top-level order; the stop leg stays
+    ``held`` under the filled parent and is invisible to ``status=open``.
+    """
+    stop_leg = _FakeOrder(
+        id="sl-1",
+        symbol=symbol,
+        side="sell",
+        order_type="stop",
+        order_class="bracket",
+        qty=qty,
+        stop_price=190.0,
+        status="held",
+    )
+    take_profit = _FakeOrder(
+        id="tp-1",
+        symbol=symbol,
+        side="sell",
+        order_type="limit",
+        order_class="bracket",
+        qty=qty,
+        limit_price=210.0,
+        status="new",
+    )
+    # Paper 2026-11-24: the filled parent nests BOTH legs and each leg carries
+    # the parent's ``bracket`` class; the take-profit leg additionally shows up
+    # top-level in the ``status=open`` listing.
+    parent = _FakeOrder(
+        id="parent-1",
+        symbol=symbol,
+        side="buy",
+        order_type="market",
+        order_class="bracket",
+        qty=qty,
+        status="filled",
+        legs=[take_profit, stop_leg],
+    )
+    return [parent, take_profit]
+
+
+def _patched_signal_store(monkeypatch, captured: list[LiveSignal]) -> None:
+    def _save(signal: LiveSignal):
+        captured.append(signal)
+        return str(signal.id or uuid4()), True
+
+    monkeypatch.setattr(alpaca_module, "save_live_signal", _save)
+    monkeypatch.setattr(
+        alpaca_module, "set_live_signal_broker_order_id", lambda *_a, **_k: True
+    )
+
+
+def _exit_signal_full() -> LiveSignal:
+    return LiveSignal(
+        deployment_id="dep-1",
+        symbol="AAPL",
+        action="sell",
+        theoretical_price=200.0,
+        timestamp=datetime.now(timezone.utc),
+        metadata={
+            "exit_only": True,
+            "risk_sizing_mode": "exit_only",
+            "signal_intent": "exit",
+            "exit_fraction": 1.0,
+            "qty": 10.0,
+            "explicit_qty": 10.0,
+        },
+    )
+
+
+def test_full_exit_on_bracketed_position_cancels_legs_and_closes(
+    monkeypatch,
+) -> None:
+    """The bracket legs reserve the shares; the exit must cancel them first."""
+    client = _FakeTradingClient(
+        orders=_filled_bracket(),
+        positions=[_FakePosition("AAPL", 10.0)],
+    )
+    adapter = _adapter(client)
+    captured: list[LiveSignal] = []
+    _patched_signal_store(monkeypatch, captured)
+
+    broker_order_id = asyncio.run(adapter.submit_order(_exit_signal_full(), qty=10.0))
+
+    assert broker_order_id
+    # Both legs went before the close; the position is flat afterwards.
+    assert set(client.cancelled) == {"tp-1", "sl-1"}
+    assert client.positions == []
+    market_orders = [
+        order for order in client.submitted if _type_text(order) == "market"
+    ]
+    assert len(market_orders) == 1
+    # A full exit leaves nothing to re-protect.
+    assert not [
+        order for order in client.submitted if _class_text(order) == "oco"
+    ]
+
+
+def test_full_exit_over_a_stop_limit_protection_is_not_refused(
+    monkeypatch,
+) -> None:
+    """A stop-limit leg's limit price belongs to the plan's signature too.
+
+    The flat-remainder branch used to leave ``stop_limit_price`` unset while
+    the in-lock signature always derived it from the candidates, so every
+    full exit over a stop-limit protection was refused as "the working
+    protection changed" before any cancel.
+    """
+    stop_leg = _FakeOrder(
+        id="sl-1",
+        symbol="AAPL",
+        side="sell",
+        order_type="stop_limit",
+        order_class="bracket",
+        qty=10.0,
+        stop_price=190.0,
+        limit_price=189.0,
+        status="held",
+    )
+    parent = _FakeOrder(
+        id="parent-1",
+        symbol="AAPL",
+        side="buy",
+        order_type="market",
+        order_class="bracket",
+        qty=10.0,
+        status="filled",
+        legs=[stop_leg],
+    )
+    take_profit = _FakeOrder(
+        id="tp-1",
+        symbol="AAPL",
+        side="sell",
+        order_type="limit",
+        qty=10.0,
+        limit_price=210.0,
+        status="new",
+    )
+    client = _FakeTradingClient(
+        orders=[parent, take_profit],
+        positions=[_FakePosition("AAPL", 10.0)],
+    )
+    adapter = _adapter(client)
+    _patched_signal_store(monkeypatch, [])
+
+    broker_order_id = asyncio.run(adapter.submit_order(_exit_signal_full(), qty=10.0))
+
+    assert broker_order_id
+    assert client.positions == []
+    market_orders = [
+        order for order in client.submitted if _type_text(order) == "market"
+    ]
+    assert len(market_orders) == 1
+
+
+def test_partial_exit_reprotects_remainder_at_original_levels(
+    monkeypatch,
+) -> None:
+    """Partial exit: remaining qty gets SL/TP again at the legs' own levels."""
+    client = _FakeTradingClient(
+        orders=_filled_bracket(),
+        positions=[_FakePosition("AAPL", 10.0)],
+    )
+    adapter = _adapter(client)
+    captured: list[LiveSignal] = []
+    _patched_signal_store(monkeypatch, captured)
+    cleared: list[str] = []
+    monkeypatch.setattr(
+        alpaca_module,
+        "clear_live_signal_metadata_key",
+        lambda signal_id, key: cleared.append(signal_id) or True,
+    )
+
+    signal = _exit_signal_full().model_copy(
+        update={"metadata": {**_exit_signal_full().metadata, "qty": 4.0, "explicit_qty": 4.0}}
+    )
+    asyncio.run(adapter.submit_order(signal, qty=4.0))
+
+    assert set(client.cancelled) == {"tp-1", "sl-1"}
+    # Position went 10 -> 6; the OCO re-protection covers exactly the remainder.
+    assert client.positions == [_FakePosition("AAPL", 6.0)] or client.positions[0].qty == 6.0
+    oco = [order for order in client.submitted if _class_text(order) == "oco"]
+    assert len(oco) == 1
+    assert float(oco[0].qty) == 6.0
+    assert float(oco[0].take_profit.limit_price) == 210.0
+    assert float(oco[0].stop_loss.stop_price) == 190.0
+    assert _side_text(oco[0]) == "sell"
+    # The persisted signal carried the recovery marker. The market exit is
+    # already proven terminal and fully filled when the re-place returns, so
+    # the watchdog marker is spent immediately rather than left for the next
+    # connect or stream update (#350 review).
+    assert captured
+    assert "exit_reprotection" in (captured[0].metadata or {})
+    assert len(cleared) == 1
+
+
+def test_partial_exit_reprotects_at_current_trailing_level(monkeypatch) -> None:
+    """Trailing amended the broker stop: the remainder keeps THAT level (#145)."""
+    orders = _filled_bracket()
+    # Trailing moved the held stop leg from the entry's 190 to 195.
+    stop_leg = next(leg for leg in orders[0].legs if leg.order_type == "stop")
+    stop_leg.stop_price = 195.0
+    client = _FakeTradingClient(
+        orders=orders,
+        positions=[_FakePosition("AAPL", 10.0)],
+    )
+    adapter = _adapter(client)
+    captured: list[LiveSignal] = []
+    _patched_signal_store(monkeypatch, captured)
+
+    signal = _exit_signal_full().model_copy(
+        update={"metadata": {**_exit_signal_full().metadata, "qty": 4.0, "explicit_qty": 4.0}}
+    )
+    asyncio.run(adapter.submit_order(signal, qty=4.0))
+
+    oco = [order for order in client.submitted if _class_text(order) == "oco"]
+    assert len(oco) == 1
+    assert float(oco[0].stop_loss.stop_price) == 195.0
+    assert float(oco[0].take_profit.limit_price) == 210.0
+
+
+def test_second_partial_exit_releases_the_oco_pair(monkeypatch) -> None:
+    """An exit over a position protected by a re-placed OCO releases it too.
+
+    Alpaca's real OCO shape: the parent IS the take-profit (a limit order
+    carrying ``limit_price``); the stop is its only leg. Both levels must be
+    found - the parent's take-profit price is what the remainder's new OCO
+    re-places, per the #145 decision.
+    """
+    client = _FakeTradingClient(
+        orders=[
+            _FakeOrder(
+                id=str(uuid4()),
+                symbol="AAPL",
+                side="sell",
+                order_type="limit",
+                order_class="oco",
+                qty=6.0,
+                limit_price=210.0,
+                status="new",
+                legs=[
+                    _FakeOrder(
+                        id=str(uuid4()),
+                        symbol="AAPL",
+                        side="sell",
+                        order_type="stop",
+                        order_class="oco",
+                        qty=6.0,
+                        stop_price=190.0,
+                        status="held",
+                    ),
+                ],
+            )
+        ],
+        positions=[_FakePosition("AAPL", 6.0)],
+    )
+    adapter = _adapter(client)
+    captured: list[LiveSignal] = []
+    _patched_signal_store(monkeypatch, captured)
+
+    signal = _exit_signal_full().model_copy(
+        update={"metadata": {**_exit_signal_full().metadata, "qty": 2.0, "explicit_qty": 2.0}}
+    )
+    asyncio.run(adapter.submit_order(signal, qty=2.0))
+
+    # The OCO parent and its stop leg were cancelled; the remainder is
+    # re-protected with BOTH recorded levels.
+    oco = [order for order in client.submitted if _class_text(order) == "oco"]
+    assert len(oco) == 1
+    assert float(oco[0].qty) == 4.0
+    assert float(oco[0].take_profit.limit_price) == 210.0
+    assert float(oco[0].stop_loss.stop_price) == 190.0
+    assert client.positions[0].qty == 4.0
+
+
+def test_partial_exit_refuses_ambiguous_protection_levels(monkeypatch) -> None:
+    """Two different stop prices: which tranche the exit hits is unknowable."""
+    orders = _filled_bracket()
+    second_stop = _FakeOrder(
+        id="sl-2",
+        symbol="AAPL",
+        side="sell",
+        order_type="stop",
+        qty=5.0,
+        stop_price=185.0,
+        status="new",
+    )
+    orders.append(second_stop)
+    client = _FakeTradingClient(
+        orders=orders,
+        positions=[_FakePosition("AAPL", 10.0)],
+    )
+    adapter = _adapter(client)
+    captured: list[LiveSignal] = []
+    _patched_signal_store(monkeypatch, captured)
+
+    signal = _exit_signal_full().model_copy(
+        update={"metadata": {**_exit_signal_full().metadata, "qty": 4.0, "explicit_qty": 4.0}}
+    )
+    submission = adapter.submit_order(signal, qty=4.0)
+    with pytest.raises(ValueError, match="ambiguous") as raised:
+        asyncio.run(submission)
+
+    # Refused before any broker write: nothing cancelled, nothing submitted,
+    # and the failure is marked so the caller may release its submission lease.
+    assert client.cancelled == []
+    assert client.submitted == []
+    assert is_order_not_submitted(raised.value) is True
+
+
+def test_failed_exit_submit_restores_protection(monkeypatch) -> None:
+    """Cancel succeeded but the exit order failed: put the protection back."""
+    client = _FakeTradingClient(
+        orders=_filled_bracket(),
+        positions=[_FakePosition("AAPL", 10.0)],
+    )
+    adapter = _adapter(client)
+    captured: list[LiveSignal] = []
+    _patched_signal_store(monkeypatch, captured)
+    real_submit = client.submit_order
+
+    def _fail_exit(order_data):
+        if _type_text(order_data) == "market":
+            raise RuntimeError("broker rejected the exit")
+        return real_submit(order_data)
+
+    client.submit_order = _fail_exit  # type: ignore[method-assign]
+
+    submission = adapter.submit_order(_exit_signal_full(), qty=10.0)
+    with pytest.raises(RuntimeError, match="broker rejected the exit"):
+        asyncio.run(submission)
+
+    # The protection the strategy had is back on the still-open position
+    # (SL+TP go back as one OCO pair, so the stop lives on its leg).
+    flat_orders = list(client.orders)
+    for order in client.orders:
+        flat_orders.extend(order.legs)
+    stops = [
+        order
+        for order in flat_orders
+        if order.order_type == "stop" and _status_text(order) not in _TERMINAL_ORDER_STATUSES
+    ]
+    assert len(stops) == 1
+    assert stops[0].stop_price == 190.0
+    assert stops[0].qty == 10.0
+
+
+def test_failed_reprotection_is_critical_and_marker_survives(
+    monkeypatch, caplog
+) -> None:
+    """Re-place fails after the exit filled: CRITICAL alert, marker kept."""
+    client = _FakeTradingClient(
+        orders=_filled_bracket(),
+        positions=[_FakePosition("AAPL", 10.0)],
+    )
+    adapter = _adapter(client)
+    captured: list[LiveSignal] = []
+    _patched_signal_store(monkeypatch, captured)
+    cleared: list[str] = []
+    monkeypatch.setattr(
+        alpaca_module,
+        "clear_live_signal_metadata_key",
+        lambda signal_id, key: cleared.append(signal_id) or True,
+    )
+    real_submit = client.submit_order
+
+    def _fail_oco(order_data):
+        if _class_text(order_data) == "oco":
+            raise RuntimeError("oco rejected")
+        return real_submit(order_data)
+
+    client.submit_order = _fail_oco  # type: ignore[method-assign]
+
+    signal = _exit_signal_full().model_copy(
+        update={"metadata": {**_exit_signal_full().metadata, "qty": 4.0, "explicit_qty": 4.0}}
+    )
+    with caplog.at_level("CRITICAL"):
+        asyncio.run(adapter.submit_order(signal, qty=4.0))
+
+    # The exit itself went through; the remainder is unprotected and alerted.
+    assert client.positions[0].qty == 6.0
+    assert any("unprotected" in record.message.lower() or "re-protect" in record.message.lower()
+               for record in caplog.records if record.levelname == "CRITICAL")
+    assert cleared == []
+
+
+def test_exit_without_protection_is_unchanged(monkeypatch) -> None:
+    """A naked position exits exactly as before: no cancels, plain market order."""
+    client = _FakeTradingClient(positions=[_FakePosition("AAPL", 10.0)])
+    adapter = _adapter(client)
+    captured: list[LiveSignal] = []
+    _patched_signal_store(monkeypatch, captured)
+
+    asyncio.run(adapter.submit_order(_exit_signal_full(), qty=10.0))
+
+    assert client.cancelled == []
+    assert client.positions == []
+    assert not [order for order in client.submitted if _class_text(order) == "oco"]
+
+
+def test_recovery_replaces_missing_protection_for_marked_exit(
+    monkeypatch,
+) -> None:
+    """After a crash mid-exit, connect() re-places what the marker recorded."""
+    client = _FakeTradingClient(positions=[_FakePosition("AAPL", 6.0)])
+    adapter = _adapter(client)
+    monkeypatch.setattr(
+        alpaca_module,
+        "list_pending_exit_reprotections",
+        lambda account_id, *, limit=50: [
+            {
+                "signal_id": "sig-1",
+                "symbol": "AAPL",
+                "deployment_id": "dep-1",
+                "timestamp": datetime.now(timezone.utc),
+                "marker": {
+                    "side": "sell",
+                    "stop_price": 190.0,
+                    "take_profit_price": 210.0,
+                    "position_qty": 10.0,
+                    "exit_qty": 4.0,
+                    "reprotect_qty": 6.0,
+                },
+            }
+        ],
+    )
+    cleared: list[str] = []
+    monkeypatch.setattr(
+        alpaca_module,
+        "clear_live_signal_metadata_key",
+        lambda signal_id, key: cleared.append(signal_id) or True,
+    )
+
+    asyncio.run(adapter._recover_exit_reprotections())
+
+    oco = [order for order in client.submitted if _class_text(order) == "oco"]
+    assert len(oco) == 1
+    assert float(oco[0].qty) == 6.0
+    assert float(oco[0].stop_loss.stop_price) == 190.0
+    assert float(oco[0].take_profit.limit_price) == 210.0
+    assert cleared == ["sig-1"]
+
+
+def test_recovery_leaves_existing_protection_alone(monkeypatch) -> None:
+    """A stop already working (e.g. trailing moved it) is never moved back."""
+    orders = [
+        _FakeOrder(
+            id="sl-new",
+            symbol="AAPL",
+            side="sell",
+            order_type="stop",
+            qty=6.0,
+            stop_price=195.0,
+            status="new",
+        )
+    ]
+    client = _FakeTradingClient(
+        orders=orders, positions=[_FakePosition("AAPL", 6.0)]
+    )
+    adapter = _adapter(client)
+    monkeypatch.setattr(
+        alpaca_module,
+        "list_pending_exit_reprotections",
+        lambda account_id, *, limit=50: [
+            {
+                "signal_id": "sig-1",
+                "symbol": "AAPL",
+                "deployment_id": "dep-1",
+                "timestamp": datetime.now(timezone.utc),
+                "marker": {
+                    "side": "sell",
+                    "stop_price": 190.0,
+                    "take_profit_price": 210.0,
+                    "position_qty": 10.0,
+                    "exit_qty": 4.0,
+                    "reprotect_qty": 6.0,
+                },
+            }
+        ],
+    )
+    cleared: list[str] = []
+    monkeypatch.setattr(
+        alpaca_module,
+        "clear_live_signal_metadata_key",
+        lambda signal_id, key: cleared.append(signal_id) or True,
+    )
+
+    asyncio.run(adapter._recover_exit_reprotections())
+
+    # Stop exists -> only the missing TP piece is reported, nothing resubmitted
+    # at the stale marker price, and the marker stays for the operator.
+    assert client.submitted == []
+    assert cleared == []
+
+
+def test_list_protective_stops_sees_an_oco_stop_leg() -> None:
+    """Re-protected positions stay trailable: the OCO stop leg is a stop."""
+    client = _FakeTradingClient(
+        orders=[
+            _FakeOrder(
+                id="oco-1",
+                symbol="AAPL",
+                side="sell",
+                order_type="limit",
+                order_class="oco",
+                qty=6.0,
+                limit_price=210.0,
+                status="new",
+                legs=[
+                    _FakeOrder(
+                        id="oco-1-sl",
+                        symbol="AAPL",
+                        side="sell",
+                        order_type="stop",
+                        order_class="oco",
+                        qty=6.0,
+                        stop_price=190.0,
+                        status="held",
+                    )
+                ],
+            )
+        ],
+        positions=[_FakePosition("AAPL", 6.0)],
+    )
+    adapter = _adapter(client)
+
+    stops = asyncio.run(adapter.list_protective_stops())
+
+    assert len(stops) == 1
+    assert stops[0].order_id == "oco-1-sl"
+    assert stops[0].stop_price == 190.0
+    assert stops[0].side == "sell"
+
+
+def test_partial_exit_submits_beyond_a_full_order_history_page(
+    monkeypatch,
+) -> None:
+    """500 newer orders on the symbol must not blind the exit (#350 blocker).
+
+    ``status=all`` is paged backwards with ``until``: the filled bracket
+    parent owning the held stop leg sits on the second page and is still
+    found, where the old single-page read raised and refused every exit on a
+    long-lived symbol.
+    """
+    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    history = [
+        _FakeOrder(
+            id=f"hist-{index}",
+            symbol="AAPL",
+            side="buy",
+            order_type="limit",
+            status="canceled",
+            qty=1.0,
+            submitted_at=base + timedelta(seconds=600 - index),
+        )
+        for index in range(500)
+    ]
+    bracket = _filled_bracket()
+    for order in bracket:
+        order.submitted_at = base
+        for leg in order.legs:
+            leg.submitted_at = base
+    client = _FakeTradingClient(
+        orders=history + bracket,
+        positions=[_FakePosition("AAPL", 10.0)],
+    )
+    adapter = _adapter(client)
+    captured: list[LiveSignal] = []
+    _patched_signal_store(monkeypatch, captured)
+
+    asyncio.run(adapter.submit_order(_partial_signal(4.0), qty=4.0))
+
+    market_orders = [
+        order for order in client.submitted if _type_text(order) == "market"
+    ]
+    assert len(market_orders) == 1
+    oco = [order for order in client.submitted if _class_text(order) == "oco"]
+    assert len(oco) == 1
+    assert float(oco[0].qty) == 6.0
+
+
+def _reprotect_row(marker: dict, **overrides) -> dict:
+    row = {
+        "signal_id": "sig-1",
+        "symbol": "AAPL",
+        "deployment_id": "dep-1",
+        "timestamp": datetime.now(timezone.utc),
+        "broker_order_id": "",
+        "marker": marker,
+    }
+    row.update(overrides)
+    return row
+
+
+def _working_oco(qty: float = 6.0) -> _FakeOrder:
+    return _FakeOrder(
+        id=str(uuid4()),
+        symbol="AAPL",
+        side="sell",
+        order_type="limit",
+        order_class="oco",
+        qty=qty,
+        limit_price=210.0,
+        status="new",
+        legs=[
+            _FakeOrder(
+                id=str(uuid4()),
+                symbol="AAPL",
+                side="sell",
+                order_type="stop",
+                order_class="oco",
+                qty=qty,
+                stop_price=190.0,
+                status="held",
+            )
+        ],
+    )
+
+
+def _patch_pending_reprotections(monkeypatch, rows: list[dict]) -> None:
+    monkeypatch.setattr(
+        alpaca_module,
+        "list_pending_exit_reprotections",
+        lambda account_id, *, limit=50: rows,
+    )
+
+
+def _patch_marker_clears(monkeypatch) -> list[str]:
+    cleared: list[str] = []
+    monkeypatch.setattr(
+        alpaca_module,
+        "clear_live_signal_metadata_key",
+        lambda signal_id, key: cleared.append(signal_id) or True,
+    )
+    return cleared
+
+
+def test_recovery_tops_up_shares_an_underfilled_exit_left_naked(
+    monkeypatch,
+) -> None:
+    """Exit expired after re-place: 6 of 10 shares protected, 4 naked.
+
+    The persisted marker used to be cleared the moment re-protection was
+    placed, so an exit that later expired or filled short left the uncovered
+    shares unprotected with no record. The marker now survives until replay
+    proves the exit order terminal; the uncovered quantity is topped up at
+    the recorded levels (#350 review).
+    """
+    client = _FakeTradingClient(
+        orders=[
+            _working_oco(qty=6.0),
+            _FakeOrder(
+                id="exit-1",
+                symbol="AAPL",
+                side="sell",
+                order_type="market",
+                qty=4.0,
+                status="expired",
+            ),
+        ],
+        positions=[_FakePosition("AAPL", 10.0)],
+    )
+    adapter = _adapter(client)
+    _patch_pending_reprotections(
+        monkeypatch,
+        [
+            _reprotect_row(
+                {
+                    "side": "sell",
+                    "stop_price": 190.0,
+                    "take_profit_price": 210.0,
+                    "entry_signal_id": "entry-1",
+                },
+                broker_order_id="exit-1",
+            )
+        ],
+    )
+    cleared = _patch_marker_clears(monkeypatch)
+
+    asyncio.run(adapter._recover_exit_reprotections())
+
+    top_ups = [
+        order
+        for order in client.submitted
+        if _class_text(order) == "oco" and float(order.qty) == 4.0
+    ]
+    assert len(top_ups) == 1
+    assert float(top_ups[0].stop_loss.stop_price) == 190.0
+    assert float(top_ups[0].take_profit.limit_price) == 210.0
+    assert cleared == ["sig-1"]
+
+
+def test_recovery_keeps_marker_while_the_exit_order_still_works(
+    monkeypatch,
+) -> None:
+    """A resting exit is not terminal: nothing is topped up, marker stays."""
+    client = _FakeTradingClient(
+        orders=[
+            _working_oco(qty=6.0),
+            _FakeOrder(
+                id="exit-1",
+                symbol="AAPL",
+                side="sell",
+                order_type="limit",
+                qty=4.0,
+                status="new",
+            ),
+        ],
+        positions=[_FakePosition("AAPL", 10.0)],
+    )
+    adapter = _adapter(client)
+    _patch_pending_reprotections(
+        monkeypatch,
+        [
+            _reprotect_row(
+                {
+                    "side": "sell",
+                    "stop_price": 190.0,
+                    "take_profit_price": 210.0,
+                },
+                broker_order_id="exit-1",
+            )
+        ],
+    )
+    cleared = _patch_marker_clears(monkeypatch)
+
+    asyncio.run(adapter._recover_exit_reprotections())
+
+    assert client.submitted == []
+    assert cleared == []
+
+
+def test_recovery_alerts_but_keeps_marker_when_exit_outcome_unknown(
+    monkeypatch, caplog
+) -> None:
+    """No persisted order id: cannot prove the exit finished - alert, keep."""
+    client = _FakeTradingClient(
+        orders=[_working_oco(qty=6.0)],
+        positions=[_FakePosition("AAPL", 10.0)],
+    )
+    adapter = _adapter(client)
+    _patch_pending_reprotections(
+        monkeypatch,
+        [
+            _reprotect_row(
+                {
+                    "side": "sell",
+                    "stop_price": 190.0,
+                    "take_profit_price": 210.0,
+                }
+            )
+        ],
+    )
+    cleared = _patch_marker_clears(monkeypatch)
+
+    with caplog.at_level("ERROR"):
+        asyncio.run(adapter._recover_exit_reprotections())
+
+    assert client.submitted == []
+    assert cleared == []
+    assert any("unprotected" in record.message for record in caplog.records)
+
+
+# ─── #350 review: whole-share exits, pinned guards, attribution ─────────────
+
+
+def _partial_signal(qty: float) -> LiveSignal:
+    base = _exit_signal_full()
+    return base.model_copy(
+        update={
+            "metadata": {
+                **base.metadata,
+                "qty": qty,
+                "explicit_qty": qty,
+            }
+        }
+    )
+
+
+def test_partial_exit_floors_qty_so_the_remainder_stays_whole(monkeypatch) -> None:
+    """3 shares, exit 1.5: the OCO/GTC re-place rejects fractions, so the exit
+    floors to 1 and the remainder 2 is re-protected as whole shares."""
+    client = _FakeTradingClient(
+        orders=_filled_bracket(qty=3.0),
+        positions=[_FakePosition("AAPL", 3.0)],
+    )
+    adapter = _adapter(client)
+    captured: list[LiveSignal] = []
+    _patched_signal_store(monkeypatch, captured)
+
+    asyncio.run(adapter.submit_order(_partial_signal(1.5), qty=1.5))
+
+    market_orders = [
+        order for order in client.submitted if _type_text(order) == "market"
+    ]
+    assert len(market_orders) == 1
+    assert float(market_orders[0].qty) == 1.0
+    oco = [order for order in client.submitted if _class_text(order) == "oco"]
+    assert len(oco) == 1
+    assert float(oco[0].qty) == 2.0
+    # The persisted signal records the floored qty that was actually sent.
+    assert captured[0].metadata["explicit_qty"] == 1.0
+    marker = captured[0].metadata["exit_reprotection"]
+    assert marker["exit_qty"] == 1.0
+    assert marker["reprotect_qty"] == 2.0
+
+
+def test_partial_exit_refuses_when_flooring_leaves_less_than_one_share(
+    monkeypatch,
+) -> None:
+    """A sub-share requested exit cannot floor to a whole share: refuse before
+    any broker write rather than leave an unprotectable remainder."""
+    client = _FakeTradingClient(
+        orders=_filled_bracket(qty=3.0),
+        positions=[_FakePosition("AAPL", 3.0)],
+    )
+    adapter = _adapter(client)
+    captured: list[LiveSignal] = []
+    _patched_signal_store(monkeypatch, captured)
+
+    submission = adapter.submit_order(_partial_signal(0.5), qty=0.5)
+    with pytest.raises(ValueError, match="floors"):
+        asyncio.run(submission)
+
+    assert client.cancelled == []
+    assert client.submitted == []
+
+
+def test_partial_exit_refuses_a_fractional_broker_position(monkeypatch) -> None:
+    """No whole-share exit leaves a whole remainder of a fractional position:
+    refuse before any broker write."""
+    client = _FakeTradingClient(
+        orders=_filled_bracket(qty=3.5),
+        positions=[_FakePosition("AAPL", 3.5)],
+    )
+    adapter = _adapter(client)
+    captured: list[LiveSignal] = []
+    _patched_signal_store(monkeypatch, captured)
+
+    submission = adapter.submit_order(_partial_signal(1.0), qty=1.0)
+    with pytest.raises(ValueError, match="fractional"):
+        asyncio.run(submission)
+
+    assert client.cancelled == []
+    assert client.submitted == []
+
+
+def test_position_change_during_release_refuses_and_restores(monkeypatch) -> None:
+    """The position moved between planning and release: refuse the exit and
+    put the recorded protection back on the position that remains."""
+    client = _FakeTradingClient(
+        orders=_filled_bracket(),
+        positions=[_FakePosition("AAPL", 10.0)],
+    )
+    adapter = _adapter(client)
+    captured: list[LiveSignal] = []
+    _patched_signal_store(monkeypatch, captured)
+    calls = {"n": 0}
+
+    async def _qty(symbol: str) -> float | None:
+        calls["n"] += 1
+        # First read plans against 10; every later read sees 9.
+        return 10.0 if calls["n"] == 1 else 9.0
+
+    monkeypatch.setattr(adapter, "_symbol_position_qty", _qty)
+
+    submission = adapter.submit_order(_exit_signal_full(), qty=10.0)
+    with pytest.raises(RuntimeError, match="position changed"):
+        asyncio.run(submission)
+
+    # The exit never went out; the restore re-protected the 9 that remain.
+    assert not [
+        order for order in client.submitted if _type_text(order) == "market"
+    ]
+    oco = [order for order in client.submitted if _class_text(order) == "oco"]
+    assert len(oco) == 1
+    assert float(oco[0].qty) == 9.0
+
+
+def test_still_working_protection_after_cancel_refuses_the_exit(
+    monkeypatch, caplog
+) -> None:
+    """A cancel Alpaca accepted but has not settled still reserves the shares.
+
+    The bounded re-read refuses the exit - and must NOT restore protection:
+    the still-working orders already reserve the quantity, so a re-place
+    would double-reserve it. The marker stays pending and a CRITICAL alert
+    asks for operator action (#350 review).
+    """
+    monkeypatch.setattr(alpaca_module, "_CANCEL_CONFIRM_INTERVAL_SECONDS", 0.001)
+    client = _FakeTradingClient(
+        orders=_filled_bracket(),
+        positions=[_FakePosition("AAPL", 10.0)],
+        cancel_settles=False,
+    )
+    adapter = _adapter(client)
+    captured: list[LiveSignal] = []
+    _patched_signal_store(monkeypatch, captured)
+
+    with caplog.at_level("CRITICAL"):
+        submission = adapter.submit_order(_exit_signal_full(), qty=10.0)
+        with pytest.raises(RuntimeError, match="still"):
+            asyncio.run(submission)
+
+    # The exit never went out and NOTHING was re-placed: the pending-cancel
+    # orders still reserve the shares.
+    assert client.submitted == []
+    assert any(
+        record.levelname == "CRITICAL" and "still working after the bounded" in record.message
+        for record in caplog.records
+    )
+
+
+def test_exit_order_rejected_on_submission_restores_protection(monkeypatch) -> None:
+    """The broker answering 'rejected' at submit means the exit never happened:
+    the cancelled protection must be re-placed."""
+    client = _FakeTradingClient(
+        orders=_filled_bracket(),
+        positions=[_FakePosition("AAPL", 10.0)],
+    )
+    adapter = _adapter(client)
+    captured: list[LiveSignal] = []
+    _patched_signal_store(monkeypatch, captured)
+    real_submit = client.submit_order
+
+    def _reject_exit(order_data):
+        if _type_text(order_data) == "market":
+            return SimpleNamespace(
+                id=str(uuid4()), symbol="AAPL", status="rejected"
+            )
+        return real_submit(order_data)
+
+    client.submit_order = _reject_exit  # type: ignore[method-assign]
+
+    submission = adapter.submit_order(_exit_signal_full(), qty=10.0)
+    with pytest.raises(RuntimeError, match="rejected on submission"):
+        asyncio.run(submission)
+
+    oco = [order for order in client.submitted if _class_text(order) == "oco"]
+    assert len(oco) == 1
+    assert float(oco[0].qty) == 10.0
+
+
+def test_changed_protection_between_plan_and_release_refuses_before_cancel(
+    monkeypatch,
+) -> None:
+    """Trailing replaced the stop after the plan was computed: the in-lock
+    re-read sees a different book and refuses BEFORE the first cancel, so no
+    restore is needed and nothing is written."""
+    client = _FakeTradingClient(
+        orders=_filled_bracket(),
+        positions=[_FakePosition("AAPL", 10.0)],
+    )
+    adapter = _adapter(client)
+    captured: list[LiveSignal] = []
+    _patched_signal_store(monkeypatch, captured)
+    real_candidates = adapter._exit_protection_candidates
+    calls = {"n": 0}
+
+    async def _candidates(client_, symbol, side):
+        calls["n"] += 1
+        result = await real_candidates(client_, symbol, side)
+        if calls["n"] == 2:
+            # The second read (inside _order_book_lock) sees the protection
+            # gone - e.g. trailing replaced it a moment ago.
+            return []
+        return result
+
+    monkeypatch.setattr(adapter, "_exit_protection_candidates", _candidates)
+
+    submission = adapter.submit_order(_exit_signal_full(), qty=10.0)
+    with pytest.raises(RuntimeError, match="changed"):
+        asyncio.run(submission)
+
+    assert client.cancelled == []
+    assert client.submitted == []
+
+
+def test_filled_bracket_legs_carry_the_parent_class_and_are_found() -> None:
+    """Paper 2026-11-24: a filled bracket's legs carry ``order_class='bracket'``
+    like their parent, the take-profit leg is ALSO top-level in the open
+    listing, and the stop leg stays ``held`` under the filled parent. The class
+    alone cannot tell them from the entry parent - structure must (#350 fix).
+    """
+    client = _FakeTradingClient(
+        orders=_filled_bracket(),
+        positions=[_FakePosition("AAPL", 10.0)],
+    )
+    adapter = _adapter(client)
+
+    candidates = asyncio.run(adapter._exit_protection_candidates(client, "AAPL", "sell"))
+
+    assert {candidate["order_id"] for candidate in candidates} == {"tp-1", "sl-1"}
+
+
+def test_working_entry_bracket_is_not_exit_protection() -> None:
+    """A still-working bracket ENTRY parent with legs protects nothing yet.
+
+    Same ``bracket`` class on parent and legs, but the parent is not ``filled``
+    and not ``oco``, so neither it nor its legs may be cancelled for an exit -
+    they belong to a pending entry, not to open-position protection.
+    """
+    take_profit = _FakeOrder(
+        id="tp-wip",
+        symbol="AAPL",
+        side="sell",
+        order_type="limit",
+        order_class="bracket",
+        qty=10.0,
+        limit_price=210.0,
+        status="new",
+    )
+    stop_leg = _FakeOrder(
+        id="sl-wip",
+        symbol="AAPL",
+        side="sell",
+        order_type="stop",
+        order_class="bracket",
+        qty=10.0,
+        stop_price=190.0,
+        status="held",
+    )
+    entry_parent = _FakeOrder(
+        id="entry-wip",
+        symbol="AAPL",
+        side="buy",
+        order_type="market",
+        order_class="bracket",
+        qty=10.0,
+        status="new",
+        legs=[take_profit, stop_leg],
+    )
+    client = _FakeTradingClient(orders=[entry_parent])
+    adapter = _adapter(client)
+
+    candidates = asyncio.run(adapter._exit_protection_candidates(client, "AAPL", "sell"))
+
+    assert candidates == []
+
+
+class _DelayedCancelClient(_FakeTradingClient):
+    """Alpaca's asynchronous cancel: an accepted cancel sits ``pending_cancel``
+    (still working) for a few working-book reads before it settles to
+    ``canceled`` (#350 paper fix)."""
+
+    def __init__(self, *args: Any, settle_after_reads: int = 2, **kwargs: Any) -> None:
+        super().__init__(*args, cancel_settles=False, **kwargs)
+        self._settle_after_reads = settle_after_reads
+        self._post_cancel_reads = 0
+        self._cancel_seen = False
+
+    def cancel_order_by_id(self, order_id: str) -> None:
+        self._cancel_seen = True
+        super().cancel_order_by_id(order_id)
+
+    def get_orders(self, filter=None):  # noqa: A002 - mirrors alpaca-py
+        if self._cancel_seen:
+            self._post_cancel_reads += 1
+            if self._post_cancel_reads > self._settle_after_reads:
+                resting = [
+                    *self.orders,
+                    *[leg for parent in self.orders for leg in getattr(parent, "legs", [])],
+                ]
+                for resting_order in resting:
+                    if _status_text(resting_order) == "pending_cancel":
+                        resting_order.status = "canceled"
+        return super().get_orders(filter)
+
+
+def test_partial_exit_succeeds_when_the_cancel_lands_a_few_reads_late(
+    monkeypatch,
+) -> None:
+    """Paper 2026-11-24: one immediate re-read still listed the cancelled
+    take-profit as working (``pending_cancel``) and the exit was refused. The
+    bounded re-read wait lets a cancel that lands within it through."""
+    monkeypatch.setattr(alpaca_module, "_CANCEL_CONFIRM_INTERVAL_SECONDS", 0.001)
+    client = _DelayedCancelClient(
+        orders=_filled_bracket(),
+        positions=[_FakePosition("AAPL", 10.0)],
+        settle_after_reads=3,
+    )
+    adapter = _adapter(client)
+    captured: list[LiveSignal] = []
+    _patched_signal_store(monkeypatch, captured)
+
+    signal = _exit_signal_full().model_copy(
+        update={"metadata": {**_exit_signal_full().metadata, "qty": 4.0, "explicit_qty": 4.0}}
+    )
+    broker_order_id = asyncio.run(adapter.submit_order(signal, qty=4.0))
+
+    assert broker_order_id
+    assert client.positions[0].qty == 6.0
+    oco = [order for order in client.submitted if _class_text(order) == "oco"]
+    assert len(oco) == 1
+    assert float(oco[0].qty) == 6.0
+
+
+def test_partial_exit_still_refuses_and_does_not_restore_when_the_cancel_never_lands(
+    monkeypatch, caplog
+) -> None:
+    """The wait is bounded: a cancel that never settles still refuses the exit.
+
+    And it must NOT restore: the orders stuck in ``pending_cancel`` still
+    reserve the shares, so a re-place would double-reserve them. The marker
+    stays pending for the connect replay and a CRITICAL alert asks for
+    operator action (#350 review).
+    """
+    monkeypatch.setattr(alpaca_module, "_CANCEL_CONFIRM_INTERVAL_SECONDS", 0.001)
+    client = _FakeTradingClient(
+        orders=_filled_bracket(),
+        positions=[_FakePosition("AAPL", 10.0)],
+        cancel_settles=False,
+    )
+    adapter = _adapter(client)
+    captured: list[LiveSignal] = []
+    _patched_signal_store(monkeypatch, captured)
+
+    signal = _exit_signal_full().model_copy(
+        update={"metadata": {**_exit_signal_full().metadata, "qty": 4.0, "explicit_qty": 4.0}}
+    )
+    with caplog.at_level("CRITICAL"):
+        submission = adapter.submit_order(signal, qty=4.0)
+        with pytest.raises(RuntimeError, match="still working after cancel"):
+            asyncio.run(submission)
+
+    # The exit order never went out and no protection was re-placed: the
+    # still-working orders already reserve the whole position.
+    assert client.submitted == []
+    assert any(
+        record.levelname == "CRITICAL" and "still working after the bounded" in record.message
+        for record in caplog.records
+    )
+
+
+def test_unknown_exit_submit_outcome_is_logged_and_protection_restored(
+    monkeypatch, caplog
+) -> None:
+    """A timeout is not a refusal: the log must say the outcome is unknown,
+    and protection is still restored for whatever position remains."""
+    client = _FakeTradingClient(
+        orders=_filled_bracket(),
+        positions=[_FakePosition("AAPL", 10.0)],
+    )
+    adapter = _adapter(client)
+    captured: list[LiveSignal] = []
+    _patched_signal_store(monkeypatch, captured)
+
+    def _timeout(order_data):
+        if _type_text(order_data) == "market":
+            raise TimeoutError("read timed out")
+        return _FakeTradingClient.submit_order(client, order_data)
+
+    client.submit_order = _timeout  # type: ignore[method-assign]
+
+    with caplog.at_level("WARNING"):
+        submission = adapter.submit_order(_exit_signal_full(), qty=10.0)
+        with pytest.raises(TimeoutError):
+            asyncio.run(submission)
+
+    assert any("outcome is unknown" in record.message for record in caplog.records)
+    oco = [order for order in client.submitted if _class_text(order) == "oco"]
+    assert len(oco) == 1
+    assert float(oco[0].qty) == 10.0
+
+
+def test_definite_broker_rejection_does_not_claim_unknown_outcome(
+    monkeypatch, caplog
+) -> None:
+    """An alpaca-py APIError is the broker answering 'no': no unknown-outcome
+    warning, but the protection is still restored."""
+    from alpaca.common.exceptions import APIError
+
+    client = _FakeTradingClient(
+        orders=_filled_bracket(),
+        positions=[_FakePosition("AAPL", 10.0)],
+    )
+    adapter = _adapter(client)
+    captured: list[LiveSignal] = []
+    _patched_signal_store(monkeypatch, captured)
+
+    def _reject(order_data):
+        if _type_text(order_data) == "market":
+            raise APIError("insufficient qty available for order to be filled")
+        return _FakeTradingClient.submit_order(client, order_data)
+
+    client.submit_order = _reject  # type: ignore[method-assign]
+
+    with caplog.at_level("WARNING"):
+        submission = adapter.submit_order(_exit_signal_full(), qty=10.0)
+        with pytest.raises(APIError):
+            asyncio.run(submission)
+
+    assert not any(
+        "outcome is unknown" in record.message for record in caplog.records
+    )
+    oco = [order for order in client.submitted if _class_text(order) == "oco"]
+    assert len(oco) == 1
+
+
+def test_lone_stop_limit_leg_is_replaced_as_a_stop_limit(monkeypatch) -> None:
+    """A stop-limit protection goes back as a stop-limit, not a plain stop:
+    re-placing it as a stop would widen the trigger into a market order."""
+    client = _FakeTradingClient(
+        orders=[
+            _FakeOrder(
+                id="sl-1",
+                symbol="AAPL",
+                side="sell",
+                order_type="stop_limit",
+                qty=10.0,
+                stop_price=190.0,
+                limit_price=189.5,
+                status="new",
+            )
+        ],
+        positions=[_FakePosition("AAPL", 10.0)],
+    )
+    adapter = _adapter(client)
+    captured: list[LiveSignal] = []
+    _patched_signal_store(monkeypatch, captured)
+
+    asyncio.run(adapter.submit_order(_partial_signal(4.0), qty=4.0))
+
+    stops = [
+        order
+        for order in client.submitted
+        if _type_text(order) == "stop_limit"
+    ]
+    assert len(stops) == 1
+    assert float(stops[0].stop_price) == 190.0
+    assert float(stops[0].limit_price) == 189.5
+    assert float(stops[0].qty) == 6.0
+
+
+def test_reprotect_order_names_the_parent_entry_signal(monkeypatch) -> None:
+    """The re-placed OCO's client_order_id embeds the entry signal id so a
+    later broker-side close of the remainder can be booked against the
+    parent's ledger (#277 attribution contract)."""
+    client = _FakeTradingClient(
+        orders=_filled_bracket(),
+        positions=[_FakePosition("AAPL", 10.0)],
+    )
+    adapter = _adapter(client)
+    captured: list[LiveSignal] = []
+    _patched_signal_store(monkeypatch, captured)
+    monkeypatch.setattr(
+        alpaca_module,
+        "find_latest_filled_live_entry_signals",
+        lambda deployment_ids, symbols: {
+            "AAPL": {"signal_id": "entry-sig-1", "deployment_id": "dep-1"}
+        },
+    )
+
+    asyncio.run(adapter.submit_order(_partial_signal(4.0), qty=4.0))
+
+    oco = [order for order in client.submitted if _class_text(order) == "oco"]
+    assert len(oco) == 1
+    client_order_id = str(getattr(oco[0], "client_order_id", ""))
+    entry_part, _, exit_part = client_order_id.partition("-reprotect-")
+    assert entry_part == "entry-sig-1"
+    assert exit_part  # the exit signal id keeps the key unique per exit
+    marker = captured[0].metadata["exit_reprotection"]
+    assert marker["entry_signal_id"] == "entry-sig-1"
+
+
+def test_recovery_replays_only_the_newest_marker_per_symbol(monkeypatch) -> None:
+    """Two pending markers on one symbol: the newest (first row) is replayed;
+    the older one is left pending rather than placing stale protection."""
+    client = _FakeTradingClient(positions=[_FakePosition("AAPL", 6.0)])
+    adapter = _adapter(client)
+    monkeypatch.setattr(
+        alpaca_module,
+        "list_pending_exit_reprotections",
+        lambda account_id, *, limit=50: [
+            {
+                "signal_id": "sig-new",
+                "symbol": "AAPL",
+                "deployment_id": "dep-1",
+                "timestamp": datetime.now(timezone.utc),
+                "marker": {
+                    "side": "sell",
+                    "stop_price": 195.0,
+                    "take_profit_price": 215.0,
+                },
+            },
+            {
+                "signal_id": "sig-old",
+                "symbol": "AAPL",
+                "deployment_id": "dep-1",
+                "timestamp": datetime.now(timezone.utc),
+                "marker": {
+                    "side": "sell",
+                    "stop_price": 180.0,
+                    "take_profit_price": 220.0,
+                },
+            },
+        ],
+    )
+    cleared: list[str] = []
+    monkeypatch.setattr(
+        alpaca_module,
+        "clear_live_signal_metadata_key",
+        lambda signal_id, key: cleared.append(signal_id) or True,
+    )
+
+    asyncio.run(adapter._recover_exit_reprotections())
+
+    oco = [order for order in client.submitted if _class_text(order) == "oco"]
+    assert len(oco) == 1
+    assert float(oco[0].stop_loss.stop_price) == 195.0
+    assert cleared == ["sig-new"]
+
+
+def test_recovery_sees_a_held_stop_leg_nested_under_a_filled_parent(
+    monkeypatch,
+) -> None:
+    """The held stop leg is only reachable nested under its filled parent
+    (status=all listing); without nested reads the marker looks half-missing
+    and is never cleared."""
+    client = _FakeTradingClient(
+        orders=_filled_bracket(),
+        positions=[_FakePosition("AAPL", 6.0)],
+    )
+    adapter = _adapter(client)
+    monkeypatch.setattr(
+        alpaca_module,
+        "list_pending_exit_reprotections",
+        lambda account_id, *, limit=50: [
+            {
+                "signal_id": "sig-1",
+                "symbol": "AAPL",
+                "deployment_id": "dep-1",
+                "timestamp": datetime.now(timezone.utc),
+                "marker": {
+                    "side": "sell",
+                    "stop_price": 190.0,
+                    "take_profit_price": 210.0,
+                },
+            }
+        ],
+    )
+    cleared: list[str] = []
+    monkeypatch.setattr(
+        alpaca_module,
+        "clear_live_signal_metadata_key",
+        lambda signal_id, key: cleared.append(signal_id) or True,
+    )
+
+    asyncio.run(adapter._recover_exit_reprotections())
+
+    # Both legs are seen (stop via the filled parent's held leg, tp working):
+    # the marker is satisfied and cleared, nothing is re-placed.
+    assert client.submitted == []
+    assert cleared == ["sig-1"]
+
+
+def test_recovery_clears_a_marker_whose_side_no_longer_matches(monkeypatch) -> None:
+    """A marker for the opposite side is stale: alert, then clear it so it
+    cannot pile up ahead of recoverable markers."""
+    client = _FakeTradingClient(positions=[_FakePosition("AAPL", 6.0)])
+    adapter = _adapter(client)
+    monkeypatch.setattr(
+        alpaca_module,
+        "list_pending_exit_reprotections",
+        lambda account_id, *, limit=50: [
+            {
+                "signal_id": "sig-1",
+                "symbol": "AAPL",
+                "deployment_id": "dep-1",
+                "timestamp": datetime.now(timezone.utc),
+                "marker": {
+                    "side": "buy",
+                    "stop_price": 190.0,
+                    "take_profit_price": 210.0,
+                },
+            }
+        ],
+    )
+    cleared: list[str] = []
+    monkeypatch.setattr(
+        alpaca_module,
+        "clear_live_signal_metadata_key",
+        lambda signal_id, key: cleared.append(signal_id) or True,
+    )
+
+    asyncio.run(adapter._recover_exit_reprotections())
+
+    assert client.submitted == []
+    assert cleared == ["sig-1"]
+
+
+def test_recovery_clears_a_marker_with_no_recorded_levels(monkeypatch) -> None:
+    """A marker that never recorded levels and finds no protection can never
+    place anything: alert, then clear it."""
+    client = _FakeTradingClient(positions=[_FakePosition("AAPL", 6.0)])
+    adapter = _adapter(client)
+    monkeypatch.setattr(
+        alpaca_module,
+        "list_pending_exit_reprotections",
+        lambda account_id, *, limit=50: [
+            {
+                "signal_id": "sig-1",
+                "symbol": "AAPL",
+                "deployment_id": "dep-1",
+                "timestamp": datetime.now(timezone.utc),
+                "marker": {"side": "sell"},
+            }
+        ],
+    )
+    cleared: list[str] = []
+    monkeypatch.setattr(
+        alpaca_module,
+        "clear_live_signal_metadata_key",
+        lambda signal_id, key: cleared.append(signal_id) or True,
+    )
+
+    asyncio.run(adapter._recover_exit_reprotections())
+
+    assert client.submitted == []
+    assert cleared == ["sig-1"]
+
+
+# ─── #350 bundle-32 review: real OCO shape, ambiguous-level restore ────────
+
+
+def test_a_working_market_exit_is_never_cancelled_as_protection() -> None:
+    """A working market order on the reducing side is an exit in flight, not
+    bracket protection: it must not be collected as a cancel candidate."""
+    client = _FakeTradingClient(
+        orders=[
+            _FakeOrder(
+                id="mkt-1",
+                symbol="AAPL",
+                side="sell",
+                order_type="market",
+                qty=4.0,
+                status="new",
+            )
+        ],
+        positions=[_FakePosition("AAPL", 10.0)],
+    )
+    adapter = _adapter(client)
+
+    candidates = asyncio.run(adapter._exit_protection_candidates(client, "AAPL", "sell"))
+
+    assert candidates == []
+
+
+def test_recovery_replaces_a_lone_recorded_stop(monkeypatch) -> None:
+    """A marker carrying only a stop level and no working stop gets that stop
+    re-placed as a lone order on recovery."""
+    client = _FakeTradingClient(positions=[_FakePosition("AAPL", 6.0)])
+    adapter = _adapter(client)
+    monkeypatch.setattr(
+        alpaca_module,
+        "list_pending_exit_reprotections",
+        lambda account_id, *, limit=50: [
+            {
+                "signal_id": "sig-1",
+                "symbol": "AAPL",
+                "deployment_id": "dep-1",
+                "timestamp": datetime.now(timezone.utc),
+                "marker": {
+                    "side": "sell",
+                    "stop_price": 190.0,
+                    "stop_limit_price": None,
+                    "take_profit_price": None,
+                    "position_qty": 10.0,
+                    "exit_qty": 4.0,
+                    "reprotect_qty": 6.0,
+                },
+            }
+        ],
+    )
+    cleared: list[str] = []
+    monkeypatch.setattr(
+        alpaca_module,
+        "clear_live_signal_metadata_key",
+        lambda signal_id, key: cleared.append(signal_id) or True,
+    )
+
+    asyncio.run(adapter._recover_exit_reprotections())
+
+    assert not [order for order in client.submitted if _class_text(order) == "oco"]
+    stops = [
+        order
+        for order in client.submitted
+        if "stop" in _type_text(order) or getattr(order, "stop_price", None) is not None
+    ]
+    assert len(stops) == 1
+    assert float(stops[0].stop_price) == 190.0
+    assert float(stops[0].qty) == 6.0
+    assert cleared == ["sig-1"]
+
+
+def _filled_bracket_tranche(
+    symbol: str, qty: float, *, stop_id: str, tp_id: str, parent_id: str,
+    stop_price: float, tp_price: float,
+) -> list[_FakeOrder]:
+    """One filled bracket tranche with distinct order ids (pyramided entries)."""
+    stop_leg = _FakeOrder(
+        id=stop_id,
+        symbol=symbol,
+        side="sell",
+        order_type="stop",
+        order_class="bracket",
+        qty=qty,
+        stop_price=stop_price,
+        status="held",
+    )
+    take_profit = _FakeOrder(
+        id=tp_id,
+        symbol=symbol,
+        side="sell",
+        order_type="limit",
+        order_class="bracket",
+        qty=qty,
+        limit_price=tp_price,
+        status="new",
+    )
+    parent = _FakeOrder(
+        id=parent_id,
+        symbol=symbol,
+        side="buy",
+        order_type="market",
+        order_class="bracket",
+        qty=qty,
+        status="filled",
+        legs=[take_profit, stop_leg],
+    )
+    return [parent, take_profit]
+
+
+def test_a_full_exit_over_ambiguous_levels_restores_each_recorded_candidate(
+    monkeypatch,
+) -> None:
+    """Pyramided protection (two stops, two take-profits) on a FULL exit whose
+    submit is then refused: the marker's per-candidate record lets the restore
+    re-place each tranche as its own OCO - nothing is left unprotected."""
+    orders = _filled_bracket_tranche(
+        "AAPL", 5.0, stop_id="sl-a", tp_id="tp-a", parent_id="parent-a",
+        stop_price=190.0, tp_price=210.0,
+    ) + _filled_bracket_tranche(
+        "AAPL", 5.0, stop_id="sl-b", tp_id="tp-b", parent_id="parent-b",
+        stop_price=185.0, tp_price=215.0,
+    )
+    client = _FakeTradingClient(
+        orders=orders,
+        positions=[_FakePosition("AAPL", 10.0)],
+    )
+    adapter = _adapter(client)
+    captured: list[LiveSignal] = []
+    _patched_signal_store(monkeypatch, captured)
+    real_submit = client.submit_order
+
+    def _fail_exit(order_data):
+        if _type_text(order_data) == "market":
+            raise RuntimeError("broker rejected the exit")
+        return real_submit(order_data)
+
+    client.submit_order = _fail_exit  # type: ignore[method-assign]
+
+    submission = adapter.submit_order(_exit_signal_full(), qty=10.0)
+    with pytest.raises(RuntimeError, match="broker rejected the exit"):
+        asyncio.run(submission)
+
+    # The marker recorded every candidate, not just the ambiguous Nones.
+    marker = captured[0].metadata["exit_reprotection"]
+    assert marker["stop_price"] is None
+    assert marker["take_profit_price"] is None
+    assert len(marker["protection"]) == 4
+
+    # The restore re-placed both tranches as OCO pairs at their own levels.
+    oco = [order for order in client.submitted if _class_text(order) == "oco"]
+    assert len(oco) == 2
+    assert sorted(float(order.qty) for order in oco) == [5.0, 5.0]
+    assert sorted(float(order.stop_loss.stop_price) for order in oco) == [185.0, 190.0]
+    assert sorted(float(order.take_profit.limit_price) for order in oco) == [210.0, 215.0]
+
+
+# ─── #350 review round 3: marker lifecycle, stream watchdog, scan bounds ────
+
+
+def test_stream_expired_exit_alerts_without_placing_orders(monkeypatch, caplog) -> None:
+    """A DAY exit that expires while the daemon runs must alert, not replay.
+
+    Maintainer decision (2026-11-22): the stream watchdog alerts only - the
+    marker replay moved to the connect-time recovery task because it raced
+    the exit path's own cancel/submit/re-place under ``_order_book_lock``.
+    An exit order going working -> ``expired`` with ``filled_qty < qty``
+    raises the ERROR alert once per (signal, order); no orders are placed
+    and the marker stays pending for the next connect (#350 review).
+    """
+    exit_order = _FakeOrder(
+        id="exit-1",
+        symbol="AAPL",
+        side="sell",
+        order_type="limit",
+        qty=4.0,
+        status="expired",
+        filled_qty=1.0,
+    )
+    client = _FakeTradingClient(
+        orders=[_working_oco(qty=6.0), exit_order],
+        # The expired exit's 1.0 fill already left the position: 10 - 1 = 9.
+        positions=[_FakePosition("AAPL", 9.0)],
+    )
+    adapter = _adapter(client)
+    signal_id = str(uuid4())
+    marker = {
+        "side": "sell",
+        "stop_price": 190.0,
+        "take_profit_price": 210.0,
+        "entry_signal_id": "entry-1",
+        "exit_qty": 4.0,
+    }
+    monkeypatch.setattr(
+        alpaca_module,
+        "get_live_signal_metadata",
+        lambda sid: {
+            "risk_sizing_mode": "exit_only",
+            "signal_intent": "exit",
+            "exit_reprotection": marker,
+        }
+        if str(sid) == signal_id
+        else {},
+    )
+    cleared = _patch_marker_clears(monkeypatch)
+    update = SimpleNamespace(
+        event="expired",
+        order=SimpleNamespace(
+            id="exit-1",
+            client_order_id=signal_id,
+            status="expired",
+            symbol="AAPL",
+            filled_qty=1.0,
+        ),
+        timestamp=datetime.now(timezone.utc),
+        qty=1.0,
+    )
+
+    with caplog.at_level("ERROR"):
+        asyncio.run(adapter._on_trade_update(update))
+
+    # The stream placed NOTHING: no top-up, no cancel, marker untouched.
+    assert client.submitted == []
+    assert client.cancelled == []
+    assert cleared == []
+    alerts = [
+        record
+        for record in caplog.records
+        if record.levelname == "ERROR" and "re-protection marker is pending" in record.message
+    ]
+    assert len(alerts) == 1
+
+    # A redelivered terminal update for the same order does not re-alert.
+    caplog.clear()
+    asyncio.run(adapter._on_trade_update(update))
+    assert not [
+        record
+        for record in caplog.records
+        if record.levelname == "ERROR" and "re-protection marker is pending" in record.message
+    ]
+    assert client.submitted == []
+
+
+def test_stream_filled_exit_with_full_coverage_is_quiet_for_the_stream(
+    monkeypatch, caplog
+) -> None:
+    """A fully filled exit raises no alert; the marker is left for connect.
+
+    The stream cannot prove coverage (it does not re-read the book), so even
+    a fully filled exit keeps its marker: the connect-time recovery replays
+    it, verifies coverage and spends it. The stream's only job here is to
+    stay silent when the fill provably covered the recorded exit quantity.
+    """
+    exit_order = _FakeOrder(
+        id="exit-2",
+        symbol="AAPL",
+        side="sell",
+        order_type="market",
+        qty=4.0,
+        status="filled",
+        filled_qty=4.0,
+    )
+    client = _FakeTradingClient(
+        orders=[_working_oco(qty=6.0), exit_order],
+        positions=[_FakePosition("AAPL", 6.0)],
+    )
+    adapter = _adapter(client)
+    signal_id = str(uuid4())
+    marker = {
+        "side": "sell",
+        "stop_price": 190.0,
+        "take_profit_price": 210.0,
+        "entry_signal_id": "entry-1",
+        "exit_qty": 4.0,
+    }
+    monkeypatch.setattr(
+        alpaca_module,
+        "get_live_signal_metadata",
+        lambda sid: {
+            "risk_sizing_mode": "exit_only",
+            "signal_intent": "exit",
+            "exit_reprotection": marker,
+        }
+        if str(sid) == signal_id
+        else {},
+    )
+    cleared = _patch_marker_clears(monkeypatch)
+    update = SimpleNamespace(
+        event="new",
+        order=SimpleNamespace(
+            id="exit-2",
+            client_order_id=signal_id,
+            status="filled",
+            symbol="AAPL",
+            filled_qty=4.0,
+        ),
+        timestamp=datetime.now(timezone.utc),
+        qty=4.0,
+    )
+
+    with caplog.at_level("ERROR"):
+        asyncio.run(adapter._on_trade_update(update))
+
+    assert client.submitted == []
+    assert cleared == []
+    assert not [
+        record
+        for record in caplog.records
+        if record.levelname == "ERROR" and "re-protection marker is pending" in record.message
+    ]
+
+
+def test_stream_filled_exit_short_of_recorded_qty_still_alerts(
+    monkeypatch, caplog
+) -> None:
+    """``filled`` with ``filled_qty < exit_qty`` is an under-fill: alert."""
+    client = _FakeTradingClient(
+        orders=[_working_oco(qty=6.0)],
+        positions=[_FakePosition("AAPL", 6.0)],
+    )
+    adapter = _adapter(client)
+    signal_id = str(uuid4())
+    marker = {
+        "side": "sell",
+        "stop_price": 190.0,
+        "take_profit_price": 210.0,
+        "entry_signal_id": "entry-1",
+        "exit_qty": 4.0,
+    }
+    monkeypatch.setattr(
+        alpaca_module,
+        "get_live_signal_metadata",
+        lambda sid: {
+            "risk_sizing_mode": "exit_only",
+            "exit_reprotection": marker,
+        }
+        if str(sid) == signal_id
+        else {},
+    )
+    _patch_marker_clears(monkeypatch)
+    update = SimpleNamespace(
+        event="new",
+        order=SimpleNamespace(
+            id="exit-3",
+            client_order_id=signal_id,
+            status="filled",
+            symbol="AAPL",
+            filled_qty=2.5,
+        ),
+        timestamp=datetime.now(timezone.utc),
+        qty=2.5,
+    )
+
+    with caplog.at_level("ERROR"):
+        asyncio.run(adapter._on_trade_update(update))
+
+    assert client.submitted == []
+    assert any(
+        record.levelname == "ERROR" and "re-protection marker is pending" in record.message
+        for record in caplog.records
+    )
+
+
+def test_stream_terminal_update_on_a_non_exit_only_signal_does_not_alert(
+    monkeypatch, caplog
+) -> None:
+    """A marker on a signal that is not ``exit_only`` is inert: no alert.
+
+    The watchdog's ``risk_sizing_mode == exit_only`` gate is what keeps a
+    forged or stale marker on an entry-sized signal from paging the operator
+    (#350 W6 alert-path equivalent).
+    """
+    client = _FakeTradingClient(
+        orders=[_working_oco(qty=6.0)],
+        positions=[_FakePosition("AAPL", 6.0)],
+    )
+    adapter = _adapter(client)
+    signal_id = str(uuid4())
+    marker = {
+        "side": "sell",
+        "stop_price": 190.0,
+        "take_profit_price": 210.0,
+        "entry_signal_id": "entry-1",
+        "exit_qty": 4.0,
+    }
+    monkeypatch.setattr(
+        alpaca_module,
+        "get_live_signal_metadata",
+        lambda sid: {
+            "risk_sizing_mode": "full",
+            "exit_reprotection": marker,
+        }
+        if str(sid) == signal_id
+        else {},
+    )
+    _patch_marker_clears(monkeypatch)
+    update = SimpleNamespace(
+        event="new",
+        order=SimpleNamespace(
+            id="exit-4",
+            client_order_id=signal_id,
+            status="expired",
+            symbol="AAPL",
+            filled_qty=0.0,
+        ),
+        timestamp=datetime.now(timezone.utc),
+        qty=0.0,
+    )
+
+    with caplog.at_level("ERROR"):
+        asyncio.run(adapter._on_trade_update(update))
+
+    assert client.submitted == []
+    assert not [
+        record
+        for record in caplog.records
+        if record.levelname == "ERROR" and "re-protection marker is pending" in record.message
+    ]
+
+
+def test_list_orders_status_all_pages_until_plus_one_microsecond() -> None:
+    """``until`` steps one microsecond past the page's oldest ``submitted_at``.
+
+    ``until`` is inclusive, so the +1µs can only *widen* the next page by the
+    boundary timestamp; the id dedupe absorbs the repeat and no order can
+    fall into a gap between pages (#350 nit).
+    """
+    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    orders = [
+        _FakeOrder(
+            id=f"ord-{index}",
+            symbol="AAPL",
+            side="buy",
+            order_type="limit",
+            status="canceled",
+            qty=1.0,
+            submitted_at=base + timedelta(seconds=1000 - index),
+        )
+        for index in range(501)
+    ]
+    client = _FakeTradingClient(orders=orders)
+    adapter = _adapter(client)
+    filters: list[object] = []
+    original = client.get_orders
+
+    def _record(filter=None):  # noqa: A002 - mirrors alpaca-py
+        filters.append(filter)
+        return original(filter)
+
+    client.get_orders = _record  # type: ignore[method-assign]
+
+    collected = asyncio.run(adapter._list_orders_status_all(client))
+
+    assert len(collected) == 501
+    assert len({order.id for order in collected}) == 501
+    assert len(filters) == 2
+    page1_oldest = orders[499].submitted_at
+    assert filters[1].until == page1_oldest + timedelta(microseconds=1)
+
+
+def test_list_orders_status_all_refuses_a_page_that_cannot_advance() -> None:
+    """A full page with no ``submitted_at`` can never move ``until`` forward.
+
+    Without the stall check the same page would repeat until the page cap
+    and only then fail with a vaguer error; the check refuses on the first
+    stalled page instead (#350 review, bot mutation #7).
+    """
+    orders = [
+        _FakeOrder(
+            id=f"ord-{index}",
+            symbol="AAPL",
+            side="buy",
+            order_type="limit",
+            status="canceled",
+            qty=1.0,
+        )
+        for index in range(_ALPACA_HELD_LEG_LOOKUP_LIMIT)
+    ]
+    client = _FakeTradingClient(orders=orders)
+    adapter = _adapter(client)
+
+    with pytest.raises(RuntimeError, match="cannot advance"):
+        asyncio.run(adapter._list_orders_status_all(client))
+
+    assert len(client.order_filters) == 1
+
+
+def test_held_leg_lookup_bounds_the_scan_at_the_ledger(monkeypatch) -> None:
+    """The ``status=all`` held-leg scan passes the ledger ``after`` bound."""
+    bound = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    monkeypatch.setattr(
+        alpaca_module,
+        "earliest_live_signal_timestamp",
+        lambda account_id, symbols: bound,
+    )
+    client = _FakeTradingClient(orders=_filled_bracket())
+    adapter = _adapter(client)
+    adapter.account_id = "acct-bound"
+
+    asyncio.run(adapter._list_filled_parents_with_held_legs(client, {"AAPL"}))
+
+    assert client.last_order_filter.after == bound - timedelta(minutes=5)
+
+
+def _patch_per_symbol_held_leg_bounds(monkeypatch) -> tuple[datetime, datetime]:
+    """AAA has an open lot at T2; BBB's ledger shows no open lot back to T1.
+
+    The per-symbol ``status=all`` bound must keep BBB's own all-signals
+    fallback window: a single account-wide open-lot bound at T2 would
+    exclude BBB's held legs submitted between T1 and T2 - the ledger/broker
+    drift ``ledger_reconciliation_required`` exists for (#350 review).
+    """
+    t_lot = datetime(2026, 2, 1, tzinfo=timezone.utc)
+    t_signal = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    monkeypatch.setattr(
+        alpaca_module,
+        "earliest_live_open_lot_entry_timestamp",
+        lambda account_id, symbols: t_lot if "AAA" in symbols else None,
+    )
+    monkeypatch.setattr(
+        alpaca_module,
+        "earliest_live_signal_timestamp",
+        lambda account_id, symbols: t_signal,
+    )
+    return t_lot, t_signal
+
+
+def _flat_symbol_held_bracket(
+    symbol: str = "BBB", *, submitted_at: datetime | None = None
+) -> tuple[_FakeOrder, _FakeOrder]:
+    """A filled bracket parent whose held stop leg only ``status=all`` shows."""
+    stop_leg = _FakeOrder(
+        id=f"sl-{symbol.lower()}",
+        symbol=symbol,
+        side="sell",
+        order_type="stop",
+        order_class="bracket",
+        qty=5.0,
+        stop_price=90.0,
+        status="held",
+    )
+    parent = _FakeOrder(
+        id=f"parent-{symbol.lower()}",
+        symbol=symbol,
+        side="buy",
+        order_type="market",
+        order_class="bracket",
+        qty=5.0,
+        status="filled",
+        legs=[stop_leg],
+        submitted_at=submitted_at,
+    )
+    return parent, stop_leg
+
+
+def test_held_leg_lookup_keeps_the_flat_symbols_fallback_window(
+    monkeypatch,
+) -> None:
+    """``after`` is the MIN over per-symbol bounds, fallbacks included."""
+    _, t_signal = _patch_per_symbol_held_leg_bounds(monkeypatch)
+    client = _FakeTradingClient(orders=[])
+    adapter = _adapter(client)
+    adapter.account_id = "acct-per-symbol"
+
+    asyncio.run(
+        adapter._list_filled_parents_with_held_legs(client, {"AAA", "BBB"})
+    )
+
+    # BBB's all-signals bound (T1) is older than AAA's open-lot bound (T2),
+    # so the scan must reach back to T1 - not stop at AAA's T2.
+    assert client.last_order_filter.after == t_signal - timedelta(minutes=5)
+
+
+def test_list_protective_stops_finds_the_flat_symbols_held_leg(
+    monkeypatch,
+) -> None:
+    """Trailing stops see BBB's held leg despite AAA's newer open lot.
+
+    ``list_protective_stops`` is the trailing-stop path: with the old
+    account-wide bound BBB's stop leg (submitted before AAA's open-lot
+    entry) fell outside ``after`` and the position read as having no
+    amendable stop.
+    """
+    _patch_per_symbol_held_leg_bounds(monkeypatch)
+    # Between BBB's signal bound and AAA's open-lot bound: excluded by the
+    # old shared bound, included by the per-symbol one.
+    parent, _leg = _flat_symbol_held_bracket(
+        submitted_at=datetime(2026, 1, 15, tzinfo=timezone.utc)
+    )
+    client = _FakeTradingClient(
+        parents=[parent],
+        positions=[
+            _FakePosition("AAA", 10.0),
+            _FakePosition("BBB", 5.0),
+        ],
+    )
+    adapter = _adapter(client)
+    adapter.account_id = "acct-trailing"
+
+    stops = asyncio.run(adapter.list_protective_stops())
+
+    assert {stop.order_id for stop in stops} == {"sl-bbb"}
+    assert stops[0].symbol == "BBB"
+
+
+def test_working_book_finds_the_flat_symbols_held_leg(monkeypatch) -> None:
+    """The orphan sweep's verify re-read keeps BBB's resting leg visible.
+
+    ``_list_working_book`` is what ``_cancel_orphaned_protections_locked``
+    re-reads after cancelling: a still-resting orphan leg on the flat-ledger
+    symbol must not fall outside the ``after`` bound, or the sweep reports
+    complete over a leg that can still trigger.
+    """
+    _patch_per_symbol_held_leg_bounds(monkeypatch)
+    parent, _leg = _flat_symbol_held_bracket(
+        submitted_at=datetime(2026, 1, 15, tzinfo=timezone.utc)
+    )
+    client = _FakeTradingClient(parents=[parent], positions=[])
+    adapter = _adapter(client)
+    adapter.account_id = "acct-sweep"
+
+    book = asyncio.run(
+        adapter._list_working_book(client, symbols={"AAA", "BBB"})
+    )
+
+    assert "sl-bbb" in {getattr(order, "id", None) for order in book}
+
+
+def test_reconcile_reprotect_orders_uses_and_advances_the_watermark(
+    monkeypatch,
+) -> None:
+    """The account-wide reprotect scan is bounded by a persisted watermark.
+
+    Without it a minute-bar account passes the 12,500-order page cap within
+    weeks and every connect's reconcile raises - the #277 defect returns.
+    The bound is the earliest still-working ``-reprotect`` order's
+    ``submitted_at`` (minus the shared margin), or the pass start when none
+    worked; a failed pass never moves it (#350 review).
+    """
+    store: dict[str, dict] = {}
+    monkeypatch.setattr(
+        alpaca_module,
+        "get_live_adapter_state",
+        lambda account_id, key: store.get(f"{account_id}|{key}"),
+    )
+    monkeypatch.setattr(
+        alpaca_module,
+        "set_live_adapter_state",
+        lambda account_id, key, value: store.__setitem__(
+            f"{account_id}|{key}", dict(value)
+        ),
+    )
+    monkeypatch.setattr(
+        alpaca_module, "get_live_signal_metadata", lambda _sid: {}
+    )
+    working_at = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
+    reprotect = _FakeOrder(
+        id=str(uuid4()),
+        symbol="AAPL",
+        side="sell",
+        order_type="stop",
+        qty=6.0,
+        stop_price=190.0,
+        status="new",
+        submitted_at=working_at,
+        client_order_id=f"{uuid4()}-reprotect-{uuid4()}",
+    )
+    client = _FakeTradingClient(orders=[reprotect])
+    adapter = _adapter(client)
+    adapter.account_id = "acct-wm"
+    seen_after: list[object] = []
+    original = client.get_orders
+
+    def _record(filter=None):  # noqa: A002 - mirrors alpaca-py
+        seen_after.append(getattr(filter, "after", None))
+        return original(filter)
+
+    client.get_orders = _record  # type: ignore[method-assign]
+
+    asyncio.run(adapter._reconcile_reprotect_orders())
+
+    # First pass: no watermark -> unbounded; the working order bounds it.
+    assert seen_after == [None]
+    expected = (working_at - timedelta(minutes=5)).isoformat()
+    assert store["acct-wm|alpaca_reprotect_reconcile_after"]["after"] == expected
+
+    asyncio.run(adapter._reconcile_reprotect_orders())
+
+    # Second pass: the persisted bound reaches the broker as ``after``.
+    assert seen_after[1] == datetime.fromisoformat(expected)
+
+
+def test_recover_exit_reprotections_clears_superseded_markers(monkeypatch) -> None:
+    """Once a symbol's newest marker resolves, its older markers are spent."""
+    client = _FakeTradingClient(
+        orders=[_working_oco(qty=6.0)],
+        positions=[_FakePosition("AAPL", 6.0)],
+    )
+    adapter = _adapter(client)
+    _patch_pending_reprotections(
+        monkeypatch,
+        [
+            _reprotect_row(
+                {
+                    "side": "sell",
+                    "stop_price": 190.0,
+                    "take_profit_price": 210.0,
+                },
+                signal_id="sig-new",
+            )
+        ],
+    )
+    _patch_marker_clears(monkeypatch)
+    superseded: list[tuple[str, str, str]] = []
+    monkeypatch.setattr(
+        alpaca_module,
+        "get_live_signal_metadata",
+        lambda _sid: {},  # marker gone -> the newest row resolved
+    )
+    monkeypatch.setattr(
+        alpaca_module,
+        "clear_superseded_exit_reprotection_markers",
+        lambda account_id, symbol, *, keep_signal_id: superseded.append(
+            (account_id, symbol, keep_signal_id)
+        )
+        or 2,
+    )
+
+    asyncio.run(adapter._recover_exit_reprotections())
+
+    assert superseded == [(adapter.account_id, "AAPL", "sig-new")]
+
+
+def test_recovery_clears_superseded_markers_only_for_the_resolved_symbol(
+    monkeypatch,
+) -> None:
+    """Two symbols, each with an older and a newest marker (#350 review).
+
+    AAPL's newest resolves (its position is flat); MSFT's newest stays
+    pending (its exit order still works). Only AAPL's superseded markers may
+    be cleared - and the clear must be keyed on AAPL's OWN resolved signal,
+    not on whatever row the listing loop happened to leave behind: passing
+    the stale ``row`` would check MSFT's still-pending signal metadata and
+    spend nothing, or worse clear under the wrong ``keep_signal_id``.
+    """
+    rows = [
+        _reprotect_row(
+            {"side": "sell", "stop_price": 190.0},
+            signal_id="sig-aapl-new",
+            symbol="AAPL",
+        ),
+        _reprotect_row(
+            {"side": "sell", "stop_price": 180.0},
+            signal_id="sig-aapl-old",
+            symbol="AAPL",
+        ),
+        _reprotect_row(
+            {"side": "sell", "stop_price": 100.0},
+            signal_id="sig-msft-new",
+            symbol="MSFT",
+            broker_order_id="exit-msft",
+        ),
+        # Last row on purpose: a stale loop variable names THIS signal.
+        _reprotect_row(
+            {"side": "sell", "stop_price": 90.0},
+            signal_id="sig-msft-old",
+            symbol="MSFT",
+        ),
+    ]
+    _patch_pending_reprotections(monkeypatch, rows)
+    client = _FakeTradingClient(
+        orders=[
+            _FakeOrder(
+                id="exit-msft",
+                symbol="MSFT",
+                side="sell",
+                order_type="limit",
+                qty=5.0,
+                status="new",
+            )
+        ],
+        positions=[_FakePosition("MSFT", 5.0)],
+    )
+    adapter = _adapter(client)
+    adapter.account_id = "acct-two-symbol"
+    _patch_marker_clears(monkeypatch)
+
+    def _metadata(signal_id):
+        # Only AAPL's resolved signal reads as marker-free; every MSFT
+        # signal still carries its marker, so a stale-row lookup early-
+        # returns instead of clearing.
+        if str(signal_id).startswith("sig-msft"):
+            return {"exit_reprotection": {"side": "sell"}}
+        return {}
+
+    monkeypatch.setattr(
+        alpaca_module, "get_live_signal_metadata", _metadata
+    )
+    superseded: list[tuple[str, str, str]] = []
+    monkeypatch.setattr(
+        alpaca_module,
+        "clear_superseded_exit_reprotection_markers",
+        lambda account_id, symbol, *, keep_signal_id: superseded.append(
+            (account_id, symbol, keep_signal_id)
+        )
+        or 1,
+    )
+
+    asyncio.run(adapter._recover_exit_reprotections())
+
+    # AAPL resolved -> its older markers are spent, kept apart from the
+    # resolved signal. MSFT stayed pending -> no clear call for it at all.
+    assert superseded == [("acct-two-symbol", "AAPL", "sig-aapl-new")]
+
+
 def test_reconciliation_orders_do_not_mark_market_exits_as_protection() -> None:
     """#303: a working exit is a market order; "reduces a position" alone must
     not mark it protection, or the reconciler reports it missing and halts
@@ -2096,7 +4536,8 @@ def test_reconciliation_orders_mark_bracket_legs_as_protection() -> None:
 def test_order_remaining_qty_reports_qty_minus_filled() -> None:
     from live_runner.alpaca_adapter import _order_remaining_qty
 
-    assert _order_remaining_qty(_FakeOrder("o1", "AAPL", "buy", qty=10.0, filled_qty=4.0)) == pytest.approx(6.0)
+    order = _FakeOrder("o1", "AAPL", "buy", qty=10.0, filled_qty=4.0)
+    assert _order_remaining_qty(order) == pytest.approx(6.0)
 
 
 def test_order_remaining_qty_is_none_when_qty_is_unreadable() -> None:
@@ -2111,8 +4552,10 @@ def test_order_remaining_qty_is_none_when_filled_qty_is_unreadable() -> None:
     # overstate the working quantity.
     from live_runner.alpaca_adapter import _order_remaining_qty
 
-    assert _order_remaining_qty(_FakeOrder("o1", "AAPL", "buy", qty=10.0, filled_qty="junk")) is None
-    assert _order_remaining_qty(_FakeOrder("o1", "AAPL", "buy", qty=10.0, filled_qty=None)) is None
+    order = _FakeOrder("o1", "AAPL", "buy", qty=10.0, filled_qty="junk")
+    assert _order_remaining_qty(order) is None
+    order = _FakeOrder("o1", "AAPL", "buy", qty=10.0, filled_qty=None)
+    assert _order_remaining_qty(order) is None
 
 
 def test_order_remaining_qty_reports_zero_when_filled_covers_qty() -> None:
@@ -2668,7 +5111,9 @@ def test_cancel_orders_never_lists_nested_bracket_legs() -> None:
     """A bracket leg's id in the refs must not reach it: legs are position
     protection, listed only under their parent - never by the open-orders
     read this sweep uses."""
-    leg = _FakeOrder("leg-1", "AAPL", "sell", order_type="stop")
+    leg = _FakeOrder(
+        "leg-1", "AAPL", "sell", order_type="stop", order_class="bracket"
+    )
     parent = _FakeOrder(
         "parent-1", "AAPL", "buy", order_class="bracket", legs=[leg]
     )
@@ -2720,3 +5165,1418 @@ def test_cancel_orders_matched_order_without_id_is_unidentified() -> None:
 
     assert client.cancelled == []
     assert outcome.unidentified == ("order:'sig-x'",)
+
+
+# ─── #350 review round 4: recovery task, coverage union, flatten fills ────
+
+
+def test_recovery_logs_the_failing_symbols_own_signal_id(monkeypatch, caplog) -> None:
+    """Two pending markers: a failure on one must name ITS signal id.
+
+    ``_recover_exit_reprotections`` used to read ``signal_id`` from a stale
+    loop variable - the LAST row of the pending list - so the CRITICAL alert
+    for a failed symbol named another symbol's signal (#350 review).
+    """
+    rows = [
+        _reprotect_row(
+            {"side": "sell", "stop_price": 190.0},
+            signal_id="sig-aapl",
+            symbol="AAPL",
+        ),
+        _reprotect_row(
+            {"side": "sell", "stop_price": 100.0},
+            signal_id="sig-msft",
+            symbol="MSFT",
+        ),
+    ]
+    _patch_pending_reprotections(monkeypatch, rows)
+    client = _FakeTradingClient(
+        positions=[
+            _FakePosition("AAPL", 5.0),
+            _FakePosition("MSFT", 5.0),
+        ]
+    )
+    adapter = _adapter(client)
+    real = adapter._recover_exit_reprotection
+
+    async def _boom(row):
+        if row["symbol"] == "AAPL":
+            raise RuntimeError("boom")
+        return await real(row)
+
+    monkeypatch.setattr(adapter, "_recover_exit_reprotection", _boom)
+
+    with caplog.at_level("CRITICAL"):
+        asyncio.run(adapter._recover_exit_reprotections())
+
+    critical = [
+        record
+        for record in caplog.records
+        if record.levelname == "CRITICAL"
+        and "re-protection recovery failed" in record.message
+    ]
+    assert len(critical) == 1
+    data = getattr(critical[0], "data", {})
+    assert data.get("signal_id") == "sig-aapl"
+    assert data.get("symbol") == "AAPL"
+
+
+def test_covered_exit_protection_qty_counts_a_filled_brackets_legs_once() -> None:
+    """TP leg top-level + held SL leg under the filled parent = N, not 2N.
+
+    Paper shape (2026-11-24): the take-profit leg lists top-level in
+    ``status=open`` with no ancestors, the stop leg is reachable only nested
+    under the filled parent in ``status=all``. Before ``coverage_ids`` the
+    two legs shared no cancel id and counted as two units - 20 covered
+    shares for a 10-share position (#350 review, 2N double-count).
+    """
+    client = _FakeTradingClient(
+        orders=_filled_bracket(),
+        positions=[_FakePosition("AAPL", 10.0)],
+    )
+    adapter = _adapter(client)
+
+    async def _run():
+        return await adapter._exit_protection_candidates(client, "AAPL", "sell")
+
+    candidates = asyncio.run(_run())
+    assert {c["order_id"] for c in candidates} == {"tp-1", "sl-1"}
+    assert _covered_exit_protection_qty(candidates) == pytest.approx(10.0)
+
+
+def test_a_working_limit_bracket_parent_is_not_exit_protection() -> None:
+    """An entry-class parent WITH legs is never itself a candidate.
+
+    Alpaca stamps bracket legs with the parent's class, so the class alone
+    cannot separate parent from leg - the leg heuristic (``ancestors`` or
+    ``not legs``) does. A parent carrying legs fails both and is skipped;
+    only the market-type filter would have saved a leg-less pending entry.
+    """
+    adapter = _adapter(_FakeTradingClient())
+    leg = _FakeOrder(
+        id="leg-1",
+        symbol="AAPL",
+        side="sell",
+        order_type="stop",
+        order_class="bracket",
+        qty=10.0,
+        stop_price=190.0,
+        status="held",
+    )
+    parent = _FakeOrder(
+        id="parent-lim",
+        symbol="AAPL",
+        side="sell",
+        order_type="limit",
+        order_class="bracket",
+        qty=10.0,
+        limit_price=210.0,
+        status="new",
+        legs=[leg],
+    )
+    found: dict = {}
+    adapter._collect_exit_protection(
+        parent, symbol="AAPL", side="sell", found=found
+    )
+    assert found == {}
+
+
+def test_a_top_level_filled_bracket_leg_without_legs_is_a_candidate() -> None:
+    """The TP leg of a filled bracket lists top-level with NO legs of its own.
+
+    ``not legs`` is what marks it a leg: reached without ancestors it must
+    still count as protection, or the exit would cancel nothing and the
+    position would keep resting orders it cannot see (#350 review).
+    """
+    adapter = _adapter(_FakeTradingClient())
+    tp = _FakeOrder(
+        id="tp-top",
+        symbol="AAPL",
+        side="sell",
+        order_type="limit",
+        order_class="bracket",
+        qty=10.0,
+        limit_price=210.0,
+        status="new",
+    )
+    found: dict = {}
+    adapter._collect_exit_protection(tp, symbol="AAPL", side="sell", found=found)
+    assert "tp-top" in found
+
+
+def test_a_leg_reached_through_ancestors_is_a_leg_even_with_own_legs() -> None:
+    """An order reached via ``ancestors`` is a leg regardless of its own legs.
+
+    Defensive nesting (an OCO leg that itself carries legs): ``is_leg`` must
+    come from ``ancestors`` too, not only from ``not legs`` (#350 review).
+    """
+    adapter = _adapter(_FakeTradingClient())
+    inner = _FakeOrder(
+        id="inner-1",
+        symbol="AAPL",
+        side="sell",
+        order_type="stop",
+        order_class="bracket",
+        qty=10.0,
+        stop_price=180.0,
+        status="held",
+    )
+    leg = _FakeOrder(
+        id="leg-nested",
+        symbol="AAPL",
+        side="sell",
+        order_type="stop",
+        order_class="bracket",
+        qty=10.0,
+        stop_price=190.0,
+        status="new",
+        legs=[inner],
+    )
+    parent = _FakeOrder(
+        id="oco-p",
+        symbol="AAPL",
+        side="sell",
+        order_type="limit",
+        order_class="oco",
+        qty=10.0,
+        limit_price=210.0,
+        status="new",
+        legs=[leg],
+    )
+    found: dict = {}
+    adapter._collect_exit_protection(
+        parent, symbol="AAPL", side="sell", found=found
+    )
+    assert "leg-nested" in found
+
+
+def test_flatten_fill_is_classified_not_flagged_unattributed(
+    monkeypatch, caplog
+) -> None:
+    """A kill-switch flatten fill must not raise the unattributed ERROR.
+
+    ``close_position`` orders carry a broker-generated client order id that
+    names no signal; the adapter remembers the returned broker order id under
+    ``_order_book_lock`` so the fill is classified as a flatten: the
+    ``ledger_reconciliation_required`` audit row is still written (a flatten
+    IS a reconciliation event) at WARNING, once per order (#350 review).
+    """
+    client = _FakeTradingClient(positions=[_FakePosition("AAPL", 10.0)])
+    adapter = _adapter(client)
+    asyncio.run(adapter.close_all_positions())
+    assert adapter._flatten_order_ids
+    flatten_order_id = next(iter(adapter._flatten_order_ids))
+
+    flagged: list[dict] = []
+    monkeypatch.setattr(
+        alpaca_module,
+        "flag_live_ledger_reconciliation",
+        lambda **kwargs: flagged.append(kwargs) or {},
+    )
+    update = SimpleNamespace(
+        event="fill",
+        order=SimpleNamespace(
+            id=flatten_order_id,
+            client_order_id=str(uuid4()),
+            status="filled",
+            symbol="AAPL",
+            order_type="market",
+            filled_qty=10.0,
+        ),
+        timestamp=datetime.now(timezone.utc),
+        qty=10.0,
+    )
+
+    with caplog.at_level("WARNING"):
+        asyncio.run(adapter._on_trade_update(update))
+
+    assert flagged
+    assert flagged[0]["cause"] == "alpaca_flatten_fill"
+    assert flagged[0]["symbol"] == "AAPL"
+    assert any(
+        record.levelname == "WARNING" and "flatten fill" in record.message
+        for record in caplog.records
+    )
+    assert not any(
+        record.levelname == "ERROR" and "could not be attributed" in record.message
+        for record in caplog.records
+    )
+
+    # A second fill event for the same flatten order does not re-flag.
+    flagged.clear()
+    with caplog.at_level("WARNING"):
+        asyncio.run(adapter._on_trade_update(update))
+    assert flagged == []
+
+
+def test_flatten_fill_arriving_before_the_order_id_is_remembered(
+    monkeypatch, caplog
+) -> None:
+    """The stream can deliver the flatten fill BEFORE ``close_position``
+    returns the broker order id (#350 review).
+
+    ``close_position`` runs in a worker thread; the fake emits the fill
+    update from inside it - exactly the race the in-flight marker covers -
+    so the fill reaches the unattributed branch with no remembered id. It
+    must still classify as ``alpaca_flatten_fill`` at WARNING, never the
+    ERROR unattributed alert.
+    """
+    flagged: list[dict] = []
+    monkeypatch.setattr(
+        alpaca_module,
+        "flag_live_ledger_reconciliation",
+        lambda **kwargs: flagged.append(kwargs) or {},
+    )
+    client = _FakeTradingClient(positions=[_FakePosition("AAPL", 10.0)])
+    adapter = _adapter(client)
+
+    def _close_position(symbol: str, close_options=None):
+        # The broker accepts the close and the fill streams back before the
+        # HTTP response returns the order id to remember.
+        order_id = str(uuid4())
+        update = SimpleNamespace(
+            event="fill",
+            order=SimpleNamespace(
+                id=order_id,
+                client_order_id=str(uuid4()),
+                status="filled",
+                symbol=symbol,
+                side="sell",
+                order_type="market",
+                filled_qty=10.0,
+            ),
+            timestamp=datetime.now(timezone.utc),
+            qty=10.0,
+        )
+        # Runs on the worker thread's own loop, like the trading stream's.
+        asyncio.run(adapter._on_trade_update(update))
+        client.positions = [
+            position for position in client.positions if position.symbol != symbol
+        ]
+        return SimpleNamespace(id=order_id, symbol=symbol)
+
+    client.close_position = _close_position  # type: ignore[method-assign]
+
+    with caplog.at_level("WARNING"):
+        outcome = asyncio.run(adapter.close_all_positions())
+
+    assert outcome.complete
+    assert flagged
+    assert flagged[0]["cause"] == "alpaca_flatten_fill"
+    assert flagged[0]["symbol"] == "AAPL"
+    assert any(
+        record.levelname == "WARNING" and "flatten fill" in record.message
+        for record in caplog.records
+    )
+    assert not any(
+        record.levelname == "ERROR" and "could not be attributed" in record.message
+        for record in caplog.records
+    )
+
+
+def test_an_unknown_order_fill_still_flags_unattributed(monkeypatch, caplog) -> None:
+    """Only remembered flatten ids are excused; anything else still alerts."""
+    client = _FakeTradingClient(positions=[])
+    adapter = _adapter(client)
+    flagged: list[dict] = []
+    monkeypatch.setattr(
+        alpaca_module,
+        "flag_live_ledger_reconciliation",
+        lambda **kwargs: flagged.append(kwargs) or {},
+    )
+    update = SimpleNamespace(
+        event="fill",
+        order=SimpleNamespace(
+            id=str(uuid4()),
+            client_order_id=str(uuid4()),
+            status="filled",
+            symbol="AAPL",
+            order_type="market",
+            filled_qty=1.0,
+        ),
+        timestamp=datetime.now(timezone.utc),
+        qty=1.0,
+    )
+
+    with caplog.at_level("ERROR"):
+        asyncio.run(adapter._on_trade_update(update))
+
+    assert flagged
+    assert flagged[0]["cause"] == "alpaca_unattributed_order_fill"
+    assert any(
+        record.levelname == "ERROR" and "could not be attributed" in record.message
+        for record in caplog.records
+    )
+
+
+def test_recovery_task_holds_account_lock_then_book_lock(monkeypatch) -> None:
+    """The connect-time replay takes the account lock BEFORE the book lock.
+
+    Lock order is fixed everywhere an Alpaca order is placed: account
+    order-placement lock, then ``_order_book_lock`` (#362). The recovery
+    task must hold both while it replays markers (#350 review).
+    """
+    from live_runner.account_order_lock import account_order_lock
+
+    adapter = _adapter(_FakeTradingClient(positions=[]))
+    adapter.account_id = "acct-recovery"
+    seen: dict[str, bool] = {}
+
+    async def _spy(self) -> None:
+        seen["account_locked"] = account_order_lock("acct-recovery").locked()
+        seen["book_locked"] = self._order_book_lock().locked()
+
+    monkeypatch.setattr(
+        AlpacaLiveAdapter, "_recover_exit_reprotections", _spy
+    )
+    asyncio.run(adapter._run_exit_reprotection_recovery())
+    assert seen == {"account_locked": True, "book_locked": True}
+
+
+def test_recovery_takes_the_account_lock_before_the_book_lock(monkeypatch) -> None:
+    """Lock ORDER is pinned: account lock first, ``_order_book_lock`` second.
+
+    The daemon's exit path holds the account lock and then takes the book
+    lock inside ``_submit_exit_releasing_protection``; a recovery that took
+    them in the opposite order would deadlock against it - the recovery
+    would hold the book lock while waiting up to 120 s for the account
+    lock, and the daemon would hold the account lock while waiting on the
+    book lock with no timeout (#350 review).
+    """
+    from live_runner.account_order_lock import account_order_lock
+
+    adapter = _adapter(_FakeTradingClient(positions=[]))
+    adapter.account_id = "acct-order-pin"
+    ran: list[str] = []
+
+    async def _spy(self) -> None:
+        ran.append("replayed")
+
+    monkeypatch.setattr(
+        AlpacaLiveAdapter, "_recover_exit_reprotections", _spy
+    )
+
+    async def _run() -> None:
+        async with account_order_lock("acct-order-pin"):
+            task = asyncio.create_task(
+                adapter._run_exit_reprotection_recovery()
+            )
+            # Let the task start and block on the account lock.
+            for _ in range(10):
+                await asyncio.sleep(0)
+            assert not task.done()
+            # Still waiting for the ACCOUNT lock: the book lock must NOT be
+            # held yet - holding it here is exactly the swapped-order
+            # deadlock.
+            assert not adapter._order_book_lock().locked()
+        await asyncio.wait_for(task, 2)
+        assert ran == ["replayed"]
+
+    asyncio.run(_run())
+
+
+def test_recovery_retries_when_the_account_lock_times_out(monkeypatch) -> None:
+    """A lock wait that times out is retried, not left for the next connect.
+
+    ``AccountOrderLockTimeoutError`` (120 s default) used to be swallowed by
+    the generic handler: markers stayed pending possibly for days. The task
+    now retries a bounded number of times, so a lock that frees up inside
+    the retry window still replays (#350 review).
+    """
+    import live_runner.account_order_lock as lock_module
+    from live_runner.account_order_lock import account_order_lock
+
+    monkeypatch.setattr(
+        lock_module, "ACCOUNT_ORDER_LOCK_TIMEOUT_SECONDS", 0.05
+    )
+    monkeypatch.setattr(alpaca_module, "_RECOVERY_LOCK_RETRY_SECONDS", 0.01)
+    monkeypatch.setattr(alpaca_module, "_RECOVERY_LOCK_ATTEMPTS", 50)
+
+    adapter = _adapter(_FakeTradingClient(positions=[]))
+    adapter.account_id = "acct-lock-retry"
+    ran: list[str] = []
+
+    async def _spy(self) -> None:
+        ran.append("replayed")
+
+    monkeypatch.setattr(
+        AlpacaLiveAdapter, "_recover_exit_reprotections", _spy
+    )
+
+    async def _run() -> None:
+        async with account_order_lock("acct-lock-retry"):
+            task = asyncio.create_task(
+                adapter._run_exit_reprotection_recovery()
+            )
+            # Several attempts time out while the lock is held.
+            await asyncio.sleep(0.2)
+            assert ran == []
+        await asyncio.wait_for(task, 2)
+        assert ran == ["replayed"]
+
+    asyncio.run(_run())
+
+
+def test_recovery_gives_up_after_bounded_lock_retries(
+    monkeypatch, caplog
+) -> None:
+    """Exhausted retries alert and stop - markers wait for the next connect."""
+    import live_runner.account_order_lock as lock_module
+    from live_runner.account_order_lock import account_order_lock
+
+    monkeypatch.setattr(
+        lock_module, "ACCOUNT_ORDER_LOCK_TIMEOUT_SECONDS", 0.02
+    )
+    monkeypatch.setattr(alpaca_module, "_RECOVERY_LOCK_RETRY_SECONDS", 0.001)
+    monkeypatch.setattr(alpaca_module, "_RECOVERY_LOCK_ATTEMPTS", 2)
+
+    adapter = _adapter(_FakeTradingClient(positions=[]))
+    adapter.account_id = "acct-lock-giveup"
+    ran: list[str] = []
+
+    async def _spy(self) -> None:
+        ran.append("replayed")
+
+    monkeypatch.setattr(
+        AlpacaLiveAdapter, "_recover_exit_reprotections", _spy
+    )
+
+    async def _run() -> None:
+        async with account_order_lock("acct-lock-giveup"):
+            task = asyncio.create_task(
+                adapter._run_exit_reprotection_recovery()
+            )
+            await asyncio.wait_for(task, 2)
+
+    with caplog.at_level("ERROR"):
+        asyncio.run(_run())
+
+    assert ran == []
+    assert any(
+        record.levelname == "ERROR"
+        and "until the next connect" in record.message
+        for record in caplog.records
+    )
+
+
+def test_connect_inside_both_locks_does_not_deadlock(monkeypatch) -> None:
+    """``connect`` may run inside the account lock AND ``_order_book_lock``.
+
+    The daemon's submit section and ``cancel_orders`` both call ``connect``
+    while holding those locks; the marker replay must therefore be a
+    separate task that takes the locks itself once they are free - never
+    inline on the connect path (#350 review, maintainer decision).
+    """
+    from live_runner.account_order_lock import account_order_placement
+
+    client = _FakeTradingClient(positions=[])
+    adapter = _adapter(client)
+    adapter.account_id = "acct-connect"
+
+    async def _noop_reconcile(self, **kwargs) -> None:
+        return None
+
+    # connect() rebuilds real alpaca clients; stub the account read and the
+    # reconcile pass, then swap the fake client back in before the replay.
+    monkeypatch.setattr(
+        AlpacaLiveAdapter, "reconcile_executions", _noop_reconcile
+    )
+    monkeypatch.setattr(
+        "alpaca.trading.client.TradingClient.get_account",
+        lambda self: SimpleNamespace(),
+    )
+
+    async def _run() -> None:
+        async with account_order_placement("acct-connect"):
+            async with adapter._order_book_lock():
+                await adapter.connect()
+                # connect returned while holding both locks: no deadlock,
+                # and the replay is queued, not running inline.
+                task = adapter._exit_reprotection_recovery_task
+                assert task is not None
+                assert not task.done()
+                adapter._trading_client = client
+        await task
+
+    asyncio.run(_run())
+
+
+def test_disconnect_cancels_a_pending_recovery_task() -> None:
+    """A queued/running replay task is cancelled AND awaited on disconnect.
+
+    The assertion keeps a reference to the hang task itself: reading the
+    adapter attribute afterwards always sees ``None`` (disconnect clears it
+    first), which made the old ``task is None or ...`` check vacuous - with
+    ``task.cancel()`` removed the test still passed after a 60 s hang
+    (#350 review).
+    """
+    adapter = _adapter(_FakeTradingClient(positions=[]))
+    adapter.account_id = "acct-disc"
+
+    async def _hang() -> None:
+        await asyncio.sleep(60)
+
+    async def _run() -> None:
+        hang = asyncio.create_task(_hang())
+        adapter._exit_reprotection_recovery_task = hang
+        # Bounded: without the cancel+await the hang would stall disconnect
+        # for its full 60 s (well past the suite's patience here).
+        await asyncio.wait_for(adapter.disconnect(), 2)
+        assert hang.cancelled()
+        assert adapter._exit_reprotection_recovery_task is None
+
+    asyncio.run(_run())
+
+
+def test_superseded_markers_are_not_cleared_while_the_newest_stays_pending(
+    monkeypatch,
+) -> None:
+    """A pending newest marker keeps its symbol's older markers (#350 W12).
+
+    The superseded clear used to run after ANY non-raising replay; it must
+    run only on a "resolved" verdict - a marker whose exit order is still
+    working stays pending and its superseded siblings stay as history.
+    """
+    rows = [
+        _reprotect_row(
+            {"side": "sell", "stop_price": 190.0},
+            signal_id="sig-aapl",
+            symbol="AAPL",
+            broker_order_id="exit-working",
+        )
+    ]
+    _patch_pending_reprotections(monkeypatch, rows)
+    client = _FakeTradingClient(
+        orders=[
+            _FakeOrder(
+                id="exit-working",
+                symbol="AAPL",
+                side="sell",
+                order_type="limit",
+                qty=4.0,
+                status="new",
+            )
+        ],
+        positions=[_FakePosition("AAPL", 5.0)],
+    )
+    adapter = _adapter(client)
+    superseded_calls: list[tuple] = []
+    monkeypatch.setattr(
+        alpaca_module,
+        "clear_superseded_exit_reprotection_markers",
+        lambda *args, **kwargs: superseded_calls.append((args, kwargs)) or 0,
+    )
+    # The metadata re-read must not be what saves the markers: return a dict
+    # WITHOUT the marker so only the verdict gate can prevent the clear.
+    monkeypatch.setattr(
+        alpaca_module, "get_live_signal_metadata", lambda sid: {}
+    )
+
+    asyncio.run(adapter._recover_exit_reprotections())
+
+    assert superseded_calls == []
+
+
+def test_marker_survives_when_re_read_shows_a_short_fill(monkeypatch) -> None:
+    """``filled`` but ``filled_qty < exit_qty`` keeps the marker (#350 W2)."""
+    client = _FakeTradingClient(
+        orders=[
+            _FakeOrder(
+                id="exit-short",
+                symbol="AAPL",
+                side="sell",
+                order_type="market",
+                qty=4.0,
+                status="filled",
+                filled_qty=2.0,
+            )
+        ],
+        positions=[],
+    )
+    adapter = _adapter(client)
+    cleared = _patch_marker_clears(monkeypatch)
+    order = client.orders[0]
+    plan = {"symbol": "AAPL", "exit_qty": 4.0}
+
+    asyncio.run(
+        adapter._maybe_clear_exit_marker_on_full_fill(
+            client, order, plan, signal_id="sig-1"
+        )
+    )
+
+    assert cleared == []
+
+
+def test_marker_survives_when_re_read_shows_a_working_order(monkeypatch) -> None:
+    """A still-working re-read keeps the marker even at full ``filled_qty`` (#350 W3).
+
+    ``pending_replace`` is NOT terminal, so the terminal-status guard alone
+    must keep the marker: with ``filled_qty == exit_qty`` the under-fill
+    guard passes, and removing the terminal check is what this test kills.
+    The re-read sleeps between attempts are injected away - this test is
+    about the verdict, not the wait (#350 N3).
+    """
+    client = _FakeTradingClient(
+        orders=[
+            _FakeOrder(
+                id="exit-live",
+                symbol="AAPL",
+                side="sell",
+                order_type="limit",
+                qty=4.0,
+                status="pending_replace",
+                filled_qty=4.0,
+            )
+        ],
+        positions=[],
+    )
+    adapter = _adapter(client)
+    cleared = _patch_marker_clears(monkeypatch)
+    order = client.orders[0]
+    plan = {"symbol": "AAPL", "exit_qty": 4.0}
+
+    async def _no_sleep(_seconds: float) -> None:
+        return None
+
+    asyncio.run(
+        adapter._maybe_clear_exit_marker_on_full_fill(
+            client, order, plan, signal_id="sig-1", sleep=_no_sleep
+        )
+    )
+
+    assert cleared == []
+
+
+def test_marker_clears_when_re_read_shows_terminal_full_fill(monkeypatch) -> None:
+    """Positive control for the two guards above: proven full fill spends it."""
+    client = _FakeTradingClient(
+        orders=[
+            _FakeOrder(
+                id="exit-full",
+                symbol="AAPL",
+                side="sell",
+                order_type="market",
+                qty=4.0,
+                status="filled",
+                filled_qty=4.0,
+            )
+        ],
+        positions=[],
+    )
+    adapter = _adapter(client)
+    cleared = _patch_marker_clears(monkeypatch)
+    order = client.orders[0]
+    plan = {"symbol": "AAPL", "exit_qty": 4.0}
+
+    asyncio.run(
+        adapter._maybe_clear_exit_marker_on_full_fill(
+            client, order, plan, signal_id="sig-1"
+        )
+    )
+
+    assert cleared == ["sig-1"]
+
+
+# ─── #350 bundle-82 finish: in-flight guards, crypto key, scan bound ────
+
+
+def _unknown_uuid_fill(
+    symbol: str, *, side: str, order_type: str
+) -> SimpleNamespace:
+    """A fill whose client order id is a UUID naming no persisted signal."""
+    return SimpleNamespace(
+        event="fill",
+        order=SimpleNamespace(
+            id=str(uuid4()),
+            client_order_id=str(uuid4()),
+            status="filled",
+            symbol=symbol,
+            side=side,
+            order_type=order_type,
+            filled_qty=1.0,
+        ),
+        timestamp=datetime.now(timezone.utc),
+        qty=1.0,
+    )
+
+
+def _assert_unattributed_fill(
+    monkeypatch, caplog, adapter: AlpacaLiveAdapter, update: SimpleNamespace
+) -> None:
+    """The fill must raise the unattributed ERROR, not a flatten WARNING."""
+    flagged: list[dict] = []
+    monkeypatch.setattr(
+        alpaca_module,
+        "flag_live_ledger_reconciliation",
+        lambda **kwargs: flagged.append(kwargs) or {},
+    )
+    with caplog.at_level("ERROR"):
+        asyncio.run(adapter._on_trade_update(update))
+    assert flagged
+    assert flagged[0]["cause"] == "alpaca_unattributed_order_fill"
+    assert any(
+        record.levelname == "ERROR" and "could not be attributed" in record.message
+        for record in caplog.records
+    )
+
+
+def test_in_flight_match_rejects_a_fill_on_the_wrong_side(
+    monkeypatch, caplog
+) -> None:
+    """A foreign BUY during a long flatten's window is not the flatten's fill.
+
+    The marker records the reducing side (``sell`` for a long position); a
+    ``buy`` market fill - an operator's manual order, a lost-registration
+    entry - must keep the unattributed ERROR severity (#350 S1).
+    """
+    adapter = _adapter(_FakeTradingClient(positions=[]))
+    adapter._flatten_in_flight["AAPL"] = (time.monotonic(), "sell")
+
+    _assert_unattributed_fill(
+        monkeypatch,
+        caplog,
+        adapter,
+        _unknown_uuid_fill("AAPL", side="buy", order_type="market"),
+    )
+
+
+def test_in_flight_match_rejects_a_non_market_fill(
+    monkeypatch, caplog
+) -> None:
+    """A resting ``stop`` fill during the window is not the flatten's fill.
+
+    ``close_position`` only ever submits market orders; a same-side stop
+    fill is somebody else's order and keeps the unattributed ERROR (#350 S1).
+    """
+    adapter = _adapter(_FakeTradingClient(positions=[]))
+    adapter._flatten_in_flight["AAPL"] = (time.monotonic(), "sell")
+
+    _assert_unattributed_fill(
+        monkeypatch,
+        caplog,
+        adapter,
+        _unknown_uuid_fill("AAPL", side="sell", order_type="stop"),
+    )
+
+
+def test_in_flight_match_rejects_a_fill_past_the_ttl(
+    monkeypatch, caplog
+) -> None:
+    """A marker older than the TTL no longer lends attribution (#350 S1).
+
+    The window exists only to cover the submit/remember race; a same-symbol
+    market fill long after it is unrelated and must stay an ERROR.
+    """
+    adapter = _adapter(_FakeTradingClient(positions=[]))
+    adapter._flatten_in_flight["AAPL"] = (
+        time.monotonic() - alpaca_module._FLATTEN_IN_FLIGHT_TTL_SECONDS - 1.0,
+        "sell",
+    )
+
+    _assert_unattributed_fill(
+        monkeypatch,
+        caplog,
+        adapter,
+        _unknown_uuid_fill("AAPL", side="sell", order_type="market"),
+    )
+    # The stale marker is spent by the lookup, not left to match again.
+    assert "AAPL" not in adapter._flatten_in_flight
+
+
+def test_flatten_in_flight_marker_matches_across_crypto_symbol_forms(
+    monkeypatch, caplog
+) -> None:
+    """``BTCUSD`` (position) and ``BTC/USD`` (order) name the same flatten.
+
+    The marker is written under the position symbol but looked up under the
+    order symbol; without canonicalisation a crypto flatten fill missed the
+    marker and raised the unattributed ERROR (#350 N1).
+    """
+    flagged: list[dict] = []
+    monkeypatch.setattr(
+        alpaca_module,
+        "flag_live_ledger_reconciliation",
+        lambda **kwargs: flagged.append(kwargs) or {},
+    )
+    adapter = _adapter(_FakeTradingClient(positions=[]))
+    # Written exactly the way ``close_all_positions`` writes it: keyed by
+    # the position symbol through the canonicalising helper.
+    adapter._flatten_in_flight[alpaca_module._flatten_marker_key("BTCUSD")] = (
+        time.monotonic(),
+        "sell",
+    )
+
+    with caplog.at_level("WARNING"):
+        asyncio.run(
+            adapter._on_trade_update(
+                _unknown_uuid_fill("BTC/USD", side="sell", order_type="market")
+            )
+        )
+
+    assert flagged
+    assert flagged[0]["cause"] == "alpaca_flatten_fill"
+    assert flagged[0]["symbol"] == "BTC/USD"
+    assert not any(
+        record.levelname == "ERROR" and "could not be attributed" in record.message
+        for record in caplog.records
+    )
+
+
+def test_disconnect_does_not_self_await_the_recovery_task() -> None:
+    """``connect`` failing inside the recovery task runs ``disconnect`` on it.
+
+    ``_exit_reprotection_recovery_task`` can point at the CURRENT task; the
+    self-await guard must return early instead of ``task.cancel()`` +
+    ``await task`` raising ``RuntimeError``/``CancelledError`` (#350 S3).
+    """
+    adapter = _adapter(_FakeTradingClient(positions=[]))
+    adapter.account_id = "acct-self-await"
+
+    async def _run() -> None:
+        me = asyncio.current_task()
+        adapter._exit_reprotection_recovery_task = me
+        await adapter._cancel_exit_reprotection_recovery()
+        assert adapter._exit_reprotection_recovery_task is None
+        assert me is not None
+        assert not me.cancelling()
+        assert not me.cancelled()
+
+    asyncio.run(_run())
+
+
+def test_held_leg_scan_after_is_unbounded_when_a_symbol_has_no_bound(
+    monkeypatch,
+) -> None:
+    """A symbol with neither bound leaves the whole scan unbounded (#350 N2).
+
+    AAA's open-lot bound must not narrow the window for BBB: with no open
+    lot and no signal, BBB's held legs could be arbitrarily old, so
+    ``after`` stays ``None`` - the page cap is the only backstop.
+    """
+    t_lot = datetime(2026, 2, 1, tzinfo=timezone.utc)
+    monkeypatch.setattr(
+        alpaca_module,
+        "earliest_live_open_lot_entry_timestamp",
+        lambda account_id, symbols: t_lot if "AAA" in symbols else None,
+    )
+    monkeypatch.setattr(
+        alpaca_module,
+        "earliest_live_signal_timestamp",
+        lambda account_id, symbols: None,
+    )
+    adapter = _adapter(_FakeTradingClient())
+    adapter.account_id = "acct-unbounded"
+
+    # Positive control: a fully bounded symbol still gets min - margin.
+    assert asyncio.run(adapter._held_leg_scan_after({"AAA"})) == (
+        t_lot - timedelta(minutes=5)
+    )
+    # BBB has no bound at all: the scan is unbounded, not AAA's window.
+    assert asyncio.run(adapter._held_leg_scan_after({"AAA", "BBB"})) is None
+    # ``None`` symbols is the account-wide orphan sweep: unbounded by design.
+    assert asyncio.run(adapter._held_leg_scan_after(None)) is None
+
+    client = _FakeTradingClient(orders=[])
+    asyncio.run(
+        adapter._list_filled_parents_with_held_legs(client, {"AAA", "BBB"})
+    )
+    assert client.last_order_filter.after is None
+
+
+# ─── #350 bundle-84 review: money-path refusal guards pinned (B1) ────────────
+#
+# Each test below fails when its guard is removed: the guards are the only
+# thing stopping a wrong-level or naked re-protection on a live account, so a
+# silent deletion must turn a test red.
+
+
+def test_partial_exit_refuses_ambiguous_tp_levels(monkeypatch) -> None:
+    """Two working take-profit prices: which tranche the exit hits is
+    unknowable, so the partial exit refuses before any broker write (#350 M2).
+    """
+    orders = _filled_bracket()
+    orders.append(
+        _FakeOrder(
+            id="tp-2",
+            symbol="AAPL",
+            side="sell",
+            order_type="limit",
+            qty=5.0,
+            limit_price=215.0,
+            status="new",
+        )
+    )
+    client = _FakeTradingClient(
+        orders=orders,
+        positions=[_FakePosition("AAPL", 10.0)],
+    )
+    adapter = _adapter(client)
+    _patched_signal_store(monkeypatch, [])
+
+    submission = adapter.submit_order(_partial_signal(4.0), qty=4.0)
+    with pytest.raises(ValueError, match="ambiguous take_profit") as raised:
+        asyncio.run(submission)
+
+    assert "ambiguous take_profit levels" in str(raised.value)
+    assert client.cancelled == []
+    assert client.submitted == []
+    assert is_order_not_submitted(raised.value) is True
+
+
+def test_partial_exit_refuses_unreadable_levels(monkeypatch) -> None:
+    """A protection leg whose price cannot be read refuses the exit (#350 M3).
+
+    Re-placing at a ``None`` level would submit a protection order with no
+    price at all; the refusal fires before any cancel or submit.
+    """
+    orders = _filled_bracket()
+    orders.append(
+        _FakeOrder(
+            id="sl-2",
+            symbol="AAPL",
+            side="sell",
+            order_type="stop",
+            qty=5.0,
+            stop_price=None,
+            status="new",
+        )
+    )
+    client = _FakeTradingClient(
+        orders=orders,
+        positions=[_FakePosition("AAPL", 10.0)],
+    )
+    adapter = _adapter(client)
+    _patched_signal_store(monkeypatch, [])
+
+    submission = adapter.submit_order(_partial_signal(4.0), qty=4.0)
+    with pytest.raises(ValueError, match="unreadable") as raised:
+        asyncio.run(submission)
+
+    assert "stop_loss level unreadable" in str(raised.value)
+    assert client.cancelled == []
+    assert client.submitted == []
+    assert is_order_not_submitted(raised.value) is True
+
+
+def _underfilled_exit_client() -> _FakeTradingClient:
+    """Position 10, OCO protecting 6, terminal exit order ``exit-1``: 4 naked."""
+    return _FakeTradingClient(
+        orders=[
+            _working_oco(qty=6.0),
+            _FakeOrder(
+                id="exit-1",
+                symbol="AAPL",
+                side="sell",
+                order_type="market",
+                qty=4.0,
+                status="expired",
+            ),
+        ],
+        positions=[_FakePosition("AAPL", 10.0)],
+    )
+
+
+def test_recovery_tops_up_refuses_per_candidate_recorded_levels(
+    monkeypatch, caplog
+) -> None:
+    """Under-filled exit + marker that recorded protection per candidate.
+
+    The top-up cannot pick which recorded tranche to re-place, so it alerts
+    and keeps the marker pending rather than guessing a level (#350 M11).
+    """
+    client = _underfilled_exit_client()
+    adapter = _adapter(client)
+    row = _reprotect_row(
+        {
+            "side": "sell",
+            "protection": [
+                {
+                    "kind": "stop",
+                    "order_type": "stop",
+                    "stop_price": 190.0,
+                    "limit_price": None,
+                    "qty": 6.0,
+                },
+                {
+                    "kind": "tp",
+                    "order_type": "limit",
+                    "stop_price": None,
+                    "limit_price": 210.0,
+                    "qty": 6.0,
+                },
+            ],
+        },
+        broker_order_id="exit-1",
+    )
+    cleared = _patch_marker_clears(monkeypatch)
+
+    with caplog.at_level("ERROR"):
+        verdict = asyncio.run(adapter._recover_exit_reprotection(row))
+
+    assert verdict == "pending"
+    assert client.submitted == []
+    assert client.cancelled == []
+    assert cleared == []
+    assert any(
+        "per-candidate" in record.message for record in caplog.records
+    )
+
+
+def test_recovery_tops_up_clears_a_marker_that_recorded_no_levels(
+    monkeypatch, caplog
+) -> None:
+    """Under-filled exit + marker with no recorded levels at all.
+
+    There is nothing the top-up could place, so it alerts and spends the
+    marker as ``unverified`` instead of leaving it to pile up (#350 M12).
+    """
+    client = _underfilled_exit_client()
+    adapter = _adapter(client)
+    row = _reprotect_row({"side": "sell"}, broker_order_id="exit-1")
+    cleared = _patch_marker_clears(monkeypatch)
+
+    with caplog.at_level("ERROR"):
+        verdict = asyncio.run(adapter._recover_exit_reprotection(row))
+
+    assert verdict == "unverified"
+    assert client.submitted == []
+    assert client.cancelled == []
+    assert cleared == ["sig-1"]
+    assert any(
+        "recorded no levels" in record.message for record in caplog.records
+    )
+
+
+def test_recovery_keeps_marker_and_places_nothing_on_an_unreadable_qty(
+    monkeypatch, caplog
+) -> None:
+    """One OCO leg whose qty cannot be read: coverage is unmeasurable.
+
+    ``_covered_exit_protection_qty`` counts an unreadable qty as 0, which
+    inflates ``uncovered`` and would top up protection on shares already
+    covered - over-protection, the opposite of fail-closed. Recovery must
+    alert, keep the marker pending and place nothing (#350 S2).
+    """
+    oco = _working_oco(qty=6.0)
+    oco.legs[0].qty = "unreadable"
+    client = _FakeTradingClient(
+        orders=[
+            oco,
+            _FakeOrder(
+                id="exit-1",
+                symbol="AAPL",
+                side="sell",
+                order_type="market",
+                qty=4.0,
+                status="expired",
+            ),
+        ],
+        positions=[_FakePosition("AAPL", 10.0)],
+    )
+    adapter = _adapter(client)
+    row = _reprotect_row(
+        {"side": "sell", "stop_price": 190.0, "take_profit_price": 210.0},
+        broker_order_id="exit-1",
+    )
+    cleared = _patch_marker_clears(monkeypatch)
+
+    with caplog.at_level("ERROR"):
+        verdict = asyncio.run(adapter._recover_exit_reprotection(row))
+
+    assert verdict == "pending"
+    assert cleared == []
+    assert client.submitted == []
+    assert client.cancelled == []
+    assert any(
+        "quantity is unreadable" in record.message for record in caplog.records
+    )
+
+
+def test_recovery_clears_an_unusable_marker(monkeypatch, caplog) -> None:
+    """A marker with an empty symbol or an unknown side can never be replayed.
+
+    Both halves of the guard end ``unverified``: the empty symbol would
+    otherwise read as "position flat" (``resolved``) and spend superseded
+    markers on a record that proved nothing, and the bad side must alert as
+    unusable rather than as a side mismatch - on a FLAT position in
+    particular, where without the side check the marker would be recorded
+    ``resolved`` (#350 M14/S1).
+    """
+    client = _FakeTradingClient(positions=[_FakePosition("AAPL", 6.0)])
+    adapter = _adapter(client)
+    cleared = _patch_marker_clears(monkeypatch)
+
+    verdict = asyncio.run(
+        adapter._recover_exit_reprotection(_reprotect_row({"side": "sell"}, symbol=""))
+    )
+    assert verdict == "unverified"
+
+    # Flat position + bad side: the side-mismatch path needs a live position
+    # on the other side, so with the side half of the guard deleted this
+    # marker falls through to "position flat" and reads ``resolved``. caplog
+    # is cleared first so the "unusable" assertion below can only come from
+    # THIS call, not the empty-symbol call above.
+    flat_adapter = _adapter(_FakeTradingClient(positions=[]))
+    with caplog.at_level("ERROR"):
+        caplog.clear()
+        verdict = asyncio.run(
+            flat_adapter._recover_exit_reprotection(
+                _reprotect_row({"side": "hold", "stop_price": 190.0})
+            )
+        )
+    assert verdict == "unverified"
+
+    assert cleared == ["sig-1", "sig-1"]
+    assert client.submitted == []
+    assert client.cancelled == []
+    assert any("unusable" in record.message for record in caplog.records)
+
+
+def test_recovery_clears_recorded_protection_with_no_recognisable_kind(
+    monkeypatch, caplog
+) -> None:
+    """Recorded candidates whose ``kind`` is neither ``stop`` nor ``tp``.
+
+    No kind means coverage can be neither verified nor rebuilt, so the
+    marker is cleared ``unverified`` - NOT ``resolved``, which would spend
+    the symbol's superseded markers on a check that never ran (#350 M17).
+    """
+    client = _FakeTradingClient(positions=[_FakePosition("AAPL", 6.0)])
+    adapter = _adapter(client)
+    cleared = _patch_marker_clears(monkeypatch)
+    row = _reprotect_row(
+        {
+            "side": "sell",
+            "protection": [
+                {
+                    "kind": "mleg",
+                    "order_type": "mleg",
+                    "stop_price": None,
+                    "limit_price": None,
+                    "qty": 6.0,
+                }
+            ],
+        }
+    )
+
+    with caplog.at_level("ERROR"):
+        verdict = asyncio.run(adapter._recover_exit_reprotection(row))
+
+    assert verdict == "unverified"
+    assert cleared == ["sig-1"]
+    assert client.submitted == []
+    assert client.cancelled == []
+    assert any(
+        "no recognisable kind" in record.message for record in caplog.records
+    )
+
+
+def test_recovery_clears_marker_with_no_levels_and_no_working_protection(
+    monkeypatch,
+) -> None:
+    """No recorded levels AND no working protection: ``unverified``, not
+    ``resolved``.
+
+    Both branches clear the marker, so only the verdict tells them apart -
+    ``resolved`` would also spend the symbol's superseded markers on a
+    coverage check that never ran (#350 M18).
+    """
+    client = _FakeTradingClient(positions=[_FakePosition("AAPL", 6.0)])
+    adapter = _adapter(client)
+    cleared = _patch_marker_clears(monkeypatch)
+    row = _reprotect_row({"side": "sell"})
+
+    verdict = asyncio.run(adapter._recover_exit_reprotection(row))
+
+    assert verdict == "unverified"
+    assert cleared == ["sig-1"]
+    assert client.submitted == []
+    assert client.cancelled == []
+
+
+# ─── #350 bundle-84 review: bounded marker re-read (S-A) ─────────────────────
+
+
+def _exit_reread_client(reads: list[_FakeOrder]) -> _FakeTradingClient:
+    """A client whose ``get_order_by_id`` walks ``reads`` in order."""
+    client = _FakeTradingClient(positions=[])
+    queue = list(reads)
+
+    def _get(order_id: str):
+        if not queue:
+            return reads[-1]
+        return queue.pop(0)
+
+    client.get_order_by_id = _get  # type: ignore[method-assign]
+    return client
+
+
+def _reread_order(status: str, *, filled_qty: float = 0.0) -> _FakeOrder:
+    return _FakeOrder(
+        id="exit-1",
+        symbol="AAPL",
+        side="sell",
+        order_type="market",
+        qty=4.0,
+        status=status,
+        filled_qty=filled_qty,
+    )
+
+
+def test_marker_clear_retries_the_exit_read_until_terminal(monkeypatch) -> None:
+    """First re-read ``new``, second ``filled``: the marker is spent (#350 S-A).
+
+    A market exit is usually still working on the first read right after the
+    re-place; the bounded retry is what lets the proven full fill clear the
+    marker instead of stranding it until the next connect.
+    """
+    client = _exit_reread_client(
+        [_reread_order("new"), _reread_order("filled", filled_qty=4.0)]
+    )
+    adapter = _adapter(client)
+    cleared = _patch_marker_clears(monkeypatch)
+    sleeps: list[float] = []
+
+    async def _sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    asyncio.run(
+        adapter._maybe_clear_exit_marker_on_full_fill(
+            client,
+            _reread_order("new"),
+            {"symbol": "AAPL", "exit_qty": 4.0},
+            signal_id="sig-1",
+            sleep=_sleep,
+        )
+    )
+
+    assert cleared == ["sig-1"]
+    assert sleeps == [0.5]
+
+
+def test_marker_stays_when_the_exit_never_reads_terminal(monkeypatch) -> None:
+    """Three non-terminal reads: the marker stays, and the loop stops at the
+    bound - it does not poll forever under the account order lock (#350 S-A).
+
+    The bound itself is pinned, not the constants read back: at most 3 reads
+    and a total sleep budget of 1.5 s, so raising the attempts or the
+    interval fails here (#350 N1).
+    """
+    reads: list[str] = []
+    client = _FakeTradingClient(positions=[])
+
+    def _get(order_id: str):
+        reads.append(order_id)
+        return _reread_order("new")
+
+    client.get_order_by_id = _get  # type: ignore[method-assign]
+    adapter = _adapter(client)
+    cleared = _patch_marker_clears(monkeypatch)
+    sleeps: list[float] = []
+
+    async def _sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    asyncio.run(
+        adapter._maybe_clear_exit_marker_on_full_fill(
+            client,
+            _reread_order("new"),
+            {"symbol": "AAPL", "exit_qty": 4.0},
+            signal_id="sig-1",
+            sleep=_sleep,
+        )
+    )
+
+    assert cleared == []
+    assert reads == ["exit-1"] * 3
+    assert sleeps == [0.5, 0.5]
+    assert sum(sleeps) <= 1.5
+
+
+def test_marker_stays_and_stops_reading_when_the_re_read_fails(
+    monkeypatch,
+) -> None:
+    """A failed re-read keeps the marker and ends the retry loop at once:
+    the outcome is unknown, so no further reads are made (#350 S-A)."""
+    reads: list[str] = []
+    client = _FakeTradingClient(positions=[])
+
+    def _get(order_id: str):
+        reads.append(order_id)
+        raise RuntimeError("broker read failed")
+
+    client.get_order_by_id = _get  # type: ignore[method-assign]
+    adapter = _adapter(client)
+    cleared = _patch_marker_clears(monkeypatch)
+    sleeps: list[float] = []
+
+    async def _sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    asyncio.run(
+        adapter._maybe_clear_exit_marker_on_full_fill(
+            client,
+            _reread_order("new"),
+            {"symbol": "AAPL", "exit_qty": 4.0},
+            signal_id="sig-1",
+            sleep=_sleep,
+        )
+    )
+
+    assert cleared == []
+    assert reads == ["exit-1"]
+    assert sleeps == []
+
+
+# ─── #350 bundle-84 review: crypto flatten attribution through the real path ──
+
+
+def test_close_all_positions_attributes_a_crypto_flatten_fill(
+    monkeypatch, caplog
+) -> None:
+    """A ``BTCUSD`` position flatten is matched by fills naming ``BTC/USD``.
+
+    ``close_all_positions`` writes the in-flight marker under the *position*
+    symbol and the stream looks it up under the *order* symbol; both go
+    through ``_flatten_marker_key`` so the crypto forms meet (#350 N-a). The
+    second fill uses the position's own ``BTCUSD`` spelling on purpose: a
+    lookup that skipped canonicalisation would still match ``BTC/USD`` but
+    miss this one, so both call sites stay pinned.
+    """
+    client = _FakeTradingClient(positions=[_FakePosition("BTCUSD", 0.5)])
+    adapter = _adapter(client)
+    flagged: list[dict] = []
+    monkeypatch.setattr(
+        alpaca_module,
+        "flag_live_ledger_reconciliation",
+        lambda **kwargs: flagged.append(kwargs) or {},
+    )
+
+    outcome = asyncio.run(adapter.close_all_positions())
+
+    assert outcome.completed == 1
+    assert client.close_calls == ["BTCUSD"]
+    assert client.positions == []
+    # Written by the real flatten path, under the canonicalised key.
+    assert (
+        alpaca_module._flatten_marker_key("BTCUSD") in adapter._flatten_in_flight
+    )
+
+    with caplog.at_level("ERROR"):
+        for symbol in ("BTC/USD", "BTCUSD"):
+            asyncio.run(
+                adapter._on_trade_update(
+                    _unknown_uuid_fill(symbol, side="sell", order_type="market")
+                )
+            )
+
+    assert [flag["cause"] for flag in flagged] == [
+        "alpaca_flatten_fill",
+        "alpaca_flatten_fill",
+    ]
+    assert flagged[0]["symbol"] == "BTC/USD"
+    assert flagged[1]["symbol"] == "BTCUSD"
+    assert not any(
+        "could not be attributed" in record.message
+        for record in caplog.records
+    )

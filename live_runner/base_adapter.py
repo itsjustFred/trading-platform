@@ -17,6 +17,15 @@ from shared.models import LiveSignal
 #: (adapters) must never compare divergent spellings again.
 EXIT_ONLY_RISK_SIZING_MODE = "exit_only"
 
+#: Metadata key an adapter stamps on an exit-only signal when the exit had to
+#: release broker-side protection (bracket legs reserve the position's shares)
+#: before it could be submitted (#145). The value records the side and the
+#: SL/TP levels the remainder must be re-protected at, so a crash between the
+#: release and the re-place is recoverable on the next adapter connect. Only
+#: the adapter writes it: producers must not forge it (the daemon pops it from
+#: incoming signal metadata like every other adapter-owned key).
+EXIT_REPROTECTION_METADATA_KEY = "exit_reprotection"
+
 #: Explicit unbounded-take-profit policy (C1 owner decision). Set ONLY by
 #: the originating processor (RocketFuel exits on the opposite signal) —
 #: never inferred. Matched via :func:`is_unbounded_tp`, not string
@@ -60,6 +69,28 @@ def order_not_submitted() -> Iterator[None]:
 def is_order_not_submitted(exc: BaseException) -> bool:
     """Whether an adapter proved the failure happened before any broker write."""
     return bool(getattr(exc, _ORDER_NOT_SUBMITTED_ATTR, False))
+
+
+class BrokerOrderRejectedError(RuntimeError):
+    """The broker received the order request and definitively refused it.
+
+    Distinct from a pre-request failure marked by :func:`order_not_submitted`:
+    the request DID reach the broker, but the broker's correlated answer was
+    a refusal (cTrader ``ProtoOAOrderErrorEvent`` as the response payload),
+    not an acceptance - so nothing was opened (entry) or closed (exit) and
+    the outcome is as certain as a pre-request refusal. A caller may release
+    its submission lease and record the signal as rejected instead of holding
+    it for reconciliation.
+
+    Adapters raise this ONLY when the refusal is provably tied to the request
+    that was sent: a timeout, a transport failure, or an error event that
+    cannot be correlated to this order stays an ordinary exception (unknown
+    outcome), never this type.
+    """
+
+    def __init__(self, message: str, *, error_code: str = "") -> None:
+        self.error_code = str(error_code or "").strip()
+        super().__init__(message)
 
 
 def is_unbounded_tp(metadata: object) -> bool:

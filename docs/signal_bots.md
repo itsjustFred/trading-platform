@@ -304,9 +304,15 @@ Bedingung nennt, erzeugt eine neue Entry-Order.
   sized gegen den eigenen Anteil statt gegen die Deckelung.
   Die Zuordnung Leg-Order-Id → Parent-Signal wird beim Submit und in jedem
   Reconciliation-Pass aus den verschachtelten Legs der Parent-Order gelernt (der
-  Pass läuft beim Connect, bevor der Trading-Stream Events verarbeitet); ein
-  Fill, dessen Order-Id keine bekannte Leg ist, bleibt unverändert auf dem
-  bisherigen Pfad. Eine Leg auf der *aufbauenden* Seite, ein unbekanntes
+  Pass läuft beim Connect, bevor der Trading-Stream Events verarbeitet); die
+  eigene Order-Id eines OCO-Parents wird ebenfalls gelernt, denn bei Alpaca
+  **ist** der OCO-Parent der Take-Profit selbst (die Stop-Leg ist sein einziges
+  Child) - sein Fill ist also ein eigener Fill, kein Container-Echo. Ein Fill
+  mit `-reprotect`-Client-Order-Id wird über die darin eingebettete Entry-Signal-Id
+  zugeordnet (#350); ein Fill, dessen UUID-Client-Order-Id kein bekanntes Signal
+  und dessen Order-Id keine gelernte Leg ist, wird nicht als Signal-Fill gebucht,
+  sondern als `ledger_reconciliation_required` geflaggt. Eine Leg auf der
+  *aufbauenden* Seite, ein unbekanntes
   Parent-Signal, ein Fill ohne Zeitstempel oder ohne nutzbare Menge wird
   abgelehnt (geloggt, nichts geschrieben) - nie erfunden.
   **cTrader (#144):** Eine broker-seitige Positionsschließung (SL/TP, Flatten,
@@ -507,7 +513,9 @@ Daemon-Neustart kann zuletzt emittierte Nachrichten erneut archivieren.
   `unmapped_channel`, `stale_signal`, `signal_gate_rejected`,
   `invalid_deployment_config`, `submission_claim_failed`, `halt_refused`,
   `loss_breaker_refused`,
-  `broker_refused_pre_request`, `broker_submit_outcome_unknown`,
+  `broker_refused_pre_request`, `exit_refused_pre_request`,
+  `broker_rejected`, `exit_broker_rejected`,
+  `broker_submit_outcome_unknown`,
   `nothing_to_exit`, `exit_below_step`, `exit_in_flight`,
   `unhandled_error`), `detail`,
   `broker_order_id`, `signal_age_seconds`, Deployment-/Strategy-IDs und

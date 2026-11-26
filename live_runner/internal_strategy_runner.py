@@ -90,7 +90,7 @@ Risk-policy notes (maintainer decision 2026-11-22):
   unfilled entries the broker still lists as working or holds a non-zero
   position for — and the total is
   capped at ``TRADE_ENGINE_MAX_POSITIONS``. A cap above 1 is refused
-  (entries disabled) on Alpaca accounts until #350 lands and on any
+  (entries disabled) on Alpaca accounts until #417 lands and on any
   deployment carrying the live ``supertrend_flip`` opt-in, and a strategy
   exit first cancels the deployment's still-working entry orders for the
   symbol.
@@ -202,9 +202,10 @@ SUBMIT_FAILURE_ESCALATION = 3
 #: Outcomes the daemon's submit chokepoint reports back through
 #: ``SubmitSignal``. ``submitted`` reached the broker; ``ignored`` was a
 #: deliberate no-op (e.g. an exit with nothing to close); ``refused`` was
-#: rejected before the broker saw anything; ``unknown`` means the broker may
-#: have the order and reconciliation is required. Anything else is treated
-#: as a failure.
+#: definitively rejected - before the broker saw anything, or by the broker's
+#: own correlated refusal, so nothing is in flight; ``unknown`` means the
+#: broker may have the order and reconciliation is required. Anything else
+#: is treated as a failure.
 SUBMIT_OUTCOME_SUBMITTED = "submitted"
 SUBMIT_OUTCOME_REFUSED = "refused"
 SUBMIT_OUTCOME_IGNORED = "ignored"
@@ -276,6 +277,45 @@ def _internal_runner_opted_in(deployment: LiveDeploymentConfig) -> bool:
     return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+def internal_runner_untradeable_reason(
+    deployment: LiveDeploymentConfig,
+    *,
+    load_target: Callable[[str], Any] = strategy_target,
+) -> str | None:
+    """Why this deployment can never trade, or ``None`` when the runner covers it.
+
+    The daemon's untradeable-ACTIVE-row alert asks this so the log cannot
+    drift from the runner: the answer is built from the runner's own
+    predicates — ``_deployment_is_active_internal`` and
+    ``_internal_runner_opted_in`` — and the same ``strategy_target``
+    resolution the promotion gate binds (a bare strategy slug naming
+    ``strategies/<name>/<name>.py``). Only the conditions that make a row
+    permanently inert are reported here; what the runner might still refuse
+    at evaluation time — an unserved timeframe, a missing adapter, an
+    unusable open-position cap — is a per-tick report of the runner itself,
+    not an untradeable deployment.
+    """
+    if not _deployment_is_active_internal(deployment):
+        return (
+            "signal source 'internal' without signal_source_type 'internal' "
+            "is evaluated by neither the Discord listener nor the internal "
+            "strategy runner"
+        )
+    if not _internal_runner_opted_in(deployment):
+        return (
+            "the internal strategy runner is not enabled for this deployment; "
+            f"set settings.{INTERNAL_RUNNER_ENABLED_KEY}=true to opt in"
+        )
+    try:
+        load_target(deployment.strategy_name)
+    except Exception as exc:  # except-kind: money-decision
+        return (
+            f"internal strategy '{deployment.strategy_name}' cannot be "
+            f"resolved: {exc}"
+        )
+    return None
+
+
 def _max_open_per_symbol(
     deployment: LiveDeploymentConfig, bundle: _StrategyBundle
 ) -> int:
@@ -321,7 +361,7 @@ async def _multi_lot_cap_refusal(
 
     Maintainer defaults for #382: ``internal_max_open_per_symbol > 1`` is
     refused (entries disabled, exits keep flowing - the same fail-closed
-    shape as an unusable cap) on Alpaca accounts until #350 lands, because a
+    shape as an unusable cap) on Alpaca accounts until #417 lands, because a
     netted Alpaca book reserves bracket-leg quantity a second lot's exit
     cannot prove; on cTrader accounts that cannot prove they hedge positions
     (``ProtoOAAccountType`` NETTED or unreadable), because a netted cTrader
@@ -336,9 +376,9 @@ async def _multi_lot_cap_refusal(
     if source == "alpaca":
         return (
             f"{MAX_OPEN_PER_SYMBOL_KEY}={cap} is refused on Alpaca accounts "
-            "until #350 lands: a netted book cannot prove a per-lot exit "
+            "until #417 lands: a netted book cannot prove a per-lot exit "
             "against bracket-leg quantity reservations. Set the cap to 1 "
-            "or wait for #350; entries are disabled, exits still evaluated."
+            "or wait for #417; entries are disabled, exits still evaluated."
         )
     if source == "ctrader":
         account_type = await _adapter_account_type(adapter)

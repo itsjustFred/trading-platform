@@ -950,6 +950,20 @@ def test_exit_only_metadata_restamps_action_for_short_book(monkeypatch):
     assert prepared.action == "buy"
 
 
+def test_exit_only_metadata_drops_a_forged_reprotection_marker(monkeypatch):
+    """#145: ``exit_reprotection`` is adapter-owned crash-recovery state. A
+    producer payload carrying it must not survive to persistence - only the
+    adapter may stamp it after it released the broker-side protection itself."""
+    prepared, _qty = _prepare_exit_only(
+        monkeypatch,
+        [{"symbol": "EURUSD", "qty": 2.0}],
+        ledger_qty=2.0,
+        exit_reprotection={"side": "sell", "stop_price": 1.0},
+    )
+
+    assert "exit_reprotection" not in prepared.metadata
+
+
 def test_exit_only_metadata_rejects_multiple_positions(monkeypatch):
     with pytest.raises(ValueError, match="2 broker positions"):
         _prepare_exit_only(
@@ -2851,6 +2865,9 @@ def test_alpaca_partial_fill_persists_event_qty_not_cumulative(monkeypatch):
         return execution.filled_qty
 
     monkeypatch.setattr(module, "save_live_execution_up_to_cumulative", _capture)
+    # The fill pipeline is under test, not attribution: this UUID names no
+    # persisted signal, so the stream's unknown-signal guard would flag it.
+    monkeypatch.setattr(module, "get_live_signal_metadata", lambda _sid: {})
 
     signal_id = str(uuid4())
     update = SimpleNamespace(
@@ -2929,6 +2946,9 @@ def test_alpaca_delayed_stream_fill_is_reported_as_duplicate(monkeypatch):
     monkeypatch.setattr(
         module, "save_live_execution_up_to_cumulative", lambda _execution, _cumulative: 0.0
     )
+    # The fill pipeline is under test, not attribution: this UUID names no
+    # persisted signal, so the stream's unknown-signal guard would flag it.
+    monkeypatch.setattr(module, "get_live_signal_metadata", lambda _sid: {})
     update = SimpleNamespace(
         event="fill",
         qty="1",
@@ -3738,7 +3758,6 @@ def test_ctrader_request_build_refusal_persists_no_signal_row(monkeypatch):
             self.timeInForce = 0
             self.clientOrderId = ""
             self.relativeStopLoss = 0
-            self.relativeTakeProfit = 0
 
     adapter._ProtoOANewOrderReq = _NewOrderReq
     adapter._ProtoOAOrderType = SimpleNamespace(MARKET=1)
@@ -4008,6 +4027,11 @@ def _make_ctrader_request_builder_adapter():
             self.clientOrderId = ""
             self.stopLoss = 0
             self.takeProfit = 0
+
+        def HasField(self, name: str) -> bool:
+            # Proto-presence double: relativeStopLoss/relativeTakeProfit are
+            # deliberately absent from __init__ so presence tracks assignment.
+            return name in self.__dict__
 
     adapter._ProtoOANewOrderReq = _NewOrderReq
     adapter._ProtoOAOrderType = SimpleNamespace(MARKET=1)
@@ -5045,7 +5069,9 @@ def test_ctrader_sub_tick_stop_loss_is_refused_on_stop_only_order() -> None:
         adapter._build_new_order_request(_ethusd_signal(1925.50 - 0.004, None), symbol_id=9)
     request = adapter._build_new_order_request(_ethusd_signal(1925.49, None), symbol_id=9)
     assert request.relativeStopLoss == 1000
-    assert request.relativeTakeProfit == 0
+    # "No take profit" is an ABSENT field, never a present zero: the broker
+    # rejects a present relativeTakeProfit <= 0 ("SL/TP have to be positive").
+    assert not request.HasField("relativeTakeProfit")
 
 
 @pytest.mark.parametrize(
@@ -5236,7 +5262,58 @@ def test_unbounded_tp_policy_builds_stop_only_requests() -> None:
     )
     request = cadapter._build_new_order_request(csignal, symbol_id=7)
     assert request.relativeStopLoss == 5000
-    assert request.relativeTakeProfit == 0
+    # Absent, not zero: a present relativeTakeProfit of 0 is a broker rejection.
+    assert not request.HasField("relativeTakeProfit")
+
+
+def test_ctrader_unbounded_tp_leaves_relative_take_profit_unset_on_the_wire() -> None:
+    """Live soak regression (2026-11-25): cTrader rejected the order with
+    INVALID_REQUEST "SL/TP have to be positive" because the builder assigned
+    ``relativeTakeProfit = 0``. On the proto2 optional int64 field a present
+    zero is a VALUE, not "no TP" - the field must be absent. This test uses
+    the real generated message so ``HasField`` is the wire truth, not a fake.
+    """
+    from ctrader_open_api.messages.OpenApiMessages_pb2 import ProtoOANewOrderReq
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import (
+        ProtoOAOrderType,
+        ProtoOATimeInForce,
+        ProtoOATradeSide,
+    )
+
+    _module, adapter = _make_ctrader_request_builder_adapter()
+    adapter._ProtoOANewOrderReq = ProtoOANewOrderReq
+    adapter._ProtoOAOrderType = ProtoOAOrderType
+    adapter._ProtoOATradeSide = ProtoOATradeSide
+    adapter._ProtoOATimeInForce = ProtoOATimeInForce
+
+    unbounded = LiveSignal(
+        deployment_id="dep-1",
+        symbol="EURUSD",
+        action="buy",
+        theoretical_price=1.1,
+        timestamp=datetime.now(timezone.utc),
+        metadata={
+            "qty": 1.0,
+            "stop_loss": 1.05,
+            "take_profit_policy": "unbounded_exit_on_opposite_signal",
+        },
+    )
+    request = adapter._build_new_order_request(unbounded, symbol_id=7)
+    assert request.HasField("relativeStopLoss")
+    assert request.relativeStopLoss == 5000
+    assert not request.HasField("relativeTakeProfit")
+
+    bounded = LiveSignal(
+        deployment_id="dep-1",
+        symbol="EURUSD",
+        action="buy",
+        theoretical_price=1.1,
+        timestamp=datetime.now(timezone.utc),
+        metadata={"qty": 1.0, "stop_loss": 1.05, "take_profit": 1.2},
+    )
+    bounded_request = adapter._build_new_order_request(bounded, symbol_id=7)
+    assert bounded_request.HasField("relativeTakeProfit")
+    assert bounded_request.relativeTakeProfit == 10_000
 
 
 def test_is_unbounded_tp_rejects_non_dict_metadata() -> None:
@@ -5772,6 +5849,9 @@ def _alpaca_bracket_adapter(monkeypatch):
     adapter._trading_client = SimpleNamespace(
         get_account=lambda: SimpleNamespace(cash="100000", equity="100000"),
         submit_order=_submit_order,
+        # The real client always lists orders; the exit path (#145) reads the
+        # working book to find protection that reserves the position's shares.
+        get_orders=lambda filter=None: [],  # noqa: A002 - mirrors alpaca-py
     )
 
     def _save(signal):

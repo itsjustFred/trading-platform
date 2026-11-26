@@ -1242,10 +1242,13 @@ not tracked.
 
 ### ACTIVE deployments nothing can trade (#242)
 
-The daemon's only signal path is Discord. A deployment whose `signal_source` is `internal` (the default)
-with status `ACTIVE` has no live strategy runner behind it: it still gets a broker adapter and an execution
-listener, so the dashboard and the listener log make it look live, but it will never place an order. The same
-holds for any stored `signal_source` that is neither `internal` nor `discord`.
+The daemon trades Discord deployments through the channel listeners and `internal` deployments through the
+internal strategy runner (#348) — but only when the deployment opted in
+(`settings["internal_runner_enabled"]` truthy) and its `strategy_name` resolves through
+`live_runner.promotion.strategy_target` (a bare slug naming `strategies/<name>/<name>.py`). An ACTIVE
+`internal` deployment that fails either check — and any stored `signal_source` that is neither `internal`
+nor `discord` — has no runner behind it: it still gets a broker adapter and an execution listener, so the
+dashboard and the listener log make it look live, but it will never place an order.
 
 The deployment-sync loop alerts this at ERROR, carrying `alert: "untradeable_active_deployment"` and
 `untradeable_reason` in the log `data`, with the id, account and signal source of each affected deployment.
@@ -1256,7 +1259,15 @@ event), not as a Sentry tag, so filter it on `untradeable_reason`/`alert` as eve
 It is not repeated on every tick of the (permanent) sync loop: the first tick of every daemon start reports
 each affected row, and a row is reported again only when its status or signal source changes, so restarting
 or repointing is what you see again. The daemon does not block or stop: the operator stops the row or moves
-it to a Discord signal source.
+it to a Discord signal source, or — for an `internal` row — set
+`settings["internal_runner_enabled"]` and fix its `strategy_name`.
+
+For `internal` rows the daemon's alert reason comes from the runner itself
+(`live_runner.internal_strategy_runner.internal_runner_untradeable_reason`), so it names the actual
+blocker — the missing opt-in or the unresolvable strategy — instead of claiming no runner exists. The
+preflights keep the source-level answer (`live_runner.deployment_policy.untradeable_signal_source_reason`)
+and still warn on every ACTIVE `internal` row, opted in or not: they cannot see the per-deployment opt-in,
+so read their warning as "check the opt-in and the strategy name", not proof the row is dead.
 
 Both preflights warn for these rows using the same definition
 (`live_runner.deployment_policy.untradeable_signal_source_reason`), so a clean preflight no longer hides
@@ -1274,8 +1285,9 @@ them, but they see different things:
   `internal`/`discord` and the DB read coerces anything else to `internal`, so a new source is a
   model-and-migration change (`live_runner/deployment_policy.py` says so where the set is defined).
 
-A live strategy runner is a separate decision; until one exists, every `ACTIVE` `internal` row is untradeable by
-design, not by accident.
+An ACTIVE `internal` row is untradeable only while it lacks the runner opt-in or names a strategy that does
+not resolve; once both hold, the internal strategy runner trades it (see "Internal strategy live runner"
+above).
 
 ## Kill Switch (#300)
 

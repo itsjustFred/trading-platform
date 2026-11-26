@@ -407,6 +407,10 @@ def _stream_capture(monkeypatch):
     from live_runner import alpaca_adapter as module
 
     saved: list[LiveExecution] = []
+    # These tests exercise the fill pipeline, not attribution: the UUID
+    # client order ids they use name no persisted signal, so the stream's
+    # unknown-signal guard would flag them instead of reaching the pipeline.
+    monkeypatch.setattr(module, "get_live_signal_metadata", lambda _sid: {})
     monkeypatch.setattr(
         module,
         "save_live_execution_up_to_cumulative",

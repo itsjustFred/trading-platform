@@ -245,6 +245,10 @@ def _alpaca_capture(monkeypatch):
 
     adapter = module.AlpacaLiveAdapter(api_key="k", secret_key="s", paper=True)
     saved: list[tuple[LiveExecution, float]] = []
+    # These tests exercise dedupe keys, not attribution: the UUID client
+    # order ids they use name no persisted signal, so the stream's
+    # unknown-signal guard would flag them instead of reaching the pipeline.
+    monkeypatch.setattr(module, "get_live_signal_metadata", lambda _sid: {})
 
     def _capture_cumulative(execution: LiveExecution, cumulative_qty: float) -> float:
         saved.append((execution, cumulative_qty))
