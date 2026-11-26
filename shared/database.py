@@ -7577,14 +7577,16 @@ def list_live_control_audit(
     target_id: str | None = None,
     action: str | None = None,
     created_after: datetime | None = None,
+    offset: int = 0,
 ) -> list[dict[str, Any]]:
     """Most recent first. Read-only; there is no delete path on purpose.
 
-    ``limit`` is capped at 1000 rows, so callers needing a complete window
-    must bound it with ``created_after`` - the cap silently drops the oldest
-    rows otherwise.
+    ``limit`` is capped at 1000 rows per page; callers needing a complete
+    window must bound it with ``created_after`` and page with ``offset`` -
+    the cap silently drops the oldest rows otherwise.
     """
     bounded = max(1, min(int(limit or 100), 1000))
+    bounded_offset = max(0, int(offset or 0))
     init_db()
     with get_session() as session:
         statement = select(LiveControlAuditModel)
@@ -7606,7 +7608,12 @@ def list_live_control_audit(
                 LiveControlAuditModel.created_at >= created_after
             )
         rows = session.exec(
-            statement.order_by(LiveControlAuditModel.created_at.desc()).limit(bounded)
+            statement.order_by(
+                LiveControlAuditModel.created_at.desc(),
+                LiveControlAuditModel.id.desc(),
+            )
+            .offset(bounded_offset)
+            .limit(bounded)
         ).all()
     return [
         {

@@ -601,3 +601,11 @@ def test_list_live_control_audit_created_after_bounds_window(
 
     assert len(inside) == 1 and inside[0]["target_id"] == "one"
     assert outside == []
+    assert (
+        list_live_control_audit(
+            action="t_created_after_probe",
+            created_after=datetime.now(timezone.utc) - timedelta(hours=1),
+            offset=1,
+        )
+        == []
+    )

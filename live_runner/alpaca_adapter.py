@@ -6560,23 +6560,31 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         order's ``canceled_at`` far from the expiry proof window, so it would
         read as an unproven operator cancel - alerted, never healed. The
         cancel writes a ``_EXPIRED_STOP_REPLACE_CANCEL_ACTION`` audit row
-        first, so the intent survives the restart. The read is bounded to the
-        intent TTL window: ``list_live_control_audit`` caps at 1000 rows, and
-        bounding by ``created_after`` keeps that cap from silently dropping
-        in-window intents under audit-table growth. A read failure returns an
-        empty set: unproven cancels still alert rather than heal.
+        first, so the intent survives the restart. The read pages through
+        the intent TTL window: ``list_live_control_audit`` caps each page at
+        1000 rows, and paging keeps that cap from silently dropping
+        in-window intents under audit-table growth. A read failure returns
+        an empty set: unproven cancels still alert rather than heal.
         """
         cutoff = (
             datetime.now(timezone.utc)
             - _EXPIRED_STOP_REPLACE_CANCEL_INTENT_TTL
         )
+        rows: list[dict[str, Any]] = []
         try:
-            rows = await asyncio.to_thread(
-                list_live_control_audit,
-                action=_EXPIRED_STOP_REPLACE_CANCEL_ACTION,
-                created_after=cutoff,
-                limit=1000,
-            )
+            offset = 0
+            while True:
+                page = await asyncio.to_thread(
+                    list_live_control_audit,
+                    action=_EXPIRED_STOP_REPLACE_CANCEL_ACTION,
+                    created_after=cutoff,
+                    limit=1000,
+                    offset=offset,
+                )
+                rows.extend(page)
+                if len(page) < 1000:
+                    break
+                offset += 1000
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # except-kind: money-decision
