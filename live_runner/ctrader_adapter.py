@@ -3753,9 +3753,11 @@ class CTraderLiveAdapter(BaseLiveAdapter):
 
         Invariant: EVERY presence check in this method goes through
         ``_present_proto_field_fail_closed`` and every attached-message check
-        stays an ``is not None`` identity test - protobuf messages are falsy
-        when empty, so truthiness would read an attached empty deal/position
-        as absent and could release the lease on a possible execution.
+        stays an ``is not None`` identity test - presence comes only from
+        ``HasField`` (via the fail-closed wrapper); truthiness is not a
+        presence test (a protobuf sub-message's truthiness says nothing about
+        ``HasField``, and test doubles differ), so it must never decide
+        whether a deal/position is attached.
         """
         order = _present_proto_field_fail_closed(event, "order")
         if order is _PRESENT_BUT_UNKNOWN or order is None:
@@ -3774,9 +3776,10 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 return False
         except (TypeError, ValueError):
             return False
-        # ``is not None``, never truthiness: protobuf messages are falsy when
-        # empty, and an attached-but-empty deal is still an execution record
-        # whose presence cannot be proven harmless.
+        # ``is not None``, never truthiness: presence comes from ``HasField``
+        # via the fail-closed wrapper, truthiness is not a presence test, and
+        # an attached-but-empty deal is still an execution record whose
+        # presence cannot be proven harmless.
         if _present_proto_field_fail_closed(event, "deal") is not None:
             return False
         position = _present_proto_field_fail_closed(event, "position")
@@ -3785,9 +3788,9 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         if self._is_close_position_request(request):
             return True
         # For a new order ANY attached position - even one whose positionId
-        # reads as unset, and protobuf messages are falsy when empty so this
-        # must stay an identity check - is state the rejection must not have
-        # produced.
+        # reads as unset; presence comes from ``HasField`` so this must stay
+        # an identity check, not truthiness - is state the rejection must
+        # not have produced.
         return position is None
 
     def _handle_spot_event(self, payload: Any) -> None:
