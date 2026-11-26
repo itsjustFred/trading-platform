@@ -1216,25 +1216,34 @@ def test_transient_reconnect_failure_is_retried_on_next_sync(monkeypatch) -> Non
 # ── #81: auth scheme, env expansion, env allowlist ────────────────────────────
 
 class TestIssue81AuthScheme:
-    def test_raw_scheme_sends_token_as_is(self) -> None:
-        source = _source(token="user-token-abc", auth_scheme="raw")
-        assert source._auth_header() == "user-token-abc"
+    @pytest.mark.parametrize(
+        ("auth_scheme", "token", "expected"),
+        [
+            # Account tokens ("raw" is the historical spelling, "account" the
+            # explicit one — same credential kind) are sent verbatim, even when
+            # the pasted value already carries a "Bot " prefix.
+            ("raw", "abc", "abc"),
+            ("raw", "Bot abc", "Bot abc"),
+            ("account", "abc", "abc"),
+            ("account", "Bot abc", "Bot abc"),
+            # Bot tokens get the "Bot " prefix, never doubled.
+            ("bot", "abc", "Bot abc"),
+            ("bot", "Bot abc", "Bot abc"),
+        ],
+    )
+    def test_authorization_header_matches_the_credential_kind(
+        self, auth_scheme: str, token: str, expected: str
+    ) -> None:
+        source = _source(token=token, auth_scheme=auth_scheme)
+        assert source._auth_header() == expected
 
     def test_default_scheme_is_raw(self) -> None:
         source = _source(token="user-token-abc")
         assert source.auth_scheme == "raw"
         assert source._auth_header() == "user-token-abc"
 
-    def test_bot_scheme_prefixes_bot(self) -> None:
-        source = _source(token="bot-token-abc", auth_scheme="bot")
-        assert source._auth_header() == "Bot bot-token-abc"
-
-    def test_bot_scheme_does_not_double_prefix(self) -> None:
-        source = _source(token="Bot bot-token-abc", auth_scheme="bot")
-        assert source._auth_header() == "Bot bot-token-abc"
-
     def test_unknown_scheme_raises(self) -> None:
-        with pytest.raises(ValueError, match="discord_auth_scheme"):
+        with pytest.raises(ValueError, match="Unsupported Discord auth_scheme"):
             _source(auth_scheme="bearer")
 
 
@@ -2055,68 +2064,6 @@ def test_dispatch_discards_stale_signals() -> None:
         daemon.wait_for_candle_close = original
 
     assert submitted == []
-
-
-# ─── Credential type: bot tokens and account tokens are not interchangeable ──
-
-
-def test_bot_token_is_sent_with_the_bot_prefix():
-    from live_runner.signal_sources.discord_source import DiscordSignalSource
-
-    # Merge resolution: the scheme is now configured explicitly. With no
-    # configuration the resolved default is "raw" (a user/account token, sent
-    # verbatim), so relying on the default here would no longer exercise the
-    # "Bot " prefix at all. The unconfigured default is covered by
-    # `TestIssue81AuthScheme::test_default_scheme_is_raw`.
-    source = DiscordSignalSource(
-        bot_name="NITRO",
-        token="abc123",
-        channel_id="1",
-        trusted_author_ids=["1"],
-        auth_scheme="bot",
-    )
-    assert source._authorization_header() == "Bot abc123"
-
-
-def test_account_token_is_sent_raw():
-    """An account token must NOT carry the "Bot " prefix or Discord answers 401."""
-    from live_runner.signal_sources.discord_source import DiscordSignalSource
-
-    source = DiscordSignalSource(
-        bot_name="NITRO",
-        token="abc123",
-        channel_id="1",
-        trusted_author_ids=["1"],
-        auth_scheme="account",
-    )
-    assert source._authorization_header() == "abc123"
-
-
-def test_preset_scheme_in_token_is_not_double_prefixed():
-    from live_runner.signal_sources.discord_source import DiscordSignalSource
-
-    for scheme in ("bot", "account"):
-        source = DiscordSignalSource(
-            bot_name="NITRO",
-            token="Bot preset",
-            channel_id="1",
-            trusted_author_ids=["1"],
-            auth_scheme=scheme,
-        )
-        assert source._authorization_header() == "Bot preset"
-
-
-def test_unknown_auth_scheme_is_rejected():
-    from live_runner.signal_sources.discord_source import DiscordSignalSource
-
-    with pytest.raises(ValueError, match="Unsupported Discord auth_scheme"):
-        DiscordSignalSource(
-            bot_name="NITRO",
-            token="t",
-            channel_id="1",
-            trusted_author_ids=["1"],
-            auth_scheme="bearer",
-        )
 
 
 def _no_auth_scheme_in_environment(monkeypatch) -> None:
