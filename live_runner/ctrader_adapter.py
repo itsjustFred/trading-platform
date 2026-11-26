@@ -584,11 +584,35 @@ def _present_proto_field(
         try:
             if not bool(has_field(name)):
                 return None
-        except (TypeError, ValueError):
+        except Exception:  # except-kind: money-decision
+            # Presence is unanswerable: fail_closed callers get the sentinel,
+            # everyone else reads the field as absent - never as proof. The
+            # catch is deliberately wider than (TypeError, ValueError):
+            # HasField is protobuf-version-dependent and test doubles raise
+            # arbitrary errors, and EVERY exception here means the same thing -
+            # presence could not be proven - so the fail-closed policy applies
+            # uniformly. Logged because a swallowed HasField failure is
+            # otherwise invisible.
+            logger.warning(
+                "cTrader HasField(%s) failed; treating field presence as "
+                "unanswerable",
+                name,
+                exc_info=True,
+            )
             if fail_closed:
                 return _PRESENT_BUT_UNKNOWN
             return None
     return getattr(payload, name, None)
+
+
+def _present_proto_field_fail_closed(payload: Any, name: str) -> Any | None:
+    """``_present_proto_field`` for refusal classification.
+
+    Every field check on the order-refusal path MUST go through this wrapper:
+    an unanswerable ``HasField`` reads as present-but-unknown, never absent,
+    because "absent" is the direction that would release the submission lease.
+    """
+    return _present_proto_field(payload, name, fail_closed=True)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -3596,35 +3620,178 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         except CTraderApiError as exc:
             self._raise_terminal_auth_from_api_error(exc)
             raise
-        if isinstance(response, self._ProtoOAOrderErrorEvent):
-            # The response is correlated to THIS request by clientMsgId, but
-            # only an error event with no broker order id is a clean refusal:
+        self._raise_for_refused_submit_response(response, request)
+        return response
+
+    @staticmethod
+    def _classify_and_raise_refusal(
+        message: str, *, error_code: str, definitive: bool
+    ) -> None:
+        """A refusal is ``BrokerOrderRejectedError`` only when definitive."""
+        if not definitive:
+            raise RuntimeError(message)
+        raise BrokerOrderRejectedError(message, error_code=error_code)
+
+    def _raise_for_refused_submit_response(self, response: Any, request: Any) -> None:
+        """Raise for a correlated refusal payload; return for anything else.
+
+        cTrader answers a refused NewOrderReq/ClosePositionReq either with a
+        ProtoOAOrderErrorEvent or with a ProtoOAExecutionEvent whose
+        executionType is ORDER_REJECTED; both are matched to THIS request by
+        clientMsgId. Timeouts and transport failures never reach here: the
+        request may have landed, so they stay ordinary exceptions (unknown
+        outcome).
+        """
+        if self._ProtoOAOrderErrorEvent is not None and isinstance(
+            response, self._ProtoOAOrderErrorEvent
+        ):
+            # Only an error event with no broker order id is a clean refusal:
             # a non-zero orderId means the broker created an order record, and
             # for a new-order request a non-zero positionId is not provably
             # pre-position either. A close request echoes positionId, so only
-            # its orderId decides. Timeouts and transport failures still
-            # propagate as ordinary exceptions (unknown outcome): the request
-            # may have landed.
-            order_id = _present_proto_field(response, "orderId", fail_closed=True)
-            position_id = _present_proto_field(response, "positionId", fail_closed=True)
-            is_close_position = (
-                self._ProtoOAClosePositionReq is not None
-                and isinstance(request, self._ProtoOAClosePositionReq)
-            )
+            # its orderId decides.
+            order_id = _present_proto_field_fail_closed(response, "orderId")
+            position_id = _present_proto_field_fail_closed(response, "positionId")
             definitive_refusal = order_id in (None, 0) and (
-                is_close_position or position_id in (None, 0)
+                self._is_close_position_request(request)
+                or position_id in (None, 0)
             )
             message = (
                 f"Order rejected ({getattr(response, 'errorCode', '') or ''}): "
                 f"{getattr(response, 'description', '') or 'no description'}"
             )
-            if not definitive_refusal:
-                raise RuntimeError(message)
-            raise BrokerOrderRejectedError(
+            self._classify_and_raise_refusal(
                 message,
                 error_code=str(getattr(response, "errorCode", "") or ""),
+                definitive=definitive_refusal,
             )
-        return response
+        # Only ProtoOAExecutionEvent carries ``executionType`` in the proto
+        # schema, so this attribute sniff is a fallback for an unloaded class,
+        # not a general detector: an unclassifiable event must fail closed
+        # below, never pass as submitted.
+        is_execution_event = (
+            isinstance(response, self._ProtoOAExecutionEvent)
+            if self._ProtoOAExecutionEvent is not None
+            else getattr(response, "executionType", None) is not None
+            and getattr(response, "ctidTraderAccountId", None) is not None
+        )
+        if is_execution_event:
+            rejected = self._is_order_rejected_execution(response)
+            if rejected is None:
+                # The event's type cannot be classified (proto types not fully
+                # loaded, or an unreadable executionType): it may be the
+                # ORDER_REJECTED refusal this path exists to catch, so it must
+                # not fall through and be reported as a submitted order.
+                # Removing this raise reopens #428.
+                raise RuntimeError(
+                    "cTrader order response was an execution event whose "
+                    "executionType could not be classified; the outcome is "
+                    "unknown and must be reconciled."
+                )
+            if rejected:
+                # Unlike the OrderErrorEvent above, the event typically still
+                # carries an `order` object with a broker-assigned orderId, so
+                # the orderId cannot decide: definiteness comes from the
+                # order's terminal status and the absence of any created
+                # state instead.
+                error_code = str(getattr(response, "errorCode", "") or "")
+                message = (
+                    f"Order rejected ({error_code or 'ORDER_REJECTED'}): "
+                    f"{getattr(response, 'description', '') or 'no description'}"
+                )
+                self._classify_and_raise_refusal(
+                    message,
+                    error_code=error_code,
+                    definitive=self._execution_rejection_is_definitive(
+                        response, request
+                    ),
+                )
+
+    def _is_close_position_request(self, request: Any) -> bool:
+        """Whether the request is a ClosePositionReq.
+
+        ``_ProtoOAClosePositionReq`` is loaded with the other proto types
+        before any submit; if it were missing this returns False and a close
+        rejection is evaluated as a new-order one - with the position echo
+        that stays unknown, i.e. fail-closed.
+        """
+        return (
+            self._ProtoOAClosePositionReq is not None
+            and isinstance(request, self._ProtoOAClosePositionReq)
+        )
+
+    def _is_order_rejected_execution(self, event: Any) -> bool | None:
+        """Whether the event is an ORDER_REJECTED; ``None`` when unclassifiable.
+
+        ``None`` means the proto type was not fully loaded or the event's
+        ``executionType`` cannot be read - the caller must treat the response
+        as an unknown outcome rather than letting it pass as submitted.
+        """
+        execution_type = getattr(self._ProtoOAExecutionType, "ORDER_REJECTED", None)
+        if execution_type is None:
+            return None
+        try:
+            return int(getattr(event, "executionType", -1)) == int(execution_type)
+        except Exception:  # except-kind: money-decision
+            # Any unreadable type is "unclassifiable" (None), never False:
+            # False would let the event pass through as a submitted order.
+            return None
+
+    def _execution_rejection_is_definitive(self, event: Any, request: Any) -> bool:
+        """Whether an ORDER_REJECTED execution event proves nothing was opened.
+
+        Safe means two things: the order can never execute, and no state was
+        created. The event's ``order`` must report ``ORDER_STATUS_REJECTED``
+        (terminal - a rejected order does not fill later), no ``deal`` may be
+        attached (a deal is an execution record, so its presence means an
+        execution may exist), and a new-order request must not carry a
+        ``position`` (a created position is exactly the state a rejection
+        must not have produced). A close request echoes the still-open
+        position it failed to close, so position does not decide there -
+        the same rule the OrderErrorEvent path applies to ``positionId``.
+        Unanswerable field presence fails closed to "unknown".
+
+        Invariant: EVERY presence check in this method goes through
+        ``_present_proto_field_fail_closed`` and every attached-message check
+        stays an ``is not None`` identity test - presence comes only from
+        ``HasField`` (via the fail-closed wrapper); truthiness is not a
+        presence test (a protobuf sub-message's truthiness says nothing about
+        ``HasField``, and test doubles differ), so it must never decide
+        whether a deal/position is attached.
+        """
+        order = _present_proto_field_fail_closed(event, "order")
+        if order is _PRESENT_BUT_UNKNOWN or order is None:
+            return False
+        status_enum = getattr(self, "_ProtoOAOrderStatus", None)
+        rejected_status = (
+            getattr(status_enum, "ORDER_STATUS_REJECTED", None)
+            if status_enum is not None
+            else None
+        )
+        order_status = getattr(order, "orderStatus", None)
+        if order_status is None or rejected_status is None:
+            return False
+        try:
+            if int(order_status) != int(rejected_status):
+                return False
+        except (TypeError, ValueError):
+            return False
+        # ``is not None``, never truthiness: presence comes from ``HasField``
+        # via the fail-closed wrapper, truthiness is not a presence test, and
+        # an attached-but-empty deal is still an execution record whose
+        # presence cannot be proven harmless.
+        if _present_proto_field_fail_closed(event, "deal") is not None:
+            return False
+        position = _present_proto_field_fail_closed(event, "position")
+        if position is _PRESENT_BUT_UNKNOWN:
+            return False
+        if self._is_close_position_request(request):
+            return True
+        # For a new order ANY attached position - even one whose positionId
+        # reads as unset; presence comes from ``HasField`` so this must stay
+        # an identity check, not truthiness - is state the rejection must
+        # not have produced.
+        return position is None
 
     def _handle_spot_event(self, payload: Any) -> None:
         """Feed a spot event to the pending :meth:`get_quote` for its symbol."""
