@@ -5677,6 +5677,26 @@ def test_ctrader_submit_refuses_when_qty_normalization_is_not_idempotent(
     assert volumes == []
 
 
+def test_ctrader_volume_resolution_is_idempotent_at_the_int32_bound(
+    monkeypatch,
+) -> None:
+    """The submit path's exact-int idempotency compare must hold for every
+    volume the cTrader protocol can express (int32): the volume -> qty ->
+    volume float round-trip error stays near 1e-7 units at INT32_MAX, far
+    inside the lot-grid floor's 1e-6-unit noise band, so re-resolving from
+    the normalized qty cannot land one unit off and false-positive the
+    guard."""
+    _module, adapter, _saved, _volumes = _ctrader_submit_harness(monkeypatch)
+    # EURUSD fallback scale: volume_per_qty 1000, step_volume 1. The largest
+    # whole-qty volume below INT32_MAX (2147483647) is 2_147_483_000 units.
+    volume = 2_147_483_000
+    signal = _ctrader_entry_signal().model_copy(
+        update={"metadata": {"qty": volume / 1000.0}}
+    )
+
+    assert adapter._resolve_order_volume(signal) == volume
+
+
 def _ctrader_entry_signal() -> LiveSignal:
     return LiveSignal(
         deployment_id="dep-1",

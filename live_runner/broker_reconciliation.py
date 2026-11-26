@@ -428,11 +428,7 @@ def _requested_qty(metadata: Mapping[str, Any]) -> float | None:
     """
     explicit = _positive_qty_metadata_value(metadata.get("explicit_qty"))
     qty = _positive_qty_metadata_value(metadata.get("qty"))
-    if (
-        explicit is not None
-        and qty is not None
-        and not math.isclose(explicit, qty, rel_tol=1e-9, abs_tol=0.0)
-    ):
+    if explicit is not None and qty is not None and explicit != qty:
         logger.warning(
             "broker reconciliation: signal metadata qty keys disagree "
             "(explicit_qty=%r, qty=%r); keeping the working-order expectation",

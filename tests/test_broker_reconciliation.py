@@ -986,12 +986,17 @@ def test_nonpositive_or_nonfinite_step_keeps_the_expectation(
     assert "missing_working_order" in kinds
 
 
-def test_disagreeing_qty_keys_keep_the_expectation(isolated_db, tmp_path, caplog) -> None:
+@pytest.mark.parametrize("explicit_qty", [5.5, 5.0 + 1e-12])
+def test_disagreeing_qty_keys_keep_the_expectation(
+    isolated_db, tmp_path, caplog, explicit_qty
+) -> None:
     """``qty`` and ``explicit_qty`` disagreeing is adapter corruption: the
     reconciler must not silently pick one - it logs and keeps the
-    working-order expectation (fail closed). Here either key alone would
-    have produced no expectation (5.0 is fully filled; 5.5 - 5.0 = 0.5 is
-    sub-step), so only the fail-closed path yields the finding."""
+    working-order expectation (fail closed), even when the two values differ
+    by less than any plausible tolerance (they are written as the same
+    float). Here either key alone would have produced no expectation (5.0 is
+    fully filled; the explicit remainder is sub-step or inside tolerance),
+    so only the fail-closed path yields the finding."""
     database, _engine, _data_dir = isolated_db
     _seed_db(database)
     signal_id, _ = save_live_signal(
@@ -1005,7 +1010,7 @@ def test_disagreeing_qty_keys_keep_the_expectation(isolated_db, tmp_path, caplog
             metadata={
                 "broker_order_id": "ord-split",
                 "qty": 5.0,
-                "explicit_qty": 5.5,
+                "explicit_qty": explicit_qty,
             },
         )
     )
