@@ -149,3 +149,52 @@ def test_agent_workflows_skip_drafts_and_keep_free_model_defaults() -> None:
             f"{label} default {default!r} is not a free-tier model; the "
             "workflows hold no API key"
         )
+
+
+def test_secret_scan_covers_only_the_change_range() -> None:
+    workflow = _workflow("secret-scan.yml")
+    on = _on_block(workflow)
+    assert "pull_request" in on, "the scan must gate every PR"
+    assert on["push"]["branches"] == ["main"], "pushes are gated on main only"
+
+    commands = _run_commands(workflow)
+    scans = [c for c in commands if "gitleaks git" in c]
+    assert len(scans) == 2, "one scan step for pull_request, one for push"
+    for scan in scans:
+        # --redact keeps a finding's secret out of the public log, and an
+        # explicit --log-opts range keeps the scan off the whole history.
+        assert "--redact" in scan, scan
+        assert "--log-opts" in scan, scan
+    assert not any("gitleaks dir" in c for c in commands)
+
+    # The range commits must exist locally: a shallow checkout would make
+    # base..head unresolvable.
+    checkouts = [
+        step
+        for job in workflow["jobs"].values()
+        for step in job.get("steps") or []
+        if str(step.get("uses", "")).startswith("actions/checkout")
+    ]
+    assert checkouts and checkouts[0]["with"]["fetch-depth"] == 0
+
+    # The binary is pinned by version AND checksum, like the other pinned
+    # tooling in this repo.
+    install = [c for c in commands if "gitleaks" in c and "curl" in c]
+    assert install and "sha256sum -c" in install[0]
+
+
+def test_gitleaks_allowlist_stays_path_and_value_scoped() -> None:
+    config = tomllib.loads(
+        (ROOT / ".gitleaks.toml").read_text(encoding="utf-8")
+    )
+    allowlist = config["allowlist"]
+    # AND is load-bearing: with the default OR, a matching path or a matching
+    # dummy regex alone would suppress real findings. regexTarget="match" is
+    # required because generic-api-key captures a substring secret that loses
+    # the fixture's distinguishing prefix.
+    assert str(allowlist["condition"]).upper() == "AND"
+    assert allowlist["regexTarget"] == "match"
+    assert allowlist["paths"] and allowlist["regexes"]
+    assert all("tests/" in p for p in allowlist["paths"]), (
+        "the allowlist may only name test fixtures"
+    )
