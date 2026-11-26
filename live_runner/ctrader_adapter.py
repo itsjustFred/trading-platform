@@ -3074,10 +3074,17 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         (the request may already have been written) - never as
         not-submitted and never as a broker refusal.
         """
-        deferreds = getattr(client, "_responseDeferreds", None)
-        if not deferreds:
+        try:
+            deferreds = getattr(client, "_responseDeferreds", None)
+            if not deferreds:
+                return
+            pending = list(deferreds.values())
+        except Exception:  # except-kind: loop-survival
+            # A ctrader-open-api bump that renames or reshapes
+            # ``_responseDeferreds`` must not abort the rest of teardown
+            # (``stopService``, the event clear and the listener wake).
             return
-        for deferred in list(deferreds.values()):
+        for deferred in pending:
             try:
                 deferred.errback(
                     CTraderConnectionLostError(
