@@ -51,6 +51,8 @@ def _load_validation_reference(
     path: Path,
     importer_name: str,
     timeframe: str | None = None,
+    source_timezone: str | None = None,
+    broker_clock: str | None = None,
 ) -> ValidationReference:
     """Load a ValidationReference from a file path.
 
@@ -97,7 +99,11 @@ def _load_validation_reference(
 
     if importer_name == "mt5_xlsx":
         importer = MT5XLSXImporter()
-        return importer.load(path)
+        return importer.load(
+            path,
+            source_timezone=source_timezone,
+            broker_clock=broker_clock,
+        )
 
     raise ValueError(f"Unknown importer: {importer_name}")
 
@@ -138,6 +144,16 @@ def _build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--timeframe",
         help="Explicit source timeframe for importers that cannot infer it safely.",
+    )
+    timezone_group = parser.add_mutually_exclusive_group()
+    timezone_group.add_argument(
+        "--source-timezone",
+        help="IANA timezone for naive MT5 XLSX report timestamps (e.g. Europe/Athens).",
+    )
+    timezone_group.add_argument(
+        "--broker-clock",
+        help="Named broker server clock for MT5 XLSX report timestamps "
+             "(e.g. dukascopy_mt5_index).",
     )
     parser.add_argument(
         "--time-tolerance", "-t",
@@ -307,6 +323,8 @@ def main(argv: list[str] | None = None) -> int:
             ref_path,
             args.importer,
             timeframe=args.timeframe,
+            source_timezone=args.source_timezone,
+            broker_clock=args.broker_clock,
         )
     except FileNotFoundError as exc:
         logger.error(str(exc))
@@ -321,6 +339,8 @@ def main(argv: list[str] | None = None) -> int:
             platform_path,
             args.importer,
             timeframe=args.timeframe,
+            source_timezone=args.source_timezone,
+            broker_clock=args.broker_clock,
         )
     except FileNotFoundError as exc:
         logger.error(str(exc))

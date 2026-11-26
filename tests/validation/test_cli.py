@@ -288,6 +288,81 @@ class TestCliAutoImporterXLSX:
         assert data["readiness"] is not None
 
 
+class TestCliMt5TimezoneOptions:
+    def test_load_forwards_source_timezone_to_xlsx_importer(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        source = tmp_path / "report.xlsx"
+        calls: list[dict[str, Any]] = []
+
+        class _Importer:
+            def load(self, path: Path, **kwargs: Any) -> ValidationReference:
+                calls.append({"path": path, **kwargs})
+                return _make_reference()
+
+        monkeypatch.setattr(validation_cli, "MT5XLSXImporter", _Importer)
+
+        validation_cli._load_validation_reference(
+            source,
+            "mt5_xlsx",
+            source_timezone="Europe/Athens",
+        )
+
+        assert calls == [
+            {
+                "path": source,
+                "source_timezone": "Europe/Athens",
+                "broker_clock": None,
+            }
+        ]
+
+    def test_cli_forwards_broker_clock_to_xlsx_importer(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        reference_path = tmp_path / "reference.xlsx"
+        platform_path = tmp_path / "platform.xlsx"
+        calls: list[dict[str, Any]] = []
+
+        class _Importer:
+            def load(self, path: Path, **kwargs: Any) -> ValidationReference:
+                calls.append({"path": path, **kwargs})
+                return _make_reference()
+
+        monkeypatch.setattr(validation_cli, "MT5XLSXImporter", _Importer)
+
+        rc, _ = _invoke_cli([
+            "--reference", str(reference_path),
+            "--platform", str(platform_path),
+            "--importer", "mt5_xlsx",
+            "--broker-clock", "dukascopy_mt5_index",
+            "--format", "json",
+        ], capsys)
+
+        assert rc == 1  # no readiness golden: fail-closed readiness check
+        assert calls == [
+            {
+                "path": reference_path,
+                "source_timezone": None,
+                "broker_clock": "dukascopy_mt5_index",
+            },
+            {
+                "path": platform_path,
+                "source_timezone": None,
+                "broker_clock": "dukascopy_mt5_index",
+            },
+        ]
+
+    def test_source_timezone_and_broker_clock_are_mutually_exclusive(self) -> None:
+        parser = validation_cli._build_argument_parser()
+        with pytest.raises(SystemExit):
+            parser.parse_args([
+                "--reference", "reference.json",
+                "--platform", "platform.json",
+                "--source-timezone", "Europe/Athens",
+                "--broker-clock", "dukascopy_mt5_index",
+            ])
+
+
 class TestCliExitCode0OnPerfectMatch:
     def test_cli_exit_code_0_on_perfect_match(
         self,
