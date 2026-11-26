@@ -4290,6 +4290,26 @@ def test_ctrader_build_new_order_request_rejects_unknown_signal_action():
         )
 
 
+@pytest.mark.parametrize("volume", [0, -1, False, float("nan")])
+def test_ctrader_new_order_request_fails_closed_on_an_unusable_volume(volume) -> None:
+    """The volume reaches this seam from the submit path, so it must be
+    validated here like the close request validates its own: a non-positive or
+    non-finite volume is a broker rejection at best and a wrong-size order at
+    worst, never something to put on the wire."""
+    _module, adapter = _make_ctrader_request_builder_adapter()
+    signal = LiveSignal(
+        deployment_id="dep-1",
+        symbol="EURUSD",
+        action="buy",
+        theoretical_price=1.1,
+        timestamp=datetime.now(timezone.utc),
+        metadata={"qty": 1.0, "stop_loss": 1.05, "take_profit": 1.2},
+    )
+
+    with pytest.raises(ValueError, match="volume"):
+        adapter._build_new_order_request(signal, symbol_id=7, volume=volume)
+
+
 def test_alpaca_rejects_non_finite_sl_tp_prices():
     """NaN/inf prices must fail closed like missing ones — a NaN stop_price
     reaches the broker as an unvalidatable order and blocks the position."""
