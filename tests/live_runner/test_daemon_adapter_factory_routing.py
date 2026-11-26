@@ -89,7 +89,7 @@ def test_alpaca_paper_mode_comes_from_the_credential_mapping(
     assert adapter.account_id == ACCOUNT_ID
 
 
-def test_alpaca_credential_blocks_route_by_the_account_that_configured_them() -> None:
+def testalpaca_credential_blocks_route_by_the_account_that_configured_them() -> None:
     """Two accounts, two key pairs: each must get its own keys and paper flag."""
     other = dict(_ALPACA_KEYS)
     other.update(
@@ -114,7 +114,7 @@ def test_alpaca_credential_blocks_route_by_the_account_that_configured_them() ->
     assert adapter.account_id == ACCOUNT_ID
 
 
-def test_alpaca_credential_blocks_route_by_the_broker_login() -> None:
+def testalpaca_credential_blocks_route_by_the_broker_login() -> None:
     env = dict(_ALPACA_KEYS)
     env.update(
         {

@@ -24,7 +24,7 @@ import pytest
 from pydantic import ValidationError
 
 from runner.engines.base import BacktestConfig
-from runner.engines.vectorbt_adapter import _resolve_max_position_exposure_pct
+from runner.engines.vectorbt_adapter import resolve_max_position_exposure_pct
 from tests.helpers import with_zero_fees
 
 # ─── BacktestConfig field semantics ─────────────────────────────────────────
@@ -92,9 +92,9 @@ class TestBacktestConfigField:
 
 class TestResolveHelperRename:
     def test_new_helper_name_is_canonical(self):
-        assert _resolve_max_position_exposure_pct(None, "unknown") == 0.20
-        assert _resolve_max_position_exposure_pct(None, "equities") == 1.0
-        assert _resolve_max_position_exposure_pct(0.3, "equities") == 0.3
+        assert resolve_max_position_exposure_pct(None, "unknown") == 0.20
+        assert resolve_max_position_exposure_pct(None, "equities") == 1.0
+        assert resolve_max_position_exposure_pct(0.3, "equities") == 0.3
 
     def test_deprecated_helper_alias_keeps_working_and_warns(self):
         from runner.engines import vectorbt_adapter

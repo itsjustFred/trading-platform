@@ -5723,6 +5723,26 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             return ORDER_STATE_TERMINAL
         return None
 
+    async def get_order_details(self, order_id: int, *, timeout_seconds: int = 20) -> Any:
+        """Raw ``ProtoOAOrderDetailsRes`` for one order on this account.
+
+        Public read seam for operator tooling (``scripts/verify_ctrader_order.py``);
+        the caller must already be connected and authenticated. Unlike
+        :meth:`get_order_state` this does not fail closed - transport and auth
+        errors propagate so the verifier can report them.
+        """
+        if self._ProtoOAOrderDetailsReq is None:
+            raise RuntimeError(
+                "cTrader order-details protobuf is unavailable; "
+                "the ctrader-open-api package failed to load."
+            )
+        details_req = self._ProtoOAOrderDetailsReq()
+        details_req.ctidTraderAccountId = self.ctid_trader_account_id
+        details_req.orderId = int(order_id)
+        return await self._send_request_with_refresh_retry(
+            details_req, timeout_seconds=timeout_seconds
+        )
+
     def position_qty_tolerance(self, symbol: str) -> float:
         """Half of one broker volume unit, in qty units, for ``symbol``.
 
