@@ -7,7 +7,8 @@ useDefault = true
 # Known dummy credentials in tests. Each entry suppresses a finding only when
 # BOTH the file path and the secret pattern match (condition = "AND"), so a real
 # secret in the same file - or the same dummy string elsewhere - is still
-# reported.
+# reported. tests/test_ci_workflow_contract.py enforces this AND scoping; do
+# not relax it to the OR default.
 [allowlist]
 description = "Dummy credentials used by tests"
 condition = "AND"
@@ -22,12 +23,13 @@ paths = [
   '''^tests/test_preflight_db\.py$''',
 ]
 regexes = [
-  # Fake NVIDIA API keys seeded for workflow-file scans.
-  '''nvapi-test-[0-9]+''',
-  # Synthetic claim tokens for the live-deployment lease tests.
-  '''token-(first|second|expired)''',
-  # Deliberately malformed secret used to test redaction of boolean errors.
-  '''sk-live-[0-9a-f]+''',
+  # Exact dummy literals the fixtures use - no open-ended patterns, so a real
+  # key with the same prefix is still reported.
+  '''nvapi-test-0123456789''',
+  '''token-first''',
+  '''token-second''',
+  '''token-expired''',
+  '''sk-live-9f8e7d6c''',
   # Numeric Discord snowflake-shaped channel id, not a credential.
   '''123456789012345678''',
 ]

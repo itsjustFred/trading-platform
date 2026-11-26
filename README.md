@@ -60,7 +60,7 @@ and the accepted-risk pins.
 Pull requests and pushes to `main` are also scanned for committed secrets
 with gitleaks (`.github/workflows/secret-scan.yml`, config `.gitleaks.toml`);
 run the same check locally with
-`gitleaks git --log-opts="origin/main..HEAD" --redact .`
+`gitleaks git --log-opts="origin/main..HEAD" --redact .` (adjust base)
 
 ## Data Directory
 

@@ -168,6 +168,8 @@ def test_secret_scan_covers_only_the_change_range() -> None:
     # explicit --log-opts range keeps the scan off the whole history.
     assert "--redact" in scan, scan
     assert "--log-opts" in scan, scan
+    # The allowlist must be passed explicitly, not left to auto-discovery.
+    assert "--config .gitleaks.toml" in scan, scan
     assert "pull_request" in scan and "push" in scan, scan
     # Fail closed where the range cannot be determined: a push with no
     # 'before' SHA and any event the case does not name.
@@ -212,7 +214,10 @@ def test_gitleaks_allowlist_stays_path_and_value_scoped() -> None:
     assert all("tests/" in p for p in allowlist["paths"]), (
         "the allowlist may only name test fixtures"
     )
+    # Value entries are the exact dummy literals the fixtures use: an open
+    # character class or quantifier (e.g. `sk-live-[0-9a-f]+`) would also
+    # suppress a real key sharing the prefix.
     assert all(
-        r.strip() not in {".*", "^.*$"} and ".*" not in r
+        re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._~/-]*", r)
         for r in allowlist["regexes"]
-    ), "value patterns must stay specific, not wildcard matches"
+    ), "value patterns must be exact literals, not regexes"
