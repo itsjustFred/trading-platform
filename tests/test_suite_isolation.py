@@ -974,6 +974,130 @@ def test_a_deselected_integration_test_makes_no_http_call() -> None:
     assert "deselected" in combined, combined
 
 
+# --- the inherited environment and the children a test spawns ---------------------------------- #
+
+
+def test_a_parent_env_var_outside_the_allowlist_never_reaches_a_test(tmp_path: Path) -> None:
+    """S16: the sandbox clears to an allowlist, so an inherited variable is gone.
+
+    The sandbox used to clear only credential-shaped names. Everything else a
+    developer exported (or a CI runner set) reached every test and every child a
+    test spawned, and a name the allowlist does not carry has no meaning inside
+    the suite: either a test sets it itself, or nothing may observe it. The child
+    is a real pytest process, so this pin covers the sweep itself and not only
+    the helper a test would use.
+    """
+    result = _run_throwaway_suite(
+        tmp_path,
+        "import os\n"
+        "from pathlib import Path\n"
+        "def test_sees_no_inherited_variable():\n"
+        "    assert 'TP_SANDBOX_PROBE' not in os.environ\n"
+        "def test_home_is_the_session_sandbox():\n"
+        "    session_root = Path(os.environ['DATA_DIR']).parent\n"
+        "    assert Path(os.environ['HOME']) == session_root / 'home'\n",
+        env_extra={"TP_SANDBOX_PROBE": "leaked"},
+    )
+
+    assert result.returncode == pytest.ExitCode.OK, result.stdout + result.stderr
+
+
+def test_a_subprocess_resolves_the_accounts_env_into_the_session_sandbox() -> None:
+    """S16: a child resolves the accounts env to the session sandbox, not the checkout.
+
+    The sandbox patches the module constant in this process only, so a child
+    imported the real value and would read the checkout's real credential file.
+    The path is printed, never read, so the pin holds in a checkout with or
+    without that file.
+    """
+    from tests.conftest import sandboxed_env
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import live_runner.credential_env as credential_env\n"
+            "print(credential_env.DEFAULT_ACCOUNTS_ENV)\n",
+        ],
+        cwd=str(_PROJECT_ROOT),
+        env=sandboxed_env(),
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    resolved = Path(result.stdout.strip())
+    assert resolved == ISOLATED_ACCOUNTS_ENV, (
+        f"a child resolved the accounts env to {resolved}, not the session sandbox"
+        f" {ISOLATED_ACCOUNTS_ENV}"
+    )
+    assert not resolved.exists(), "the session sandbox file must not exist"
+
+
+def test_a_subprocess_does_not_load_the_repo_dotenv() -> None:
+    """S16: a child importing ``shared.constants`` loads the session substitute.
+
+    ``shared.constants`` loads ``<repo>/.env`` at import time. This process
+    redirects that load; a child had no redirect and filled its environment from
+    the checkout's real file - broker credentials included. The redirect is what
+    the child reports, so the pin names the loader a sandboxed child gets rather
+    than the raw library call.
+    """
+    from tests.conftest import sandboxed_env
+
+    body = (
+        "import dotenv\n"
+        "print('LOADER', dotenv.load_dotenv.__name__)\n"
+        "import shared.constants\n"
+        "print('IMPORTED', bool(shared.constants.DATA_DIR))\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", body],
+        cwd=str(_PROJECT_ROOT),
+        env=sandboxed_env(),
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "IMPORTED True" in result.stdout, result.stdout + result.stderr
+    assert "LOADER _redirected_load_dotenv" in result.stdout, (
+        "a child loads .env through the raw loader: " + result.stdout + result.stderr
+    )
+
+
+def test_a_subprocess_refuses_the_network() -> None:
+    """S16: the network guard covers a child too, or a call escapes the audit hook.
+
+    The hook is installed in the pytest process only; a child that resolved a
+    remote host did so unguarded. The child reports what its lookup raised, so
+    the pin holds without this machine (or CI) having network access.
+    """
+    from tests.conftest import sandboxed_env
+
+    body = (
+        "import socket\n"
+        "try:\n"
+        "    socket.getaddrinfo('api.alpaca.markets', 443)\n"
+        "    print('REACHED')\n"
+        "except Exception as exc:\n"
+        "    print('BLOCKED', type(exc).__name__)\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", body],
+        cwd=str(_PROJECT_ROOT),
+        env=sandboxed_env(),
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "BLOCKED SuiteHermeticityViolation" in result.stdout, result.stdout + result.stderr
+
+
 # --- end-to-end: the real pytest process must exit non-zero ----------------------------------- #
 #
 # The tests above assert that ``pytest_sessionfinish`` mutates a fake session's exit status. That
@@ -989,6 +1113,7 @@ def _run_throwaway_suite(
     test_source: str,
     extra_args: tuple[str, ...] = (),
     seed_files: dict[str, str] | None = None,
+    env_extra: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     project = tmp_path / "project"
     (project / "tests").mkdir(parents=True)
@@ -1000,7 +1125,7 @@ def _run_throwaway_suite(
         Path(suite_conftest.__file__).read_text(encoding="utf-8"), encoding="utf-8"
     )
     (project / "tests" / "test_throwaway.py").write_text(test_source, encoding="utf-8")
-    env = {**os.environ, "PYTHONPATH": str(_PROJECT_ROOT)}
+    env = {**os.environ, "PYTHONPATH": str(_PROJECT_ROOT), **(env_extra or {})}
     return subprocess.run(
         [
             sys.executable,
