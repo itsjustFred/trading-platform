@@ -665,8 +665,9 @@ def test_submit_order_after_token_invalidation_fails_closed_before_sending(
         metadata={"qty": 1.0},
     )
 
+    submit = adapter.submit_order(signal, qty=1.0)
     with pytest.raises(CTraderAuthTerminalError) as excinfo:
-        asyncio.run(adapter.submit_order(signal, qty=1.0))
+        asyncio.run(submit)
 
     assert is_order_not_submitted(excinfo.value)
 
@@ -846,6 +847,140 @@ def test_token_invalidation_after_refresh_reauth_and_resend_keeps_session(
     asyncio.run(_run())
 
 
+def test_token_invalidation_between_refresh_and_reauth_keeps_session(
+    tmp_path,
+) -> None:
+    """Ordering: order fails auth -> refresh completes -> the invalidation
+    event for the OLD token arrives while the re-auth ``AccountAuthReq`` is
+    still awaiting its response. The rotation+re-auth is still in flight, so
+    the session must survive; tearing down here would orphan the pending
+    re-auth and turn a recoverable submit into an unknown outcome."""
+    from ctrader_open_api.messages.OpenApiMessages_pb2 import (
+        ProtoOAAccountsTokenInvalidatedEvent,
+    )
+
+    adapter, client, ProtoMessage = _lifecycle_event_adapter()
+    adapter.accounts_env_path = tmp_path / ".accounts.env"
+    adapter.access_token = "old_access"
+    adapter.refresh_token = "old_refresh"
+    adapter._session_access_token = "old_access"
+
+    class _RefreshReq:
+        def __init__(self) -> None:
+            self.refreshToken = ""
+
+    class _RefreshRes:
+        accessToken = "new_access"
+        refreshToken = "new_refresh"
+        expiresIn = 2628000
+
+    class _AccountAuthReq:
+        def __init__(self) -> None:
+            self.ctidTraderAccountId = 0
+            self.accessToken = ""
+
+    class _AccountAuthRes:
+        pass
+
+    order_request = object()
+    sent: list[object] = []
+    auth_gate = asyncio.Event()
+
+    async def _fake_send(request, **_kwargs):
+        sent.append(request)
+        if request is order_request:
+            if sent.count(order_request) == 1:
+                raise CTraderApiError("CH_ACCESS_TOKEN_INVALID", "expired")
+            return "order_response"
+        if isinstance(request, _RefreshReq):
+            return _RefreshRes()
+        if isinstance(request, _AccountAuthReq):
+            await auth_gate.wait()
+            return _AccountAuthRes()
+        raise AssertionError(f"unexpected request: {type(request).__name__}")
+
+    adapter._ProtoOARefreshTokenReq = _RefreshReq
+    adapter._ProtoOARefreshTokenRes = _RefreshRes
+    adapter._ProtoOAAccountAuthReq = _AccountAuthReq
+    adapter._ProtoOAAccountAuthRes = _AccountAuthRes
+    adapter._send_request = _fake_send
+
+    async def _run() -> object:
+        task = asyncio.create_task(
+            adapter._send_request_with_refresh_retry(order_request)
+        )
+        for _ in range(1000):
+            if any(isinstance(r, _AccountAuthReq) for r in sent):
+                break
+            await asyncio.sleep(0)
+        assert any(isinstance(r, _AccountAuthReq) for r in sent), (
+            "re-auth request was never sent"
+        )
+        adapter._on_message(
+            client,
+            _wire_payload(
+                ProtoMessage,
+                ProtoOAAccountsTokenInvalidatedEvent(
+                    ctidTraderAccountIds=[46736452], reason="token refreshed"
+                ),
+            ),
+        )
+        assert adapter._client is client
+        assert adapter._connected is True
+        assert adapter._authenticated is True
+        auth_gate.set()
+        return await task
+
+    assert asyncio.run(_run()) == "order_response"
+    assert adapter._session_access_token == "new_access"
+
+
+def test_refresh_returns_true_for_stale_session_pair_without_spending_refresh(
+    tmp_path,
+) -> None:
+    """Defensive: when the adapter holds a persisted pair the session never
+    authenticated with (``access_token != _session_access_token``) and no own
+    rotation is in flight, ``_refresh_access_token`` must NOT spend the
+    shared single-use refresh token - the caller re-authenticates with the
+    adopted access token instead."""
+    env_path = tmp_path / ".accounts.env"
+    env_path.write_text(
+        "CTRADER_ACCESS_TOKEN=adopted_access\nCTRADER_REFRESH_TOKEN=adopted_refresh\n",
+        encoding="utf-8",
+    )
+    adapter = CTraderLiveAdapter(
+        app_id="app",
+        app_secret="secret",
+        access_token="adopted_access",
+        refresh_token="adopted_refresh",
+        account_id="46736452",
+        accounts_env_path=env_path,
+    )
+    adapter._session_access_token = "old_session_token"
+
+    class _RefreshReq:
+        def __init__(self) -> None:
+            self.refreshToken = ""
+
+    class _RefreshRes:
+        accessToken = "unused"
+        refreshToken = "unused"
+        expiresIn = 1
+
+    async def _unexpected_send(*_args, **_kwargs):
+        raise AssertionError(
+            "refresh request sent although the session only needs re-auth"
+        )
+
+    adapter._ProtoOARefreshTokenReq = _RefreshReq
+    adapter._ProtoOARefreshTokenRes = _RefreshRes
+    adapter._send_request = _unexpected_send
+
+    assert asyncio.run(adapter._refresh_access_token()) is True
+    assert adapter.access_token == "adopted_access"
+    assert adapter.refresh_token == "adopted_refresh"
+
+
 def test_token_invalidation_for_current_token_without_recent_rotation_drops_session(
     tmp_path,
 ) -> None:
@@ -874,10 +1009,14 @@ def test_token_invalidation_for_current_token_without_recent_rotation_drops_sess
     _assert_session_dropped_for_reconnect(adapter)
 
 
-def test_token_invalidation_adopts_newer_persisted_pair(tmp_path, caplog) -> None:
+def test_token_invalidation_adopts_newer_persisted_pair_and_drops_session(
+    tmp_path, caplog
+) -> None:
     """A sibling adapter rotated the shared token pair; this adapter's
-    invalidation event must make it adopt the persisted pair and keep the
-    session decision to the token comparison, not tear down blindly."""
+    invalidation event means cTrader terminated THIS account's session, so
+    the dead session must be dropped even though the persisted pair was
+    adopted. Keeping it would let the next request spend the shared
+    single-use refresh token and rotate the pair again for every sibling."""
     import logging
 
     from ctrader_open_api.messages.OpenApiMessages_pb2 import (
@@ -906,14 +1045,123 @@ def test_token_invalidation_adopts_newer_persisted_pair(tmp_path, caplog) -> Non
             ),
         )
 
+    # The persisted pair is adopted so the reconnect re-authenticates with
+    # the fresh credentials, but the session itself is dead and dropped.
     assert adapter.access_token == "file_access"
     assert adapter.refresh_token == "file_refresh"
-    # The session token (old_access) differs from the adopted current token,
-    # so the teardown is skipped: the next request's auth failure drives the
-    # refresh/re-auth path with the adopted pair.
-    assert adapter._client is client
-    assert adapter._connected is True
-    assert adapter._authenticated is True
+    _assert_session_dropped_for_reconnect(adapter)
+
+
+def test_token_invalidation_adopted_pair_reauths_without_refresh(
+    tmp_path, monkeypatch
+) -> None:
+    """Sibling rotation end-to-end: invalidation event -> adopt persisted
+    pair + teardown -> next connect re-authenticates with the ADOPTED access
+    token and never sends a ``RefreshTokenReq`` (the shared refresh token
+    may already be consumed; spending it would rotate the pair again and
+    invalidate every sibling)."""
+    from ctrader_open_api.messages.OpenApiMessages_pb2 import (
+        ProtoOAAccountsTokenInvalidatedEvent,
+    )
+
+    env_path = tmp_path / ".accounts.env"
+    env_path.write_text(
+        "CTRADER_ACCESS_TOKEN=file_access\nCTRADER_REFRESH_TOKEN=file_refresh\n",
+        encoding="utf-8",
+    )
+    adapter, client, ProtoMessage = _lifecycle_event_adapter()
+    adapter.accounts_env_path = env_path
+    adapter.access_token = "old_access"
+    adapter.refresh_token = "old_refresh"
+    adapter._session_access_token = "old_access"
+
+    adapter._on_message(
+        client,
+        _wire_payload(
+            ProtoMessage,
+            ProtoOAAccountsTokenInvalidatedEvent(
+                ctidTraderAccountIds=[46736452], reason="token refreshed"
+            ),
+        ),
+    )
+    _assert_session_dropped_for_reconnect(adapter)
+    assert adapter.access_token == "file_access"
+
+    sent: list[object] = []
+
+    class _AppAuthReq:
+        pass
+
+    class _AppAuthRes:
+        pass
+
+    class _AccountAuthReq:
+        def __init__(self) -> None:
+            self.ctidTraderAccountId = 0
+            self.accessToken = ""
+
+    class _AccountAuthRes:
+        pass
+
+    class _RefreshReq:
+        def __init__(self) -> None:
+            self.refreshToken = ""
+
+    class _RefreshRes:
+        accessToken = "unused"
+        refreshToken = "unused"
+        expiresIn = 1
+
+    class _SymbolsReq:
+        pass
+
+    class _SymbolsRes:
+        symbol: list[object] = []
+
+    async def _fake_send(request, **_kwargs):
+        sent.append(request)
+        if isinstance(request, _AppAuthReq):
+            return _AppAuthRes()
+        if isinstance(request, _AccountAuthReq):
+            return _AccountAuthRes()
+        if isinstance(request, _SymbolsReq):
+            return _SymbolsRes()
+        raise AssertionError(
+            f"unexpected request reached the broker: {type(request).__name__}"
+        )
+
+    adapter._ProtoOAApplicationAuthReq = _AppAuthReq
+    adapter._ProtoOAApplicationAuthRes = _AppAuthRes
+    adapter._ProtoOAAccountAuthReq = _AccountAuthReq
+    adapter._ProtoOAAccountAuthRes = _AccountAuthRes
+    adapter._ProtoOARefreshTokenReq = _RefreshReq
+    adapter._ProtoOARefreshTokenRes = _RefreshRes
+    adapter._ProtoOASymbolsListReq = _SymbolsReq
+    adapter._ProtoOASymbolsListRes = _SymbolsRes
+    adapter._send_request = _fake_send
+
+    new_client = SimpleNamespace(running=False)
+
+    def _start_service() -> None:
+        new_client.running = True
+        adapter._on_connected(new_client)
+
+    new_client.startService = _start_service
+
+    async def _reconcile(*, max_signals: int = 200) -> int:
+        return 0
+
+    monkeypatch.setattr(adapter, "_load_openapi_types", lambda: None)
+    monkeypatch.setattr(adapter, "_create_client", lambda: new_client)
+    monkeypatch.setattr(adapter, "reconcile_executions", _reconcile)
+
+    asyncio.run(adapter.connect())
+
+    account_auth_reqs = [r for r in sent if isinstance(r, _AccountAuthReq)]
+    assert len(account_auth_reqs) == 1
+    assert account_auth_reqs[0].accessToken == "file_access"
+    assert not any(isinstance(r, _RefreshReq) for r in sent)
+    assert adapter._session_access_token == "file_access"
 
 
 def test_refresh_adopts_persisted_pair_without_spending_refresh_token(tmp_path) -> None:
@@ -995,11 +1243,26 @@ def test_concurrent_adapter_refreshes_share_one_refresh_request(tmp_path) -> Non
     adapter_a = _make_adapter(11111111)
     adapter_b = _make_adapter(22222222)
 
+    a_refresh_started = asyncio.Event()
+    b_refresh_started = asyncio.Event()
+
+    original_b_refresh = adapter_b._refresh_access_token
+
+    async def _b_refresh_started_wrapper(*args, **kwargs):
+        b_refresh_started.set()
+        return await original_b_refresh(*args, **kwargs)
+
+    adapter_b._refresh_access_token = _b_refresh_started_wrapper
+
     async def _send_a(request, **_kwargs):
         assert isinstance(request, _RefreshReq)
         refresh_sends.append(request.refreshToken)
-        # Give adapter B time to reach the shared refresh lock.
-        await asyncio.sleep(0.1)
+        a_refresh_started.set()
+        # Hold the shared refresh lock until adapter B has entered its own
+        # ``_refresh_access_token`` and is contending for it - otherwise B
+        # could finish after A and merely adopt the persisted pair without
+        # ever exercising the lock.
+        await b_refresh_started.wait()
         return _RefreshRes()
 
     async def _send_b(*_args, **_kwargs):
@@ -1009,12 +1272,10 @@ def test_concurrent_adapter_refreshes_share_one_refresh_request(tmp_path) -> Non
     adapter_b._send_request = _send_b
 
     async def _run() -> list[bool]:
-        return list(
-            await asyncio.gather(
-                adapter_a._refresh_access_token(),
-                adapter_b._refresh_access_token(),
-            )
-        )
+        task_a = asyncio.create_task(adapter_a._refresh_access_token())
+        await a_refresh_started.wait()
+        task_b = asyncio.create_task(adapter_b._refresh_access_token())
+        return list(await asyncio.gather(task_a, task_b))
 
     assert asyncio.run(_run()) == [True, True]
     assert refresh_sends == ["old_refresh"]
@@ -1071,6 +1332,88 @@ def test_teardown_errbacks_in_flight_request_deferreds() -> None:
 
     assert len(deferred.errbacks) == 1
     assert isinstance(deferred.errbacks[0], CTraderConnectionLostError)
+
+
+def test_listener_reconnect_delay_after_teardown_is_bounded() -> None:
+    """``listen_executions`` reconnects immediately after a teardown-wake;
+    without a minimum interval a broker that keeps dropping the session
+    right after auth would produce an unbounded reconnect loop. The delay
+    helper caps it and expires once the interval has passed."""
+    from live_runner import ctrader_adapter as module
+
+    adapter = CTraderLiveAdapter(
+        app_id="app", app_secret="secret", access_token="token", account_id="1"
+    )
+
+    assert adapter._listener_reconnect_delay_seconds() == 0.0
+
+    adapter._teardown_client()
+    delay = adapter._listener_reconnect_delay_seconds()
+    assert 0.0 < delay <= module._LISTENER_RECONNECT_MIN_INTERVAL_SECONDS
+
+    adapter._last_session_teardown_at = (
+        time.monotonic() - module._LISTENER_RECONNECT_MIN_INTERVAL_SECONDS - 1.0
+    )
+    assert adapter._listener_reconnect_delay_seconds() == 0.0
+
+
+def test_on_disconnected_errbacks_in_flight_request_deferreds() -> None:
+    """A plain transport loss (``_on_disconnected``, not a session teardown)
+    must fail in-flight requests promptly with a connection-lost error.
+    Upstream ``Client._disconnected`` clears ``_responseDeferreds`` BEFORE
+    invoking our callback, so the adapter tracks pending deferreds itself -
+    otherwise each caller would wait out its own response timeout."""
+    from live_runner.ctrader_adapter import CTraderConnectionLostError
+
+    async def _run() -> BaseException:
+        adapter = CTraderLiveAdapter(
+            app_id="app", app_secret="secret", access_token="token", account_id="1"
+        )
+        adapter._loop = asyncio.get_running_loop()
+
+        class _Deferred:
+            def __init__(self, loop) -> None:
+                self._future = loop.create_future()
+                self.errbacks: list[BaseException] = []
+
+            def asFuture(self, _loop):
+                return self._future
+
+            def errback(self, exc: BaseException) -> None:
+                self.errbacks.append(exc)
+                if not self._future.done():
+                    self._future.set_exception(exc)
+
+        deferred = _Deferred(adapter._loop)
+
+        class _Client:
+            _responseDeferreds: dict = {}
+
+            def send(self, _request, **_kwargs):
+                return deferred
+
+        client = _Client()
+        adapter._client = client
+        adapter._connected = True
+
+        send_task = asyncio.create_task(
+            adapter._send_request(object(), timeout_seconds=15)
+        )
+        for _ in range(1000):
+            if adapter._in_flight_request_deferreds:
+                break
+            await asyncio.sleep(0)
+        assert deferred in adapter._in_flight_request_deferreds
+
+        adapter._on_disconnected(client, "connection lost")
+
+        assert len(deferred.errbacks) == 1
+        assert isinstance(deferred.errbacks[0], CTraderConnectionLostError)
+        with pytest.raises(CTraderConnectionLostError):
+            await send_task
+        return deferred.errbacks[0]
+
+    asyncio.run(_run())
 
 
 def test_submit_awaiting_when_disconnect_event_arrives_ends_unknown(
