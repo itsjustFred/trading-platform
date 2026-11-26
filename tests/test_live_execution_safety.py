@@ -3789,7 +3789,8 @@ def test_ctrader_request_build_refusal_persists_no_signal_row(monkeypatch):
         "save_live_signal",
         lambda saved_signal: saved.append(saved_signal) or (str(signal.id), True),
     )
-    monkeypatch.setattr(adapter, "_resolve_order_volume", lambda _signal: 1.0)
+    # Whole broker volume units, as the resolver always returns.
+    monkeypatch.setattr(adapter, "_resolve_order_volume", lambda _signal: 1)
 
     class _NewOrderReq:
         def __init__(self) -> None:
@@ -4290,15 +4291,47 @@ def test_ctrader_build_new_order_request_rejects_unknown_signal_action():
 
 
 @pytest.mark.parametrize(
-    "volume", [0, -1, False, float("nan"), 1.5, 1000.5, 0.5]
+    "key",
+    [
+        "position_id",
+        "requested_position_id",
+        "exit_target_signal_id",
+        "exit_only",
+        "broker_position_id",
+    ],
+)
+def test_ctrader_resolved_volume_ignores_exit_position_metadata(key: str) -> None:
+    """The exit path no longer re-resolves its volume after ``position_id`` is
+    written into the signal, and that is only safe because the resolver reads
+    no position metadata: adding the keys a close carries cannot change the
+    volume it resolves. A resolver that started reading them would size the
+    close from something other than the normalized qty - silently, because the
+    submit-level idempotency guard compares against this same resolver. This
+    test is what makes that a visible change instead.
+    """
+    from live_runner.base_adapter import EXIT_ONLY_RISK_SIZING_MODE
+
+    _module, adapter = _make_ctrader_adapter()
+    base = _ctrader_signal(
+        "EURUSD", {"qty": 1.3336, "risk_sizing_mode": EXIT_ONLY_RISK_SIZING_MODE}
+    )
+    addressed = base.model_copy(
+        update={"metadata": {**base.metadata, key: "position-7"}}
+    )
+
+    assert adapter._resolve_order_volume(addressed) == adapter._resolve_order_volume(base)
+
+
+@pytest.mark.parametrize(
+    "volume", [0, -1, False, float("nan"), 1.5, 1000.5, 0.5, "1000"]
 )
 def test_ctrader_new_order_request_fails_closed_on_an_unusable_volume(volume) -> None:
     """The volume reaches this seam from the submit path, so it must be
-    validated here: a non-positive or non-finite volume is a broker rejection
-    at best and a wrong-size order at worst, and a fractional one is a unit
-    confusion (qty or a scaled value handed over as broker units) whose rounding
-    would put a size on the wire that nobody decided on. None of them may be
-    silently rounded into an order."""
+    validated here: a non-positive volume is a broker rejection at best and a
+    wrong-size order at worst, and a fractional or non-int one is a unit
+    confusion (qty, or a scaled value handed over as broker units) whose
+    rounding or coercion would put a size on the wire that nobody decided on.
+    None of them may be silently turned into an order."""
     _module, adapter = _make_ctrader_request_builder_adapter()
     signal = LiveSignal(
         deployment_id="dep-1",
@@ -4311,6 +4344,28 @@ def test_ctrader_new_order_request_fails_closed_on_an_unusable_volume(volume) ->
 
     with pytest.raises(ValueError, match="volume"):
         adapter._build_new_order_request(signal, symbol_id=7, volume=volume)
+
+
+@pytest.mark.parametrize(
+    "volume", [0, -1, False, float("nan"), 1.5, 1000.5, 0.5, "3000"]
+)
+def test_ctrader_close_position_request_fails_closed_on_an_unusable_volume(
+    volume,
+) -> None:
+    """The same contract on the close seam, because the two builders must not
+    disagree: the close builder used to round a fractional volume, which a
+    future edit "aligning" the two would reintroduce into the entry path.
+    """
+    _module, adapter = _make_ctrader_request_builder_adapter()
+
+    class _CloseReq:
+        def __init__(self) -> None:
+            self.volume = 0
+
+    adapter._ProtoOAClosePositionReq = _CloseReq
+
+    with pytest.raises(ValueError, match="close volume"):
+        adapter._build_close_position_request(position_id=77, volume=volume)
 
 
 def test_alpaca_rejects_non_finite_sl_tp_prices():

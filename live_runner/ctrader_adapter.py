@@ -855,6 +855,27 @@ def _qty_to_broker_volume(qty: float, volume_per_qty: float = QTY_VOLUME_SCALE) 
     return int(volume)
 
 
+def _coerce_broker_volume(volume: Any, *, field_name: str) -> int:
+    """Coerce the broker volume a request builder was handed, failing closed.
+
+    Both builders receive the volume ``submit_order`` resolved once, in whole
+    broker volume units (the protocol fields are int32). A fractional, boolean
+    or textual value means the caller handed this seam something else - qty, or
+    a scaled quantity - and rounding it would put a size on the wire that
+    nobody decided on. The two builders must agree on this contract, so the
+    check lives here rather than in each of them.
+    """
+    if isinstance(volume, bool) or not isinstance(volume, int):
+        raise ValueError(
+            f"{field_name} must be an int count of broker volume units, got "
+            f"{volume!r}; refusing to round or coerce a size."
+        )
+    broker_volume = int(volume)
+    if broker_volume <= 0:
+        raise ValueError(f"{field_name} must be a positive integer.")
+    return broker_volume
+
+
 def _floor_to_volume_step(volume: int, step_volume: int) -> int:
     """Floor *volume* onto the broker's volume grid.
 
@@ -3660,10 +3681,9 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             isinstance(position_id, float) and position_id != position_id_value
         ):
             raise ValueError("cTrader close position id must be positive integer.")
-        volume_value = coerce_positive_live_qty(volume, field_name="cTrader close volume")
-        broker_volume = round(volume_value)
-        if broker_volume <= 0:
-            raise ValueError("cTrader close volume must be a positive integer.")
+        broker_volume = _coerce_broker_volume(
+            volume, field_name="cTrader close volume"
+        )
         request = self._ProtoOAClosePositionReq()
         request.ctidTraderAccountId = self.ctid_trader_account_id
         request.positionId = position_id_value
@@ -3695,22 +3715,11 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             self._ProtoOATradeSide.BUY if signal.action == "buy" else self._ProtoOATradeSide.SELL
         )
         # The volume no longer arrives validated from the resolver, so validate
-        # it here. A fractional value means the caller handed this seam qty or a
-        # scaled quantity instead of broker units: rounding it would put a size
-        # on the wire that nobody decided on, so refuse it. The protocol field
-        # is an int32 - a whole number of broker units is the only usable input.
-        volume_value = coerce_positive_live_qty(
+        # it here, on the same contract the close request uses: whole broker
+        # volume units or nothing.
+        request.volume = _coerce_broker_volume(
             volume, field_name="cTrader new-order volume"
         )
-        if not volume_value.is_integer():
-            raise ValueError(
-                "cTrader new-order volume must be a whole number of broker "
-                f"volume units, got {volume!r}; refusing to round a size."
-            )
-        broker_volume = int(volume_value)
-        if broker_volume <= 0:
-            raise ValueError("cTrader new-order volume must be a positive integer.")
-        request.volume = broker_volume
         request.timeInForce = self._ProtoOATimeInForce.IMMEDIATE_OR_CANCEL
         request.clientOrderId = str(signal.id)
         stop_loss = _first_metadata_float(
