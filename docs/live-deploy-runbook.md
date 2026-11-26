@@ -1573,6 +1573,62 @@ so a trimming that hides an older conflict cannot happen there.
 
 `live_executions.commission` is a positive cost for every broker; a broker rebate cannot be stored as a negative cost, so the cTrader adapter stores it as `NULL` (fee unknown) and logs an ERROR — the fill is kept and net PnL stays flagged incomplete (#285). The first `init_db` of a build with this change converts existing cTrader rows once (`abs` of the stored value, recorded in `schema_data_migrations`). Stop the daemon (and any process on the same SQLite file) before starting the new build: an old build that still writes cTrader fills after the marker is recorded stores a raw negative charge that violates the positive-cost convention and is never converted (the marker is already recorded, and new-convention rebates are stored as NULL, so the stray negative is at least distinguishable). Roll out as stop, deploy, start; do not run old and new builds side by side.
 
+## cTrader close fills attributed by broker order id
+
+An internal strategy's exit on cTrader is sent as `ProtoOAClosePositionReq`,
+which carries **no `clientOrderId` field** (payload type, account id,
+position id, volume only). The fill's execution event therefore arrives with
+an SDK-assigned client order id that parses as no signal of ours. Before the
+fix such a fill was booked through `record_live_broker_side_close_fill` as a
+synthetic `broker_close` signal — while the exit signal that actually owns
+the broker order id looked unfilled, and every restart's
+`reconcile_executions` re-fetched the deal, hit the dedupe key already owned
+by the synthetic signal, and logged `ERROR` "Dedupe key collision across
+signals ... the fill is NOT stored".
+
+The adapter now attributes a fill whose `clientOrderId` names no signal by
+its **broker order id** instead: the in-memory order→signal map first, then
+the `broker_order_id` persisted on the signal row — and only when that
+signal's metadata marks it as an exit (`signal_intent=exit`, `exit_only`,
+or `risk_sizing_mode=exit_only`). A fill arriving while its close submit is
+still in flight (order id not yet persisted) is retained for reconciliation
+rather than booked as a broker-side close; the pending mark expires after
+`_PENDING_CLOSE_POSITION_TTL_SECONDS` (1 h) so a stuck submit cannot hold a
+genuine broker close forever. An order id no exit signal owns still takes
+the ordinary broker-side close path.
+
+**Repairing rows written before the fix.** Fills already booked as synthetic
+`broker_close` signals whose executions carry a `broker_order_id` owned by
+exactly one exit signal on the same deployment are moved onto that signal by
+`scripts/repair_ctrader_close_attribution.py`. The ledger stays identical —
+the moved fill keeps quantity, price, timestamp and broker order id, and a
+`parent_signal_id` stamp is written on the owner only when it is needed to
+keep crediting the same entry; anything ambiguous (no unique owner, a
+non-exit owner, an action/symbol/attribution conflict, an owner that already
+carries fills the stamp would re-attribute) is refused and reported, never
+guessed. A `broker_close` signal emptied by the repair is deleted — its id
+is deterministic, so a genuine broker-side close recreates it on demand.
+Every applied repair writes a `live_control_audit` row
+(`action=broker_close_attribution_repair`).
+
+```bash
+# Report only - writes nothing:
+uv run python -m scripts.repair_ctrader_close_attribution
+
+# Apply the moves, stamps, deletions and audit rows in one transaction:
+uv run python -m scripts.repair_ctrader_close_attribution --apply
+```
+
+Review the dry-run report first: `moves` lists each fill that would change
+owner, `metadata_updates` each `parent_signal_id` stamp, `deleted_signals`
+each emptied synthetic signal, and `refusals`/`unmatched` the rows left
+untouched with their reasons (`ambiguous_owner`, `owner_not_exit_signal`,
+`action_mismatch`, `symbol_mismatch`, `attribution_conflict`,
+`conflicting_parents`, `owner_has_other_fills`,
+`would_be_attributed_by_repair`, `no_same_deployment_owner`,
+`empty_broker_order_id`). Refused and unmatched rows need a human decision;
+the script is safe to re-run — an applied repair is a no-op the second time.
+
 ## Release / rollback
 
 The live state that must survive a deploy is the SQLite database (`live_executions`, the

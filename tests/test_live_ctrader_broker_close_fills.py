@@ -20,6 +20,7 @@ maintainer decision on #277.
 from __future__ import annotations
 
 import asyncio
+import time
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any
@@ -212,6 +213,7 @@ def _adapter(
     deal_list_has_more: Any = False,
     deal_list_fail_predicate: Any = None,
     order_details: dict[int, Any] | None = None,
+    order_details_deals: dict[int, list[Any]] | None = None,
 ) -> CTraderLiveAdapter:
     """A cTrader adapter whose broker reads are faked, on the isolated DB."""
     adapter = CTraderLiveAdapter(
@@ -285,7 +287,8 @@ def _adapter(
             return response
         if isinstance(request, _OrderDetailsReq):
             order = details_by_order.get(int(request.orderId))
-            return _OrderDetailsRes(order=order, deals=[])
+            deals = list((order_details_deals or {}).get(int(request.orderId), []))
+            return _OrderDetailsRes(order=order, deals=deals)
         raise AssertionError(f"unexpected broker request {type(request).__name__}")
 
     adapter._send_request_with_refresh_retry = fake_send  # type: ignore[assignment]
@@ -506,6 +509,235 @@ def test_an_own_exit_fill_is_never_taken_for_a_broker_close(database) -> None:
     assert exit_rows[0].dedupe_key == "ctrader:deal:9001"
     assert close_rows == []
     assert _reconciliation_flags(database) == []
+
+
+# ─── own close fills whose clientOrderId is not ours (#144 follow-up) ──────────────────────────
+#
+# ``ProtoOAClosePositionReq`` has no ``clientOrderId`` field (payloadType,
+# ctidTraderAccountId, positionId, volume), so the execution event for one of
+# our exits carries an SDK/broker-assigned id - never the signal UUID. The
+# attribution is the broker order id the submit persisted instead; without it
+# the fill was booked as a synthetic broker-side close and every later
+# reconcile of the exit signal hit the dedupe-key collision.
+
+SDK_CLOSE_CLIENT_ORDER_ID = "12345-0f1e2d3c-ProtoOAClosePositionReq-3"
+
+
+def _persist_exit_signal(
+    database,
+    *,
+    deployment_id: str = DEP_ENTRY,
+    order_id: int | None = CLOSE_ORDER_ID,
+    action: str = "sell",
+    metadata_extra: dict[str, Any] | None = None,
+) -> str:
+    """An exit-only signal as the internal runner persists it.
+
+    ``order_id=None`` leaves ``broker_order_id`` unset, the state between
+    ``save_live_signal`` and ``set_live_signal_broker_order_id``.
+    """
+    import shared.database as db
+
+    metadata: dict[str, Any] = {
+        "signal_intent": "exit",
+        "exit_only": True,
+        "risk_sizing_mode": "exit_only",
+        **(metadata_extra or {}),
+    }
+    if order_id is not None:
+        metadata["broker_order_id"] = str(order_id)
+    signal = LiveSignal(
+        deployment_id=deployment_id,
+        symbol="AAPL",
+        action=action,
+        theoretical_price=95.0,
+        timestamp=T1,
+        metadata=metadata,
+    )
+    signal_id, created = db.save_live_signal(signal)
+    assert created
+    return signal_id
+
+
+def _sdk_closing_order(*, order_id: int = CLOSE_ORDER_ID, volume: float = 10.0) -> Any:
+    """The closing order as the broker reports it for a ClosePositionReq:
+    an SDK-assigned ``clientOrderId`` that is not our signal UUID."""
+    order = _closing_order(order_id=order_id, volume=volume)
+    order.clientOrderId = SDK_CLOSE_CLIENT_ORDER_ID
+    return order
+
+
+def _signal_execution_rows(database, signal_id: str) -> list[Any]:
+    import shared.database as db
+
+    with db.get_session() as session:
+        return session.exec(
+            db.select(db.LiveExecutionModel).where(
+                db.LiveExecutionModel.signal_id == signal_id
+            )
+        ).all()
+
+
+def test_own_close_fill_with_sdk_client_order_id_attributes_by_broker_order_id(
+    database,
+) -> None:
+    """The soak bug: the fill's clientOrderId parses as no signal, but its
+    order id is persisted on the exit signal - attribute there, book no
+    synthetic broker-side close."""
+    import shared.database as db
+
+    entry_id = _persist_entry(database, qty=10.0)
+    exit_id = _persist_exit_signal(database)
+    adapter = _adapter(database, position_orders={POSITION_ID: [_entry_order(entry_id)]})
+
+    asyncio.run(adapter._persist_execution_event(_event(_sdk_closing_order(), _close_deal())))
+
+    exit_rows = _signal_execution_rows(database, exit_id)
+    assert len(exit_rows) == 1
+    assert exit_rows[0].dedupe_key == "ctrader:deal:9001"
+    assert exit_rows[0].broker_order_id == str(CLOSE_ORDER_ID)
+    assert _signal_execution_rows(database, db.broker_close_signal_id(entry_id)) == []
+    with db.get_session() as session:
+        assert (
+            session.get(db.LiveSignalModel, db.broker_close_signal_id(entry_id)) is None
+        )
+    assert _ledger(database) == pytest.approx(0.0)
+    assert _reconciliation_flags(database) == []
+
+
+def test_own_close_fill_attributes_via_the_in_memory_order_map(database) -> None:
+    """Same attribution while the process lives: ``_order_id_to_signal_id``
+    resolves the order id even before ``broker_order_id`` is persisted."""
+    import shared.database as db
+
+    entry_id = _persist_entry(database, qty=10.0)
+    exit_id = _persist_exit_signal(database, order_id=None)
+    adapter = _adapter(database, position_orders={POSITION_ID: [_entry_order(entry_id)]})
+    adapter._order_id_to_signal_id[CLOSE_ORDER_ID] = exit_id
+
+    asyncio.run(adapter._persist_execution_event(_event(_sdk_closing_order(), _close_deal())))
+
+    assert len(_signal_execution_rows(database, exit_id)) == 1
+    assert _signal_execution_rows(database, db.broker_close_signal_id(entry_id)) == []
+    assert _ledger(database) == pytest.approx(0.0)
+
+
+def test_a_broker_side_close_with_an_sdk_style_client_order_id_still_books(
+    database,
+) -> None:
+    """An order id no signal owns is still a genuine broker-side close: the
+    non-UUID clientOrderId changes nothing for it."""
+    import shared.database as db
+
+    entry_id = _persist_entry(database, qty=10.0)
+    unknown_order_id = 999
+    adapter = _adapter(database, position_orders={POSITION_ID: [_entry_order(entry_id)]})
+
+    asyncio.run(
+        adapter._persist_execution_event(
+            _event(
+                _sdk_closing_order(order_id=unknown_order_id),
+                _close_deal(order_id=unknown_order_id),
+            )
+        )
+    )
+
+    close_rows = _signal_execution_rows(database, db.broker_close_signal_id(entry_id))
+    assert len(close_rows) == 1
+    assert _ledger(database) == pytest.approx(0.0)
+
+
+def test_a_close_fill_during_an_in_flight_submit_is_retained_not_booked(
+    database,
+) -> None:
+    """The fill can reach the listener before ``submit_order`` has the broker
+    order id: while the close submit for the position is in flight the event
+    is retained for reconciliation, never booked as a broker-side close."""
+    import shared.database as db
+
+    entry_id = _persist_entry(database, qty=10.0)
+    exit_id = _persist_exit_signal(database, order_id=None)
+    adapter = _adapter(database, position_orders={POSITION_ID: [_entry_order(entry_id)]})
+    adapter._pending_close_positions[POSITION_ID] = (exit_id, time.monotonic())
+
+    with pytest.raises(ValueError, match="in flight"):
+        asyncio.run(adapter._persist_execution_event(_event(_sdk_closing_order(), _close_deal())))
+
+    # Nothing was booked while the submit was in flight.
+    assert _ledger(database) == pytest.approx(10.0)
+    assert _signal_execution_rows(database, db.broker_close_signal_id(entry_id)) == []
+
+    # The submit completes: broker order id persisted, pending mark cleared.
+    database.set_live_signal_broker_order_id(exit_id, str(CLOSE_ORDER_ID))
+    adapter._pending_close_positions.clear()
+    asyncio.run(adapter._persist_execution_event(_event(_sdk_closing_order(), _close_deal())))
+
+    assert len(_signal_execution_rows(database, exit_id)) == 1
+    assert _signal_execution_rows(database, db.broker_close_signal_id(entry_id)) == []
+    assert _ledger(database) == pytest.approx(0.0)
+
+
+def test_an_expired_pending_mark_does_not_hold_a_broker_close(database) -> None:
+    """A pending mark only covers the submit window: once it expires a close
+    on the position takes the ordinary broker-close path again."""
+    import shared.database as db
+
+    entry_id = _persist_entry(database, qty=10.0)
+    adapter = _adapter(database, position_orders={POSITION_ID: [_entry_order(entry_id)]})
+    adapter._pending_close_positions[POSITION_ID] = (
+        "00000000-0000-4000-8000-000000000000",
+        time.monotonic() - 7200.0,
+    )
+
+    asyncio.run(adapter._persist_execution_event(_event(_sdk_closing_order(), _close_deal())))
+
+    assert len(_signal_execution_rows(database, db.broker_close_signal_id(entry_id))) == 1
+    assert _ledger(database) == pytest.approx(0.0)
+
+
+def test_restart_reconcile_of_an_attributed_close_fill_has_no_dedupe_collision(
+    database, caplog
+) -> None:
+    """Regression for the 2026-11-26 ERROR: with the fill owned by the exit
+    signal, the per-signal reconcile finds the dedupe key already stored
+    under the SAME signal and skips it - no cross-signal collision."""
+    import logging
+
+    import shared.database as db
+
+    entry_id = _persist_entry(database, qty=10.0)
+    exit_id = _persist_exit_signal(database)
+    live_adapter = _adapter(
+        database, position_orders={POSITION_ID: [_entry_order(entry_id)]}
+    )
+    asyncio.run(
+        live_adapter._persist_execution_event(_event(_sdk_closing_order(), _close_deal()))
+    )
+
+    adapter = _reconcilable_adapter(
+        database,
+        position_orders={POSITION_ID: [_entry_order(entry_id)]},
+        deal_list=[_close_deal()],
+        order_details={CLOSE_ORDER_ID: _closing_order()},
+        order_details_deals={CLOSE_ORDER_ID: [_close_deal()]},
+    )
+    with caplog.at_level(logging.ERROR):
+        asyncio.run(adapter.reconcile_executions())
+
+    assert not [
+        record
+        for record in caplog.records
+        if "Dedupe key collision" in record.getMessage()
+    ]
+    with db.get_session() as session:
+        deal_rows = session.exec(
+            db.select(db.LiveExecutionModel).where(
+                db.LiveExecutionModel.dedupe_key == "ctrader:deal:9001"
+            )
+        ).all()
+    assert len(deal_rows) == 1
+    assert deal_rows[0].signal_id == exit_id
+    assert _ledger(database) == pytest.approx(0.0)
 
 
 # ─── the reconciliation backfill ──────────────────────────────────────────────────────────────

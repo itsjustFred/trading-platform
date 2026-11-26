@@ -3214,7 +3214,11 @@ def test_ctrader_fill_fallback_lookup_uses_canonical_account_scope(monkeypatch):
     with pytest.raises(ValueError, match="could not be mapped"):
         asyncio.run(adapter._persist_execution_event(event))
 
-    assert queried == [("local-account-123", "45678")]
+    # The order-id fallback runs once to backfill an empty clientOrderId and
+    # again for exit-signal attribution; every call must use the canonical
+    # account scope, never a deployment-local id.
+    assert queried
+    assert set(queried) == {("local-account-123", "45678")}
 
 
 def test_ctrader_reconcile_backfills_missing_fill(monkeypatch):
