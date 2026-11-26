@@ -5677,6 +5677,43 @@ def test_ctrader_submit_refuses_when_qty_normalization_is_not_idempotent(
     assert volumes == []
 
 
+def test_ctrader_exit_submit_refuses_when_qty_normalization_is_not_idempotent(
+    monkeypatch,
+) -> None:
+    """Same fail-closed invariant on the exit path: the close request's
+    volume is re-resolved from the normalized signal, so a non-idempotent
+    resolution must refuse before the send, marked as not submitted."""
+    _module, adapter, saved, _volumes = _ctrader_submit_harness(monkeypatch)
+    adapter._position_ids_by_symbol = {"EURUSD": (7,)}
+    resolutions = {"n": 0}
+
+    def _resolve(_signal):
+        resolutions["n"] += 1
+        return 1_333 if resolutions["n"] == 1 else 1_334
+
+    monkeypatch.setattr(adapter, "_resolve_order_volume", _resolve)
+    monkeypatch.setattr(
+        adapter,
+        "_build_close_position_request",
+        lambda *, position_id, volume: SimpleNamespace(volume=volume),
+    )
+    signal = LiveSignal(
+        deployment_id="dep-1",
+        symbol="EURUSD",
+        action="sell",
+        theoretical_price=1.1,
+        timestamp=datetime.now(timezone.utc),
+        metadata={"exit_only": True, "risk_sizing_mode": "exit_only"},
+    )
+    submit = adapter.submit_order(signal, qty=1.3336)
+
+    with pytest.raises(RuntimeError, match="not idempotent") as excinfo:
+        asyncio.run(submit)
+
+    assert is_order_not_submitted(excinfo.value)
+    assert saved == []
+
+
 def test_ctrader_volume_resolution_is_idempotent_at_the_int32_bound(
     monkeypatch,
 ) -> None:
