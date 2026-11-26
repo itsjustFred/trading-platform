@@ -78,14 +78,18 @@ class RiskEngine:
     ) -> float:
         """The protective stop used when a signal carries none.
 
-        The one fallback-stop computation (improvement-run G03): the sizing
-        engine, the native backtest's creation-time and fill-time entries, its
-        pending-order exposure estimate and the live internal-strategy entry all
-        call this. The stop sits ``fallback_stop_pct`` of the price below the
-        entry for a long and above it for a short; a positive ``stop_distance``
-        (the strategy's own distance) or an ``atr`` value replaces the percent
-        distance. This helper does not validate the resulting price — the
-        sizing path validates the signal's entry price and stop.
+        The one protective fallback-stop computation (improvement-run G03):
+        the sizing engine, the native backtest's creation-time and fill-time
+        entries and the live internal-strategy entry call this. The stop sits
+        ``fallback_stop_pct`` of the price below the entry for a long and above
+        it for a short; a positive ``stop_distance`` (the strategy's own
+        distance) or an ``atr`` value replaces the percent distance. This
+        helper does not validate the resulting price — the sizing path
+        validates the signal's entry price and stop.
+
+        Deliberately NOT used by the native engine's pending-order exposure
+        estimate: that is an estimate from the order's own trigger level, not
+        a protective stop (see ``TradeEngine._current_risk_exposure``).
         """
         distance = self._fallback_stop_distance(
             entry_price=entry_price, atr=atr, stop_distance=stop_distance
@@ -106,7 +110,6 @@ class RiskEngine:
         return self._place_stop(
             action=signal.action, entry_price=signal.entry_price, distance=distance
         )
-
 
     @staticmethod
     def _risk_reward_ratio(signal: TradeSignal, stop_loss: float) -> float | None:

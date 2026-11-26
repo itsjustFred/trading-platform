@@ -98,6 +98,17 @@ def test_every_setting_is_mapped() -> None:
     )
 
 
+def test_from_settings_defaults_are_the_dataclass_fields() -> None:
+    """The one mapping must not re-type a default literal.
+
+    Improvement-run G03: with no settings the builder returns exactly
+    ``RiskConfig()``, so changing a dataclass default reaches live deployments
+    instead of being shadowed by a second copy of the old literal.
+    """
+    assert RiskConfig.from_settings({}) == RiskConfig()
+    assert RiskConfig.from_settings(None) == RiskConfig()
+
+
 def test_risk_per_trade_pct_is_the_documented_alias() -> None:
     config = _risk_config_for_deployment(_deployment(risk_per_trade_pct=0.005))
     assert config.max_risk_per_trade == pytest.approx(0.005)
