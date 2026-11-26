@@ -306,8 +306,26 @@ def test_main_fails_loudly_when_a_junit_input_is_missing(tmp_path: Path) -> None
 # either it matches a pattern, or it is named below with the reason it is not
 # a money-path test. Update the lists together — that is the point.
 
+# The money-path modules a test can import, enumerated explicitly: the live
+# order path, the risk engine, and the runner modules that carry the trade
+# math — engine(s), fees, slippage, and the backtest runners/optimizers that
+# MUST_NOT_SKIP_PATTERNS classifies. Both ``runner.x`` and ``from runner
+# import x`` forms are matched. Deliberately out of scope, matching the
+# MUST_NOT_SKIP_PATTERNS boundary: runner.stats/strategy_ir/converters/grid/
+# cli/agent_*/llm_* (reporting, codegen, plumbing), shared.* (data models —
+# the math lives in runner/risk), data_tools, validation.*, signal_bots,
+# scheduler.
+_MONEY_PATH_RUNNER = (
+    r"(?:engines|engine|fees|slippage|daily_equity|walkforward|optimizer"
+    r"|portfolio_optimizer)\b"
+)
 _MONEY_PATH_IMPORT = re.compile(
-    r"^\s*(?:from|import)\s+(?:live_runner|risk|runner\.engines)\b", re.M
+    r"^\s*(?:"
+    r"(?:from|import)\s+(?:live_runner|risk)\b"
+    r"|(?:from|import)\s+runner\." + _MONEY_PATH_RUNNER +
+    r"|from\s+runner\s+import\s+" + _MONEY_PATH_RUNNER +
+    r")",
+    re.M,
 )
 
 _NON_MONEY_PATH_MODULES = {
@@ -317,6 +335,10 @@ _NON_MONEY_PATH_MODULES = {
     ),
     "tests.test_discord_signal_parsing": (
         "Discord message text parsing; feeds ingestion, not order/risk math"
+    ),
+    "tests.test_models": (
+        "shared model shapes; the runner.daily_equity import only exercises "
+        "result attachment, not order/risk math"
     ),
     "tests.test_packaging": "packaging and wheel surface checks",
     "tests.test_resample": (
@@ -328,6 +350,10 @@ _NON_MONEY_PATH_MODULES = {
     ),
     "tests.test_suite_isolation": "suite hermeticity self-guard",
     "tests.test_symbol_class": "symbol classification / market-data plumbing",
+    "tests.test_universe_provenance": (
+        "universe provenance tracking around optimizer artifacts; not "
+        "order/risk math"
+    ),
     "tests.test_venue_calendar": "venue calendar helpers",
 }
 
@@ -339,6 +365,18 @@ _NON_MONEY_PATH_PREFIXES = ("tests.strategies.",)
 
 
 def test_every_money_path_importing_module_is_classified() -> None:
+    # An exemption must never cover a money-path module: that would let its
+    # skips pass unreported while looking reviewed.
+    misclassified = [
+        module
+        for module in (*_NON_MONEY_PATH_MODULES, *_NON_MONEY_PATH_PREFIXES)
+        if is_money_path(module)
+    ]
+    assert not misclassified, (
+        "money-path modules cannot be exempted in _NON_MONEY_PATH_MODULES / "
+        "_NON_MONEY_PATH_PREFIXES: " + ", ".join(misclassified)
+    )
+
     tests_root = Path(__file__).resolve().parents[1] / "tests"
     unclassified: list[str] = []
     for path in sorted(tests_root.rglob("test_*.py")):
