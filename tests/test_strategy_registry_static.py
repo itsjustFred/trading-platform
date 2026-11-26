@@ -199,6 +199,62 @@ def test_iter_strategy_entries_skips_dynamic_meta(tmp_path: Path) -> None:
     assert iter_strategy_entries(dynamic_dir) == []
 
 
+def test_vectorbt_only_signal_keys_detects_dict_and_subscript(tmp_path: Path) -> None:
+    """``entry_stop`` counts as a dict-literal key or subscript index only."""
+    from shared.strategy_registry import vectorbt_only_signal_keys
+
+    strategy_dir = tmp_path / "stop_strategy"
+    strategy_dir.mkdir()
+    (strategy_dir / "stop_strategy.py").write_text(
+        "import pandas as pd\n"
+        "def generate_signals(df, params):\n"
+        "    indicators = {'stop_loss': pd.Series([1.0]), 'entry_stop': pd.Series([2.0])}\n"
+        "    indicators['entry_stop'] = indicators['entry_stop'] * 2\n"
+        "    return pd.Series([True]), pd.Series([False]), indicators\n",
+        encoding="utf-8",
+    )
+
+    assert vectorbt_only_signal_keys(strategy_dir / "stop_strategy.py") == frozenset(
+        {"entry_stop"}
+    )
+
+
+def test_vectorbt_only_signal_keys_ignores_mentions_and_other_keys(tmp_path: Path) -> None:
+    """A STRATEGY_META note or variable name mentioning the key must not match."""
+    from shared.strategy_registry import vectorbt_only_signal_keys
+
+    strategy_dir = tmp_path / "mention_strategy"
+    strategy_dir.mkdir()
+    (strategy_dir / "mention_strategy.py").write_text(
+        "STRATEGY_META = {'name': 'Mention', 'notes': 'no entry_stop fills here'}\n"
+        "entry_stop_distance = 1.5\n"
+        "def generate_signals(df, params):\n"
+        "    indicators = {'stop_distance': entry_stop_distance, 'exit_reason': 'x'}\n"
+        "    return None, None, indicators\n",
+        encoding="utf-8",
+    )
+
+    assert vectorbt_only_signal_keys(strategy_dir / "mention_strategy.py") == frozenset()
+
+
+def test_vectorbt_only_signal_keys_real_registry() -> None:
+    """The shipped registry: only us100_scalper emits a vectorbt-only key."""
+    from shared.strategy_registry import (
+        iter_strategy_files,
+        strategy_slug_for_path,
+        vectorbt_only_signal_keys,
+    )
+
+    strategies_dir = Path(__file__).resolve().parents[1] / "strategies"
+    hits = {
+        strategy_slug_for_path(path, strategies_dir)
+        for path in iter_strategy_files(strategies_dir)
+        if vectorbt_only_signal_keys(path)
+    }
+
+    assert hits == {"us100_scalper"}
+
+
 def test_load_strategy_module_remains_explicit(tmp_path: Path) -> None:
     """The explicit load entry point still exists for real backtest runs."""
     from shared.strategy_registry import load_strategy_module

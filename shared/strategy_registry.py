@@ -51,6 +51,48 @@ class StrategyEntry:
             return ""
 
 
+#: Signal-dict keys only the frozen vectorbt adapter executes (#318, ADR 0001).
+#: The native engine ignores them silently, so a strategy emitting one cannot
+#: be run faithfully off vectorbt — today that is ``entry_stop`` (the D2-strict
+#: stop-entry fill, which the maintainer decided does not survive as a native
+#: option). ``exit_reason`` is deliberately absent: it is a label the native
+#: engine replaces with its own exit reasons, not a fill-semantics input.
+VECTORBT_ONLY_SIGNAL_KEYS = frozenset({"entry_stop"})
+
+
+def vectorbt_only_signal_keys(path: Path) -> frozenset[str]:
+    """Return the :data:`VECTORBT_ONLY_SIGNAL_KEYS` a strategy file emits.
+
+    Pure AST check (never executes the file): a key counts when it appears as
+    a dict literal key or a subscript index — the two ways a strategy publishes
+    a signal series — so a ``STRATEGY_META`` note merely mentioning the word
+    does not match.
+    """
+    source = _read_source(path)
+    if source is None:
+        return frozenset()
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return frozenset()
+    found: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Dict):
+            candidates = [key for key in node.keys if key is not None]
+        elif isinstance(node, ast.Subscript):
+            candidates = [node.slice]
+        else:
+            continue
+        for candidate in candidates:
+            if (
+                isinstance(candidate, ast.Constant)
+                and isinstance(candidate.value, str)
+                and candidate.value in VECTORBT_ONLY_SIGNAL_KEYS
+            ):
+                found.add(candidate.value)
+    return frozenset(found)
+
+
 def iter_strategy_files(strategies_dir: Path = DEFAULT_STRATEGIES_DIR) -> list[Path]:
     if not strategies_dir.exists():
         return []
