@@ -17,7 +17,6 @@ from pathlib import Path
 from validation.comparison.comparison import TradeComparisonConfig
 from validation.comparison.delta_report import TradeDeltaReport
 from validation.comparison.matcher import MatchResult, TradeMatcher
-from validation.importers.mt5_html import MT5HTMLImporter
 from validation.importers.mt5_xlsx import MT5XLSXImporter
 from validation.importers.quantconnect_result import QuantConnectResultImporter
 from validation.readiness.models import ReadinessConfig, ReadinessReport
@@ -55,11 +54,14 @@ def _load_validation_reference(
 ) -> ValidationReference:
     """Load a ValidationReference from a file path.
 
-    Supports JSON, XLSX and HTML.  JSON is parsed directly as a
-    ``ValidationReference``.  XLSX and HTML are dispatched to the MT5
-    importers.
+    Supports JSON and XLSX.  JSON is parsed directly as a
+    ``ValidationReference`` or as a QuantConnect result.  XLSX is handled by
+    the MT5 importer.
     """
     suffix = path.suffix.lower()
+
+    if suffix in {".html", ".htm"}:
+        raise ValueError("HTML reports are not parsed; export the XLSX report")
 
     if suffix == ".json" and importer_name == "quantconnect":
         importer = QuantConnectResultImporter()
@@ -87,8 +89,6 @@ def _load_validation_reference(
     if importer_name == "auto":
         if suffix == ".xlsx":
             importer_name = "mt5_xlsx"
-        elif suffix == ".html":
-            importer_name = "mt5_html"
         else:
             raise ValueError(
                 f"Cannot auto-detect importer for file '{path}' (unknown extension '{suffix}'). "
@@ -97,9 +97,6 @@ def _load_validation_reference(
 
     if importer_name == "mt5_xlsx":
         importer = MT5XLSXImporter()
-        return importer.load(path)
-    if importer_name == "mt5_html":
-        importer = MT5HTMLImporter()
         return importer.load(path)
 
     raise ValueError(f"Unknown importer: {importer_name}")
@@ -114,12 +111,12 @@ def _build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--reference", "-r",
         required=True,
-        help="Path to the reference file (JSON, XLSX or HTML) or a ValidationReference JSON.",
+        help="Path to the reference file (JSON or XLSX) or a ValidationReference JSON.",
     )
     parser.add_argument(
         "--platform", "-p",
         required=True,
-        help="Path to the platform file (JSON, XLSX or HTML) or a ValidationReference JSON.",
+        help="Path to the platform file (JSON or XLSX) or a ValidationReference JSON.",
     )
     parser.add_argument(
         "--format", "-f",
@@ -134,7 +131,7 @@ def _build_argument_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--importer", "-i",
-        choices=["auto", "mt5_xlsx", "mt5_html", "quantconnect"],
+        choices=["auto", "mt5_xlsx", "quantconnect"],
         default="auto",
         help="Importer to use for non-canonical files (default: auto).",
     )

@@ -9,7 +9,7 @@ import pytest
 
 from shared.models import Trade, TradeExit
 from validation.comparison.comparison import TradeComparisonConfig
-from validation.importers.mt5_html import MT5HTMLImporter
+from validation.importers.mt5_xlsx import MT5XLSXImporter
 from validation.reference import ValidationReference
 from validation.regression.runner import (
     RegressionConfig,
@@ -406,16 +406,16 @@ class TestTolerances:
 
 class TestImporterAndEdgeCases:
     def test_regression_run_with_importer(self, tmp_path: Path) -> None:
-        html_path = Path("tests/fixtures/validation/mt5_html/sample_report.html")
-        if not html_path.exists():
-            pytest.skip("HTML fixture not available")
+        xlsx_path = Path("tests/fixtures/validation/mt5_xlsx/hedged_partial_open.xlsx")
+        if not xlsx_path.exists():
+            pytest.skip("XLSX fixture not available")
 
-        importer = MT5HTMLImporter()
-        golden_ref = importer.load(html_path)
+        importer = MT5XLSXImporter()
+        golden_ref = importer.load(xlsx_path)
         golden_path = tmp_path / "golden.json"
         _write_golden(golden_ref, golden_path)
 
-        result = run_regression(golden_path, importer_class=MT5HTMLImporter)
+        result = run_regression(golden_path, importer_class=MT5XLSXImporter)
         assert isinstance(result, RegressionResult)
         assert result.passed is True
         assert len(result.current_reference.trades) == len(golden_ref.trades)

@@ -98,6 +98,7 @@ class TestCliHelp:
         assert "--reference" in result.stdout
         assert "--platform" in result.stdout
         assert "quantconnect" in result.stdout
+        assert "mt5_html" not in result.stdout
 
 
 class TestCliAutoImporterFallback:
@@ -473,60 +474,23 @@ class TestCliStatsToleranceArgument:
         assert data["stat_passed"] is False
 
 
-class TestCliHtmlImporter:
-    def test_cli_html_importer(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
-        pytest.importorskip("bs4")
-        html_content = """<!DOCTYPE html>
-<html>
-<head><title>Report</title></head>
-<body>
-<table>
-  <tr><td>Expertenprogramm:</td><td>HtmlStrategy</td></tr>
-  <tr><td>Symbol:</td><td>EURUSD</td></tr>
-  <tr><td>Periode:</td><td>H1 (1 hour)</td></tr>
-  <tr><td>Ersteinlage:</td><td>10000</td></tr>
-</table>
-<h2>Orders</h2>
-<table>
-  <thead><tr><th>Auftrag</th><th>S / L</th><th>T / P</th></tr></thead>
-  <tbody><tr><td>1</td><td>1.0900</td><td>1.1200</td></tr></tbody>
-</table>
-<h2>Trades</h2>
-<table>
-  <thead>
-    <tr>
-      <th>Zeit</th><th>Trade</th><th>Symbol</th><th>Typ</th><th>Richtung</th>
-      <th>Volumen</th><th>Preis</th><th>Auftrag</th><th>Kommission</th>
-      <th>Swap</th><th>Gewinn</th><th>Kommentar</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td>2024.01.01 10:00:00</td><td>1</td><td>EURUSD</td><td>buy</td><td>in</td>
-      <td>0.1</td><td>1.10000</td><td>1</td><td>0</td><td>0</td><td>0</td><td></td>
-    </tr>
-    <tr>
-      <td>2024.01.01 11:00:00</td><td>1</td><td>EURUSD</td><td>sell</td><td>out</td>
-      <td>0.1</td><td>1.10500</td><td>1</td><td>0</td><td>0</td><td>50.00</td><td>tp 1</td>
-    </tr>
-  </tbody>
-</table>
-</body>
-</html>"""
-        html_path = tmp_path / "report.html"
-        html_path.write_text(html_content, encoding="utf-8")
+class TestCliMt5HtmlRejected:
+    @pytest.mark.parametrize("suffix", [".html", ".htm"])
+    @pytest.mark.parametrize("importer_name", ["auto", "mt5_xlsx"])
+    def test_html_input_fails_with_xlsx_message(
+        self,
+        tmp_path: Path,
+        suffix: str,
+        importer_name: str,
+    ) -> None:
+        report_path = tmp_path / f"report{suffix}"
+        report_path.write_text("<html></html>", encoding="utf-8")
 
-        rc, out = _invoke_cli([
-            "--reference", str(html_path),
-            "--platform", str(html_path),
-            "--format", "json",
-            "--importer", "mt5_html",
-        ], capsys)
-        assert rc == 1
-        data = json.loads(out)
-        assert data["strategy_name"] == "HtmlStrategy"
-        assert data["passed"] is False
-        assert data["equity_evidence_status"] == "missing"
+        with pytest.raises(
+            ValueError,
+            match="HTML reports are not parsed; export the XLSX report",
+        ):
+            validation_cli._load_validation_reference(report_path, importer_name)
 
 
 class TestCliStdinStdoutBehavior:
