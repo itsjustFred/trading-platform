@@ -1765,15 +1765,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             try:
                 async with self.order_placement_lock(), self._order_book_lock():
                     await self._recover_exit_reprotections()
-                # Protective-stop maintenance runs after the unbounded
-                # recovery lock is released: it takes the account
-                # order-placement lock per symbol with a bounded wait, so a
-                # busy submit section skips the write rather than stalling
-                # connect. Positions whose protective order was lost - an
-                # expired DAY leg, an aged-policy cancel - are re-protected
-                # here at connect, not only on the periodic loop.
-                await self.maintain_protective_stops(force=True)
-                return
+                break
             except asyncio.CancelledError:
                 raise
             except AccountOrderLockTimeoutError as exc:
@@ -1792,7 +1784,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                             }
                         },
                     )
-                    return
+                    break
                 logger.warning(
                     "Alpaca exit re-protection recovery waited out the "
                     "account order-placement lock; retrying in %.0fs "
@@ -1814,7 +1806,29 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                     "replaying markers; markers stay pending for the next connect",
                     extra={"data": {"account_id": self.account_id, "error": repr(exc)}},
                 )
-                return
+                break
+        # Protective-stop maintenance runs after the unbounded recovery
+        # lock is released, and regardless of the replay outcome: it takes
+        # the account order-placement lock per symbol with a bounded wait,
+        # so a busy submit section skips the write rather than stalling
+        # connect, and a marker-replay failure must not also skip the heal.
+        # Positions whose protective order was lost - an expired DAY leg,
+        # an aged-policy cancel - are re-protected here at connect, not
+        # only on the periodic loop.
+        try:
+            await self.maintain_protective_stops(force=True)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # except-kind: money-decision
+            logger.exception(
+                "Alpaca protective-stop maintenance failed at connect",
+                extra={
+                    "data": {
+                        "account_id": self.account_id,
+                        "error": repr(exc),
+                    }
+                },
+            )
 
     async def _cancel_exit_reprotection_recovery(self) -> None:
         """Cancel a queued/running marker replay on disconnect."""
