@@ -4668,6 +4668,11 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             return None, True
         members = self._execution_type_members(enum)
         if not members:
+            logger.warning(
+                "cTrader ProtoOAExecutionType member extraction returned "
+                "nothing; every execution event will fail closed as "
+                "unclassifiable until the enum shape is understood."
+            )
             return None, True
         known = {number for _, number in members}
         if value not in known:
@@ -5651,13 +5656,13 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 )
         elif (
             getattr(response, "errorCode", None) is not None
-            and getattr(response, "description", None) is not None
             and getattr(response, "executionType", None) is None
         ):
             # The error-event class is not loaded, so isinstance cannot
             # prove this is NOT a ProtoOAOrderErrorEvent - and a real one
-            # carries exactly this shape (errorCode + description, no
-            # executionType). Fail closed: a refusal must never pass as done.
+            # carries errorCode and no executionType (its description may be
+            # unset, so it cannot be required here). Fail closed: a refusal
+            # must never pass as done.
             raise CTraderApiError(
                 error_code=str(getattr(response, "errorCode", "")),
                 description=str(getattr(response, "description", ""))

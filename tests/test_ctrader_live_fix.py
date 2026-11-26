@@ -1341,9 +1341,10 @@ def test_a_cancel_refused_with_an_order_error_event_is_a_failure() -> None:
 def test_a_refusal_shaped_response_fails_closed_when_the_error_class_is_unloaded() -> None:
     """With `_ProtoOAOrderErrorEvent` unset, isinstance cannot rule a refusal out.
 
-    A real `ProtoOAOrderErrorEvent` carries `errorCode` + `description` and no
-    `executionType`, so a response with that shape must still count as a
-    refusal rather than passing as a completed control.
+    A real `ProtoOAOrderErrorEvent` carries `errorCode` and no
+    `executionType` (its `description` may be unset), so a response with
+    `errorCode` alone must still count as a refusal rather than passing as
+    a completed control.
     """
     from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOAOrderType
 
@@ -1354,9 +1355,7 @@ def test_a_refusal_shaped_response_fails_closed_when_the_error_class_is_unloaded
         ]
     )
     adapter._ProtoOAOrderErrorEvent = None
-    adapter.exec_event[611] = SimpleNamespace(
-        errorCode="ORDER_NOT_FOUND", description="refused 611"
-    )
+    adapter.exec_event[611] = SimpleNamespace(errorCode="ORDER_NOT_FOUND")
 
     outcome = _run(adapter.cancel_open_orders())
 
