@@ -20,7 +20,7 @@ from dataclasses import dataclass
 
 import pytest
 
-from live_runner import alpaca_adapter, ctrader_adapter, daemon, loss_breaker, preflight
+from live_runner import alpaca_adapter, daemon, loss_breaker, preflight
 from live_runner.credential_env import parse_bool_env
 from live_runner.ctrader_adapter import CTraderLiveAdapter
 from shared.models import LiveDeploymentConfig
@@ -95,14 +95,6 @@ SHARED_PARSERS = [
         "credential_env.parse_bool_env",
         "CTRADER_DEMO",
         lambda name, raw, default: parse_bool_env(name, raw, default=default),
-        _canonical_error,
-    ),
-    BoolParser(
-        "ctrader_adapter._parse_bool_env",
-        "CTRADER_DEMO",
-        lambda name, raw, default: ctrader_adapter._parse_bool_env(  # noqa: SLF001
-            name, raw, default=default
-        ),
         _canonical_error,
     ),
     BoolParser(
