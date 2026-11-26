@@ -4,7 +4,7 @@
 Runs every strategy-registry entry through ``NativeAdapter`` and
 ``VectorbtAdapter`` on the *same* configuration and writes a per-strategy
 trade/stat diff report. This is the phase-S evidence for the phase-M default
-flips described in ``docs/adr/0001-native-single-strategy-engine.md``: the
+flips described in ``docs/adr/0002-native-single-strategy-engine.md``: the
 gate changes no defaults and asserts nothing — per-strategy differences are
 *reported* so each can be explained before any flip.
 
@@ -42,7 +42,7 @@ from typing import Any
 
 # --- import-origin guard ---
 # `shared` must resolve to this checkout, not the installed package. The mechanism lives in
-# scripts/_import_origin.py; only the invocation is per script. scripts/ goes on sys.path - never
+# scripts/import_origin.py; only the invocation is per script. scripts/ goes on sys.path - never
 # the repo root, which would repair `import shared` and defeat the guard - so a direct run is
 # refused (exit 2) instead of mutating another tree's schema. See
 # tests/test_script_import_origin.py; run as:
@@ -53,7 +53,7 @@ from pathlib import Path as _path
 _scripts_dir = str(_path(__file__).resolve().parent)
 if _scripts_dir not in _sys.path:
     _sys.path.insert(0, _scripts_dir)
-import _import_origin as _guard
+import import_origin as _guard
 
 _guard.ensure_own_checkout("engine_migration_gate")
 # --- end import-origin guard ---
@@ -75,7 +75,7 @@ from runner.engines.contract import FROZEN_SIGNAL_EXIT_ENGINES
 from runner.engines.native_adapter import NativeAdapter
 from runner.engines.vectorbt_adapter import VectorbtAdapter
 from runner.stats import merge_canonical_stats
-from scripts._safe_path import under_root
+from scripts.safe_path import under_root
 from shared.atomic_io import write_text_atomically
 from shared.constants import normalize_timeframe
 from shared.models import StrategyType

@@ -30,7 +30,7 @@ sys.path.insert(0, str(REPO))
 
 from runner.engine import TradeEngine  # noqa: E402
 from runner.engines.base import BacktestConfig, resolve_strategy_parameters  # noqa: E402
-from runner.engines.native_adapter import _load_ohlcv, _load_strategy_module  # noqa: E402
+from runner.engines.native_adapter import load_ohlcv, load_strategy_module  # noqa: E402
 
 # name: (strategy, symbol, timeframe, start, end, extra parameters)
 CASES: dict[str, tuple[str, str, str, str, str, dict]] = {
@@ -60,8 +60,8 @@ CASES: dict[str, tuple[str, str, str, str, str, dict]] = {
 def _build(name: str, data_dir: Path):
     strat, symbol, tf, start, end, extra = CASES[name]
     path = REPO / "strategies" / strat / f"{strat}.py"
-    module = _load_strategy_module(str(path))
-    data = _load_ohlcv(data_dir, symbol, tf, start, end)
+    module = load_strategy_module(str(path))
+    data = load_ohlcv(data_dir, symbol, tf, start, end)
     if data is None or data.empty:
         raise RuntimeError(f"no data for {name}")
     cfg_kwargs = {k: v for k, v in extra.items() if k in BacktestConfig.model_fields}

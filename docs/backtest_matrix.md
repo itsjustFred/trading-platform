@@ -44,6 +44,10 @@ Useful options:
 - `--subprocess` runs each grid cell through `runner.cli run` for isolation.
 - `--skip-sqlite` is recommended for large matrices to avoid SQLite write contention.
 
+## Queue runner
+
+`scripts/matrix_queue_runner.py` works through the same strategy × symbol × timeframe grid one cell at a time and writes resumable state to `data/backtests/matrix_runner_v2/` (status JSON for a status page). Its engine comes from `MATRIX_ENGINE` (default `native`; set `MATRIX_ENGINE=vectorbt` to use the frozen adapter). Strategies whose signals only vectorbt can execute faithfully — `entry_stop` stop-entry fills, or `atr*` sizing keys with no `stop_loss`/`sl_price` — are marked `excluded` under every non-vectorbt engine rather than queued with silently different results (#318).
+
 ## Grid identity: when a cached cell may be reused
 
 Every finished cell stamps its `.trades.json` with
