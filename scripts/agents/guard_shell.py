@@ -76,8 +76,7 @@ def _strip_heredocs(command: str) -> str:
                 pending.pop(0)
             continue
         out.append(line)
-        for match in _HEREDOC_RE.finditer(line):
-            pending.append(match.group(2))
+        pending.extend(match.group(2) for match in _HEREDOC_RE.finditer(line))
     return "".join(out)
 
 

@@ -38,7 +38,9 @@ _FETCH_TIMEOUT = 60
 _UV_TIMEOUT = 180
 
 
-def _git(args: list[str], cwd: Path, timeout: int = _GIT_TIMEOUT) -> subprocess.CompletedProcess[str]:
+def _git(
+    args: list[str], cwd: Path, timeout: int = _GIT_TIMEOUT
+) -> subprocess.CompletedProcess[str]:
     env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
     return subprocess.run(
         ["git", *args],
