@@ -149,17 +149,36 @@ def test_refuse_symlinks_rejects_any_symlink_below_the_base(base: Path, tmp_path
     ).resolve()
 
 
-def test_refuse_symlinks_rejects_a_symlinked_base(tmp_path: Path) -> None:
+def test_refuse_symlinks_accepts_a_symlinked_base(tmp_path: Path) -> None:
+    """A symlinked base (and its ancestors) is a deployment shape, not an escape.
+
+    Production reaches the data directory through a symlink (``~/data`` ->
+    another mount), so refusing the base would refuse every normal id under it.
+    """
     real = tmp_path / "real"
     real.mkdir()
     (real / "file.csv").write_text("x", encoding="utf-8")
     linked = tmp_path / "linked"
     _symlink_or_skip(linked, real, target_is_directory=True)
 
-    # Default: a symlinked base is resolved, so the result is inside it.
-    assert safe_join(linked, "file.csv") == (real / "file.csv").resolve()
+    assert safe_join(linked, "file.csv", refuse_symlinks=True) == (real / "file.csv").resolve()
+
+
+def test_refuse_symlinks_rejects_a_symlinked_directory_below_the_base(
+    base: Path, tmp_path: Path
+) -> None:
+    outside_dir = tmp_path / "outside-dir"
+    outside_dir.mkdir()
+    (outside_dir / "file.csv").write_text("secret", encoding="utf-8")
+    _symlink_or_skip(base / "linked-dir", outside_dir, target_is_directory=True)
+    _symlink_or_skip(base / "linked-inside", base / "sub", target_is_directory=True)
+
     with pytest.raises(PathContainmentError):
-        safe_join(linked, "file.csv", refuse_symlinks=True)
+        safe_join(base, "linked-dir/file.csv", refuse_symlinks=True)
+    # Even a link that stays inside the base is refused: the caller writes
+    # through this path and a swap must not redirect it.
+    with pytest.raises(PathContainmentError):
+        safe_join(base, "linked-inside/file.csv", refuse_symlinks=True)
 
 
 def test_a_symlinked_base_compares_against_its_resolved_target(tmp_path: Path) -> None:

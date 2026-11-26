@@ -38,7 +38,9 @@ outside it resolves outside and is refused. A symlink that stays inside is
 accepted -- it names the same tree the caller confined itself to. Callers that
 write to or delete the result refuse symlinks outright with
 ``refuse_symlinks=True``: a swap between check and use is then not a question of
-where the link pointed.
+where the link pointed. That refusal covers components *below* the base only;
+``base`` and its ancestors may be symlinks, because production reaches the data
+directory through one.
 
 Rejections raise :class:`PathContainmentError`, a ``ValueError``, so callers
 that already translate ``ValueError`` into their own error keep working.
@@ -103,13 +105,12 @@ def safe_join(
     if ".." in candidate.parts:
         raise PathContainmentError(f"refusing a path containing '..': {raw!r}")
 
-    base_path = Path(base)
-    resolved_base = base_path.resolve()
+    resolved_base = Path(base).resolve()
     if refuse_symlinks:
-        # Checked on the *unresolved* base: ``resolved_base`` has already
-        # followed a symlinked base away, so it could never report one.
-        if base_path.is_symlink():
-            raise PathContainmentError(f"refusing a symlinked base directory: {base_path}")
+        # Only components *below* the resolved base are refused. The base
+        # itself may be a symlink, and so may any of its ancestors: production
+        # runs reach the data directory through one (``~/data`` -> another
+        # mount), and resolving it first means that path is simply the base.
         # An absolute candidate is already checked against ``resolved_base``
         # below; walking its components from the anchor is what keeps the
         # symlink refusal honest for it too.

@@ -95,20 +95,19 @@ def test_log_endpoint_rejects_a_nul_byte_with_400(viewer_client, tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_task_log_path_rejects_a_symlinked_task_logs_dir(
+def test_task_log_path_accepts_a_symlinked_task_logs_dir(
     viewer_client, tmp_path, monkeypatch, symlink_or_skip
 ):
+    """The log directory may be reached through a symlink (deployment shape)."""
     real = tmp_path / "real-task-logs"
     real.mkdir()
     link = tmp_path / "task-logs"
     symlink_or_skip(link, real, target_is_directory=True)
     monkeypatch.setattr(viewer_app_module, "TASK_LOGS_DIR", link)
 
-    with pytest.raises(viewer_app_module.HTTPException) as exc_info:
-        viewer_app_module._validated_task_log_path("task-1234abcd")
-
-    assert exc_info.value.status_code == 400
-    assert exc_info.value.detail == "Invalid task log path"
+    assert viewer_app_module._validated_task_log_path("task-1234abcd") == (
+        real / "task_task-1234abcd.log"
+    ).resolve()
 
 
 def test_task_log_path_rejects_a_symlinked_log_file(
@@ -164,6 +163,36 @@ def test_codegen_gate_strategy_path_rejects_a_nul_byte_with_400(monkeypatch, tmp
 
     assert exc_info.value.status_code == 400
     assert exc_info.value.detail == "Invalid strategy file path"
+
+
+# ---------------------------------------------------------------------------
+# Asset files by id (backtests / portfolios / optimizations)
+# ---------------------------------------------------------------------------
+
+
+def test_contained_asset_path_accepts_a_symlinked_base(tmp_path, symlink_or_skip):
+    """The data directory may be reached through a symlink (deployment shape)."""
+    real = tmp_path / "backtests"
+    real.mkdir()
+    (real / "abc.json").write_text("{}", encoding="utf-8")
+    link = tmp_path / "linked-backtests"
+    symlink_or_skip(link, real, target_is_directory=True)
+
+    assert viewer_app_module._contained_asset_path(link, "abc", ".json") == (
+        real / "abc.json"
+    ).resolve()
+
+
+def test_contained_asset_path_rejects_a_symlinked_file_below_the_base(
+    tmp_path, symlink_or_skip
+):
+    base = tmp_path / "backtests"
+    base.mkdir()
+    secret = tmp_path / "secret.json"
+    secret.write_text("{}", encoding="utf-8")
+    symlink_or_skip(base / "abc.json", secret)
+
+    assert viewer_app_module._contained_asset_path(base, "abc", ".json") is None
 
 
 # ---------------------------------------------------------------------------
