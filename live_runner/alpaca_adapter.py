@@ -7159,8 +7159,9 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
 
             event_filled_qty = parse_optional(filled_qty_value)
             filled_qty = 0.0 if event_filled_qty is None else event_filled_qty
-            # alpaca-py has no commission field on TradeUpdate or Order; a crypto fee is posted end
-            # of day and backfilled, so here it is unknown unless it is a known zero (#124).
+            # alpaca-py has no commission field on TradeUpdate or Order; a crypto fee is only
+            # known once its ``CFEE`` activity posts (in delayed batches) and is backfilled,
+            # so here it is unknown unless it is a known zero (#124).
             commission = _known_commission(order)
             raw_fill_ts = getattr(data, "timestamp", None)
             fill_ts = _broker_fill_timestamp(

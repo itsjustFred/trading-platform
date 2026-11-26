@@ -5063,6 +5063,8 @@ def install_legacy_task_hooks() -> None:
     imported first and the wrapper chain is visible to static analysis. It must
     run before any helper that creates or updates task records — writes made
     before installation land on the in-memory originals and never persist.
+    ``_resume_interrupted_tasks`` enforces this with a RuntimeError; the other
+    helpers rely on the lifespan calling this first.
     """
     global _LEGACY_HOOKS_INSTALLED
     if _LEGACY_HOOKS_INSTALLED:
