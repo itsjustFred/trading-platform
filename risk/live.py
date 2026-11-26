@@ -25,34 +25,23 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
+from risk.signal_levels import (
+    SL_METADATA_KEYS,
+    TP_METADATA_KEYS,
+    LevelParsing,
+    resolve_signal_level,
+)
 from shared.models import LiveSignal
 from shared.money import parse_money, parse_optional
-
-#: Single source precedence for live trade levels (C1: mixed sources sized
-#: wrong distances). Entry falls back to theoretical_price; SL/TP accept the
-#: same alias keys the daemon resolves (stop_loss/sl_price/stop_price/
-#: resolved_stop_loss, take_profit/tp_price) — never bare theoretical math.
-_LIVE_SL_KEYS = ("stop_loss", "sl_price", "stop_price", "resolved_stop_loss")
-_LIVE_TP_KEYS = ("take_profit", "tp_price")
-
-
-def _first_metadata_float(metadata: dict[str, Any], keys: tuple[str, ...]) -> float | None:
-    for key in keys:
-        try:
-            value = parse_optional(metadata.get(key))
-        except ValueError as exc:
-            raise ValueError(f"{key}: {exc}") from exc
-        if value is not None:
-            return value
-    return None
 
 
 def resolve_live_levels(signal: LiveSignal) -> tuple[float, float | None, float | None]:
     """Resolve (entry, stop, take) for a live signal under one precedence.
 
     Entry: metadata entry_price, else theoretical_price. SL/TP: metadata
-    aliases only, first present non-None alias wins. One function so every
-    sizing path geometry-matches (#125 maintainer decision).
+    aliases only, first present alias wins. The alias allowlist itself lives in
+    :mod:`risk.signal_levels`; one function so every sizing path
+    geometry-matches (#125 maintainer decision).
 
     A missing stop or take profit resolves to ``None``; what a caller does with
     that is its policy (the risk engine may resolve a fallback stop, the daemon
@@ -70,8 +59,15 @@ def resolve_live_levels(signal: LiveSignal) -> tuple[float, float | None, float 
         raise ValueError(f"entry_price: {exc}") from exc
     if entry <= 0:
         raise ValueError("entry_price must be > 0")
-    stop = _first_metadata_float(metadata, _LIVE_SL_KEYS)
-    take = _first_metadata_float(metadata, _LIVE_TP_KEYS)
+    # Money parsing (LevelParsing.MONEY): a boolean, a non-numeric value and a
+    # non-finite number are refusals, never "the level is absent" - the
+    # alias allowlist and its strictness live in risk.signal_levels (G19).
+    stop = resolve_signal_level(
+        metadata, SL_METADATA_KEYS, parsing=LevelParsing.MONEY
+    ).price
+    take = resolve_signal_level(
+        metadata, TP_METADATA_KEYS, parsing=LevelParsing.MONEY
+    ).price
     if stop is not None and stop <= 0:
         raise ValueError("stop_loss must be > 0")
     if take is not None and take <= 0:

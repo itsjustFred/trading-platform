@@ -45,6 +45,12 @@ from live_runner.credential_env import (
     resolve_env_value,
 )
 from live_runner.exit_signals import ExitBelowStepError
+from risk.signal_levels import (
+    SL_METADATA_KEYS,
+    TP_METADATA_KEYS,
+    LevelParsing,
+    resolve_signal_level,
+)
 from shared import venue_calendar
 from shared.constants import DATA_DIR
 from shared.database import (
@@ -183,21 +189,6 @@ def _to_float(value: Any, *, default: float = 0.0) -> float:
         return default
 
 
-def _first_metadata_float(
-    metadata: Mapping[str, Any], keys: tuple[str, ...]
-) -> float | None:
-    for key in keys:
-        if key not in metadata:
-            continue
-        value = metadata.get(key)
-        if value is None:
-            continue
-        try:
-            parsed = float(value)
-        except (TypeError, ValueError, OverflowError) as exc:
-            raise ValueError(f"Invalid {key}: {value!r}") from exc
-        return parsed
-    return None
 # ── cTrader volume unit contract ───────────────────────────────────────────────
 #
 # ONE unit contract for every quantity in the cTrader path:
@@ -4363,10 +4354,16 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         request.volume = self._resolve_order_volume(signal)
         request.timeInForce = self._ProtoOATimeInForce.IMMEDIATE_OR_CANCEL
         request.clientOrderId = str(signal.id)
-        stop_loss = _first_metadata_float(
-            metadata, ("stop_loss", "sl_price", "stop_price", "resolved_stop_loss")
-        )
-        take_profit = _first_metadata_float(metadata, ("take_profit", "tp_price"))
+        # One allowlist and one resolver for both levels (G19). ANY_FLOAT keeps
+        # this adapter's own leniency: it refuses non-finite and non-positive
+        # levels itself, in _resolve_relative_sl_tp, after the missing-level
+        # guard below.
+        stop_loss = resolve_signal_level(
+            metadata, SL_METADATA_KEYS, parsing=LevelParsing.ANY_FLOAT
+        ).price
+        take_profit = resolve_signal_level(
+            metadata, TP_METADATA_KEYS, parsing=LevelParsing.ANY_FLOAT
+        ).price
         unbounded_tp = take_profit is None and is_unbounded_tp(metadata)
         if stop_loss is None or (take_profit is None and not unbounded_tp):
             missing = [
