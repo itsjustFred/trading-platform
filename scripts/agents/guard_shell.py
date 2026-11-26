@@ -132,6 +132,74 @@ def _is_main_checkout(cwd: Path) -> bool:
     return False
 
 
+def _path_in_main_checkout(path_str: str, cwd: Path) -> bool:
+    p = Path(path_str)
+    if not p.is_absolute():
+        p = cwd / p
+    try:
+        p = p.resolve()
+    except OSError:
+        pass
+    return _is_main_checkout(p)
+
+
+# Flags that point an env-mutating command at a venv/checkout other than
+# the cwd's: `uv --directory/--project`, `uv pip --python/--prefix/--target`,
+# `npm --prefix`, `pip --python/--prefix/--target`.
+_ENV_TARGET_LONGS: dict[str, set[str]] = {
+    "uv": {"--directory", "--project", "--python", "--prefix", "--target"},
+    "uvx": {"--directory", "--project", "--python", "--prefix", "--target"},
+    "pip": {"--python", "--prefix", "--target"},
+    "pip3": {"--python", "--prefix", "--target"},
+    "npm": {"--prefix"},
+    "npx": {"--prefix"},
+}
+
+
+def _env_targets_main_checkout(argv: list[str], cwd: Path) -> bool:
+    """True when ``argv`` operates on the main checkout regardless of cwd.
+
+    Covers env tools invoked by absolute/relative path inside the main
+    checkout (``<main>/.venv/bin/pip install``) and target flags
+    (``uv --directory <main> sync``, ``npm --prefix <main> ci``).
+    """
+    bare = _strip_assignments(argv)[0]
+    if not bare:
+        return False
+    first = bare[0]
+    if ("/" in first or first.startswith(".")) and _path_in_main_checkout(first, cwd):
+        return True
+    name = _basename(first).strip("`")
+    longs = _ENV_TARGET_LONGS.get(name)
+    if longs is None:
+        return False
+    args = bare[1:]
+    i = 0
+    while i < len(args):
+        tok = args[i]
+        if tok == "--":
+            break
+        if tok.startswith("--"):
+            opt, eq, val = tok.partition("=")
+            if opt in longs:
+                candidate = val if eq else (args[i + 1] if i + 1 < len(args) else "")
+                if candidate and _path_in_main_checkout(candidate, cwd):
+                    return True
+                if not eq:
+                    i += 1
+        elif name in ("uv", "uvx") and tok == "-p":
+            # `uv -p <path>` (--python, separate form)
+            if i + 1 < len(args) and _path_in_main_checkout(args[i + 1], cwd):
+                return True
+            i += 1
+        elif name in ("uv", "uvx") and tok.startswith("-p") and len(tok) > 2:
+            # `uv -p<path>` attached form (--python)
+            if _path_in_main_checkout(tok[2:], cwd):
+                return True
+        i += 1
+    return False
+
+
 def _resolve(base: Path, arg: str) -> Path:
     p = Path(arg)
     return p if p.is_absolute() else (base / p)
@@ -289,6 +357,7 @@ def _check_git_restore(rest: list[str], cwd: Path) -> str | None:
     directory, can wipe uncommitted fixes in one shot.
     """
     staged = False
+    worktree = False
     pathspecs: list[str] = []
     i = 0
     end_opts = False
@@ -308,6 +377,10 @@ def _check_git_restore(rest: list[str], cwd: Path) -> str | None:
                 staged = True
                 i += 1
                 continue
+            if name == "--worktree":
+                worktree = True
+                i += 1
+                continue
             if name in {"--source", "--pathspec-from-file"} and "=" not in tok:
                 i += 2
                 continue
@@ -320,6 +393,8 @@ def _check_git_restore(rest: list[str], cwd: Path) -> str | None:
                 ch = cluster[j]
                 if ch == "S":
                     staged = True
+                elif ch == "W":
+                    worktree = True
                 elif ch == "s":  # --source takes a value
                     if j == len(cluster) - 1:
                         i += 1  # the value is the next token
@@ -340,7 +415,7 @@ def _check_git_restore(rest: list[str], cwd: Path) -> str | None:
         except OSError:
             return False
 
-    if staged and pathspecs and all(explicit_file(spec) for spec in pathspecs):
+    if staged and not worktree and pathspecs and all(explicit_file(spec) for spec in pathspecs):
         return None
     return (
         "blocked: `git restore` can discard uncommitted work. Only "
@@ -763,8 +838,8 @@ def _check_main_env_command(argv: list[str]) -> str | None:
             if "--no-sync" in rest or "--no-project" in rest:
                 return None
             return (
-                "blocked: `uv run` syncs the project env (which can drop "
-                f"extras the live daemon needs); {_MAIN_HINT}."
+                "blocked: `uv run` can install/upgrade packages in the "
+                f"daemon's venv; {_MAIN_HINT}."
             )
         if sub in _UV_ENV_BLOCKED:
             if "--dry-run" in rest or "--check" in rest:
@@ -778,7 +853,7 @@ def _check_main_env_command(argv: list[str]) -> str | None:
     if name in ("pip", "pip3"):
         idx = _skip_options(args, 0, _PIP_GLOBAL_VALUE_OPTS, _PIP_GLOBAL_VALUE_LONGS)
         sub = args[idx] if idx < len(args) else ""
-        if sub in _PIP_MUTATING:
+        if sub in _PIP_MUTATING and "--dry-run" not in args:
             return f"blocked: `pip {sub}` changes the shared venv; {_MAIN_HINT}."
         return None
 
@@ -860,7 +935,7 @@ def _strip_assignments(argv: list[str]) -> tuple[list[str], bool]:
 
 
 def _eval_argv(
-    argv: list[str], cwd: Path, depth: int, main_ok: bool
+    argv: list[str], cwd: Path, depth: int, main_ok: bool, env_main: bool
 ) -> str | None:
     if not argv:
         return None
@@ -870,6 +945,7 @@ def _eval_argv(
     main_ok = main_ok or seg_override
     if not argv:
         return None
+    env_main = env_main or _env_targets_main_checkout(argv, cwd)
     name = _basename(argv[0]).strip("`")
     args = argv[1:]
 
@@ -885,7 +961,9 @@ def _eval_argv(
                 and "c" in tok[1:]
             ):
                 if i + 1 < len(args):
-                    return _eval_command_string(args[i + 1], cwd, depth + 1, main_ok)
+                    return _eval_command_string(
+                        args[i + 1], cwd, depth + 1, main_ok, env_main
+                    )
                 return None
             if tok == "--":
                 break
@@ -899,7 +977,9 @@ def _eval_argv(
         return None
 
     if name == "eval":
-        return _eval_command_string(" ".join(args), cwd, depth + 1, main_ok)
+        return _eval_command_string(
+            " ".join(args), cwd, depth + 1, main_ok, env_main
+        )
 
     # `python -m pip install` / `python -m ruff format` reach the same rules.
     if name == "python" or name.startswith("python"):
@@ -927,19 +1007,23 @@ def _eval_argv(
         if m_idx is not None:
             module = args[m_idx + 1]
             if module == "pip":
-                return _check_simple(["pip", *args[m_idx + 2 :]], cwd, main_ok)
+                return _check_simple(
+                    ["pip", *args[m_idx + 2 :]], cwd, main_ok, env_main
+                )
             if module == "ruff":
-                return _check_simple(["ruff", *args[m_idx + 2 :]], cwd, main_ok)
+                return _check_simple(
+                    ["ruff", *args[m_idx + 2 :]], cwd, main_ok, env_main
+                )
         return None
 
     inner = _uv_inner_argv(argv)
     if inner is not None and name in ("uv", "uvx"):
         # `uv run`/`uvx` get their own main-checkout verdict first (uv run
         # auto-syncs the env), then the wrapped command is checked too.
-        verdict = _check_simple(argv, cwd, main_ok)
+        verdict = _check_simple(argv, cwd, main_ok, env_main)
         if verdict:
             return verdict
-        return _eval_argv(inner, cwd, depth + 1, main_ok)
+        return _eval_argv(inner, cwd, depth + 1, main_ok, env_main)
 
     spec = _WRAPPER_OPTS.get(name)
     if spec is not None:
@@ -948,10 +1032,12 @@ def _eval_argv(
             # `env -S 'cmd args'` carries a whole command line as one token.
             for j, tok in enumerate(args):
                 if tok in ("-S", "--split-string") and j + 1 < len(args):
-                    return _eval_command_string(args[j + 1], cwd, depth + 1, main_ok)
+                    return _eval_command_string(
+                        args[j + 1], cwd, depth + 1, main_ok, env_main
+                    )
                 if tok.startswith("--split-string="):
                     return _eval_command_string(
-                        tok.split("=", 1)[1], cwd, depth + 1, main_ok
+                        tok.split("=", 1)[1], cwd, depth + 1, main_ok, env_main
                     )
         idx = _skip_options(args, 0, value_opts, value_longs)
         rest = args[idx + skip_pos :] if idx + skip_pos <= len(args) else []
@@ -961,10 +1047,10 @@ def _eval_argv(
                 main_ok = True
             rest = rest[1:]
         if rest:
-            return _eval_argv([rest[0], *rest[1:]], cwd, depth + 1, main_ok)
+            return _eval_argv([rest[0], *rest[1:]], cwd, depth + 1, main_ok, env_main)
         return None
 
-    return _check_simple(argv, cwd, main_ok)
+    return _check_simple(argv, cwd, main_ok, env_main)
 
 
 def _cd_target(argv: list[str], cwd: Path) -> Path | None:
@@ -983,7 +1069,9 @@ def _cd_target(argv: list[str], cwd: Path) -> Path | None:
         return None
 
 
-def _check_simple(argv: list[str], cwd: Path, main_ok: bool) -> str | None:
+def _check_simple(
+    argv: list[str], cwd: Path, main_ok: bool, env_main: bool
+) -> str | None:
     verdict = _check_pkill(argv)
     if verdict:
         return verdict
@@ -992,13 +1080,13 @@ def _check_simple(argv: list[str], cwd: Path, main_ok: bool) -> str | None:
         return verdict
     if _basename(argv[0]).strip("`") == "git":
         return _check_git(argv, cwd, main_ok)
-    if not main_ok and _is_main_checkout(cwd):
+    if not main_ok and (env_main or _is_main_checkout(cwd)):
         return _check_main_env_command(argv)
     return None
 
 
 def _eval_tokens(
-    tokens: list[str], cwd: Path, depth: int, main_ok: bool
+    tokens: list[str], cwd: Path, depth: int, main_ok: bool, env_main: bool
 ) -> str | None:
     """Walk the token stream, tracking cwd across ``cd`` and subshell parens."""
     cwd = Path(cwd)
@@ -1021,7 +1109,7 @@ def _eval_tokens(
             if target is not None:
                 cwd = target
             return None
-        return _eval_argv(seg, cwd, depth, main_ok)
+        return _eval_argv(seg, cwd, depth, main_ok, env_main)
 
     while i < len(tokens):
         tok = tokens[i]
@@ -1086,13 +1174,72 @@ def _backtick_spans(command: str) -> list[str]:
     return spans
 
 
-def _eval_command_string(command: str, cwd: Path, depth: int, main_ok: bool) -> str | None:
+def _dollar_paren_spans(command: str) -> list[str]:
+    """Inner command strings of `` $(...) `` substitutions.
+
+    Unquoted ``$(...)`` already splits into its own segment via the ``(``
+    control token, but inside double quotes it stays inside the token
+    (``git commit -m "$(git stash)"``). Single-quoted ``$(`` is literal.
+    """
+    spans: list[str] = []
+    i = 0
+    in_squote = False
+    in_dquote = False
+    while i < len(command):
+        ch = command[i]
+        if ch == "\\":
+            i += 2
+            continue
+        if in_squote:
+            if ch == "'":
+                in_squote = False
+            i += 1
+            continue
+        if ch == "'":
+            if not in_dquote:
+                in_squote = True
+        elif ch == '"':
+            in_dquote = not in_dquote
+        elif ch == "$" and i + 1 < len(command) and command[i + 1] == "(":
+            depth = 1
+            j = i + 2
+            inner_squote = False
+            inner_dquote = False
+            while j < len(command) and depth:
+                c = command[j]
+                if c == "\\":
+                    j += 2
+                    continue
+                if inner_squote:
+                    if c == "'":
+                        inner_squote = False
+                elif c == "'":
+                    if not inner_dquote:
+                        inner_squote = True
+                elif c == '"':
+                    inner_dquote = not inner_dquote
+                elif c == "(":
+                    depth += 1
+                elif c == ")":
+                    depth -= 1
+                j += 1
+            if depth == 0:
+                spans.append(command[i + 2 : j - 1])
+                i = j
+                continue
+        i += 1
+    return spans
+
+
+def _eval_command_string(
+    command: str, cwd: Path, depth: int, main_ok: bool, env_main: bool
+) -> str | None:
     command = _strip_heredocs(command)
-    for span in _backtick_spans(command):
-        verdict = _eval_command_string(span, cwd, depth + 1, main_ok)
+    for span in _backtick_spans(command) + _dollar_paren_spans(command):
+        verdict = _eval_command_string(span, cwd, depth + 1, main_ok, env_main)
         if verdict:
             return verdict
-    return _eval_tokens(_tokenize(command), cwd, depth, main_ok)
+    return _eval_tokens(_tokenize(command), cwd, depth, main_ok, env_main)
 
 
 def check_command(command: str, cwd: Path) -> str | None:
@@ -1103,7 +1250,7 @@ def check_command(command: str, cwd: Path) -> str | None:
     # assignment (or `env TP_MAIN_CHECKOUT_OK=1 ...`) disables the
     # main-checkout rules for that command - mentioning the marker in an
     # argument, string or comment does not.
-    return _eval_command_string(command, cwd, 0, main_ok=False)
+    return _eval_command_string(command, cwd, 0, main_ok=False, env_main=False)
 
 
 def main() -> int:

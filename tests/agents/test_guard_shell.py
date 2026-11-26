@@ -96,6 +96,10 @@ CASES: list[tuple[str, str, bool]] = [
     ("git restore --staged README.md", "wt", False),
     ("git restore --staged src/app.py", "wt", False),
     ("git restore -S README.md", "wt", False),
+    ("git restore --staged --worktree README.md", "wt", True),
+    ("git restore --staged -W README.md", "wt", True),
+    ("git restore -SW README.md", "wt", True),
+    ("git restore --staged -- README.md", "wt", False),
     # --- git add -------------------------------------------------------------
     ("git add -A", "wt", True),
     ("git add --all", "wt", True),
@@ -182,6 +186,11 @@ CASES: list[tuple[str, str, bool]] = [
     ('echo "`git stash`"', "wt", True),  # backticks substitute inside "..."
     ("echo '`git stash`'", "wt", False),  # single-quoted: literal text
     ("cat > /tmp/doc.md <<'EOF'\nuse `git stash` carefully\nEOF", "wt", False),
+    # $(...) inside double quotes still substitutes
+    ('git commit -m "$(git stash)"', "wt", True),
+    ("echo result: $(git stash)", "wt", True),
+    ("echo '$(git stash)'", "wt", False),  # single-quoted: literal
+    ('echo "$(git status)"', "wt", False),
     ("uv run ruff format", "wt", True),
     ("uvx ruff format .", "wt", True),
     ("python -m pip --version", "wt", False),
@@ -233,6 +242,31 @@ CASES: list[tuple[str, str, bool]] = [
     ("git status", "main", False),
     ("git push origin feature", "main", False),
     ("uv pip check", "main", False),
+    ("pip install --dry-run foo", "main", False),
+    ("uv pip install --dry-run foo", "main", False),
+    # --- main checkout addressed by path/flags from a worktree --------------------
+    ("{main}/.venv/bin/pip install foo", "wt", True),
+    ("{main}/.venv/bin/pip --version", "wt", False),
+    ("{main}/.venv/bin/python -m pip install foo", "wt", True),
+    ("{main}/.venv/bin/python -m pytest tests/", "wt", False),
+    ("{main}/.venv/bin/python -m ruff format src/app.py", "wt", False),
+    ("uv --directory {main} sync", "wt", True),
+    ("uv --directory={main} sync", "wt", True),
+    ("uv sync --project {main}", "wt", True),
+    ("uv --project {main} sync", "wt", True),
+    ("uv -p {main}/.venv/bin/python sync", "wt", True),
+    ("uv pip --python {main}/.venv/bin/python install foo", "wt", True),
+    ("uv pip --prefix {main}/.venv install foo", "wt", True),
+    ("uv --directory {main} run pytest", "wt", True),
+    ("uv run --project {main} pytest", "wt", True),
+    ("uv --directory src sync", "wt", False),  # targets the worktree itself
+    ("uv sync --project src", "wt", False),
+    ("uv run --python 3.12 pytest", "wt", False),
+    ("npm --prefix {main}/frontend ci", "wt", True),
+    ("npm --prefix {main} install", "wt", True),
+    ("npm --prefix frontend ci", "wt", False),
+    ("env FOO=1 {main}/.venv/bin/pip install foo", "wt", True),
+    ("sudo {main}/.venv/bin/pip install foo", "wt", True),
     # --- outside any checkout: only the global rules apply ----------------------
     ("git commit -m x", "plain", False),
     ("git pull", "plain", False),
