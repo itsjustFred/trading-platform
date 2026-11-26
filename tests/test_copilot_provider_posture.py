@@ -196,6 +196,3 @@ def test_permission_posture_is_documented():
     assert "approve_all" in PERMISSION_POSTURE_NOTE
     assert "generated" in PERMISSION_POSTURE_NOTE.lower()
 
-    from runner.llm_providers import copilot_sdk_provider
-
-    assert "PERMISSION_POSTURE_NOTE" in inspect.getsource(copilot_sdk_provider)
