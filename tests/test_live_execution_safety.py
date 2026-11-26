@@ -1710,7 +1710,9 @@ def test_ctrader_direct_persistence_strips_raw_broker_volume_keys(monkeypatch):
     monkeypatch.setattr(module, "get_live_signal_broker_order_id", lambda _sid: None)
     monkeypatch.setattr(module, "get_live_signal_timestamp", lambda _sid: None)
     monkeypatch.setattr(module, "save_live_signal", _capture)
-    monkeypatch.setattr(adapter, "_resolve_order_volume", lambda _signal: 5_000)
+    # A floored volume consistent with the binding qty=3.0 (never above it):
+    # 2500 broker units = 2.5 qty at the EURUSD fallback scale.
+    monkeypatch.setattr(adapter, "_resolve_order_volume", lambda _signal: 2_500)
     # The request build now runs before persistence; this test is about the
     # persisted metadata, not the wire request.
     monkeypatch.setattr(
@@ -1723,10 +1725,11 @@ def test_ctrader_direct_persistence_strips_raw_broker_volume_keys(monkeypatch):
     assert len(persisted) == 1
     metadata = persisted[0].metadata
     # The persisted qty is the quantity the broker was asked for: the mocked
-    # volume resolution returns 5000 broker units, which is 5.0 qty units at
-    # the EURUSD fallback scale (volume_per_qty 1000) - not the binding 3.0.
-    assert metadata["qty"] == pytest.approx(5.0)
-    assert metadata["explicit_qty"] == pytest.approx(5.0)
+    # volume resolution returns 2500 broker units, which is 2.5 qty units at
+    # the EURUSD fallback scale (volume_per_qty 1000) - the grid-floored
+    # submitted qty, not the binding 3.0.
+    assert metadata["qty"] == pytest.approx(2.5)
+    assert metadata["explicit_qty"] == pytest.approx(2.5)
     assert metadata["note"] == "keep"
     assert "volume" not in metadata
     assert "ctrader_volume" not in metadata

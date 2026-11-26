@@ -627,7 +627,7 @@ def _order_expectations(
         remaining = None if requested is None else requested - filled
         if remaining is not None and remaining <= tolerance:
             continue
-        if remaining is not None and math.isfinite(remaining):
+        if remaining is not None and remaining > 0.0 and math.isfinite(remaining):
             step = step_for(symbol) if symbol else None
             if step is not None and floor_qty_to_step(remaining, step) <= 0.0:
                 # A remainder below one broker volume step can never be a

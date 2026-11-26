@@ -3314,6 +3314,18 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             submitted_qty = _broker_volume_to_qty(
                 order_volume, self._scale_for(signal.symbol).volume_per_qty
             )
+            if submitted_qty > qty_value and not math.isclose(
+                submitted_qty, qty_value, rel_tol=1e-9
+            ):
+                # Volume resolution floors, so this can only happen if a
+                # future change rounds up: persisting an oversized qty would
+                # both place an oversized order and hide the excess from
+                # reconciliation. Fail closed instead.
+                raise ValueError(
+                    f"cTrader normalized qty {submitted_qty!r} exceeds the "
+                    f"binding qty {qty_value!r} for {signal.symbol}; refusing "
+                    "to submit an order larger than the risk-sized quantity."
+                )
             signal = signal.model_copy(
                 update={
                     "metadata": {
