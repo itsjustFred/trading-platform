@@ -3311,11 +3311,19 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             # volume from the normalized qty is idempotent (the lot-grid
             # floor's noise band absorbs the float round-trip), so the request
             # builders below still derive the same volume.
-            submitted_qty = _broker_volume_to_qty(
-                order_volume, self._scale_for(signal.symbol).volume_per_qty
+            scale = self._scale_for(signal.symbol)
+            submitted_qty = _broker_volume_to_qty(order_volume, scale.volume_per_qty)
+            # Only the lot-grid noise band (<= 1e-6 of a step, see
+            # floor_qty_to_step/_qty_to_broker_volume) may push the normalized
+            # qty an ulp above the binding qty; anything more means volume
+            # resolution rounded up. Compare in absolute qty units scaled to
+            # the grid step - a relative tolerance would hide a small
+            # overshoot on a large qty.
+            step_qty = float(max(int(scale.step_volume), 1)) / float(
+                scale.volume_per_qty
             )
             if submitted_qty > qty_value and not math.isclose(
-                submitted_qty, qty_value, rel_tol=1e-9
+                submitted_qty, qty_value, rel_tol=0.0, abs_tol=1e-5 * step_qty
             ):
                 # Volume resolution floors, so this can only happen if a
                 # future change rounds up: persisting an oversized qty would
