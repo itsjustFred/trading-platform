@@ -26,6 +26,7 @@ cp .env.example .env
 cd frontend && npm install && npm run build && cd ..
 python -m uvicorn viewer.main:app --host 0.0.0.0 --port 5556 --no-access-log
 # Open http://localhost:5556
+# (without a frontend build the viewer answers non-API paths with 503 "frontend not built")
 
 # Development (two terminals; Vite on :3000 proxies /api to backend on :5556)
 # Terminal 1:
