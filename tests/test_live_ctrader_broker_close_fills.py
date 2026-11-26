@@ -676,6 +676,49 @@ def test_a_close_fill_on_another_position_does_not_attribute_to_the_exit(
     assert _ledger(database) == pytest.approx(0.0)
 
 
+def test_malformed_position_metadata_fails_closed_to_the_broker_close(
+    database,
+) -> None:
+    """Pre-mortem: an exit signal whose ``position_ids`` metadata is
+    malformed cannot disprove the order-id match, but a corrupt exit must
+    not claim the fill either - attribution fails closed and the deal
+    books against the position's real opener."""
+    import shared.database as db
+
+    entry_id = _persist_entry(database, qty=10.0)
+    exit_id = _persist_exit_signal(
+        database,
+        metadata_extra={"position_ids": [1, 2]},
+    )
+    adapter = _adapter(database, position_orders={POSITION_ID: [_entry_order(entry_id)]})
+
+    asyncio.run(adapter._persist_execution_event(_event(_sdk_closing_order(), _close_deal())))
+
+    assert _signal_execution_rows(database, exit_id) == []
+    assert len(_signal_execution_rows(database, db.broker_close_signal_id(entry_id))) == 1
+    assert _ledger(database) == pytest.approx(0.0)
+
+
+def test_a_string_false_exit_only_flag_is_not_an_exit(database) -> None:
+    """Pre-mortem: ``exit_only`` can arrive as the string ``"false"`` in JSON
+    metadata; the canonical predicate must not count it, so the fill takes
+    the broker-close path instead of attributing to a non-exit."""
+    import shared.database as db
+
+    entry_id = _persist_entry(database, qty=10.0)
+    exit_id = _persist_exit_signal(
+        database,
+        metadata_extra={"exit_only": "false", "risk_sizing_mode": "sized"},
+    )
+    adapter = _adapter(database, position_orders={POSITION_ID: [_entry_order(entry_id)]})
+
+    asyncio.run(adapter._persist_execution_event(_event(_sdk_closing_order(), _close_deal())))
+
+    assert _signal_execution_rows(database, exit_id) == []
+    assert len(_signal_execution_rows(database, db.broker_close_signal_id(entry_id))) == 1
+    assert _ledger(database) == pytest.approx(0.0)
+
+
 def test_a_broker_side_close_with_an_sdk_style_client_order_id_still_books(
     database,
 ) -> None:

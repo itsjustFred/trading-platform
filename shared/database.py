@@ -5815,7 +5815,12 @@ def is_exit_only_signal_metadata(metadata: Mapping[str, Any]) -> bool:
     this same test or the two sides can disagree about which side of the
     ledger a fill lands on.
     """
-    return bool(metadata.get("exit_only")) or (
+    exit_only = metadata.get("exit_only")
+    if isinstance(exit_only, str):
+        # JSON metadata can carry "false" as a string, which bool() would
+        # count as an exit; normalise the common truthy tokens instead.
+        exit_only = exit_only.strip().lower() in {"1", "true", "yes"}
+    return bool(exit_only) or (
         str(metadata.get("risk_sizing_mode") or "").strip().lower() == "exit_only"
     )
 

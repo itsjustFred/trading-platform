@@ -7843,7 +7843,10 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             try:
                 owner_position_id = self._requested_exit_position_id(metadata or {})
             except ValueError:
-                owner_position_id = None
+                # Malformed position metadata cannot disprove the match, but
+                # a corrupt exit signal must not claim the fill either:
+                # fail closed to the broker-close path.
+                return None
             if owner_position_id is not None and owner_position_id != position_id:
                 return None
         try:
