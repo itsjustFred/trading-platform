@@ -425,7 +425,9 @@ def _requested_qty(metadata: Mapping[str, Any]) -> float | None:
     expectation is kept (``None``) rather than reconciled around a guessed
     base - a missing working order is loud, a silently wrong remainder is
     not. The keys are written as the same float, so the agreement check is
-    exact equality on purpose: it must never be relaxed to a tolerance.
+    exact equality on purpose (pinned by
+    ``test_disagreeing_qty_keys_keep_the_expectation``): it must never be
+    relaxed to a tolerance.
     """
     explicit = _positive_qty_metadata_value(metadata.get("explicit_qty"))
     qty = _positive_qty_metadata_value(metadata.get("qty"))
