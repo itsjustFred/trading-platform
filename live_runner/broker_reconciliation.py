@@ -57,6 +57,7 @@ from shared.database import (
     set_live_deployment_entries_halt,
 )
 from shared.logging import get_logger
+from shared.lot_grid import floor_qty_to_step
 from shared.models import LiveDeploymentConfig
 
 logger = get_logger("live-runner")
@@ -403,16 +404,44 @@ def effective_reconciliation_config(
     )
 
 
+def _positive_qty_metadata_value(raw: Any) -> float | None:
+    if raw is None or isinstance(raw, bool):
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) and value > 0 else None
+
+
 def _requested_qty(metadata: Mapping[str, Any]) -> float | None:
+    """The qty the broker was asked for, from persisted signal metadata.
+
+    Adapters persist the normalized submitted qty under both ``qty`` and
+    ``explicit_qty`` (they are kept equal at write time - cTrader's
+    volume-grid floor, Alpaca's whole-share bracket floor). ``explicit_qty``
+    wins the lookup order for legacy rows that carry only one key; a row
+    whose two keys disagree is adapter corruption, so it is logged and the
+    expectation is kept (``None``) rather than reconciled around a guessed
+    base - a missing working order is loud, a silently wrong remainder is
+    not. The keys are written as the same float, so the agreement check is
+    exact equality on purpose (pinned by
+    ``test_disagreeing_qty_keys_keep_the_expectation``): it must never be
+    relaxed to a tolerance.
+    """
+    explicit = _positive_qty_metadata_value(metadata.get("explicit_qty"))
+    qty = _positive_qty_metadata_value(metadata.get("qty"))
+    if explicit is not None and qty is not None and explicit != qty:
+        logger.warning(
+            "broker reconciliation: signal metadata qty keys disagree "
+            "(explicit_qty=%r, qty=%r); keeping the working-order expectation",
+            explicit,
+            qty,
+        )
+        return None
     for key in ("explicit_qty", "qty", "requested_qty"):
-        raw = metadata.get(key)
-        if raw is None or isinstance(raw, bool):
-            continue
-        try:
-            value = float(raw)
-        except (TypeError, ValueError):
-            continue
-        if math.isfinite(value) and value > 0:
+        value = _positive_qty_metadata_value(metadata.get(key))
+        if value is not None:
             return value
     return None
 
@@ -558,10 +587,39 @@ async def _broker_state(
     )
 
 
+def _instrument_qty_step(adapter: BaseLiveAdapter, symbol: str) -> float | None:
+    """The broker's smallest workable quantity increment for ``symbol``.
+
+    Both adapters expose it as ``exit_qty_step`` - the step is a property of
+    the instrument, not of the order side (the same convention
+    ``pre_submit_caps`` uses). A remainder below it can never rest as a
+    working order. ``None`` when the adapter cannot say: the expectation then
+    stays, because an unknown grid must never hide a real remainder.
+    """
+    method = getattr(adapter, "exit_qty_step", None)
+    if not callable(method):
+        return None
+    try:
+        step = float(method(symbol))
+    except Exception as exc:  # except-kind: money-decision - keeps the expectation (fail closed)
+        # One misbehaving adapter/symbol must not abort the whole account
+        # pass: an unusable step keeps the expectation (fail closed).
+        # (asyncio.CancelledError is BaseException and still propagates.)
+        logger.warning(
+            "broker reconciliation: unusable qty step for %s on %s: %r",
+            symbol,
+            type(adapter).__name__,
+            exc,
+        )
+        return None
+    return step if math.isfinite(step) and step > 0 else None
+
+
 def _order_expectations(
     rows: Iterable[Mapping[str, Any]],
     tolerance_for: Callable[[str], float],
     *,
+    step_for: Callable[[str], float | None],
     expected_deployment_ids: set[str],
     now: datetime,
 ) -> tuple[list[dict[str, Any]], list[str]]:
@@ -606,6 +664,33 @@ def _order_expectations(
         remaining = None if requested is None else requested - filled
         if remaining is not None and remaining <= tolerance:
             continue
+        if remaining is not None and remaining > 0.0 and math.isfinite(remaining):
+            try:
+                step = step_for(symbol) if symbol else None
+            except Exception as exc:  # except-kind: money-decision
+                # The step lookup must never abort the account pass, whoever
+                # supplies ``step_for``: an unusable step keeps the expectation.
+                # (asyncio.CancelledError is BaseException and still propagates.)
+                logger.warning(
+                    "broker reconciliation: step lookup failed for %s: %r",
+                    symbol,
+                    exc,
+                )
+                step = None
+            if (
+                step is not None
+                and math.isfinite(step)
+                and step > 0
+                and floor_qty_to_step(remaining, step) <= 0.0
+            ):
+                # A remainder below one broker volume step can never be a
+                # working order: the broker cannot represent it. Rows
+                # persisted before the adapters stamped the normalized
+                # submitted qty still carry the unrounded risk-sized qty, so
+                # their sub-step dust (e.g. a cTrader entry sized 1174.9875
+                # and filled 1174) must not expect an order forever. A
+                # remainder of one step or more still expects one.
+                continue
         expected.append(
             {
                 "signal_id": signal_id,
@@ -664,9 +749,13 @@ def compare_account_state(
             include_adapter_default=config.qty_tolerance_includes_adapter_default,
         )
 
+    def step_for(symbol: str) -> float | None:
+        return _instrument_qty_step(adapter, symbol)
+
     expected_orders, tracked_ids = _order_expectations(
         order_rows,
         tolerance_for,
+        step_for=step_for,
         expected_deployment_ids={str(deployment.id) for deployment in deployments},
         now=_utcnow(),
     )

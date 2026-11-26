@@ -70,7 +70,7 @@ from shared.database import (
     set_live_signal_broker_order_id,
 )
 from shared.logging import get_logger
-from shared.lot_grid import floor_qty_to_step
+from shared.lot_grid import STEP_NOISE, floor_qty_to_step
 from shared.models import (
     PRICE_ABSENT,
     PRICE_OBSERVED,
@@ -3302,7 +3302,52 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 str((signal.metadata or {}).get("risk_sizing_mode") or "")
                 == EXIT_ONLY_RISK_SIZING_MODE
             )
-            self._resolve_order_volume(signal)
+            order_volume = self._resolve_order_volume(signal)
+            # Persist the quantity the broker is actually asked for, not the
+            # unrounded risk-sized one: the volume grid floor can drop a
+            # sub-step remainder the broker can never work, and a persisted
+            # requested qty larger than the fill reads as a working-order
+            # expectation forever in broker reconciliation. Recomputing the
+            # volume from the normalized qty is idempotent (the lot-grid
+            # floor's noise band absorbs the float round-trip), so the request
+            # builders below still derive the same volume.
+            scale = self._scale_for(signal.symbol)
+            submitted_qty = _broker_volume_to_qty(order_volume, scale.volume_per_qty)
+            # Only the lot-grid noise band (<= 1e-6 of a step, see
+            # floor_qty_to_step/_qty_to_broker_volume) may push the normalized
+            # qty an ulp above the binding qty; anything more means volume
+            # resolution rounded up. The allowance is absolute qty units
+            # scaled to the grid step - a relative tolerance would hide a
+            # small overshoot on a large qty. The band tracks the shared
+            # lot-grid floor's own noise constant (2x for float margin) so
+            # the two cannot drift apart.
+            step_qty = float(max(int(scale.step_volume), 1)) / float(
+                scale.volume_per_qty
+            )
+            if submitted_qty > qty_value and not math.isclose(
+                submitted_qty,
+                qty_value,
+                rel_tol=0.0,
+                abs_tol=2.0 * float(STEP_NOISE) * step_qty,
+            ):
+                # Volume resolution floors, so this can only happen if a
+                # future change rounds up: persisting an oversized qty would
+                # both place an oversized order and hide the excess from
+                # reconciliation. Fail closed instead.
+                raise ValueError(
+                    f"cTrader normalized qty {submitted_qty!r} exceeds the "
+                    f"binding qty {qty_value!r} for {signal.symbol}; refusing "
+                    "to submit an order larger than the risk-sized quantity."
+                )
+            signal = signal.model_copy(
+                update={
+                    "metadata": {
+                        **(signal.metadata or {}),
+                        "qty": submitted_qty,
+                        "explicit_qty": submitted_qty,
+                    }
+                }
+            )
             signal = signal.model_copy(
                 update={
                     "metadata": {
@@ -3312,6 +3357,22 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                     }
                 }
             )
+            # The request builders below re-resolve the volume from this
+            # normalized signal; it must reproduce the volume resolved from
+            # the binding qty, or the wire request and the persisted qty
+            # would diverge. The float round-trip (volume -> qty -> volume)
+            # stays far inside the lot-grid floor's 1e-6-unit noise band for
+            # every volume a broker int32 can express (~5e-7 units at
+            # INT32_MAX), so an exact int compare cannot false-positive.
+            reresolved_volume = self._resolve_order_volume(signal)
+            if reresolved_volume != order_volume:
+                raise RuntimeError(
+                    "cTrader volume resolution is not idempotent under qty "
+                    f"normalization for {signal.symbol}: resolved "
+                    f"{order_volume} from the binding qty but "
+                    f"{reresolved_volume} from the normalized qty; "
+                    "refusing to submit."
+                )
             persisted_timestamp = await asyncio.to_thread(
                 get_live_signal_timestamp, signal_id
             )

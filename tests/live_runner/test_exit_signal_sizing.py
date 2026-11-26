@@ -1753,6 +1753,18 @@ def test_floor_qty_to_step_refuses_an_unusable_step(step) -> None:
         floor_qty_to_step(1.0, step)
 
 
+def test_step_noise_constant_is_pinned() -> None:
+    """The cTrader submit overshoot guard derives its allowance from
+    ``STEP_NOISE`` (2x for float margin), so widening the constant silently
+    widens that guard. Pin the value: changing it must be a deliberate,
+    reviewed edit, not drift."""
+    from decimal import Decimal
+
+    from shared.lot_grid import STEP_NOISE
+
+    assert STEP_NOISE == Decimal("1e-6")
+
+
 class _SteppedAdapter(_Adapter):
     """An adapter that names its exit quantity step."""
 

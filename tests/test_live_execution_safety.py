@@ -1710,7 +1710,9 @@ def test_ctrader_direct_persistence_strips_raw_broker_volume_keys(monkeypatch):
     monkeypatch.setattr(module, "get_live_signal_broker_order_id", lambda _sid: None)
     monkeypatch.setattr(module, "get_live_signal_timestamp", lambda _sid: None)
     monkeypatch.setattr(module, "save_live_signal", _capture)
-    monkeypatch.setattr(adapter, "_resolve_order_volume", lambda _signal: 5_000)
+    # A floored volume consistent with the binding qty=3.0 (never above it):
+    # 2500 broker units = 2.5 qty at the EURUSD fallback scale.
+    monkeypatch.setattr(adapter, "_resolve_order_volume", lambda _signal: 2_500)
     # The request build now runs before persistence; this test is about the
     # persisted metadata, not the wire request.
     monkeypatch.setattr(
@@ -1722,8 +1724,12 @@ def test_ctrader_direct_persistence_strips_raw_broker_volume_keys(monkeypatch):
 
     assert len(persisted) == 1
     metadata = persisted[0].metadata
-    assert metadata["qty"] == pytest.approx(3.0)
-    assert metadata["explicit_qty"] == pytest.approx(3.0)
+    # The persisted qty is the quantity the broker was asked for: the mocked
+    # volume resolution returns 2500 broker units, which is 2.5 qty units at
+    # the EURUSD fallback scale (volume_per_qty 1000) - the grid-floored
+    # submitted qty, not the binding 3.0.
+    assert metadata["qty"] == pytest.approx(2.5)
+    assert metadata["explicit_qty"] == pytest.approx(2.5)
     assert metadata["note"] == "keep"
     assert "volume" not in metadata
     assert "ctrader_volume" not in metadata
@@ -5513,6 +5519,255 @@ def test_ctrader_adapter_treats_incoming_qty_as_binding(monkeypatch) -> None:
 
     assert asyncio.run(adapter.submit_order(signal, qty=2.0)) == "777"
     assert volumes == [2000]
+
+
+def _ctrader_submit_harness(monkeypatch):
+    """A connected cTrader adapter with the broker boundary stubbed out.
+
+    Returns ``(module, adapter, saved, volumes)``: ``saved`` collects the
+    signals handed to ``save_live_signal`` and ``volumes`` the order volumes
+    the wire request carried.
+    """
+    module, adapter = _make_ctrader_adapter()
+    adapter._connected = True
+    adapter._authenticated = True
+    adapter._symbol_name_to_id = {"EURUSD": 1}
+    saved: list[LiveSignal] = []
+    volumes: list[int] = []
+
+    monkeypatch.setattr(
+        module,
+        "save_live_signal",
+        lambda persisted: saved.append(persisted) or (str(persisted.id), True),
+    )
+    monkeypatch.setattr(module, "get_live_signal_broker_order_id", lambda _sid: "")
+    monkeypatch.setattr(module, "get_live_signal_timestamp", lambda _sid: None)
+    monkeypatch.setattr(
+        module,
+        "set_live_signal_broker_order_id",
+        lambda _sid, _oid, *, submitted_at=None, acknowledged_at=None: True,
+    )
+
+    class _Req:
+        def __init__(self) -> None:
+            self.volume = 0
+
+    adapter._ProtoOANewOrderReq = _Req
+    adapter._ProtoOAOrderType = SimpleNamespace(MARKET=1)
+    adapter._ProtoOATradeSide = SimpleNamespace(BUY=1, SELL=2)
+    adapter._ProtoOATimeInForce = SimpleNamespace(IMMEDIATE_OR_CANCEL=1)
+
+    async def _send(request, **_kwargs):
+        volumes.append(request.volume)
+        return SimpleNamespace(orderId=777)
+
+    adapter._submit_new_order_request = _send
+    adapter._extract_order_id_from_payload = lambda _payload: 777
+    return module, adapter, saved, volumes
+
+
+def test_ctrader_submit_persists_the_normalized_qty_it_sends(monkeypatch) -> None:
+    """The persisted requested qty is the volume-grid quantity actually sent,
+    not the unrounded risk-sized qty.
+
+    Live repro (cTrader demo 49714635, 2026-11-26): an entry sized 1174.9875
+    was floored onto the broker volume grid and filled 1174; the persisted
+    ``qty``/``explicit_qty`` kept the unrounded size, so broker reconciliation
+    expected a working order for the sub-step remainder forever.
+    """
+    _module, adapter, saved, volumes = _ctrader_submit_harness(monkeypatch)
+    # EURUSD fallback scale: volume_per_qty 1000, step_volume 1 -> one qty
+    # unit is 1000 broker volume units and the grid step is 0.001 qty.
+    signal = LiveSignal(
+        deployment_id="dep-1",
+        symbol="EURUSD",
+        action="buy",
+        theoretical_price=1.1,
+        timestamp=datetime.now(timezone.utc),
+        metadata={"stop_loss": 1.05, "take_profit": 1.2},
+    )
+
+    assert asyncio.run(adapter.submit_order(signal, qty=2.0007)) == "777"
+
+    # 2.0007 qty -> 2000.7 volume units -> floored to 2000 -> 2.0 qty units.
+    assert volumes == [2000]
+    assert saved[0].metadata["qty"] == pytest.approx(2.0)
+    assert saved[0].metadata["explicit_qty"] == pytest.approx(2.0)
+    # Idempotent: the request builders re-resolve the volume from the
+    # normalized signal, and it must still be the volume actually sent.
+    assert adapter._resolve_order_volume(saved[0]) == volumes[0]
+
+
+def test_ctrader_exit_submit_persists_the_floored_qty_it_sends(monkeypatch) -> None:
+    """Same invariant on the exit path: the close's persisted qty is the
+    floored volume-grid quantity, matching the close request's volume."""
+    _module, adapter, saved, _volumes = _ctrader_submit_harness(monkeypatch)
+    adapter._position_ids_by_symbol = {"EURUSD": (7,)}
+    close_volumes: list[int] = []
+
+    def _close_request(*, position_id: int, volume: int):
+        close_volumes.append(volume)
+        return SimpleNamespace(volume=volume)
+
+    monkeypatch.setattr(adapter, "_build_close_position_request", _close_request)
+    signal = LiveSignal(
+        deployment_id="dep-1",
+        symbol="EURUSD",
+        action="sell",
+        theoretical_price=1.1,
+        timestamp=datetime.now(timezone.utc),
+        metadata={"exit_only": True, "risk_sizing_mode": "exit_only"},
+    )
+
+    assert asyncio.run(adapter.submit_order(signal, qty=1.3336)) == "777"
+
+    # 1.3336 qty -> 1333.6 volume units -> floored to the 0.001-qty grid: 1333.
+    assert close_volumes == [1333]
+    assert saved[0].metadata["qty"] == pytest.approx(1.333)
+    assert saved[0].metadata["explicit_qty"] == pytest.approx(1.333)
+    # Same idempotency invariant on the exit path.
+    assert adapter._resolve_order_volume(saved[0]) == close_volumes[0]
+
+
+def test_ctrader_submit_refuses_a_normalized_qty_above_the_binding_qty(
+    monkeypatch,
+) -> None:
+    """If volume resolution ever produced a qty above the risk-sized binding
+    qty (a future round-up), persisting it would both place an oversized
+    order and hide the excess from reconciliation. The overshoot guard must
+    refuse before the send, marked as provably not submitted."""
+    _module, adapter, saved, volumes = _ctrader_submit_harness(monkeypatch)
+    # EURUSD fallback scale: volume_per_qty 1000, so 2500 units is 2.5 qty -
+    # well above the 2.0007 binding qty and far outside the noise band.
+    monkeypatch.setattr(adapter, "_resolve_order_volume", lambda _signal: 2_500)
+    submit = adapter.submit_order(_ctrader_entry_signal(), qty=2.0007)
+
+    with pytest.raises(ValueError, match="exceeds the binding qty") as excinfo:
+        asyncio.run(submit)
+
+    assert is_order_not_submitted(excinfo.value)
+    assert saved == []
+    assert volumes == []
+
+
+def test_ctrader_submit_accepts_a_binding_qty_within_float_noise_below_a_grid_point(
+    monkeypatch,
+) -> None:
+    """The overshoot guard's tolerance band must admit float noise: a
+    risk-sized qty a hair below a grid point (2.0 - 1e-10) lands on that grid
+    point and is a legitimate submit, not an overshoot to refuse."""
+    _module, adapter, saved, volumes = _ctrader_submit_harness(monkeypatch)
+
+    assert (
+        asyncio.run(adapter.submit_order(_ctrader_entry_signal(), qty=2.0 - 1e-10))
+        == "777"
+    )
+
+    assert volumes == [2000]
+    assert saved[0].metadata["qty"] == pytest.approx(2.0)
+
+
+def test_ctrader_submit_refuses_a_sub_step_overshoot_of_the_binding_qty(
+    monkeypatch,
+) -> None:
+    """The tolerance band must stay far below one grid step: a resolution one
+    step (0.001 qty) above the grid floor of the binding qty overshoots it by
+    less than a step (2.001 vs 2.0007) and must still be refused before the
+    send, marked as provably not submitted."""
+    _module, adapter, saved, volumes = _ctrader_submit_harness(monkeypatch)
+    monkeypatch.setattr(adapter, "_resolve_order_volume", lambda _signal: 2_001)
+    submit = adapter.submit_order(_ctrader_entry_signal(), qty=2.0007)
+
+    with pytest.raises(ValueError, match="exceeds the binding qty") as excinfo:
+        asyncio.run(submit)
+
+    assert is_order_not_submitted(excinfo.value)
+    assert saved == []
+    assert volumes == []
+
+
+def test_ctrader_submit_refuses_when_qty_normalization_is_not_idempotent(
+    monkeypatch,
+) -> None:
+    """The request builders re-resolve the volume from the normalized signal;
+    if that disagrees with the volume resolved from the binding qty, the wire
+    request and the persisted qty would diverge. Refuse before the send,
+    marked as provably not submitted."""
+    _module, adapter, saved, volumes = _ctrader_submit_harness(monkeypatch)
+    resolutions = {"n": 0}
+
+    def _resolve(_signal):
+        resolutions["n"] += 1
+        # The binding-qty resolution is the real floored volume; every later
+        # resolution disagrees, as a non-idempotent resolution would.
+        return 2_000 if resolutions["n"] == 1 else 2_001
+
+    monkeypatch.setattr(adapter, "_resolve_order_volume", _resolve)
+    submit = adapter.submit_order(_ctrader_entry_signal(), qty=2.0007)
+
+    with pytest.raises(RuntimeError, match="not idempotent") as excinfo:
+        asyncio.run(submit)
+
+    assert is_order_not_submitted(excinfo.value)
+    assert saved == []
+    assert volumes == []
+
+
+def test_ctrader_exit_submit_refuses_when_qty_normalization_is_not_idempotent(
+    monkeypatch,
+) -> None:
+    """Same fail-closed invariant on the exit path: the close request's
+    volume is re-resolved from the normalized signal, so a non-idempotent
+    resolution must refuse before the send, marked as not submitted."""
+    _module, adapter, saved, _volumes = _ctrader_submit_harness(monkeypatch)
+    adapter._position_ids_by_symbol = {"EURUSD": (7,)}
+    resolutions = {"n": 0}
+
+    def _resolve(_signal):
+        resolutions["n"] += 1
+        return 1_333 if resolutions["n"] == 1 else 1_334
+
+    monkeypatch.setattr(adapter, "_resolve_order_volume", _resolve)
+    monkeypatch.setattr(
+        adapter,
+        "_build_close_position_request",
+        lambda *, position_id, volume: SimpleNamespace(volume=volume),
+    )
+    signal = LiveSignal(
+        deployment_id="dep-1",
+        symbol="EURUSD",
+        action="sell",
+        theoretical_price=1.1,
+        timestamp=datetime.now(timezone.utc),
+        metadata={"exit_only": True, "risk_sizing_mode": "exit_only"},
+    )
+    submit = adapter.submit_order(signal, qty=1.3336)
+
+    with pytest.raises(RuntimeError, match="not idempotent") as excinfo:
+        asyncio.run(submit)
+
+    assert is_order_not_submitted(excinfo.value)
+    assert saved == []
+
+
+def test_ctrader_volume_resolution_is_idempotent_at_the_int32_bound(
+    monkeypatch,
+) -> None:
+    """The submit path's exact-int idempotency compare must hold for every
+    volume the cTrader protocol can express (int32): the volume -> qty ->
+    volume float round-trip error stays near 1e-7 units at INT32_MAX, far
+    inside the lot-grid floor's 1e-6-unit noise band, so re-resolving from
+    the normalized qty cannot land one unit off and false-positive the
+    guard."""
+    _module, adapter, _saved, _volumes = _ctrader_submit_harness(monkeypatch)
+    # EURUSD fallback scale: volume_per_qty 1000, step_volume 1. The largest
+    # whole-qty volume below INT32_MAX (2147483647) is 2_147_483_000 units.
+    volume = 2_147_483_000
+    signal = _ctrader_entry_signal().model_copy(
+        update={"metadata": {"qty": volume / 1000.0}}
+    )
+
+    assert adapter._resolve_order_volume(signal) == volume
 
 
 def _ctrader_entry_signal() -> LiveSignal:

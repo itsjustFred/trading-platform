@@ -602,7 +602,17 @@ order ~90 days after creation and nothing re-places a protective order lost
 that way yet - the reconciler's `position_without_protective_stop` finding
 is what catches it), so an older
 unfilled row is a cancelled/expired/rejected historical order, not a working
-one. A younger order missing from the broker's working list is not trusted on
+one. The expected quantity is the one the broker was actually asked for:
+adapters persist the normalized submitted qty in the signal metadata (the
+cTrader volume-grid floor and the Alpaca whole-share bracket floor), so a
+filled order never leaves a phantom remainder. Rows persisted before that
+normalization still carry the unrounded sized qty; for those, a remainder
+below the instrument's broker volume step (`exit_qty_step` - a property of
+the instrument, not the order side) is never expected either, because no
+broker can work an order smaller than its own step. A remainder of one step
+or more still expects a working order, and an adapter that cannot name the
+step keeps the expectation (fail closed). A younger order missing from the
+broker's working list is not trusted on
 the age bound alone: the reconciler asks the adapter for that order's state
 (`get_order_state`, bounded lookups per pass), and only a proven `terminal`
 state clears the finding - IOC remainders, cancelled orders and rejected
