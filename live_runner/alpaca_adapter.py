@@ -1242,7 +1242,7 @@ def _alpaca_fill_dedupe_key(
     return f"alpaca:order:{broker_order_id}:{event}:{stamp}:{filled_qty}"
 
 
-def _default_alpaca_credentials(values: Mapping[str, str]) -> tuple[str, str, bool] | None:
+def default_alpaca_credentials(values: Mapping[str, str]) -> tuple[str, str, bool] | None:
     api_key = str(values.get("ALPACA_API_KEY", "")).strip()
     secret_key = str(values.get("ALPACA_SECRET_KEY", "")).strip()
     if api_key and secret_key:
@@ -1256,7 +1256,7 @@ def _default_alpaca_credentials(values: Mapping[str, str]) -> tuple[str, str, bo
     return None
 
 
-def _alpaca_acc_indexes(values: Mapping[str, str]) -> list[int]:
+def alpaca_acc_indexes(values: Mapping[str, str]) -> list[int]:
     return sorted(
         {
             int(match.group("index"))
@@ -1266,7 +1266,7 @@ def _alpaca_acc_indexes(values: Mapping[str, str]) -> list[int]:
     )
 
 
-def _alpaca_credential_block(
+def alpaca_credential_block(
     values: Mapping[str, str],
     idx: int,
 ) -> dict[str, str | bool] | None:
@@ -1303,13 +1303,13 @@ def _alpaca_credential_block(
     }
 
 
-def _alpaca_credential_blocks(
+def alpaca_credential_blocks(
     values: Mapping[str, str],
     indexes: list[int],
 ) -> list[dict[str, str | bool]]:
     blocks: list[dict[str, str | bool]] = []
     for idx in indexes:
-        block = _alpaca_credential_block(values, idx)
+        block = alpaca_credential_block(values, idx)
         if block is not None:
             blocks.append(block)
     return blocks
@@ -1354,10 +1354,10 @@ def resolve_alpaca_credentials(
     """Resolve Alpaca credentials from env (default or ACC{N} blocks)."""
     values = dict(env) if env is not None else dict(os.environ)
 
-    indexes = _alpaca_acc_indexes(values)
+    indexes = alpaca_acc_indexes(values)
     blocks: list[dict[str, str | bool]] = []
     if indexes:
-        blocks = _alpaca_credential_blocks(values, indexes)
+        blocks = alpaca_credential_blocks(values, indexes)
 
     normalized_account_id = str(account_id or "").strip().lower()
     normalized_login = str(broker_login or "").strip().lower()
@@ -1398,7 +1398,7 @@ def resolve_alpaca_credentials(
         )
         return None
 
-    default_credentials = _default_alpaca_credentials(values)
+    default_credentials = default_alpaca_credentials(values)
     if default_credentials is not None:
         return default_credentials
 
