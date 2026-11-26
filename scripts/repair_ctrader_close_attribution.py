@@ -195,12 +195,9 @@ def _first_pass_move_refusal(
     ).strip().upper():
         return "symbol_mismatch"
     if owner_target and owner_target != parent:
-        # The owner already credits a different entry: moving would
-        # re-attribute the fill.
-        return "attribution_conflict"
-    if owner_target and not parent:
-        # The synthetic fill was unattributed (FIFO); the owner's
-        # target would newly attribute it.
+        # The owner already credits a different entry - or the synthetic
+        # fill was unattributed (FIFO) while the owner has a target, which
+        # would newly attribute it. Either way the move is refused.
         return "attribution_conflict"
     return None
 

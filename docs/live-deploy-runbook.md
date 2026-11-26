@@ -1627,17 +1627,25 @@ uv run python -m scripts.repair_ctrader_close_attribution --apply
 
 1. **Deploy this build and restart the daemon FIRST.** An old build keeps
    mis-booking every new cTrader close as it arrives; repairing before the
-   new attribution code is live just refills the same hole.
-2. Take a `.backup` of `backtests.db` (the script's own snapshot discipline
-   applies: copy, dry-run, review, apply).
-3. Prefer running the script with the **daemon stopped**. A concurrent write
-   does not corrupt anything - the whole repair is one transaction with
-   foreign keys on, so a racing write only makes the commit fail and roll
-   back - but a stopped daemon makes that impossible rather than unlikely.
-4. The report is printed as JSON on **stdout**; log lines go to **stderr**,
-   so `... | jq` works. Review `moves`, `metadata_updates`,
-   `deleted_signals`, `refusals` and `unmatched` before `--apply`.
-5. Re-run the dry-run afterwards: an applied repair reports zero moves.
+   new attribution code is live just refills the same hole. Until the
+   repair runs, the restarted daemon keeps logging the "Dedupe key
+   collision" ERROR for the already-mis-booked rows on every reconcile -
+   that is expected and harmless; `--apply` is what stops it.
+2. **Stop the daemon** before touching the database.
+3. Take a `.backup` of `backtests.db` while it is stopped (the script's own
+   snapshot discipline applies: copy, dry-run, review, apply).
+4. Run the dry-run and review the report (see below), then
+   `uv run python -m scripts.repair_ctrader_close_attribution --apply`.
+   The report is printed as JSON on **stdout**; log lines go to **stderr**,
+   so `... | jq` works.
+5. **Start the daemon** and re-run the dry-run afterwards: an applied
+   repair reports zero moves.
+
+`moves` keeps growing until step 1's deploy lands - the running old build
+mis-books each new cTrader close as it arrives (11 moves on the
+2026-11-26 database copy). Expect the count to be at least that, and check
+that every row has the same shape: an exit-only `sell` owner and a
+`parent_signal_id` stamp equal to the synthetic close's parent.
 
 Review the dry-run report first: `moves` lists each fill that would change
 owner, `metadata_updates` each `parent_signal_id` stamp, `deleted_signals`
@@ -1646,8 +1654,10 @@ untouched with their reasons (`ambiguous_owner`, `owner_not_exit_signal`,
 `action_mismatch`, `symbol_mismatch`, `attribution_conflict`,
 `conflicting_parents`, `owner_has_other_fills`,
 `would_be_attributed_by_repair`, `no_same_deployment_owner`,
-`empty_broker_order_id`). Refused and unmatched rows need a human decision;
-the script is safe to re-run — an applied repair is a no-op the second time.
+`empty_broker_order_id`). `no_same_deployment_owner` rows are usually
+genuine broker-side closes (SL/TP, flatten, manual) and need no action;
+the other refused and unmatched rows need a human decision. The script is
+safe to re-run — an applied repair is a no-op the second time.
 
 ## Release / rollback
 

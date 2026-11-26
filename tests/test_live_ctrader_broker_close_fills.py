@@ -1120,6 +1120,135 @@ def test_an_unknown_outcome_close_submit_keeps_the_mark_and_parks_budget_free(
     assert adapter._pending_close_fill_event_ids == set()
     assert adapter._reconciliation_required is False
 
+    # ``_ack_execution_event`` forgets a parked id as well: the id() is only
+    # meaningful while the event is referenced, and a stale entry would
+    # budget-free-requeue an unrelated fill that reuses the address.
+    adapter._pending_close_fill_event_ids.add(id(event))
+    adapter._execution_retry_counts[id(event)] = 1
+    adapter._ack_execution_event(event)
+    assert id(event) not in adapter._pending_close_fill_event_ids
+    assert id(event) not in adapter._execution_retry_counts
+
+
+def test_the_listener_parks_a_pending_close_fill_without_spending_budget(
+    database, monkeypatch
+) -> None:
+    """Should-fix 3 pin: ``listen_executions`` must recognise
+    ``_PendingCloseFillRetentionError`` and park the fill budget-free on a
+    paced reconcile - not requeue it against ``EXECUTION_RETRY_LIMIT`` (the
+    crash loop the mark's TTL would cause) and not run a full broker
+    reconcile on every iteration."""
+    from live_runner import ctrader_adapter as module
+    from live_runner.ctrader_adapter import _PendingCloseFillRetentionError
+
+    adapter = _adapter(database)
+    adapter._connected = True
+    adapter._authenticated = True
+    event = _event(_sdk_closing_order(), _close_deal())
+    persist_calls = 0
+    reconcile_calls = 0
+
+    async def _persist(received: Any) -> None:
+        nonlocal persist_calls
+        assert received is event
+        persist_calls += 1
+        raise _PendingCloseFillRetentionError(
+            "cTrader fill closes a position whose own close order is "
+            "still in flight; retaining the event for reconciliation."
+        )
+
+    async def _reconcile(*, max_signals: int = 200) -> int:
+        nonlocal reconcile_calls
+        reconcile_calls += 1
+        # A parked fill must pace reconciliation, not run it every pass:
+        # raising keeps the listener from hot-looping on a broken pacing
+        # mutant long enough for the assertions below to observe it.
+        raise RuntimeError("reconcile ran while a fill was parked")
+
+    async def _sleep(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(adapter, "_persist_execution_event", _persist)
+    monkeypatch.setattr(adapter, "reconcile_executions", _reconcile)
+    monkeypatch.setattr(module.asyncio, "sleep", _sleep)
+    adapter._execution_queue.put_nowait(event)
+
+    started = time.monotonic()
+    # The listener loops forever; the outer timeout cancels it while it
+    # waits on the (now empty) execution queue.
+    with pytest.raises(asyncio.TimeoutError):
+        asyncio.run(asyncio.wait_for(adapter.listen_executions(), timeout=0.5))
+
+    # Parked once, budget-free: the event is never re-persisted, the retry
+    # budget is untouched, and the listener cannot crash-loop for the
+    # mark's whole TTL.
+    assert persist_calls == 1
+    assert event in adapter._unresolved_execution_events
+    assert id(event) in adapter._pending_close_fill_event_ids
+    assert adapter._execution_retry_counts == {}
+    # Paced: the next reconcile is ~30 s out, so parking does not turn the
+    # listener into one full broker reconcile per iteration.
+    assert reconcile_calls == 0
+    assert adapter._reconciliation_required is True
+    assert (
+        module._PENDING_CLOSE_FILL_RECONCILE_SECONDS - 1.0
+        < adapter._reconciliation_retry_at - started
+        <= module._PENDING_CLOSE_FILL_RECONCILE_SECONDS + 1.0
+    )
+
+
+def test_clearing_the_last_pending_mark_expedites_parked_fill_reconciliation(
+    database,
+) -> None:
+    """A9 pin: when the last pending mark lifts while fills are parked, the
+    next reconcile is expedited (``_reconciliation_retry_at = 0``) instead of
+    waiting out the paced interval."""
+    exit_id = _persist_exit_signal(
+        database, order_id=None, metadata_extra={"position_id": POSITION_ID}
+    )
+    adapter = _adapter(database)
+    adapter._pending_close_positions[POSITION_ID] = {exit_id: time.monotonic()}
+    event = _event(_sdk_closing_order(), _close_deal())
+    adapter._unresolved_execution_events.append(event)
+    adapter._pending_close_fill_event_ids.add(id(event))
+    adapter._reconciliation_required = True
+    adapter._reconciliation_retry_at = time.monotonic() + 30.0
+
+    adapter._clear_pending_close_mark(POSITION_ID, exit_id)
+
+    assert POSITION_ID not in adapter._pending_close_positions
+    assert adapter._reconciliation_retry_at == 0.0
+    assert adapter._reconciliation_required is True
+
+
+def test_reconciliation_prunes_ids_of_parked_events_that_left_the_deque(
+    database,
+) -> None:
+    """A17 pin: ``_pending_close_fill_event_ids`` must only name events still
+    in ``_unresolved_execution_events`` - a stale id would budget-free-requeue
+    an unrelated fill that later reuses the address."""
+    adapter = _adapter(database)
+    parked = object()
+    stuck = object()
+    # One free queue slot: the parked fill requeues into it, the ordinary
+    # retained fill finds the queue full and stays in the deque.
+    adapter._execution_queue = asyncio.Queue(maxsize=2)
+    adapter._execution_queue.put_nowait(object())
+    adapter._unresolved_execution_events.extend([parked, stuck])
+    adapter._pending_close_fill_event_ids.add(id(parked))
+    adapter._reconciliation_required = True
+    adapter._reconciliation_retry_at = 0.0
+
+    async def no_op_reconcile() -> int:
+        return 0
+
+    adapter.reconcile_executions = no_op_reconcile  # type: ignore[assignment]
+    asyncio.run(adapter._run_pending_reconciliation(2))
+
+    assert list(adapter._unresolved_execution_events) == [stuck]
+    assert id(parked) not in adapter._pending_close_fill_event_ids
+    assert adapter._reconciliation_required is True
+
 
 def test_a_recovered_close_order_id_clears_the_pending_mark(database) -> None:
     """Should-fix: when reconciliation recovers and persists the close's

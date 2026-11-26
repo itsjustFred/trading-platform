@@ -460,6 +460,58 @@ def test_a_symbol_mismatch_is_refused(database) -> None:
     assert _executions_for(database, close_id)[0].signal_id == close_id
 
 
+def test_an_unattributed_close_is_refused_when_the_owner_has_a_target(
+    database,
+) -> None:
+    """S5 pin: a FIFO-unattributed synthetic close must not become attributed
+    through the owner's reduction target - the fill stays on the synthetic
+    signal and the owner is not stamped."""
+    _persist_entry(database)
+    exit_id = _persist_exit_signal(
+        database, metadata_extra={"exit_target_signal_id": str(uuid4())}
+    )
+    close_id = _broker_close_signal(database, parent_id="")
+    _persist_execution(database, signal_id=close_id)
+
+    report = repair.repair_ctrader_close_attribution(apply=True)
+
+    assert report["moves"] == []
+    assert [r["reason"] for r in report["refusals"]] == ["attribution_conflict"]
+    assert report["refusals"][0]["owner_signal_id"] == exit_id
+    assert _executions_for(database, close_id)[0].signal_id == close_id
+    owner = _signal(database, exit_id)
+    assert owner is not None
+    assert BROKER_CLOSE_PARENT_SIGNAL_KEY not in (owner.metadata_json or {})
+
+
+def test_one_owner_with_two_parents_is_refused_not_stamped_arbitrarily(
+    database,
+) -> None:
+    """S6 pin: targeted moves naming two different parents cannot pick one -
+    every targeted move is refused and the owner is left unstamped."""
+    _persist_entry(database)
+    exit_id = _persist_exit_signal(database)
+    close_a = _broker_close_signal(database, parent_id=str(uuid4()))
+    close_b = _broker_close_signal(database, parent_id=str(uuid4()))
+    _persist_execution(database, signal_id=close_a, dedupe_key="ctrader:deal:9001")
+    _persist_execution(database, signal_id=close_b, dedupe_key="ctrader:deal:9002")
+
+    report = repair.repair_ctrader_close_attribution(apply=True)
+
+    assert report["moves"] == []
+    assert [r["reason"] for r in report["refusals"]] == [
+        "conflicting_parents",
+        "conflicting_parents",
+    ]
+    owner = _signal(database, exit_id)
+    assert owner is not None
+    assert BROKER_CLOSE_PARENT_SIGNAL_KEY not in (owner.metadata_json or {})
+    assert len(_executions_for(database, close_a)) == 1
+    assert len(_executions_for(database, close_b)) == 1
+    assert _signal(database, close_a) is not None
+    assert _signal(database, close_b) is not None
+
+
 def test_apply_keeps_the_open_position_lots_identical(database) -> None:
     """Ledger identity: moving a targeted close fill onto its exit owner and
     stamping ``parent_signal_id`` must leave the deployment's open position
