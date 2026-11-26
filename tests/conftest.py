@@ -40,8 +40,18 @@ _CASE_INSENSITIVE_FS = os.name == "nt" or sys.platform == "darwin"
 # an exported DATA_DIR pointing at production cannot leak in either. Both directories are set
 # before any ``shared`` import, because ``shared.constants`` resolves DATA_DIR and LOG_DIR from
 # the environment at import time and the platform writes through both.
-_SESSION_ROOT = Path(tempfile.mkdtemp(prefix="tp-pytest-session-")).resolve()
-atexit.register(shutil.rmtree, _SESSION_ROOT, ignore_errors=True)
+#
+# A subprocess a test starts is the one process that must NOT create a session of its own:
+# ``sandboxed_env()`` marks it (``TP_TEST_CHILD_SANDBOX``) and names the parent's session
+# directory (``TP_TEST_SESSION_ROOT``), so the child shares the sandbox instead of building a
+# second one - and never deletes the parent's on its way out, which an ``atexit`` rmtree of a
+# directory the parent is still using would do.
+_CHILD_PROCESS = os.environ.get("TP_TEST_CHILD_SANDBOX") == "1"
+if _CHILD_PROCESS:
+    _SESSION_ROOT = Path(os.environ["TP_TEST_SESSION_ROOT"]).resolve()
+else:
+    _SESSION_ROOT = Path(tempfile.mkdtemp(prefix="tp-pytest-session-")).resolve()
+    atexit.register(shutil.rmtree, _SESSION_ROOT, ignore_errors=True)
 TEST_DATA_DIR = _SESSION_ROOT / "data"
 TEST_LOG_DIR = _SESSION_ROOT / "logs"
 # Where a caller that names no accounts-env file resolves to. It deliberately does not exist: a
@@ -88,10 +98,21 @@ def _clear_external_credential_env() -> None:
 _clear_external_credential_env()
 for _session_dir in (TEST_DATA_DIR, TEST_LOG_DIR):
     _session_dir.mkdir(parents=True, exist_ok=True)
-ISOLATED_DOTENV_FILE.write_text("", encoding="utf-8")
+if not _CHILD_PROCESS:
+    # The parent owns the substitute .env; a child reads the same file through the
+    # redirect and must not rewrite it while the parent is still running.
+    ISOLATED_DOTENV_FILE.write_text("", encoding="utf-8")
 
-os.environ["DATA_DIR"] = str(TEST_DATA_DIR)
-os.environ["TRADING_DATA_DIR"] = str(TEST_DATA_DIR)
+# A child process gets its directories from ``sandboxed_env()`` (the parent's
+# session root, or the directory the naming test chose), so here they are filled
+# in rather than forced: forcing them would overwrite the value the test meant the
+# child to see.
+if _CHILD_PROCESS:
+    os.environ.setdefault("DATA_DIR", str(TEST_DATA_DIR))
+    os.environ.setdefault("TRADING_DATA_DIR", str(TEST_DATA_DIR))
+else:
+    os.environ["DATA_DIR"] = str(TEST_DATA_DIR)
+    os.environ["TRADING_DATA_DIR"] = str(TEST_DATA_DIR)
 # A developer's shell or .env must never turn the test suite into an alert
 # source: the ops alert sink reads OPS_ALERT_WEBHOOK_URL from the environment.
 # Set it blank rather than popping it: shared.constants load_dotenv() fills in
@@ -103,12 +124,191 @@ os.environ["OPS_ALERT_WEBHOOK_URL"] = ""
 os.environ["OPS_ALERT_MIN_LEVEL"] = ""
 os.environ["OPS_ALERT_EVENTS"] = ""
 os.environ["OPS_ALERT_IGNORE"] = ""
-os.environ["LOG_DIR"] = str(TEST_LOG_DIR)
+if _CHILD_PROCESS:
+    os.environ.setdefault("LOG_DIR", str(TEST_LOG_DIR))
+else:
+    os.environ["LOG_DIR"] = str(TEST_LOG_DIR)
 # Removed rather than redirected: an exported TP_ACCOUNTS_ENV names a real credential file, and
 # nothing in the suite may read one. Removing it leaves exactly one redirect in play - the roster
 # of module constants below - so a test that patches a module default still changes what the code
 # reads.
 os.environ.pop(ACCOUNTS_ENV_ENV_VAR, None)
+
+
+# --- the environment the suite keeps of its caller's ------------------------------------------- #
+
+# A denylist of credential-shaped names was the first cut of this guard, and it leaves the rest of
+# the caller's environment in place: a base URL pointing at the live broker, a PYTHONPATH that
+# shadows a package, a HOME that reads the developer's own configuration, a TZ that moves a date
+# boundary. None of that is the suite's business, so the environment is cleared down to an
+# explicit allowlist instead - in the pytest process and in every child a test starts.
+#
+# What survives is the minimum the suite and its children need to run:
+#   * PATH, TMP*, PATHEXT, COMSPEC, SystemRoot, windir and
+#     NoDefaultCurrentDirectoryInExePath: the interpreter and the tools a test spawns must still
+#     start, on every supported platform.
+#   * locale and TZ: the platform reads them; a test needing another zone sets it itself.
+#   * PYTHON*: the interpreter's own switches, plus the PYTHONPATH sandboxed_env() rebuilds.
+#   * PYTEST_XDIST*: an xdist worker's own identity, set by the controller before this import.
+#   * CI, GITHUB_*, RUNNER_TEMP: the CI job's context, which the workflows and the
+#     workflow-simulation tests read.
+#   * the documented opt-ins (TP_TEST_OHLCV_DIR, TP_INTEGRATION_BASE_URL, TRADING_PRODUCTION_DB,
+#     DIFFERENTIAL_REAL_SLICE_CSV, REQUIRE_REAL_DATA_SLICE, PLAYWRIGHT_BROWSERS_PATH): each names
+#     a path or flag a maintainer chose deliberately, and each test that reads one skips cleanly
+#     when it is unset.
+# HOME is not on the list: it is pointed at the session sandbox instead, so a test (or a child)
+# never reads the caller's home directory. The sandbox's own variables (DATA_DIR, LOG_DIR, the
+# OPS_ALERT_* filters) are, because the sweep runs after they were forced: they hold this
+# process's values by then, and a child that inherited them from sandboxed_env() must keep them.
+_SANDBOX_ENV_ALLOWLIST = frozenset(
+    {
+        "CI",
+        "COMSPEC",
+        "DATA_DIR",
+        "DIFFERENTIAL_REAL_SLICE_CSV",
+        "LANG",
+        "LANGUAGE",
+        "LOG_DIR",
+        "NoDefaultCurrentDirectoryInExePath",
+        "OPS_ALERT_EVENTS",
+        "OPS_ALERT_IGNORE",
+        "OPS_ALERT_MIN_LEVEL",
+        "OPS_ALERT_WEBHOOK_URL",
+        "PATHEXT",
+        "PATH",
+        "PLAYWRIGHT_BROWSERS_PATH",
+        "REQUIRE_REAL_DATA_SLICE",
+        "RUNNER_TEMP",
+        "SystemRoot",
+        "TEMP",
+        "TMP",
+        "TMPDIR",
+        "TP_INTEGRATION_BASE_URL",
+        "TP_TEST_OHLCV_DIR",
+        "TRADING_DATA_DIR",
+        "TRADING_PRODUCTION_DB",
+        "TZ",
+        "windir",
+    }
+)
+_SANDBOX_ENV_ALLOWLIST_PREFIXES = ("PYTHON", "LC_", "GITHUB_", "PYTEST_XDIST")
+# Where a sandboxed HOME points: inside the session sandbox, never the caller's home.
+SANDBOX_HOME = _SESSION_ROOT / "home"
+
+
+def _is_allowlisted_env(name: str) -> bool:
+    """Whether *name* is part of the environment the suite may observe."""
+    return name in _SANDBOX_ENV_ALLOWLIST or name.startswith(_SANDBOX_ENV_ALLOWLIST_PREFIXES)
+
+
+def _enforce_env_allowlist() -> None:
+    """Clear the caller's environment down to the allowlist.
+
+    Runs in every process that imports this file, xdist workers included: an
+    xdist worker inherits the controller's already-swept environment, so sweeping
+    again changes nothing but HOME, while an environment variable *inherited
+    further down* (a child of a worker, through a shell script) must not be able
+    to silence the sweep - a process that merely carries ``PYTEST_XDIST_WORKER``
+    is not a worker, and treating it like one would hand every descendant the
+    unswept environment. The identity variables xdist's bootstrap installs are
+    on the allowlist (``PYTEST_XDIST*``), so they survive it either way.
+    """
+    for name in [name for name in os.environ if not _is_allowlisted_env(name)]:
+        os.environ.pop(name, None)
+    os.environ["HOME"] = str(SANDBOX_HOME)
+    if os.name == "nt":
+        os.environ["USERPROFILE"] = str(SANDBOX_HOME)
+    else:
+        os.environ.pop("USERPROFILE", None)
+
+
+_enforce_env_allowlist()
+SANDBOX_HOME.mkdir(parents=True, exist_ok=True)
+# Holds the ``sitecustomize`` a sandboxed child imports at startup - inside the session sandbox,
+# so the suite leaves nothing behind in the checkout and a child cannot pick a different one.
+CHILD_SANDBOX_SHIM_DIR = _SESSION_ROOT / "child-sandbox"
+
+
+def sandboxed_env(**overrides: str) -> dict[str, str]:
+    """The environment a subprocess a test starts must be handed.
+
+    A child inherits this process's environment but none of its guards: the audit
+    hook, the ``load_dotenv`` redirect and the patched ``*ACCOUNTS_ENV*`` constants
+    all live in this process's memory, so a plain ``subprocess.run(...)`` hands the
+    child the caller's whole environment and the child loads the checkout's real
+    ``.env`` and resolves the real ``.accounts.env`` path when it imports a
+    platform module.
+
+    The returned mapping is the allowlisted environment plus the sandbox's own
+    forced values, with *overrides* (``sandboxed_env(DATA_DIR=str(child_dir))``)
+    applied last, and with a ``sitecustomize`` first on PYTHONPATH: Python imports
+    it before any ``-c``/``-m`` code runs, it imports this conftest, and that
+    installs the suite's guards inside the child as well. A ``PYTHONPATH``
+    override is prepended rather than replaced, so a test that deliberately puts
+    another tree on the path (the import-origin probe) keeps that shadowing while
+    the shim stays in front of it.
+    """
+    env = {name: value for name, value in os.environ.items() if _is_allowlisted_env(name)}
+    env["DATA_DIR"] = os.environ["DATA_DIR"]
+    env["TRADING_DATA_DIR"] = os.environ["TRADING_DATA_DIR"]
+    env["LOG_DIR"] = os.environ["LOG_DIR"]
+    env["OPS_ALERT_WEBHOOK_URL"] = ""
+    env["OPS_ALERT_MIN_LEVEL"] = ""
+    env["OPS_ALERT_EVENTS"] = ""
+    env["OPS_ALERT_IGNORE"] = ""
+    env.pop(ACCOUNTS_ENV_ENV_VAR, None)
+    env["HOME"] = str(SANDBOX_HOME)
+    if os.name == "nt":
+        env["USERPROFILE"] = str(SANDBOX_HOME)
+    else:
+        env.pop("USERPROFILE", None)
+    caller_pythonpath = overrides.pop("PYTHONPATH", None)
+    pythonpath = [str(CHILD_SANDBOX_SHIM_DIR), str(PROJECT_ROOT)]
+    if caller_pythonpath:
+        pythonpath.insert(0, caller_pythonpath)
+    env["PYTHONPATH"] = os.pathsep.join(pythonpath)
+    env.update(overrides)
+    # The xdist identity belongs to the worker xdist started, never to a child of it: a
+    # plain child that carries the marker would look like a worker to anything that
+    # checks, and the marker has no meaning in a process execnet did not start.
+    for name in [name for name in env if name.startswith("PYTEST_XDIST")]:
+        env.pop(name, None)
+    env["TP_TEST_CHILD_SANDBOX"] = "1"
+    env["TP_TEST_SESSION_ROOT"] = str(_SESSION_ROOT)
+    env["TP_TEST_REPO_ROOT"] = str(PROJECT_ROOT)
+    return env
+
+
+def _write_child_sandbox_shim() -> None:
+    """Write the ``sitecustomize`` every sandboxed child imports at startup.
+
+    Importing this conftest is what gives the child the suite's guards: the audit
+    hook that refuses the checkout's secret files and the network, the
+    ``load_dotenv`` redirect, and - under the child flag - the lazy
+    accounts-env isolation below instead of the suite's eager one. A child that
+    starts without this environment (one a test forgot to hand it to) is exactly
+    the leak ``tests/test_subprocess_env_contract.py`` fails on.
+    """
+    CHILD_SANDBOX_SHIM_DIR.mkdir(parents=True, exist_ok=True)
+    (CHILD_SANDBOX_SHIM_DIR / "sitecustomize.py").write_text(
+        "import importlib.util\n"
+        "import os\n"
+        "import sys\n"
+        "\n"
+        'if os.environ.get("TP_TEST_CHILD_SANDBOX") == "1":\n'
+        "    _path = os.path.join(os.environ['TP_TEST_REPO_ROOT'], 'tests', 'conftest.py')\n"
+        "    _spec = importlib.util.spec_from_file_location('tp_test_conftest', _path)\n"
+        "    _module = importlib.util.module_from_spec(_spec)\n"
+        "    sys.modules['tp_test_conftest'] = _module\n"
+        "    _spec.loader.exec_module(_module)\n",
+        encoding="utf-8",
+    )
+
+
+if not _CHILD_PROCESS:
+    # Only the parent writes it: every child starts from the same bytes, and a child
+    # rewriting the file another child is about to import is a race for no gain.
+    _write_child_sandbox_shim()
 
 
 class SuiteHermeticityViolation(RuntimeError):
@@ -362,7 +562,73 @@ def _isolate_accounts_env() -> None:
         setattr(module, attribute, ISOLATED_ACCOUNTS_ENV)
 
 
-_isolate_accounts_env()
+class _ChildAccountsEnvLoader:
+    """Wrap one module loader so its accounts-env constants are patched after import."""
+
+    def __init__(self, loader: object) -> None:
+        self._loader = loader
+
+    def create_module(self, spec: object) -> object:
+        return self._loader.create_module(spec)  # type: ignore[attr-defined]
+
+    def exec_module(self, module: object) -> None:
+        self._loader.exec_module(module)  # type: ignore[attr-defined]
+        for name, value in list(vars(module).items()):  # type: ignore[arg-type]
+            if "ACCOUNTS_ENV" not in name or isinstance(value, (bool, int, float)):
+                continue
+            if _repo_secret_path(value) == REPO_ACCOUNTS_ENV:
+                setattr(module, name, ISOLATED_ACCOUNTS_ENV)
+
+
+class _ChildAccountsEnvFinder:
+    """Patch the accounts-env constants of the packages that define them, lazily.
+
+    A child cannot run the suite's eager isolation: importing the roster's eleven modules before
+    the child's own code starts would make a ``--help`` probe as heavy as the daemon it is meant
+    to avoid importing. Wrapping the loader instead patches each module as it finishes importing,
+    in dependency order, so a module that binds the name from another one binds the patched value
+    exactly like the suite's own sweep.
+    """
+
+    _PACKAGES = ("live_runner", "scripts")
+
+    def find_spec(self, fullname: str, path: object = None, target: object = None) -> object:
+        if fullname.split(".")[0] not in self._PACKAGES:
+            return None
+        for finder in sys.meta_path:
+            if finder is self or not hasattr(finder, "find_spec"):
+                continue
+            spec = finder.find_spec(fullname, path, target)  # type: ignore[attr-defined]
+            if spec is None:
+                continue
+            if spec.loader is not None and hasattr(spec.loader, "exec_module"):
+                spec.loader = _ChildAccountsEnvLoader(spec.loader)
+            return spec
+        return None
+
+
+def _install_child_accounts_env_guard() -> None:
+    """Give a child the accounts-env isolation the suite applies to itself.
+
+    The audit hook refuses the checkout's real ``.accounts.env`` in a child too, but refusing an
+    open is a backstop: the child must resolve the *session sandbox* path in the first place, or a
+    reader that never opens the file (a discovery that only lists what the path's parent holds)
+    still looks at the checkout.
+    """
+    if not _CHILD_PROCESS:
+        return
+    finder = _ChildAccountsEnvFinder()
+    if not any(existing is finder for existing in sys.meta_path):
+        sys.meta_path.insert(0, finder)
+
+
+if _CHILD_PROCESS:
+    # A child imports this conftest from the shim, before its own code: the guard has to be in
+    # place by then, and the eager roster would import eleven modules to do what the finder does
+    # on the module the child actually needs.
+    _install_child_accounts_env_guard()
+else:
+    _isolate_accounts_env()
 
 
 def snapshot_tree(root: Path) -> dict[str, tuple[int, int]]:
