@@ -27,6 +27,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 # lower one; importing a higher layer is forbidden.
 #
 #   shared       models/constants/database/logging — the leaf everything uses
+#   strategies   user strategy modules; may only use shared helpers, so they
+#                sit directly above shared and below every platform layer
 #   risk         risk engine and models, built on shared
 #   data_tools   market-data download/catalog/resample, built on shared
 #   signal_bots  signal ingestion producing risk.models.TradeSignal; consumed
@@ -34,23 +36,23 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 #                live_runner (daemon registry). Scheduled for removal.
 #   runner       backtest engines and execution on risk + data_tools;
 #                live_runner reuses the engine for internal strategies
+#   validation   post-hoc comparison/validation statistics on runner.stats;
+#                only scripts consume it, so it sits directly above runner
 #   scheduler    background jobs (data refresh, bot health) orchestrating the
 #                layers below; embedded by the live daemon
 #   live_runner  live execution on runner engines + risk + shared
-#   validation   post-hoc comparison/validation statistics on runner.stats
-#   strategies   user strategy modules; may only use shared helpers
 #   viewer       FastAPI app composing the whole stack
 #   scripts      operator CLIs
 LAYERS: dict[str, int] = {
     "shared": 0,
-    "risk": 1,
-    "data_tools": 2,
-    "signal_bots": 3,
-    "runner": 4,
-    "scheduler": 5,
-    "live_runner": 6,
-    "validation": 7,
-    "strategies": 8,
+    "strategies": 1,
+    "risk": 2,
+    "data_tools": 3,
+    "signal_bots": 4,
+    "runner": 5,
+    "validation": 6,
+    "scheduler": 7,
+    "live_runner": 8,
     "viewer": 9,
     "scripts": 10,
 }
