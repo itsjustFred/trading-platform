@@ -1288,6 +1288,10 @@ def _prepare_next_open_execution_data(
     """
     roles = dict(explicit_roles or {})
     if require_explicit_roles:
+        # Signal keys this adapter executes but other engines ignore live in
+        # ``shared.strategy_registry.VECTORBT_ONLY_SIGNAL_KEYS`` — the matrix
+        # queue excludes strategies emitting them off vectorbt (#318). When a
+        # new execution key is added here, register it there too.
         canonical = {
             "entries",
             "exits",

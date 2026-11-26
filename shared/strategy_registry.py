@@ -64,9 +64,12 @@ def vectorbt_only_signal_keys(path: Path) -> frozenset[str]:
     """Return the :data:`VECTORBT_ONLY_SIGNAL_KEYS` a strategy file emits.
 
     Pure AST check (never executes the file): a key counts when it appears as
-    a dict literal key or a subscript index — the two ways a strategy publishes
-    a signal series — so a ``STRATEGY_META`` note merely mentioning the word
-    does not match.
+    a dict literal key, a subscript index, a ``dict(key=...)`` keyword, or a
+    ``setdefault("key", ...)`` positional — the publication forms a strategy
+    uses to publish a signal series — so a ``STRATEGY_META`` note merely
+    mentioning the word does not match. A dynamically computed key
+    (``d[variable]``) is undetectable statically; the scan is best-effort and
+    new publication forms must be added here.
     """
     source = _read_source(path)
     if source is None:
@@ -77,10 +80,27 @@ def vectorbt_only_signal_keys(path: Path) -> frozenset[str]:
         return frozenset()
     found: set[str] = set()
     for node in ast.walk(tree):
+        candidates: list[ast.expr] = []
         if isinstance(node, ast.Dict):
             candidates = [key for key in node.keys if key is not None]
         elif isinstance(node, ast.Subscript):
             candidates = [node.slice]
+        elif isinstance(node, ast.Call):
+            # ``dict(entry_stop=...)`` publishes the key as a keyword name;
+            # ``mapping.setdefault("entry_stop", ...)`` as a positional
+            # constant. Both are publication forms a dict literal misses.
+            if isinstance(node.func, ast.Name) and node.func.id == "dict":
+                candidates.extend(
+                    ast.Constant(value=keyword.arg)
+                    for keyword in node.keywords
+                    if keyword.arg is not None
+                )
+            if (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == "setdefault"
+                and node.args
+            ):
+                candidates.append(node.args[0])
         else:
             continue
         for candidate in candidates:

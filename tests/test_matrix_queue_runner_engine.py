@@ -76,6 +76,21 @@ def test_engine_exclusion_is_disabled_for_vectorbt(monkeypatch, tmp_path: Path) 
     assert module.engine_excluded_strategies() == {}
 
 
+@pytest.mark.parametrize("engine", ["native", "lean", "pynecore"])
+def test_engine_exclusion_fires_for_every_non_vectorbt_engine(
+    monkeypatch, tmp_path: Path, engine: str
+) -> None:
+    """Only vectorbt executes ``entry_stop``; lean/pynecore must not queue it either."""
+    monkeypatch.setenv("MATRIX_ENGINE", engine)
+    module = _load_script("matrix_queue_runner.py")
+    monkeypatch.setattr(module, "MATRIX_DIR", tmp_path / "matrix")
+
+    excluded = module.engine_excluded_strategies()
+
+    assert "us100_scalper" in excluded
+    assert engine in excluded["us100_scalper"]
+
+
 def test_excluded_strategies_are_never_picked(queue_runner, monkeypatch) -> None:
     """An excluded slug gets status 'excluded' and is not returned as pending."""
     monkeypatch.setattr(

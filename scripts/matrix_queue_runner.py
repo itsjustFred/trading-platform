@@ -60,13 +60,13 @@ def strategy_slugs() -> list[str]:
 def engine_excluded_strategies() -> dict[str, str]:
     """slug -> reason for strategies the configured ENGINE cannot run faithfully.
 
-    The native engine silently ignores signal-dict keys only the frozen
-    vectorbt adapter executes (``entry_stop`` stop-entry fills — dropped per
-    the #318 maintainer decision). Queueing such a strategy on native would
+    Every engine except the frozen vectorbt adapter silently ignores
+    signal-dict keys only vectorbt executes (``entry_stop`` stop-entry fills —
+    dropped per the #318 maintainer decision). Queueing such a strategy would
     produce next-open fills dressed up as stop-entry results, so the runner
     excludes it loudly instead of falling back.
     """
-    if ENGINE != "native":
+    if ENGINE == "vectorbt":
         return {}
     _ensure_repo_on_path()
     from shared.strategy_registry import (
@@ -84,8 +84,9 @@ def engine_excluded_strategies() -> dict[str, str]:
             continue
         slug = strategy_slug_for_path(path, REPO / "strategies")
         excluded[slug] = (
-            f"emits vectorbt-only signal key(s) {sorted(keys)}; the native "
-            "engine ignores them (stop-entry fills were dropped per #318)"
+            f"emits vectorbt-only signal key(s) {sorted(keys)}; engine "
+            f"{ENGINE!r} cannot execute them (stop-entry fills were dropped "
+            "per #318)"
         )
     return excluded
 
@@ -340,7 +341,7 @@ def main() -> int:
             print(
                 f"Matrix queue: ENGINE={ENGINE}; refusing to queue strategies "
                 "that only the frozen vectorbt engine can run faithfully "
-                "(#318):"
+                "(#318) — every other engine ignores these signal keys:"
             )
             for slug, reason in sorted(excluded.items()):
                 print(f"  - {slug}: {reason}")

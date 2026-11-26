@@ -219,6 +219,25 @@ def test_vectorbt_only_signal_keys_detects_dict_and_subscript(tmp_path: Path) ->
     )
 
 
+def test_vectorbt_only_signal_keys_covers_call_publication_forms(tmp_path: Path) -> None:
+    """``dict(entry_stop=...)`` and ``setdefault("entry_stop", ...)`` also count."""
+    from shared.strategy_registry import vectorbt_only_signal_keys
+
+    strategy_dir = tmp_path / "call_forms"
+    strategy_dir.mkdir()
+    (strategy_dir / "call_forms.py").write_text(
+        "def generate_signals(df, params):\n"
+        "    indicators = dict(entry_stop=1.0, stop_loss=2.0)\n"
+        "    indicators.setdefault('entry_stop', 3.0)\n"
+        "    return None, None, indicators\n",
+        encoding="utf-8",
+    )
+
+    assert vectorbt_only_signal_keys(strategy_dir / "call_forms.py") == frozenset(
+        {"entry_stop"}
+    )
+
+
 def test_vectorbt_only_signal_keys_ignores_mentions_and_other_keys(tmp_path: Path) -> None:
     """A STRATEGY_META note or variable name mentioning the key must not match."""
     from shared.strategy_registry import vectorbt_only_signal_keys
@@ -240,10 +259,15 @@ def test_vectorbt_only_signal_keys_ignores_mentions_and_other_keys(tmp_path: Pat
 def test_vectorbt_only_signal_keys_real_registry() -> None:
     """The shipped registry: only us100_scalper emits a vectorbt-only key."""
     from shared.strategy_registry import (
+        VECTORBT_ONLY_SIGNAL_KEYS,
         iter_strategy_files,
         strategy_slug_for_path,
         vectorbt_only_signal_keys,
     )
+
+    # exit_reason is a replaceable label, not a fill-semantics input — adding
+    # it would exclude nearly every strategy (pre-mortem finding, PR #447).
+    assert "exit_reason" not in VECTORBT_ONLY_SIGNAL_KEYS
 
     strategies_dir = Path(__file__).resolve().parents[1] / "strategies"
     hits = {
