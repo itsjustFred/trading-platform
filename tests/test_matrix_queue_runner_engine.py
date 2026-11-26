@@ -91,6 +91,25 @@ def test_engine_exclusion_fires_for_every_non_vectorbt_engine(
     assert engine in excluded["us100_scalper"]
 
 
+def test_engine_exclusion_covers_atr_fallback_without_stop(queue_runner, tmp_path: Path) -> None:
+    """A strategy emitting ``atr*`` with no stop key sizes/stops differently per engine."""
+    strategies_dir = tmp_path / "strategies"
+    strategy_dir = strategies_dir / "atr_fallback_strat"
+    strategy_dir.mkdir(parents=True)
+    (strategy_dir / "atr_fallback_strat.py").write_text(
+        "def generate_signals(df, params):\n"
+        "    indicators = {'atr': 1.0, 'take_profit': 2.0}\n"
+        "    return None, None, indicators\n",
+        encoding="utf-8",
+    )
+
+    excluded = queue_runner.engine_excluded_strategies(strategies_dir)
+
+    assert "atr_fallback_strat" in excluded
+    assert "atr" in excluded["atr_fallback_strat"]
+    assert "1xATR" in excluded["atr_fallback_strat"]
+
+
 def test_excluded_strategies_are_never_picked(queue_runner, monkeypatch) -> None:
     """An excluded slug gets status 'excluded' and is not returned as pending."""
     monkeypatch.setattr(

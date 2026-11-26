@@ -57,37 +57,50 @@ def strategy_slugs() -> list[str]:
     return sorted(dict.fromkeys(slugs))
 
 
-def engine_excluded_strategies() -> dict[str, str]:
+def engine_excluded_strategies(
+    strategies_dir: Path | None = None,
+) -> dict[str, str]:
     """slug -> reason for strategies the configured ENGINE cannot run faithfully.
 
     Every engine except the frozen vectorbt adapter silently ignores
     signal-dict keys only vectorbt executes (``entry_stop`` stop-entry fills —
-    dropped per the #318 maintainer decision). Queueing such a strategy would
-    produce next-open fills dressed up as stop-entry results, so the runner
-    excludes it loudly instead of falling back.
+    dropped per the #318 maintainer decision), and native never reads the
+    ``atr*`` series vectorbt uses as an implicit stop distance when a strategy
+    publishes no ``stop_loss``/``sl_price``. Queueing either kind of strategy
+    would produce results dressed up as faithful, so the runner excludes it
+    loudly instead of falling back.
     """
     if ENGINE == "vectorbt":
         return {}
     _ensure_repo_on_path()
     from shared.strategy_registry import (
+        atr_sizing_keys_without_stop,
         iter_strategy_files,
         strategy_slug_for_path,
         vectorbt_only_signal_keys,
     )
 
+    strategies_dir = strategies_dir or REPO / "strategies"
     excluded: dict[str, str] = {}
-    for path in iter_strategy_files(REPO / "strategies"):
+    for path in iter_strategy_files(strategies_dir):
         if path.name.endswith("_context.py"):
             continue
+        slug = strategy_slug_for_path(path, strategies_dir)
         keys = vectorbt_only_signal_keys(path)
-        if not keys:
+        if keys:
+            excluded[slug] = (
+                f"emits vectorbt-only signal key(s) {sorted(keys)}; engine "
+                f"{ENGINE!r} cannot execute them (stop-entry fills were dropped "
+                "per #318)"
+            )
             continue
-        slug = strategy_slug_for_path(path, REPO / "strategies")
-        excluded[slug] = (
-            f"emits vectorbt-only signal key(s) {sorted(keys)}; engine "
-            f"{ENGINE!r} cannot execute them (stop-entry fills were dropped "
-            "per #318)"
-        )
+        atr_keys = atr_sizing_keys_without_stop(path)
+        if atr_keys:
+            excluded[slug] = (
+                f"emits atr* sizing key(s) {sorted(atr_keys)} with no "
+                "stop_loss/sl_price; vectorbt sizes risk and places a 1xATR "
+                f"stop from them, engine {ENGINE!r} does not (#318)"
+            )
     return excluded
 
 

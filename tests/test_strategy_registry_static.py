@@ -279,6 +279,58 @@ def test_vectorbt_only_signal_keys_real_registry() -> None:
     assert hits == {"us100_scalper"}
 
 
+def test_atr_sizing_keys_without_stop_flags_atr_only(tmp_path: Path) -> None:
+    """``atr*`` keys with no stop_loss/sl_price are the vectorbt ATR fallback."""
+    from shared.strategy_registry import atr_sizing_keys_without_stop
+
+    strategy_dir = tmp_path / "atr_only"
+    strategy_dir.mkdir()
+    (strategy_dir / "atr_only.py").write_text(
+        "import pandas as pd\n"
+        "def generate_signals(df, params):\n"
+        "    indicators = {'atr': pd.Series([1.0]), 'atr_value': pd.Series([2.0])}\n"
+        "    return pd.Series([True]), pd.Series([False]), indicators\n",
+        encoding="utf-8",
+    )
+
+    assert atr_sizing_keys_without_stop(strategy_dir / "atr_only.py") == frozenset(
+        {"atr", "atr_value"}
+    )
+
+
+def test_atr_sizing_keys_without_stop_respects_stop_keys(tmp_path: Path) -> None:
+    """A stop_loss/sl_price key keeps vectorbt off the ATR fallback."""
+    from shared.strategy_registry import atr_sizing_keys_without_stop
+
+    strategy_dir = tmp_path / "atr_with_stop"
+    strategy_dir.mkdir()
+    for name, stop_key in (("with_stop_loss", "stop_loss"), ("with_sl_price", "sl_price")):
+        (strategy_dir / f"{name}.py").write_text(
+            "def generate_signals(df, params):\n"
+            f"    indicators = {{'atr': 1.0, '{stop_key}': 2.0}}\n"
+            "    return None, None, indicators\n",
+            encoding="utf-8",
+        )
+        assert atr_sizing_keys_without_stop(strategy_dir / f"{name}.py") == frozenset()
+
+
+def test_atr_sizing_keys_without_stop_real_registry() -> None:
+    """No shipped strategy relies on the vectorbt ATR fallback today."""
+    from shared.strategy_registry import (
+        atr_sizing_keys_without_stop,
+        iter_strategy_files,
+    )
+
+    strategies_dir = Path(__file__).resolve().parents[1] / "strategies"
+    hits = {
+        path.name
+        for path in iter_strategy_files(strategies_dir)
+        if atr_sizing_keys_without_stop(path)
+    }
+
+    assert hits == set()
+
+
 def test_load_strategy_module_remains_explicit(tmp_path: Path) -> None:
     """The explicit load entry point still exists for real backtest runs."""
     from shared.strategy_registry import load_strategy_module
