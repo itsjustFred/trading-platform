@@ -7202,7 +7202,7 @@ def test_protective_stop_near_aged_expiry_is_replaced(monkeypatch) -> None:
     # The cancel leaves a durable intent row so a crash before the
     # replacement still reads as OUR cancel on the next process.
     assert any(
-        row.get("action") == "alpaca_expired_stop_replace_cancel"
+        row.get("action") == alpaca_module._EXPIRED_STOP_REPLACE_CANCEL_ACTION
         and row.get("target_id") == "expiring-stop-1"
         for row in audits
     )
@@ -7274,7 +7274,7 @@ def test_protective_stop_crash_between_replace_cancel_and_place_heals(
     client = _naked_position_client(parents=[parent])
     persisted = [
         {
-            "action": "alpaca_expired_stop_replace_cancel",
+            "action": alpaca_module._EXPIRED_STOP_REPLACE_CANCEL_ACTION,
             "target_id": "crashed-replace-stop",
             "succeeded": True,
             "created_at": datetime.now(timezone.utc).isoformat(),
@@ -7549,3 +7549,48 @@ def test_protective_stop_stop_limit_keeps_recorded_limit_price(
     assert _tif_text(request) == "gtc"
     assert getattr(request, "stop_price", None) == pytest.approx(144.89)
     assert getattr(request, "limit_price", None) == pytest.approx(144.0)
+
+
+def test_protective_stop_replace_cancel_intent_action_round_trips(
+    monkeypatch,
+) -> None:
+    """The persisted replace-cancel intent's write and read sides share one
+    action constant: a rename on either side alone must fail here, not
+    silently strand a canceled stop as an unproven operator cancel."""
+    _audits, adapter = _patch_heal_ledger(monkeypatch, ledger_qty=135.0)
+    seen: dict = {}
+
+    def _audit_list(**kwargs):
+        seen.update(kwargs)
+        return []
+
+    monkeypatch.setattr(alpaca_module, "list_live_control_audit", _audit_list)
+
+    ids = asyncio.run(adapter._persisted_replace_cancel_ids())
+
+    assert ids == set()
+    assert seen["action"] == alpaca_module._EXPIRED_STOP_REPLACE_CANCEL_ACTION
+    assert seen["created_after"] is not None
+
+
+def test_reprotect_client_order_ids_carry_the_shared_marker() -> None:
+    """Every ``-reprotect`` client order id is built from
+    ``_REPROTECT_CLIENT_ORDER_MARKER``, the same constant the heal's
+    already-protected check parses - a template drift on either side fails
+    here instead of reading a live stop as absent."""
+    entry_id = str(uuid4())
+    adapter = _adapter(_naked_position_client())
+    leg = _working_stop("AAPL", side="sell", qty=1.0)
+
+    built = adapter._build_reprotect_request(
+        "AAPL",
+        1.0,
+        "sell",
+        leg,
+        leg_key="leg-1",
+        entry_signal_id=entry_id,
+    )
+
+    assert alpaca_module._REPROTECT_CLIENT_ORDER_MARKER in str(
+        getattr(built, "client_order_id", "")
+    )

@@ -3591,11 +3591,11 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         # the key unique across repeated partial exits of one position.
         entry_signal_id = plan.get("entry_signal_id")
         if signal_id and entry_signal_id:
-            client_order_id = f"{entry_signal_id}-reprotect-{signal_id}"
+            client_order_id = f"{entry_signal_id}{_REPROTECT_CLIENT_ORDER_MARKER}-{signal_id}"
         elif signal_id:
-            client_order_id = f"{signal_id}-reprotect"
+            client_order_id = f"{signal_id}{_REPROTECT_CLIENT_ORDER_MARKER}"
         elif entry_signal_id:
-            client_order_id = f"{entry_signal_id}-reprotect"
+            client_order_id = f"{entry_signal_id}{_REPROTECT_CLIENT_ORDER_MARKER}"
         else:
             client_order_id = None
         if stop_price is not None and take_profit_price is not None:
@@ -7073,7 +7073,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         ) = self._load_exit_order_types()
         request_side = order_side.SELL if side == "sell" else order_side.BUY
         request_qty = abs(qty)
-        client_order_id = f"{entry_signal_id}-reprotect-{leg_key}"[:128]
+        client_order_id = f"{entry_signal_id}{_REPROTECT_CLIENT_ORDER_MARKER}-{leg_key}"[:128]
         if order_type == "stop_limit":
             try:
                 limit_price = parse_optional(_order_attr(leg, "limit_price", None))
@@ -7336,7 +7336,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             side=order_side.SELL if side == "sell" else order_side.BUY,
             time_in_force=time_in_force.DAY,
             extended_hours=False,
-            client_order_id=f"{entry_signal_id}-reprotect-{tag}"[:128],
+            client_order_id=f"{entry_signal_id}{_REPROTECT_CLIENT_ORDER_MARKER}-{tag}"[:128],
         )
         try:
             order = await asyncio.to_thread(client.submit_order, order_data=request)
