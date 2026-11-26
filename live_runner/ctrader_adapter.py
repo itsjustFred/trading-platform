@@ -1740,6 +1740,20 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         )
         self._own_token_rotation_in_flight = False
 
+    def _clear_session_rotation_state(self) -> None:
+        """Drop the recorded session token and any in-flight rotation marker.
+
+        Every session-death path (``_teardown_client``, ``_on_disconnected``,
+        ``disconnect``) must call this: a stale ``_session_access_token`` or
+        a latched ``_own_token_rotation_in_flight`` would let
+        ``_token_invalidation_skip_reason`` treat a genuine invalidation as
+        our own rotation echo and never tear the dead session down. The
+        skip-reason check also self-heals a latched flag on a dead session
+        as a backstop for any future path that forgets.
+        """
+        self._session_access_token = ""
+        self._own_token_rotation_in_flight = False
+
     def _adopt_persisted_token_pair(self) -> bool:
         """Adopt the token pair persisted in the accounts env file when it differs.
 
@@ -1821,7 +1835,16 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         if self._refresh_lock.locked():
             return "a token refresh is in flight on this adapter"
         if self._own_token_rotation_in_flight:
-            return "this adapter's own token rotation is being re-authenticated"
+            if not self._connected:
+                # No live session can be mid-rotation: a flag still set here
+                # was left behind by a session-death path and would suppress
+                # every later invalidation event. Clear it rather than skip.
+                self._own_token_rotation_in_flight = False
+            else:
+                return (
+                    "this adapter's own token rotation is being "
+                    "re-authenticated"
+                )
         rotated_at = self._token_pair_rotated_at
         if (
             self._session_access_token
@@ -1998,8 +2021,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         # (An in-flight rotation cannot survive this anyway - its pending
         # send is errbacked by ``_fail_in_flight_requests`` below and the
         # helper's ``finally`` clears the flag on the way out.)
-        self._session_access_token = ""
-        self._own_token_rotation_in_flight = False
+        self._clear_session_rotation_state()
         self._last_session_teardown_at = time.monotonic()
         # Upstream ``Client._disconnected`` clears ``_responseDeferreds``
         # BEFORE invoking this callback, so the dict enumeration in
@@ -3311,8 +3333,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._connected = False
         self._authenticated = False
         self._already_logged_in_notified = False
-        self._session_access_token = ""
-        self._own_token_rotation_in_flight = False
+        self._clear_session_rotation_state()
         self._last_session_teardown_at = time.monotonic()
         if client is not None:
             self._fail_in_flight_requests(client)
@@ -3763,8 +3784,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._connected = False
         self._connected_event.clear()
         self._already_logged_in_notified = False
-        self._session_access_token = ""
-        self._own_token_rotation_in_flight = False
+        self._clear_session_rotation_state()
         self._symbol_name_to_id.clear()
         self._order_id_to_signal_id.clear()
         self._position_ids_by_symbol.clear()

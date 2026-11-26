@@ -1189,6 +1189,26 @@ def test_token_invalidation_adopted_pair_reauths_without_refresh(
     assert adapter._session_access_token == "file_access"
 
 
+def test_token_invalidation_skip_reason_self_heals_latched_flag_on_dead_session() -> (
+    None
+):
+    """``_own_token_rotation_in_flight`` only means something while a session
+    is connected. If a session-death path ever leaves it latched, the
+    skip-reason check must clear it instead of letting it suppress every
+    later invalidation event forever."""
+    adapter = CTraderLiveAdapter(
+        app_id="app", app_secret="secret", access_token="token", account_id="1"
+    )
+    adapter._connected = True
+    adapter._own_token_rotation_in_flight = True
+    assert adapter._token_invalidation_skip_reason() is not None
+
+    adapter._connected = False
+    adapter._own_token_rotation_in_flight = True
+    assert adapter._token_invalidation_skip_reason() is None
+    assert adapter._own_token_rotation_in_flight is False
+
+
 def test_token_invalidation_own_rotation_grace_has_a_sane_floor() -> None:
     """The grace window must stay larger than cTrader's invalidation-event
     delivery latency: a late echo for the OLD token arriving after our
