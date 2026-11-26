@@ -3560,6 +3560,10 @@ def test_a_negated_buy_instruction_does_not_open_a_long() -> None:
         "on EURUSD $1.0850 I should not long here",
         "wait on EURUSD, do not buy",
         "EURUSD is not a buy",
+        # Explicit buy directives with a negation still veto (the "add" target
+        # is what keeps "Do not add." from opening a long).
+        "AAPL buy signal @ 100. Do not add.",
+        "AAPL buy signal @ 100. Do not buy more.",
     ):
         signal_type = _detect_rocket_fuel_signal_type(content)
         assert _resolve_action(content, signal_type=signal_type) is None, (
@@ -4009,32 +4013,6 @@ class TestStandardsReviewFindings:
             assert signal_type == "momentum_reversal"
             assert _resolve_action(content, signal_type=signal_type) == "sell", (
                 f"{content!r} dropped an exit signal"
-            )
-
-    def test_a_negation_vetoes_a_buy_even_with_an_explicit_buy_directive(self) -> None:
-        """Pins the *behaviour*, which is what the simplified condition now states.
-
-        The review found the old condition had a second conjunct,
-        `and not _reads_as_buy_directive(content)`, that could never be False -
-        `_reads_as_buy_directive` already short-circuits to False whenever the
-        negation matches. So the conjunct was dead, and the comment around it
-        described an escape hatch that did not exist: a reader would reasonably
-        believe an explicit buy directive could survive the veto. It cannot.
-
-        Worth being precise about why this test cannot catch that class of defect
-        by itself: the two conditions are *logically equivalent*, so no
-        behavioural test distinguishes them. Adding the conjunct back leaves the
-        whole suite green - verified. A misleading condition is a documentation
-        bug, and only the comment change fixes it.
-        """
-        for content in (
-            "AAPL buy signal @ 100. Do not add.",
-            "AAPL buy signal @ 100. Do not buy more.",
-            "on EURUSD $1.0850 this is not a buy signal",
-        ):
-            assert _BUY_NEGATED_RE.search(content), f"precondition: {content!r}"
-            assert _resolve_action(content, signal_type=None) is None, (
-                f"{content!r} opened a long despite an explicit negation"
             )
 
     def test_both_allowlist_paths_split_a_list_identically(self) -> None:
