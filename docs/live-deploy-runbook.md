@@ -563,6 +563,14 @@ snapshot. For every account with an ACTIVE or PAUSED deployment it compares:
   stop/target orders are marked as protection, not untracked entries/exits);
 - protective stops with open broker positions when the adapter can list them.
 
+Note the Alpaca aged-order policy: any GTC order - including the protective
+legs and restored stops the adapter submits `GTC` - is cancelled by Alpaca
+~90 days after creation, and nothing re-places a protective order lost that
+way yet. A position left without a working protective stop surfaces as the
+reconciler's `position_without_protective_stop` finding (entry halt after
+the consecutive-mismatch threshold), which is the safety net until aged-order
+re-placement is implemented.
+
 Unreadable broker state is a mismatch (fail closed), but it must not flap: a
 deployment's entries are halted only after
 `broker_reconciliation_consecutive_mismatches` consecutive bad passes
@@ -590,9 +598,21 @@ expire fast (cTrader `IMMEDIATE_OR_CANCEL`, and Alpaca entries are market
 orders - they fill at the open or are rejected, never rest unfilled; the
 adapter submits them `GTC` since 2026-11-25 only so the bracket/OTO SL/TP
 legs survive the session close, and Alpaca's aged-order policy cancels any
-GTC order after 90 days regardless), so an older
+GTC order after 90 days regardless - protective orders inside the lead
+window are re-placed and alerted, and legs or top-level stops already
+canceled by that policy are healed like expired ones), so an older
 unfilled row is a cancelled/expired/rejected historical order, not a working
-one. A younger order missing from the broker's working list is not trusted on
+one. The expected quantity is the one the broker was actually asked for:
+adapters persist the normalized submitted qty in the signal metadata (the
+cTrader volume-grid floor and the Alpaca whole-share bracket floor), so a
+filled order never leaves a phantom remainder. Rows persisted before that
+normalization still carry the unrounded sized qty; for those, a remainder
+below the instrument's broker volume step (`exit_qty_step` - a property of
+the instrument, not the order side) is never expected either, because no
+broker can work an order smaller than its own step. A remainder of one step
+or more still expects a working order, and an adapter that cannot name the
+step keeps the expectation (fail closed). A younger order missing from the
+broker's working list is not trusted on
 the age bound alone: the reconciler asks the adapter for that order's state
 (`get_order_state`, bounded lookups per pass), and only a proven `terminal`
 state clears the finding - IOC remainders, cancelled orders and rejected
@@ -1071,12 +1091,32 @@ Every live account and every deployment carries a persisted loss breaker
 (`live_loss_breaker_state`, one row per `account:<id>` and `deployment:<id>`
 scope). The account scope measures the broker account's equity — for cTrader
 that is balance **plus unrealized P&L** of open positions, so an open position
-under water counts before it is closed. The deployment scope cannot read a
-"deployment equity" from the broker (positions on a netted account belong to
-the account), so it observes a synthetic equity: account equity minus every
-OTHER deployment's trading P&L, reconstructed from the persisted fill ledger
-and marked to market. The scope therefore moves only with its own
-deployment's realized+unrealized P&L, on the account-equity scale:
+under water counts before it is closed. It is the scope that catches losses
+nobody attributed: a broker-side close of a position no deployment owns, a
+manual trade, swap/fees on foreign positions, deposits and withdrawals all
+move it.
+
+The deployment scope cannot read a "deployment equity" from the broker
+(positions on a netted account belong to the account), so it observes a
+synthetic equity anchored at first observation: `equity_anchor + own P&L`,
+where `own P&L` is the deployment's realized+unrealized trading P&L
+reconstructed from the persisted fill ledger and marked to market, and
+`equity_anchor` is the residual `account_equity - sum(all deployments' P&L)`
+persisted on the breaker row (`equity_anchor` column; `status` prints it).
+Once anchored, the scope moves ONLY with that deployment's own trading
+P&L — unattributed equity changes, deposits/withdrawals and other
+deployments' P&L move the residual but not the anchor, so they cannot trip
+a deployment scope (this is the fix for the 2026-11-25 incident where one
+unattributed broker-side close tripped every deployment scope on the
+account). Rows written before the anchor existed carry NULL and anchor on
+their next observation: the scope continues from its last observed equity
+(`last_equity`) and the persisted anchor is the continuity base
+`last_equity - own_pnl`, so the anchoring observation itself cannot trip
+the breaker and own P&L is never double-counted afterwards. Own P&L that
+moved between the last pre-anchor observation and the first anchored one
+is absorbed into the anchor; if that drift matters, `re-anchor` re-bases
+it explicitly. The scope
+stays on the account-equity scale, so the same fractions apply:
 
 - **Daily loss** — equity down the configured fraction (default 5 %) of the
   start-of-day equity. The baseline is the last equity observed before the UTC
@@ -1095,9 +1135,31 @@ webhook. An unreadable breaker state, unreadable equity, or a deployment P&L
 that cannot be measured (untrusted fill price, missing quote/pip value) fails
 closed and refuses entries.
 
-Deposits and withdrawals are NOT separated from P&L: a 5 % withdrawal trips
-the daily breaker and a 20 % withdrawal latches drawdown. After a planned
-withdrawal, run `reset-drawdown` once the new equity is being observed.
+On the ACCOUNT scope deposits and withdrawals are NOT separated from P&L: a
+5 % withdrawal trips the daily breaker and a 20 % withdrawal latches
+drawdown. Deployment scopes are immune to the *movement* — a deposit does
+not move their anchored equity at all — but their fraction basis is FROZEN
+at the account equity captured when the anchor was written, so after a
+large withdrawal the deployment breaker is effectively LOOSER in real
+terms: anchored at $100k and $90k withdrawn, the account is now $10k but a
+5 % daily trip still needs a $5k loss — 50 % of the real account, not 5 %.
+After a large deposit it is stricter for the same reason; the account
+scope still measures the real account equity, so this is a calibration
+issue, not a hole. After a planned large deposit/withdrawal, or after
+repointing a deployment to a different account (`update_live_deployment_account`
+keeps the scope row, so the anchor keeps the OLD account's scale while own
+P&L is measured on the new one), run `re-anchor` on each affected
+deployment scope once the new equity is being observed — prefer running it
+while the deployment is paused. `re-anchor` resolves the deployment's
+CURRENT account from the deployment row (a re-pointed deployment
+re-anchors on its new account, and the scope row follows it), refuses when
+the fill-ledger P&L is not fully measurable (unresolved
+`ledger_reconciliation_required` flag, untrusted fill, or a deployment row
+with fills whose last observation is stale), re-bases the anchor to the
+current residual, and preserves any existing latch — it re-bases the
+measurement, it does not clear a trip; use `reset-drawdown` for that. For
+a planned withdrawal that trips only the account breaker,
+`reset-drawdown` on the account scope is still the right command.
 
 Thresholds, most specific first: deployment `settings` keys
 (`loss_breaker_enabled`, `loss_breaker_daily_loss_fraction`,
@@ -1120,6 +1182,11 @@ uv run python -m scripts.live_loss_breaker status --account alpaca-paper
 # latched - the daily latches intentionally survive until the UTC rollover:
 uv run python -m scripts.live_loss_breaker reset-drawdown --account alpaca-paper
 uv run python -m scripts.live_loss_breaker reset-drawdown --deployment <id>
+
+# Re-base a deployment scope's equity_anchor to the CURRENT residual after a
+# large deposit/withdrawal or an account repoint (keeps any latch):
+uv run python -m scripts.live_loss_breaker re-anchor --deployment <id>
+uv run python -m scripts.live_loss_breaker re-anchor --scope deployment:<id> --account-equity 90000
 ```
 
 Without `--equity` a scope re-bases to its OWN last observed breaker equity -
@@ -1127,7 +1194,13 @@ the same series the breaker measures (on cTrader that includes unrealized
 P&L, which the balance snapshot's equity slot does not carry). An account
 scope refuses an observation older than 10 minutes; pass `--equity` to state
 the figure explicitly. A deployment scope always re-bases to its own last
-observed (P&L-adjusted) equity; `--equity` does not apply to it.
+observed (P&L-adjusted) equity; `--equity` does not apply to it. Because a
+deployment scope always re-bases to its own last observed equity, the reset
+delta for a deployment scope is always 0 and its `equity_anchor` does not
+move — the CLI never offers a different re-base figure for it.
+(`reset_live_loss_breaker_drawdown` itself shifts the anchor by whatever
+delta it is given; only a caller bypassing the CLI could produce a non-zero
+one.)
 
 There is deliberately no daily reset command: the daily breaker resets itself
 at the UTC boundary.
@@ -1509,6 +1582,92 @@ so a trimming that hides an older conflict cannot happen there.
    repeat steps 3-5.
 
 `live_executions.commission` is a positive cost for every broker; a broker rebate cannot be stored as a negative cost, so the cTrader adapter stores it as `NULL` (fee unknown) and logs an ERROR — the fill is kept and net PnL stays flagged incomplete (#285). The first `init_db` of a build with this change converts existing cTrader rows once (`abs` of the stored value, recorded in `schema_data_migrations`). Stop the daemon (and any process on the same SQLite file) before starting the new build: an old build that still writes cTrader fills after the marker is recorded stores a raw negative charge that violates the positive-cost convention and is never converted (the marker is already recorded, and new-convention rebates are stored as NULL, so the stray negative is at least distinguishable). Roll out as stop, deploy, start; do not run old and new builds side by side.
+
+## cTrader close fills attributed by broker order id
+
+An internal strategy's exit on cTrader is sent as `ProtoOAClosePositionReq`,
+which carries **no `clientOrderId` field** (payload type, account id,
+position id, volume only). The fill's execution event therefore arrives with
+an SDK-assigned client order id that parses as no signal of ours. Before the
+fix such a fill was booked through `record_live_broker_side_close_fill` as a
+synthetic `broker_close` signal — while the exit signal that actually owns
+the broker order id looked unfilled, and every restart's
+`reconcile_executions` re-fetched the deal, hit the dedupe key already owned
+by the synthetic signal, and logged `ERROR` "Dedupe key collision across
+signals ... the fill is NOT stored".
+
+The adapter now attributes a fill whose `clientOrderId` names no signal by
+its **broker order id** instead: the in-memory order→signal map first, then
+the `broker_order_id` persisted on the signal row — and only when that
+signal's metadata marks it as an exit **the way the ledger defines one**
+(`exit_only` or `risk_sizing_mode=exit_only` — `shared.database.
+is_exit_only_signal_metadata`, the same predicate `_position_lot_entries`
+uses, so a fill can never be attributed onto a signal the ledger would count
+as an entry). A fill arriving while its close submit is
+still in flight (order id not yet persisted) is retained for reconciliation
+rather than booked as a broker-side close; the pending mark expires after
+`_PENDING_CLOSE_POSITION_TTL_SECONDS` (1 h) so a stuck submit cannot hold a
+genuine broker close forever. An order id no exit signal owns still takes
+the ordinary broker-side close path.
+
+**Repairing rows written before the fix.** Fills already booked as synthetic
+`broker_close` signals whose executions carry a `broker_order_id` owned by
+exactly one exit signal on the same deployment are moved onto that signal by
+`scripts/repair_ctrader_close_attribution.py`. The ledger stays identical —
+the moved fill keeps quantity, price, timestamp and broker order id, and a
+`parent_signal_id` stamp is written on the owner only when it is needed to
+keep crediting the same entry; anything ambiguous (no unique owner, a
+non-exit owner, an action/symbol/attribution conflict, an owner that already
+carries fills the stamp would re-attribute) is refused and reported, never
+guessed. A `broker_close` signal emptied by the repair is deleted — its id
+is deterministic, so a genuine broker-side close recreates it on demand.
+Every applied repair writes a `live_control_audit` row
+(`action=broker_close_attribution_repair`).
+
+```bash
+# Report only - writes no data (init_db can still apply pending schema
+# migrations, so run it on a quiesced daemon like any other process start):
+uv run python -m scripts.repair_ctrader_close_attribution
+
+# Apply the moves, stamps, deletions and audit rows in one transaction:
+uv run python -m scripts.repair_ctrader_close_attribution --apply
+```
+
+**Operator steps, in order:**
+
+1. **Deploy this build and restart the daemon FIRST.** An old build keeps
+   mis-booking every new cTrader close as it arrives; repairing before the
+   new attribution code is live just refills the same hole. Until the
+   repair runs, the restarted daemon keeps logging the "Dedupe key
+   collision" ERROR for the already-mis-booked rows on every reconcile -
+   that is expected and harmless; `--apply` is what stops it.
+2. **Stop the daemon** before touching the database.
+3. Take a `.backup` of `backtests.db` while it is stopped (the script's own
+   snapshot discipline applies: copy, dry-run, review, apply).
+4. Run the dry-run and review the report (see below), then
+   `uv run python -m scripts.repair_ctrader_close_attribution --apply`.
+   The report is printed as JSON on **stdout**; log lines go to **stderr**,
+   so `... | jq` works.
+5. **Start the daemon** and re-run the dry-run afterwards: an applied
+   repair reports zero moves.
+
+`moves` keeps growing until step 1's deploy lands - the running old build
+mis-books each new cTrader close as it arrives (11 moves on the
+2026-11-26 database copy). Expect the count to be at least that, and check
+that every row has the same shape: an exit-only `sell` owner and a
+`parent_signal_id` stamp equal to the synthetic close's parent.
+
+Review the dry-run report first: `moves` lists each fill that would change
+owner, `metadata_updates` each `parent_signal_id` stamp, `deleted_signals`
+each emptied synthetic signal, and `refusals`/`unmatched` the rows left
+untouched with their reasons (`ambiguous_owner`, `owner_not_exit_signal`,
+`action_mismatch`, `symbol_mismatch`, `attribution_conflict`,
+`conflicting_parents`, `owner_has_other_fills`,
+`would_be_attributed_by_repair`, `no_same_deployment_owner`,
+`empty_broker_order_id`). `no_same_deployment_owner` rows are usually
+genuine broker-side closes (SL/TP, flatten, manual) and need no action;
+the other refused and unmatched rows need a human decision. The script is
+safe to re-run — an applied repair is a no-op the second time.
 
 ## Release / rollback
 

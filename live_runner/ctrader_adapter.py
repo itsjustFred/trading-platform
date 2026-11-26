@@ -25,6 +25,7 @@ from live_runner.base_adapter import (
     ORDER_STATE_TERMINAL,
     ORDER_STATE_WORKING,
     BaseLiveAdapter,
+    BrokerOrderRejectedError,
     BrokerOrderView,
     ControlOutcome,
     LivePipValue,
@@ -46,6 +47,7 @@ from shared.database import (
     BROKER_CLOSE_REASON_CTRADER_POSITION_CLOSE,
     broker_close_signal_id,
     find_live_signal_id_by_broker_order_id,
+    find_live_signal_ids_by_broker_order_id,
     flag_live_ledger_reconciliation,
     get_live_adapter_state,
     get_live_signal_account_id,
@@ -53,6 +55,7 @@ from shared.database import (
     get_live_signal_metadata,
     get_live_signal_reconciliation_cursor,
     get_live_signal_timestamp,
+    is_exit_only_signal_metadata,
     list_live_account_open_position_lots,
     list_live_ledger_reconciliation_deal_ids,
     list_live_ledger_reconciliation_flag_entries,
@@ -69,7 +72,7 @@ from shared.database import (
     set_live_signal_broker_order_id,
 )
 from shared.logging import get_logger
-from shared.lot_grid import floor_qty_to_step
+from shared.lot_grid import STEP_NOISE, floor_qty_to_step
 from shared.models import (
     PRICE_ABSENT,
     PRICE_OBSERVED,
@@ -98,6 +101,19 @@ class CTraderAuthTerminalError(RuntimeError):
     def __init__(self, message: str, *, error_code: str = "") -> None:
         self.error_code = str(error_code or "").strip()
         super().__init__(message)
+
+
+class _PendingCloseFillRetentionError(ValueError):
+    """A position-close fill retained while its own close submit is unresolved.
+
+    Subclasses ``ValueError`` so every existing retain-for-reconciliation
+    handler still applies, but ``listen_executions`` recognises it and parks
+    the event in ``_unresolved_execution_events`` WITHOUT spending the retry
+    budget: a pending mark can live up to ``_PENDING_CLOSE_POSITION_TTL_SECONDS``
+    (an unknown-outcome submit), and a budgeted requeue would crash-loop the
+    listener - delaying every other fill on the account - for that whole
+    window.
+    """
 
 
 _TRUE_BOOL_TOKENS = {"1", "true", "yes", "y", "on"}
@@ -206,6 +222,24 @@ MAX_CONVERSION_HOPS = 3
 CTRADER_RELATIVE_PRICE_UNIT_DIVISOR = 100_000
 EXECUTION_RETRY_LIMIT = 3
 UNRESOLVED_EXECUTION_EVENT_LIMIT = 1000
+#: How long a ``ClosePositionReq`` submit keeps its position marked pending
+#: (position_id -> (signal_id, monotonic timestamp)). ``ProtoOAClosePositionReq``
+#: carries no ``clientOrderId`` of ours, so while the submit is in flight - or
+#: after an unknown-outcome submit until reconciliation persists the broker
+#: order id - a fill on the position can only be retained, not attributed.
+#: The mark expires so a failed submit cannot hold a genuine broker-side
+#: close on the position out of the stream path indefinitely. The TTL is a
+#: bound, not a guarantee: a submit whose broker outcome stays unknown past
+#: it loses retention, and a later fill on the position books as a
+#: broker-side close - acceptable because an unknown-outcome submit is
+#: already an operator-visible reconciliation case. The TTL must stay well
+#: above the reconciliation cadence so an ordinary in-flight submit cannot
+#: outlive it.
+_PENDING_CLOSE_POSITION_TTL_SECONDS = 3600.0
+#: How often a parked pending-close fill triggers a reconciliation pass while
+#: its submit's mark is still live. Budget-free parking would otherwise never
+#: re-arm the pass that can recover the close's broker order id.
+_PENDING_CLOSE_FILL_RECONCILE_SECONDS = 30.0
 #: Bounded broker-state confirmation for ProtoOAAmendPositionSLTPReq (#168):
 #: the request has no dedicated response, so the amended stop is confirmed by
 #: re-reading the position. The broker applies the amend asynchronously, so a
@@ -512,7 +546,7 @@ def _relative_distance(
 
     Floors toward the entry so a stop never widens beyond the risk the position was
     sized for. A stop under one tick is refused; a take-profit under one tick is
-    sent as one tick (0 would mean "no TP").
+    sent as one tick.
     """
     leg = "SL" if is_stop else "TP"
     if math.isnan(price) or math.isinf(price) or price <= 0:
@@ -561,21 +595,57 @@ class _SpotWaiter:
     received_at: datetime | None = None
 
 
-def _present_proto_field(payload: Any, name: str) -> Any | None:
+# Sentinel returned by ``_present_proto_field`` when field presence cannot be
+# proven. For refusal classification "absent" would release the order lease,
+# so an unanswerable ``HasField`` must read as "present / unknown" instead.
+_PRESENT_BUT_UNKNOWN = object()
+
+
+def _present_proto_field(
+    payload: Any, name: str, *, fail_closed: bool = False
+) -> Any | None:
     """The field's value when it was sent, else ``None``.
 
     Spot ``bid``/``ask`` are ``optional uint64``: ``HasField`` tells an omitted
     side from a sent one. A payload without ``HasField`` (a test double) falls
-    back to attribute presence.
+    back to attribute presence. With ``fail_closed`` a ``HasField`` failure
+    reports the field as present but unknown (the sentinel) rather than
+    absent, for callers where "absent" is the unsafe direction.
     """
     has_field = getattr(payload, "HasField", None)
     if has_field is not None:
         try:
             if not bool(has_field(name)):
                 return None
-        except (TypeError, ValueError):
+        except Exception:  # except-kind: money-decision
+            # Presence is unanswerable: fail_closed callers get the sentinel,
+            # everyone else reads the field as absent - never as proof. The
+            # catch is deliberately wider than (TypeError, ValueError):
+            # HasField is protobuf-version-dependent and test doubles raise
+            # arbitrary errors, and EVERY exception here means the same thing -
+            # presence could not be proven - so the fail-closed policy applies
+            # uniformly. Logged because a swallowed HasField failure is
+            # otherwise invisible.
+            logger.warning(
+                "cTrader HasField(%s) failed; treating field presence as "
+                "unanswerable",
+                name,
+                exc_info=True,
+            )
+            if fail_closed:
+                return _PRESENT_BUT_UNKNOWN
             return None
     return getattr(payload, name, None)
+
+
+def _present_proto_field_fail_closed(payload: Any, name: str) -> Any | None:
+    """``_present_proto_field`` for refusal classification.
+
+    Every field check on the order-refusal path MUST go through this wrapper:
+    an unanswerable ``HasField`` reads as present-but-unknown, never absent,
+    because "absent" is the direction that would release the submission lease.
+    """
+    return _present_proto_field(payload, name, fail_closed=True)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1348,6 +1418,19 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._account_type: str | None = None
         self._account_type_unreadable_at: float | None = None
         self._order_id_to_signal_id: dict[int, str] = {}
+        # position_id -> {signal_id: monotonic timestamp}: a ClosePositionReq
+        # has no clientOrderId of ours, so until its broker order id is known
+        # a fill on the position is retained for reconciliation rather than
+        # booked as a broker-side close (see _close_position_fill_pending).
+        # Keyed per signal so two concurrent close submits on one position do
+        # not clear each other's guard when the first finishes.
+        self._pending_close_positions: dict[int, dict[str, float]] = {}
+        # id()s of execution events parked in ``_unresolved_execution_events``
+        # because their own close submit is still in flight. These are
+        # requeued after a reconciliation pass WITHOUT spending the retry
+        # budget: the pending mark can live up to the TTL, and a budgeted
+        # requeue would crash-loop the listener for that whole window.
+        self._pending_close_fill_event_ids: set[int] = set()
         # #80: order id -> upper symbol name (for order-only fills whose
         # payload carries no symbolId).
         self._order_id_to_symbol: dict[int, str] = {}
@@ -2935,9 +3018,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
 
     async def _persisted_exit_position_id(self, signal_id: str) -> int | None:
         metadata = await asyncio.to_thread(get_live_signal_metadata, signal_id)
-        if not metadata:
-            return None
-        if str(metadata.get("risk_sizing_mode") or "") != EXIT_ONLY_RISK_SIZING_MODE:
+        if not metadata or not is_exit_only_signal_metadata(metadata):
             return None
         return self._requested_exit_position_id(metadata)
 
@@ -2961,6 +3042,11 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             )
             return None
         self._order_id_to_signal_id[int(broker_order_id)] = signal_id
+        if position_id is not None:
+            # The close's broker order id is known now: fills on the position
+            # can attribute to this exit signal, so the pending mark has done
+            # its job (an unknown-outcome submit may have left it behind).
+            self._clear_pending_close_mark(position_id, signal_id)
         return broker_order_id
 
     async def _fetch_reconciliation_order_details(
@@ -3158,6 +3244,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._already_logged_in_notified = False
         self._symbol_name_to_id.clear()
         self._order_id_to_signal_id.clear()
+        self._pending_close_positions.clear()
         self._position_ids_by_symbol.clear()
         self._position_volumes.clear()
         self._position_orders_cache.clear()
@@ -3176,6 +3263,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._execution_queue = asyncio.Queue(maxsize=5000)
         self._execution_retry_counts.clear()
         self._unresolved_execution_events.clear()
+        self._pending_close_fill_event_ids.clear()
         self._terminal_auth_failure_reason = ""
         self._terminal_auth_failure_code = ""
 
@@ -3216,6 +3304,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         # the broker sees an order, so a failure here is marked and the caller
         # can safely retry instead of treating the outcome as unknown. The
         # `_submit_new_order_request` call below is deliberately outside.
+        close_position_id: int | None = None
         with order_not_submitted():
             self._raise_if_terminal_auth_failed()
             signal_id = str(signal.id)
@@ -3265,7 +3354,52 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 str((signal.metadata or {}).get("risk_sizing_mode") or "")
                 == EXIT_ONLY_RISK_SIZING_MODE
             )
-            self._resolve_order_volume(signal)
+            order_volume = self._resolve_order_volume(signal)
+            # Persist the quantity the broker is actually asked for, not the
+            # unrounded risk-sized one: the volume grid floor can drop a
+            # sub-step remainder the broker can never work, and a persisted
+            # requested qty larger than the fill reads as a working-order
+            # expectation forever in broker reconciliation. Recomputing the
+            # volume from the normalized qty is idempotent (the lot-grid
+            # floor's noise band absorbs the float round-trip), so the request
+            # builders below still derive the same volume.
+            scale = self._scale_for(signal.symbol)
+            submitted_qty = _broker_volume_to_qty(order_volume, scale.volume_per_qty)
+            # Only the lot-grid noise band (<= 1e-6 of a step, see
+            # floor_qty_to_step/_qty_to_broker_volume) may push the normalized
+            # qty an ulp above the binding qty; anything more means volume
+            # resolution rounded up. The allowance is absolute qty units
+            # scaled to the grid step - a relative tolerance would hide a
+            # small overshoot on a large qty. The band tracks the shared
+            # lot-grid floor's own noise constant (2x for float margin) so
+            # the two cannot drift apart.
+            step_qty = float(max(int(scale.step_volume), 1)) / float(
+                scale.volume_per_qty
+            )
+            if submitted_qty > qty_value and not math.isclose(
+                submitted_qty,
+                qty_value,
+                rel_tol=0.0,
+                abs_tol=2.0 * float(STEP_NOISE) * step_qty,
+            ):
+                # Volume resolution floors, so this can only happen if a
+                # future change rounds up: persisting an oversized qty would
+                # both place an oversized order and hide the excess from
+                # reconciliation. Fail closed instead.
+                raise ValueError(
+                    f"cTrader normalized qty {submitted_qty!r} exceeds the "
+                    f"binding qty {qty_value!r} for {signal.symbol}; refusing "
+                    "to submit an order larger than the risk-sized quantity."
+                )
+            signal = signal.model_copy(
+                update={
+                    "metadata": {
+                        **(signal.metadata or {}),
+                        "qty": submitted_qty,
+                        "explicit_qty": submitted_qty,
+                    }
+                }
+            )
             signal = signal.model_copy(
                 update={
                     "metadata": {
@@ -3275,6 +3409,22 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                     }
                 }
             )
+            # The request builders below re-resolve the volume from this
+            # normalized signal; it must reproduce the volume resolved from
+            # the binding qty, or the wire request and the persisted qty
+            # would diverge. The float round-trip (volume -> qty -> volume)
+            # stays far inside the lot-grid floor's 1e-6-unit noise band for
+            # every volume a broker int32 can express (~5e-7 units at
+            # INT32_MAX), so an exact int compare cannot false-positive.
+            reresolved_volume = self._resolve_order_volume(signal)
+            if reresolved_volume != order_volume:
+                raise RuntimeError(
+                    "cTrader volume resolution is not idempotent under qty "
+                    f"normalization for {signal.symbol}: resolved "
+                    f"{order_volume} from the binding qty but "
+                    f"{reresolved_volume} from the normalized qty; "
+                    "refusing to submit."
+                )
             persisted_timestamp = await asyncio.to_thread(
                 get_live_signal_timestamp, signal_id
             )
@@ -3299,6 +3449,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 position_id = self._position_id_for_exit(
                     signal.symbol, requested_position_id
                 )
+                close_position_id = position_id
                 signal = signal.model_copy(
                     update={
                         "metadata": {
@@ -3332,7 +3483,26 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         # #134: bracket the broker call with the order-timing stamps, persisted
         # with the order id once the broker answers.
         submitted_at = datetime.now(timezone.utc)
-        response = await self._submit_new_order_request(request)
+        if close_position_id is not None:
+            # A ClosePositionReq carries no clientOrderId of ours: until the
+            # broker order id is known, a fill on this position can only be
+            # retained for reconciliation, not attributed - mark the position
+            # so the listener does not book our own exit as a broker-side
+            # close. The mark is per signal so a second concurrent close on
+            # the same position keeps its own guard, and is lifted once this
+            # submit's ownership is recorded below, or expires on its own
+            # after an unknown-outcome submit.
+            self._pending_close_positions.setdefault(close_position_id, {})[
+                canonical_signal_id
+            ] = time.monotonic()
+        try:
+            response = await self._submit_new_order_request(request)
+        except BrokerOrderRejectedError:
+            # A definitive refusal created no order: nothing can fill, so the
+            # pending mark has nothing left to cover.
+            if close_position_id is not None:
+                self._clear_pending_close_mark(close_position_id, canonical_signal_id)
+            raise
         acknowledged_at = datetime.now(timezone.utc)
 
         order_id = self._extract_order_id_from_payload(response)
@@ -3346,6 +3516,14 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 "cannot be tracked or retried safely."
             )
         broker_order_id = str(order_id)
+        # Ownership is registered BEFORE the persist await: a fill event the
+        # listener processes while the DB write is in flight still resolves to
+        # this signal. A persist failure rolls the registration back; the
+        # pending mark stays so fills keep being retained until reconciliation
+        # recovers the broker order id.
+        self._order_id_to_signal_id[order_id] = canonical_signal_id
+        # #80: remember the symbol for order-only fills (no symbolId).
+        self._order_id_to_symbol[order_id] = str(signal.symbol).strip().upper()
         persisted = await asyncio.to_thread(
             set_live_signal_broker_order_id,
             canonical_signal_id,
@@ -3354,10 +3532,11 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             acknowledged_at=acknowledged_at,
         )
         if not persisted:
+            self._order_id_to_signal_id.pop(order_id, None)
+            self._order_id_to_symbol.pop(order_id, None)
             raise RuntimeError("Failed to persist cTrader broker order id.")
-        self._order_id_to_signal_id[order_id] = canonical_signal_id
-        # #80: remember the symbol for order-only fills (no symbolId).
-        self._order_id_to_symbol[order_id] = str(signal.symbol).strip().upper()
+        if close_position_id is not None:
+            self._clear_pending_close_mark(close_position_id, canonical_signal_id)
 
         logger.info(
             "Submitted cTrader live order",
@@ -3395,6 +3574,8 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         if not persisted:
             raise RuntimeError(unpersisted_error)
         self._order_id_to_signal_id[int(recovered_order_id)] = signal_id
+        if position_id is not None:
+            self._clear_pending_close_mark(position_id, signal_id)
         return recovered_order_id
 
     async def _recover_duplicate_signal_order_id(self, canonical_signal_id: str) -> str:
@@ -3408,6 +3589,12 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                     "Persisted cTrader broker order id is invalid; refusing duplicate submission."
                 )
             self._order_id_to_signal_id[normalized_order_id] = canonical_signal_id
+            position_id = await self._persisted_exit_position_id(canonical_signal_id)
+            if position_id is not None:
+                # The close's broker order id is already known, so a pending
+                # mark this exit left on its position has done its job (same
+                # lift as the order-id recovery paths).
+                self._clear_pending_close_mark(position_id, canonical_signal_id)
             return str(normalized_order_id)
         canonical_timestamp = await asyncio.to_thread(
             get_live_signal_timestamp, canonical_signal_id
@@ -3502,12 +3689,17 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             signal, stop_loss, take_profit
         )
         request.relativeStopLoss = relative_stop
-        request.relativeTakeProfit = relative_take
+        if relative_take is not None and relative_take > 0:
+            # proto2 optional int64: assigning 0 would make the field PRESENT
+            # and the broker validates a present relativeTakeProfit as > 0
+            # ("SL/TP have to be positive"). "No take profit" means the field
+            # is absent, so it is only ever assigned a positive distance.
+            request.relativeTakeProfit = relative_take
         return request
 
     def _resolve_relative_sl_tp(
         self, signal: LiveSignal, stop_loss: float, take_profit: float | None
-    ) -> tuple[int, int]:
+    ) -> tuple[int, int | None]:
         """Convert absolute SL/TP prices into cTrader relative units.
 
         Per the cTrader Open API docs, ProtoOANewOrderReq's absolute
@@ -3523,8 +3715,13 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         to the symbol grid of ``10 ** (5 - price_digits)`` units (1 when the symbol
         is finer than 5 digits), i.e. toward the entry, so the real risk never
         exceeds the sized risk (docs/live-risk-consistency.md). A take-profit under
-        one tick is sent as one tick (0 would mean "no TP"); a stop-loss under one
-        tick is refused, because widening it would exceed the sized risk.
+        one tick is sent as one tick; a stop-loss under one tick is refused,
+        because widening it would exceed the sized risk.
+
+        Returns ``(relative_stop, relative_take)`` where ``relative_take`` is
+        ``None`` for the explicit unbounded-TP policy: the caller must leave
+        ``relativeTakeProfit`` unset on the wire, because a present zero is a
+        broker rejection, not "no take profit".
         """
         reference_price = float(signal.theoretical_price)
         if not math.isfinite(reference_price) or reference_price <= 0:
@@ -3554,9 +3751,10 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 f"reference={reference_price!r}; refusing to submit."
             )
         if take_profit is None:
-            # C1: explicit unbounded policy — stop-only order. cTrader treats
-            # a zero relativeTakeProfit as "no take profit".
-            return (distance(stop_loss, is_stop=True), 0)
+            # C1: explicit unbounded policy — stop-only order. cTrader has no
+            # "no take profit" value for a present field: the field must be
+            # left unset entirely (None here -> the caller never assigns it).
+            return (distance(stop_loss, is_stop=True), None)
         take_outward = take_profit - reference_price if buy else reference_price - take_profit
         if take_outward <= 0:
             raise ValueError(
@@ -3572,11 +3770,178 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         except CTraderApiError as exc:
             self._raise_terminal_auth_from_api_error(exc)
             raise
-        if isinstance(response, self._ProtoOAOrderErrorEvent):
-            raise RuntimeError(
-                f"Order rejected ({response.errorCode}): {response.description or 'no description'}"
-            )
+        self._raise_for_refused_submit_response(response, request)
         return response
+
+    @staticmethod
+    def _classify_and_raise_refusal(
+        message: str, *, error_code: str, definitive: bool
+    ) -> None:
+        """A refusal is ``BrokerOrderRejectedError`` only when definitive."""
+        if not definitive:
+            raise RuntimeError(message)
+        raise BrokerOrderRejectedError(message, error_code=error_code)
+
+    def _raise_for_refused_submit_response(self, response: Any, request: Any) -> None:
+        """Raise for a correlated refusal payload; return for anything else.
+
+        cTrader answers a refused NewOrderReq/ClosePositionReq either with a
+        ProtoOAOrderErrorEvent or with a ProtoOAExecutionEvent whose
+        executionType is ORDER_REJECTED; both are matched to THIS request by
+        clientMsgId. Timeouts and transport failures never reach here: the
+        request may have landed, so they stay ordinary exceptions (unknown
+        outcome).
+        """
+        if self._ProtoOAOrderErrorEvent is not None and isinstance(
+            response, self._ProtoOAOrderErrorEvent
+        ):
+            # Only an error event with no broker order id is a clean refusal:
+            # a non-zero orderId means the broker created an order record, and
+            # for a new-order request a non-zero positionId is not provably
+            # pre-position either. A close request echoes positionId, so only
+            # its orderId decides.
+            order_id = _present_proto_field_fail_closed(response, "orderId")
+            position_id = _present_proto_field_fail_closed(response, "positionId")
+            definitive_refusal = order_id in (None, 0) and (
+                self._is_close_position_request(request)
+                or position_id in (None, 0)
+            )
+            message = (
+                f"Order rejected ({getattr(response, 'errorCode', '') or ''}): "
+                f"{getattr(response, 'description', '') or 'no description'}"
+            )
+            self._classify_and_raise_refusal(
+                message,
+                error_code=str(getattr(response, "errorCode", "") or ""),
+                definitive=definitive_refusal,
+            )
+        # Only ProtoOAExecutionEvent carries ``executionType`` in the proto
+        # schema, so this attribute sniff is a fallback for an unloaded class,
+        # not a general detector: an unclassifiable event must fail closed
+        # below, never pass as submitted.
+        is_execution_event = (
+            isinstance(response, self._ProtoOAExecutionEvent)
+            if self._ProtoOAExecutionEvent is not None
+            else getattr(response, "executionType", None) is not None
+            and getattr(response, "ctidTraderAccountId", None) is not None
+        )
+        if is_execution_event:
+            rejected = self._is_order_rejected_execution(response)
+            if rejected is None:
+                # The event's type cannot be classified (proto types not fully
+                # loaded, or an unreadable executionType): it may be the
+                # ORDER_REJECTED refusal this path exists to catch, so it must
+                # not fall through and be reported as a submitted order.
+                # Removing this raise reopens #428.
+                raise RuntimeError(
+                    "cTrader order response was an execution event whose "
+                    "executionType could not be classified; the outcome is "
+                    "unknown and must be reconciled."
+                )
+            if rejected:
+                # Unlike the OrderErrorEvent above, the event typically still
+                # carries an `order` object with a broker-assigned orderId, so
+                # the orderId cannot decide: definiteness comes from the
+                # order's terminal status and the absence of any created
+                # state instead.
+                error_code = str(getattr(response, "errorCode", "") or "")
+                message = (
+                    f"Order rejected ({error_code or 'ORDER_REJECTED'}): "
+                    f"{getattr(response, 'description', '') or 'no description'}"
+                )
+                self._classify_and_raise_refusal(
+                    message,
+                    error_code=error_code,
+                    definitive=self._execution_rejection_is_definitive(
+                        response, request
+                    ),
+                )
+
+    def _is_close_position_request(self, request: Any) -> bool:
+        """Whether the request is a ClosePositionReq.
+
+        ``_ProtoOAClosePositionReq`` is loaded with the other proto types
+        before any submit; if it were missing this returns False and a close
+        rejection is evaluated as a new-order one - with the position echo
+        that stays unknown, i.e. fail-closed.
+        """
+        return (
+            self._ProtoOAClosePositionReq is not None
+            and isinstance(request, self._ProtoOAClosePositionReq)
+        )
+
+    def _is_order_rejected_execution(self, event: Any) -> bool | None:
+        """Whether the event is an ORDER_REJECTED; ``None`` when unclassifiable.
+
+        ``None`` means the proto type was not fully loaded or the event's
+        ``executionType`` cannot be read - the caller must treat the response
+        as an unknown outcome rather than letting it pass as submitted.
+        """
+        execution_type = getattr(self._ProtoOAExecutionType, "ORDER_REJECTED", None)
+        if execution_type is None:
+            return None
+        try:
+            return int(getattr(event, "executionType", -1)) == int(execution_type)
+        except Exception:  # except-kind: money-decision
+            # Any unreadable type is "unclassifiable" (None), never False:
+            # False would let the event pass through as a submitted order.
+            return None
+
+    def _execution_rejection_is_definitive(self, event: Any, request: Any) -> bool:
+        """Whether an ORDER_REJECTED execution event proves nothing was opened.
+
+        Safe means two things: the order can never execute, and no state was
+        created. The event's ``order`` must report ``ORDER_STATUS_REJECTED``
+        (terminal - a rejected order does not fill later), no ``deal`` may be
+        attached (a deal is an execution record, so its presence means an
+        execution may exist), and a new-order request must not carry a
+        ``position`` (a created position is exactly the state a rejection
+        must not have produced). A close request echoes the still-open
+        position it failed to close, so position does not decide there -
+        the same rule the OrderErrorEvent path applies to ``positionId``.
+        Unanswerable field presence fails closed to "unknown".
+
+        Invariant: EVERY presence check in this method goes through
+        ``_present_proto_field_fail_closed`` and every attached-message check
+        stays an ``is not None`` identity test - presence comes only from
+        ``HasField`` (via the fail-closed wrapper); truthiness is not a
+        presence test (a protobuf sub-message's truthiness says nothing about
+        ``HasField``, and test doubles differ), so it must never decide
+        whether a deal/position is attached.
+        """
+        order = _present_proto_field_fail_closed(event, "order")
+        if order is _PRESENT_BUT_UNKNOWN or order is None:
+            return False
+        status_enum = getattr(self, "_ProtoOAOrderStatus", None)
+        rejected_status = (
+            getattr(status_enum, "ORDER_STATUS_REJECTED", None)
+            if status_enum is not None
+            else None
+        )
+        order_status = getattr(order, "orderStatus", None)
+        if order_status is None or rejected_status is None:
+            return False
+        try:
+            if int(order_status) != int(rejected_status):
+                return False
+        except (TypeError, ValueError):
+            return False
+        # ``is not None``, never truthiness: presence comes from ``HasField``
+        # via the fail-closed wrapper, truthiness is not a presence test, and
+        # an attached-but-empty deal is still an execution record whose
+        # presence cannot be proven harmless.
+        if _present_proto_field_fail_closed(event, "deal") is not None:
+            return False
+        position = _present_proto_field_fail_closed(event, "position")
+        if position is _PRESENT_BUT_UNKNOWN:
+            return False
+        if self._is_close_position_request(request):
+            return True
+        # For a new order ANY attached position - even one whose positionId
+        # reads as unset; presence comes from ``HasField`` so this must stay
+        # an identity check, not truthiness - is state the rejection must
+        # not have produced.
+        return position is None
 
     def _handle_spot_event(self, payload: Any) -> None:
         """Feed a spot event to the pending :meth:`get_quote` for its symbol."""
@@ -5634,6 +5999,21 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             client_order_id, order_id=order_id, execution_type=execution_type
         )
         if signal_id is None:
+            # A ClosePositionReq has no clientOrderId of ours: the fill's id
+            # is SDK-assigned, so the broker order id the submit persisted is
+            # the attribution. Only an exit signal may claim a position-close
+            # fill this way - an entry order's id on a close deal still takes
+            # the broker-close path, which resolves the real opener.
+            signal_id = await self._exit_signal_uuid_for_order_id(
+                order_id,
+                position_id=self._position_id_from_payload(order, deal),
+            )
+        if signal_id is None:
+            if self._close_position_fill_pending(order=order, deal=deal):
+                raise _PendingCloseFillRetentionError(
+                    "cTrader fill closes a position whose own close order is "
+                    "still in flight; retaining the event for reconciliation."
+                )
             # #144: a broker-side position close (SL/TP, flatten, manual) names
             # no signal of ours, but its deal still resolves to the position's
             # opening order and through it to the parent signal's ledger. Only
@@ -5943,12 +6323,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         # broker did not flag its order ``closingOrder`` it must still not be
         # booked as the parent, or the close would reduce the wrong ledger side.
         metadata = await asyncio.to_thread(get_live_signal_metadata, candidate)
-        if metadata and (
-            str(metadata.get("signal_intent") or "") == "exit"
-            or bool(metadata.get("exit_only"))
-            or str(metadata.get("risk_sizing_mode") or "")
-            == EXIT_ONLY_RISK_SIZING_MODE
-        ):
+        if is_exit_only_signal_metadata(metadata or {}):
             return None
         return candidate
 
@@ -6379,6 +6754,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         flagged_deal_ids: set[int],
         order_window: tuple[int, int] | None = None,
         pace: dict[str, Any] | None = None,
+        deferred_close_deals: list[Any],
     ) -> int:
         """Book one deal-list close the stream missed, or flag it (#144).
 
@@ -6387,6 +6763,11 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         cause (unreadable order list, refused record, a too-narrow opener
         window) can resolve on a later pass. Booking it then supersedes the
         flag with a ``ledger_reconciliation_resolved`` audit row.
+
+        ``deferred_close_deals`` collects deals skipped because their
+        position's own close submit is still marked pending: the caller puts
+        their windows back on the scan cursor so a later pass books them
+        once the submit's broker order id is known.
         """
         if not self._event_is_position_close(None, deal):
             return 0
@@ -6427,17 +6808,55 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             # A deal our own order made is the per-signal reconcile's job, not
             # this pass's: booking it here too would close the ledger twice.
             if order_id not in own_order_cache:
-                own_order_cache[order_id] = bool(
-                    self._order_id_to_signal_id.get(order_id)
-                ) or bool(
-                    await asyncio.to_thread(
-                        find_live_signal_id_by_broker_order_id,
+                own_order_cache[order_id] = (
+                    self._order_id_to_signal_id.get(order_id) is not None
+                )
+                if not own_order_cache[order_id]:
+                    owner_ids = await asyncio.to_thread(
+                        find_live_signal_ids_by_broker_order_id,
                         self.account_config_id,
                         str(order_id),
                     )
-                )
+                    if len(owner_ids) > 1:
+                        # Ambiguous ownership - broker_order_id is indexed,
+                        # not unique, so recovered duplicates can share one.
+                        # The deal may be ours or a broker-side close and
+                        # booking either way risks the wrong ledger side:
+                        # flag it for an operator instead of guessing.
+                        self._flag_ledger_reconciliation(
+                            self._fill_symbol_name(
+                                order_id=order_id, order=None, deal=deal
+                            )
+                            or "",
+                            "ambiguous_broker_order_id",
+                            {
+                                "position_id": position_id,
+                                "deal_id": deal_id,
+                                "order_id": str(order_id),
+                                "owner_signal_ids": owner_ids,
+                                "deal_timestamp_ms": (
+                                    self._resolve_execution_timestamp_ms(
+                                        order=None, deal=deal
+                                    )
+                                ),
+                                "source": "reconcile",
+                            },
+                            flagged_ids=flagged_deal_ids,
+                        )
+                        own_order_cache[order_id] = True
+                        return 0
+                    own_order_cache[order_id] = bool(owner_ids)
             if own_order_cache[order_id]:
                 return 0
+        if self._pending_close_position_active(position_id):
+            # A ClosePositionReq submit for this position is still in flight
+            # (or its outcome is unknown): this deal may be OUR close, whose
+            # broker order id is not yet attributable - booking it here
+            # would mis-book our own exit as a broker-side close, the exact
+            # bug the pending mark exists to prevent. Defer the deal's
+            # window instead of booking or flagging it.
+            deferred_close_deals.append(deal)
+            return 0
         if position_id not in parent_cache:
             parent_cache[position_id] = await self._resolve_position_parent_signal(
                 position_id, order_window=order_window, pace=pace
@@ -7159,6 +7578,10 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             )
             flagged_deal_ids = set()
         deal_retry_pending: list[list[int]] = []
+        # Deals deferred because their position's close submit is still
+        # marked pending: never booked, never flagged - their windows go
+        # back on the cursor so a later pass retries them.
+        deferred_close_deals: list[Any] = []
         try:
             for index, deal in enumerate(deals):
                 # Windows abut and subdivided halves can both return a boundary
@@ -7177,6 +7600,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                         flagged_deal_ids=flagged_deal_ids,
                         order_window=order_window,
                         pace=budget,
+                        deferred_close_deals=deferred_close_deals,
                     )
                 except CTraderApiError:
                     # This deal and every deal not yet reached stay
@@ -7227,6 +7651,17 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                     )
                     raise
         finally:
+            # Deferred deals' windows re-join the pending set exactly like
+            # failed ones: the cursor may not advance past a deal that was
+            # deliberately not booked this pass.
+            deal_retry_pending.extend(
+                self._broker_close_deal_retry_ranges(
+                    deferred_close_deals,
+                    deal_scan_ranges,
+                    floor_ms=floor_ms,
+                    now_ms=now_ms,
+                )
+            )
             # The cursor advances only now - after every gathered deal was
             # processed or re-queued - so a transient read error can never
             # mark a deal's range covered without booking it.
@@ -7406,6 +7841,159 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 },
             )
             return None
+
+    async def _exit_signal_uuid_for_order_id(
+        self, order_id: int | None, *, position_id: int | None = None
+    ) -> UUID | None:
+        """The exit signal that owns this broker order id, or ``None``.
+
+        ``ProtoOAClosePositionReq`` has no ``clientOrderId`` field (its proto
+        fields are ``payloadType``, ``ctidTraderAccountId``, ``positionId``
+        and ``volume``), so a close we submitted fills under an SDK-assigned
+        id that parses as no signal. Attribution falls back to the broker
+        order id persisted at submit time - the in-memory map first, then the
+        database - but only when the resolved signal is itself an exit *as the
+        ledger defines it* (``is_exit_only_signal_metadata``): a
+        position-close deal carrying an *entry* order's id must still take
+        the broker-close path, which resolves the position's real opener.
+        ``position_id`` is the fill's own position: a resolved exit whose
+        recorded position id disagrees cannot be this fill's owner.
+        """
+        if order_id is None:
+            return None
+        resolved = self._order_id_to_signal_id.get(order_id)
+        if resolved is None:
+            owner_ids = await asyncio.to_thread(
+                find_live_signal_ids_by_broker_order_id,
+                self.account_config_id,
+                str(order_id),
+            )
+            if len(owner_ids) == 1:
+                resolved = owner_ids[0]
+            elif owner_ids:
+                # ``broker_order_id`` is indexed, not unique: a recovered
+                # duplicate can share one. Only an exit-only signal can
+                # claim a position-close fill this way, so when exactly one
+                # match is an exit it is the plausible owner; anything more
+                # ambiguous stays unresolved and takes the broker-close
+                # path, which resolves the position's real opener.
+                exit_owners: list[str] = []
+                for owner_id in owner_ids:
+                    owner_metadata = await asyncio.to_thread(
+                        get_live_signal_metadata, owner_id
+                    )
+                    if is_exit_only_signal_metadata(owner_metadata or {}):
+                        exit_owners.append(owner_id)
+                if len(exit_owners) == 1:
+                    resolved = exit_owners[0]
+        if not resolved:
+            return None
+        metadata = await asyncio.to_thread(
+            get_live_signal_metadata, str(resolved)
+        )
+        # The LEDGER's exit predicate, not a looser one: a fill attributed to
+        # a signal the ledger counts as an entry would open quantity instead
+        # of reducing it.
+        if not is_exit_only_signal_metadata(metadata or {}):
+            return None
+        if position_id is not None:
+            # A broker order id is not unique, so the resolved exit can still
+            # be the wrong owner: its recorded position id is the last check
+            # that it closed THIS position. A signal with none recorded
+            # cannot disprove the match and keeps the attribution.
+            try:
+                owner_position_id = self._requested_exit_position_id(metadata or {})
+            except ValueError:
+                # Malformed position metadata cannot disprove the match, but
+                # a corrupt exit signal must not claim the fill either:
+                # fail closed to the broker-close path.
+                return None
+            if owner_position_id is not None and owner_position_id != position_id:
+                return None
+        try:
+            return UUID(str(resolved))
+        except (ValueError, AttributeError, TypeError):
+            return None
+
+    def _close_position_fill_pending(self, *, order: Any | None, deal: Any | None) -> bool:
+        """Whether this position-close fill belongs to an in-flight close submit.
+
+        While ``submit_order`` waits on a ``ClosePositionReq`` response the
+        broker order id is still unknown, so the fill's order id resolves to
+        nothing and the event would be booked as a broker-side close - the
+        misattribution this guard exists to prevent. The submit registers its
+        position id for exactly that window; a fill on it is retained for
+        reconciliation, which re-reads it once ownership is recorded. Marks
+        expire so a failed submit cannot hold a genuine broker-side close on
+        the position out of the stream path indefinitely.
+        """
+        if not self._pending_close_positions:
+            return False
+        if not self._event_is_position_close(order, deal):
+            return False
+        position_id = self._position_id_from_payload(order, deal)
+        if position_id is None:
+            return False
+        return self._pending_close_position_active(position_id)
+
+    def _pending_close_position_active(self, position_id: int) -> bool:
+        """Whether an unexpired close submit still marks this position pending.
+
+        Marks are per submitting signal and expire individually; expired
+        entries are pruned here so a dead submit cannot hold the guard (or
+        the dict) forever.
+        """
+        marks = self._pending_close_positions.get(position_id)
+        if not marks:
+            return False
+        now = time.monotonic()
+        for signal_id in [
+            sid
+            for sid, marked_at in marks.items()
+            if now - marked_at > _PENDING_CLOSE_POSITION_TTL_SECONDS
+        ]:
+            del marks[signal_id]
+            # An expired mark means a submit's broker outcome stayed unknown
+            # past the TTL: retention is gone, so a later fill on this
+            # position books as a broker-side close. Surface it - silent
+            # expiry would hide exactly the mis-booking the mark prevents.
+            logger.warning(
+                "cTrader pending close mark expired before the submit's "
+                "broker order id was known; fills on the position may book "
+                "as broker-side closes",
+                extra={
+                    "data": {
+                        "account_id": self.account_config_id,
+                        "position_id": position_id,
+                        "signal_id": signal_id,
+                    }
+                },
+            )
+        if not marks:
+            self._pending_close_positions.pop(position_id, None)
+            return False
+        return True
+
+    def _clear_pending_close_mark(self, position_id: int, signal_id: str) -> None:
+        """Lift one submit's pending mark on a position.
+
+        Only this signal's entry is removed: a second close submit still in
+        flight on the same position keeps its own guard. When the position's
+        last mark lifts and fills are parked waiting on it, the next
+        reconciliation pass is expedited - the parked fill can attribute as
+        soon as the order id is known instead of waiting out the retry
+        interval.
+        """
+        marks = self._pending_close_positions.get(position_id)
+        if marks is None:
+            return
+        marks.pop(signal_id, None)
+        if marks:
+            return
+        self._pending_close_positions.pop(position_id, None)
+        if self._pending_close_fill_event_ids:
+            self._reconciliation_required = True
+            self._reconciliation_retry_at = 0.0
 
     @staticmethod
     def _resolve_execution_price(*, order: Any | None, deal: Any | None) -> float:
@@ -7588,6 +8176,59 @@ class CTraderLiveAdapter(BaseLiveAdapter):
 
     def _ack_execution_event(self, event: Any) -> None:
         self._execution_retry_counts.pop(id(event), None)
+        self._pending_close_fill_event_ids.discard(id(event))
+
+    def _park_pending_close_fill(self, event: Any) -> None:
+        """Park a fill retained for an in-flight close submit, budget-free.
+
+        The event waits in ``_unresolved_execution_events`` - the same deque
+        every other retained fill uses - but never spends
+        ``EXECUTION_RETRY_LIMIT``: the pending mark can live up to the TTL
+        after an unknown-outcome submit, and a budgeted requeue would
+        crash-loop the listener (and delay every other fill on the account)
+        for that whole window. Reconciliation is re-armed on a paced interval
+        instead: each pass may recover the close's broker order id, clear the
+        mark, and requeue the event for attribution.
+        """
+        if len(self._unresolved_execution_events) >= UNRESOLVED_EXECUTION_EVENT_LIMIT:
+            # Degenerate overflow: the deque is full, so fall back to the
+            # budgeted path rather than dropping the fill.
+            logger.warning(
+                "cTrader pending-close fill park overflowed the unresolved "
+                "deque; falling back to the budgeted requeue",
+                extra={"data": {"account_id": self.ctid_trader_account_id}},
+            )
+            if not self._requeue_execution_event(event):
+                raise RuntimeError(
+                    "cTrader execution event could not be requeued after "
+                    "pending-close retention; broker reconciliation is "
+                    "required."
+                )
+            return
+        self._reconciliation_required = True
+        self._reconciliation_retry_at = (
+            time.monotonic() + _PENDING_CLOSE_FILL_RECONCILE_SECONDS
+        )
+        self._unresolved_execution_events.append(event)
+        self._pending_close_fill_event_ids.add(id(event))
+        logger.info(
+            "cTrader close fill retained while its submit is unresolved; "
+            "parked for reconciliation",
+            extra={
+                "data": {
+                    "account_id": self.ctid_trader_account_id,
+                    "unresolved_events": len(self._unresolved_execution_events),
+                }
+            },
+        )
+
+    def _requeue_pending_close_fill(self, event: Any) -> bool:
+        """Return a parked pending-close fill to the queue without spending budget."""
+        try:
+            self._execution_queue.put_nowait(event)
+        except asyncio.QueueFull:
+            return False
+        return True
 
     async def listen_executions(self) -> None:
         backoff_seconds = 2
@@ -7619,6 +8260,13 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 self._log_listener_terminal_auth_failure(exc)
                 return
             except Exception as exc:  # except-kind: money-decision
+                if event is not None and isinstance(
+                    exc, _PendingCloseFillRetentionError
+                ):
+                    self._park_pending_close_fill(event)
+                    continue
+                if event is not None:
+                    self._pending_close_fill_event_ids.discard(id(event))
                 if event is not None and not self._requeue_execution_event(event):
                     raise RuntimeError(
                         "cTrader execution event exhausted its retry budget; "
@@ -7665,7 +8313,13 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             self._unresolved_execution_events.clear()
             still_unresolved: list[Any] = []
             for pending_event in unresolved:
-                requeued = self._requeue_execution_event(pending_event)
+                if id(pending_event) in self._pending_close_fill_event_ids:
+                    # Parked for an in-flight close submit: requeue WITHOUT
+                    # spending the retry budget - the mark can outlive the
+                    # whole budget many times over.
+                    requeued = self._requeue_pending_close_fill(pending_event)
+                else:
+                    requeued = self._requeue_execution_event(pending_event)
                 if not requeued or any(
                     id(pending_event) == id(stored_event)
                     for stored_event in self._unresolved_execution_events
@@ -7676,9 +8330,17 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 self._unresolved_execution_events.extend(
                     still_unresolved[:UNRESOLVED_EXECUTION_EVENT_LIMIT]
                 )
+                # Forget ids of events that left the deque: an id() is only
+                # meaningful while its event object is still referenced, and
+                # a stale entry would budget-free-requeue an unrelated fill.
+                self._pending_close_fill_event_ids.intersection_update(
+                    id(stored_event)
+                    for stored_event in self._unresolved_execution_events
+                )
                 self._reconciliation_required = True
                 self._reconciliation_retry_at = time.monotonic() + backoff_seconds
                 return
+            self._pending_close_fill_event_ids.clear()
             self._reconciliation_required = False
             self._reconciliation_retry_at = 0.0
 

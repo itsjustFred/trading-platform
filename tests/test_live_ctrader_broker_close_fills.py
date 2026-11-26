@@ -20,6 +20,7 @@ maintainer decision on #277.
 from __future__ import annotations
 
 import asyncio
+import time
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any
@@ -212,6 +213,7 @@ def _adapter(
     deal_list_has_more: Any = False,
     deal_list_fail_predicate: Any = None,
     order_details: dict[int, Any] | None = None,
+    order_details_deals: dict[int, list[Any]] | None = None,
 ) -> CTraderLiveAdapter:
     """A cTrader adapter whose broker reads are faked, on the isolated DB."""
     adapter = CTraderLiveAdapter(
@@ -285,7 +287,8 @@ def _adapter(
             return response
         if isinstance(request, _OrderDetailsReq):
             order = details_by_order.get(int(request.orderId))
-            return _OrderDetailsRes(order=order, deals=[])
+            deals = list((order_details_deals or {}).get(int(request.orderId), []))
+            return _OrderDetailsRes(order=order, deals=deals)
         raise AssertionError(f"unexpected broker request {type(request).__name__}")
 
     adapter._send_request_with_refresh_retry = fake_send  # type: ignore[assignment]
@@ -506,6 +509,873 @@ def test_an_own_exit_fill_is_never_taken_for_a_broker_close(database) -> None:
     assert exit_rows[0].dedupe_key == "ctrader:deal:9001"
     assert close_rows == []
     assert _reconciliation_flags(database) == []
+
+
+# ─── own close fills whose clientOrderId is not ours (#144 follow-up) ──────────────────────────
+#
+# ``ProtoOAClosePositionReq`` has no ``clientOrderId`` field (payloadType,
+# ctidTraderAccountId, positionId, volume), so the execution event for one of
+# our exits carries an SDK/broker-assigned id - never the signal UUID. The
+# attribution is the broker order id the submit persisted instead; without it
+# the fill was booked as a synthetic broker-side close and every later
+# reconcile of the exit signal hit the dedupe-key collision.
+
+SDK_CLOSE_CLIENT_ORDER_ID = "12345-0f1e2d3c-ProtoOAClosePositionReq-3"
+
+
+def _persist_exit_signal(
+    database,
+    *,
+    deployment_id: str = DEP_ENTRY,
+    order_id: int | None = CLOSE_ORDER_ID,
+    action: str = "sell",
+    metadata_extra: dict[str, Any] | None = None,
+) -> str:
+    """An exit-only signal as the internal runner persists it.
+
+    ``order_id=None`` leaves ``broker_order_id`` unset, the state between
+    ``save_live_signal`` and ``set_live_signal_broker_order_id``.
+    """
+    import shared.database as db
+
+    metadata: dict[str, Any] = {
+        "signal_intent": "exit",
+        "exit_only": True,
+        "risk_sizing_mode": "exit_only",
+        **(metadata_extra or {}),
+    }
+    if order_id is not None:
+        metadata["broker_order_id"] = str(order_id)
+    signal = LiveSignal(
+        deployment_id=deployment_id,
+        symbol="AAPL",
+        action=action,
+        theoretical_price=95.0,
+        timestamp=T1,
+        metadata=metadata,
+    )
+    signal_id, created = db.save_live_signal(signal)
+    assert created
+    return signal_id
+
+
+def _sdk_closing_order(*, order_id: int = CLOSE_ORDER_ID, volume: float = 10.0) -> Any:
+    """The closing order as the broker reports it for a ClosePositionReq:
+    an SDK-assigned ``clientOrderId`` that is not our signal UUID."""
+    order = _closing_order(order_id=order_id, volume=volume)
+    order.clientOrderId = SDK_CLOSE_CLIENT_ORDER_ID
+    return order
+
+
+def _signal_execution_rows(database, signal_id: str) -> list[Any]:
+    import shared.database as db
+
+    with db.get_session() as session:
+        return session.exec(
+            db.select(db.LiveExecutionModel).where(
+                db.LiveExecutionModel.signal_id == signal_id
+            )
+        ).all()
+
+
+def test_own_close_fill_with_sdk_client_order_id_attributes_by_broker_order_id(
+    database,
+) -> None:
+    """The soak bug: the fill's clientOrderId parses as no signal, but its
+    order id is persisted on the exit signal - attribute there, book no
+    synthetic broker-side close."""
+    import shared.database as db
+
+    entry_id = _persist_entry(database, qty=10.0)
+    exit_id = _persist_exit_signal(database)
+    adapter = _adapter(database, position_orders={POSITION_ID: [_entry_order(entry_id)]})
+
+    asyncio.run(adapter._persist_execution_event(_event(_sdk_closing_order(), _close_deal())))
+
+    exit_rows = _signal_execution_rows(database, exit_id)
+    assert len(exit_rows) == 1
+    assert exit_rows[0].dedupe_key == "ctrader:deal:9001"
+    assert exit_rows[0].broker_order_id == str(CLOSE_ORDER_ID)
+    assert _signal_execution_rows(database, db.broker_close_signal_id(entry_id)) == []
+    with db.get_session() as session:
+        assert (
+            session.get(db.LiveSignalModel, db.broker_close_signal_id(entry_id)) is None
+        )
+    assert _ledger(database) == pytest.approx(0.0)
+    assert _reconciliation_flags(database) == []
+
+
+def test_own_close_fill_attributes_via_the_in_memory_order_map(database) -> None:
+    """Same attribution while the process lives: ``_order_id_to_signal_id``
+    resolves the order id even before ``broker_order_id`` is persisted."""
+    import shared.database as db
+
+    entry_id = _persist_entry(database, qty=10.0)
+    exit_id = _persist_exit_signal(database, order_id=None)
+    adapter = _adapter(database, position_orders={POSITION_ID: [_entry_order(entry_id)]})
+    adapter._order_id_to_signal_id[CLOSE_ORDER_ID] = exit_id
+
+    asyncio.run(adapter._persist_execution_event(_event(_sdk_closing_order(), _close_deal())))
+
+    assert len(_signal_execution_rows(database, exit_id)) == 1
+    assert _signal_execution_rows(database, db.broker_close_signal_id(entry_id)) == []
+    assert _ledger(database) == pytest.approx(0.0)
+
+
+def test_an_ambiguous_order_id_attributes_to_the_single_exit_owner(database) -> None:
+    """Pre-mortem: ``broker_order_id`` is not unique, so a recovered duplicate
+    can leave an entry and an exit signal sharing one order id. Only an
+    exit-only signal can claim a position-close fill this way - when exactly
+    one match is an exit it is the plausible owner; booking the fill as a
+    broker-side close would leave the real exit looking unfilled."""
+    import shared.database as db
+
+    entry_id = _persist_entry(database, qty=10.0)
+    exit_id = _persist_exit_signal(
+        database,
+        order_id=ENTRY_ORDER_ID,
+        metadata_extra={"position_id": POSITION_ID},
+    )
+    adapter = _adapter(database, position_orders={POSITION_ID: [_entry_order(entry_id)]})
+
+    asyncio.run(
+        adapter._persist_execution_event(
+            _event(
+                _sdk_closing_order(order_id=ENTRY_ORDER_ID),
+                _close_deal(order_id=ENTRY_ORDER_ID),
+            )
+        )
+    )
+
+    assert len(_signal_execution_rows(database, exit_id)) == 1
+    assert _signal_execution_rows(database, db.broker_close_signal_id(entry_id)) == []
+    assert _ledger(database) == pytest.approx(0.0)
+
+
+def test_a_close_fill_on_another_position_does_not_attribute_to_the_exit(
+    database,
+) -> None:
+    """Pre-mortem: a broker order id shared across signals can resolve to an
+    exit that closed a DIFFERENT position. The fill's own ``positionId`` is
+    the last check: a recorded position id that disagrees disproves the
+    match, and the fill takes the broker-close path against the real
+    opener."""
+    import shared.database as db
+
+    entry_id = _persist_entry(database, qty=10.0)
+    exit_id = _persist_exit_signal(
+        database,
+        metadata_extra={"position_id": 9999},
+    )
+    adapter = _adapter(database, position_orders={POSITION_ID: [_entry_order(entry_id)]})
+
+    asyncio.run(adapter._persist_execution_event(_event(_sdk_closing_order(), _close_deal())))
+
+    assert _signal_execution_rows(database, exit_id) == []
+    assert len(_signal_execution_rows(database, db.broker_close_signal_id(entry_id))) == 1
+    assert _ledger(database) == pytest.approx(0.0)
+
+
+def test_malformed_position_metadata_fails_closed_to_the_broker_close(
+    database,
+) -> None:
+    """Pre-mortem: an exit signal whose ``position_ids`` metadata is
+    malformed cannot disprove the order-id match, but a corrupt exit must
+    not claim the fill either - attribution fails closed and the deal
+    books against the position's real opener."""
+    import shared.database as db
+
+    entry_id = _persist_entry(database, qty=10.0)
+    exit_id = _persist_exit_signal(
+        database,
+        metadata_extra={"position_ids": [1, 2]},
+    )
+    adapter = _adapter(database, position_orders={POSITION_ID: [_entry_order(entry_id)]})
+
+    asyncio.run(adapter._persist_execution_event(_event(_sdk_closing_order(), _close_deal())))
+
+    assert _signal_execution_rows(database, exit_id) == []
+    assert len(_signal_execution_rows(database, db.broker_close_signal_id(entry_id))) == 1
+    assert _ledger(database) == pytest.approx(0.0)
+
+
+def test_a_string_false_exit_only_flag_is_not_an_exit(database) -> None:
+    """Pre-mortem: ``exit_only`` can arrive as the string ``"false"`` in JSON
+    metadata; the canonical predicate must not count it, so the fill takes
+    the broker-close path instead of attributing to a non-exit."""
+    import shared.database as db
+
+    entry_id = _persist_entry(database, qty=10.0)
+    exit_id = _persist_exit_signal(
+        database,
+        metadata_extra={"exit_only": "false", "risk_sizing_mode": "sized"},
+    )
+    adapter = _adapter(database, position_orders={POSITION_ID: [_entry_order(entry_id)]})
+
+    asyncio.run(adapter._persist_execution_event(_event(_sdk_closing_order(), _close_deal())))
+
+    assert _signal_execution_rows(database, exit_id) == []
+    assert len(_signal_execution_rows(database, db.broker_close_signal_id(entry_id))) == 1
+    assert _ledger(database) == pytest.approx(0.0)
+
+
+def test_a_broker_side_close_with_an_sdk_style_client_order_id_still_books(
+    database,
+) -> None:
+    """An order id no signal owns is still a genuine broker-side close: the
+    non-UUID clientOrderId changes nothing for it."""
+    import shared.database as db
+
+    entry_id = _persist_entry(database, qty=10.0)
+    unknown_order_id = 999
+    adapter = _adapter(database, position_orders={POSITION_ID: [_entry_order(entry_id)]})
+
+    asyncio.run(
+        adapter._persist_execution_event(
+            _event(
+                _sdk_closing_order(order_id=unknown_order_id),
+                _close_deal(order_id=unknown_order_id),
+            )
+        )
+    )
+
+    close_rows = _signal_execution_rows(database, db.broker_close_signal_id(entry_id))
+    assert len(close_rows) == 1
+    assert _ledger(database) == pytest.approx(0.0)
+
+
+def test_a_close_fill_during_an_in_flight_submit_is_retained_not_booked(
+    database,
+) -> None:
+    """The fill can reach the listener before ``submit_order`` has the broker
+    order id: while the close submit for the position is in flight the event
+    is retained for reconciliation, never booked as a broker-side close."""
+    import shared.database as db
+
+    entry_id = _persist_entry(database, qty=10.0)
+    exit_id = _persist_exit_signal(database, order_id=None)
+    adapter = _adapter(database, position_orders={POSITION_ID: [_entry_order(entry_id)]})
+    adapter._pending_close_positions[POSITION_ID] = {exit_id: time.monotonic()}
+
+    with pytest.raises(ValueError, match="in flight"):
+        asyncio.run(
+            adapter._persist_execution_event(_event(_sdk_closing_order(), _close_deal()))
+        )
+
+    # Nothing was booked while the submit was in flight.
+    assert _ledger(database) == pytest.approx(10.0)
+    assert _signal_execution_rows(database, db.broker_close_signal_id(entry_id)) == []
+
+    # The submit completes: broker order id persisted, pending mark cleared.
+    database.set_live_signal_broker_order_id(exit_id, str(CLOSE_ORDER_ID))
+    adapter._pending_close_positions.clear()
+    asyncio.run(adapter._persist_execution_event(_event(_sdk_closing_order(), _close_deal())))
+
+    assert len(_signal_execution_rows(database, exit_id)) == 1
+    assert _signal_execution_rows(database, db.broker_close_signal_id(entry_id)) == []
+    assert _ledger(database) == pytest.approx(0.0)
+
+
+def test_an_expired_pending_mark_does_not_hold_a_broker_close(
+    database, caplog
+) -> None:
+    """A pending mark only covers the submit window: once it expires a close
+    on the position takes the ordinary broker-close path again - and the
+    expiry is logged so the lost retention is operator-visible."""
+    import logging
+
+    import shared.database as db
+
+    entry_id = _persist_entry(database, qty=10.0)
+    adapter = _adapter(database, position_orders={POSITION_ID: [_entry_order(entry_id)]})
+    adapter._pending_close_positions[POSITION_ID] = {
+        "00000000-0000-4000-8000-000000000000": time.monotonic() - 7200.0
+    }
+
+    with caplog.at_level(logging.WARNING):
+        asyncio.run(adapter._persist_execution_event(_event(_sdk_closing_order(), _close_deal())))
+
+    assert len(_signal_execution_rows(database, db.broker_close_signal_id(entry_id))) == 1
+    assert _ledger(database) == pytest.approx(0.0)
+    assert any(
+        "pending close mark expired" in record.getMessage() for record in caplog.records
+    )
+
+
+def test_restart_reconcile_of_an_attributed_close_fill_has_no_dedupe_collision(
+    database, caplog
+) -> None:
+    """Regression for the 2026-11-26 ERROR: with the fill owned by the exit
+    signal, the per-signal reconcile finds the dedupe key already stored
+    under the SAME signal and skips it - no cross-signal collision."""
+    import logging
+
+    import shared.database as db
+
+    entry_id = _persist_entry(database, qty=10.0)
+    exit_id = _persist_exit_signal(database)
+    live_adapter = _adapter(
+        database, position_orders={POSITION_ID: [_entry_order(entry_id)]}
+    )
+    asyncio.run(
+        live_adapter._persist_execution_event(_event(_sdk_closing_order(), _close_deal()))
+    )
+
+    adapter = _reconcilable_adapter(
+        database,
+        position_orders={POSITION_ID: [_entry_order(entry_id)]},
+        deal_list=[_close_deal()],
+        order_details={CLOSE_ORDER_ID: _closing_order()},
+        order_details_deals={CLOSE_ORDER_ID: [_close_deal()]},
+    )
+    with caplog.at_level(logging.ERROR):
+        asyncio.run(adapter.reconcile_executions())
+
+    assert not [
+        record
+        for record in caplog.records
+        if "Dedupe key collision" in record.getMessage()
+    ]
+    with db.get_session() as session:
+        deal_rows = session.exec(
+            db.select(db.LiveExecutionModel).where(
+                db.LiveExecutionModel.dedupe_key == "ctrader:deal:9001"
+            )
+        ).all()
+    assert len(deal_rows) == 1
+    assert deal_rows[0].signal_id == exit_id
+    assert _ledger(database) == pytest.approx(0.0)
+
+
+# ─── pending-mark lifecycle and the deal-list reconcile ───────────────────────
+#
+# ``submit_order`` marks a position while its ``ClosePositionReq`` is in
+# flight; the mark must (a) keep BOTH fill paths - the stream listener and
+# the deal-list reconcile - from booking our own close as a broker-side
+# close, (b) lift as soon as the submit's outcome is known one way or the
+# other, and (c) never spend the listener's retry budget while it lives.
+
+
+def test_deal_list_reconcile_defers_a_close_while_its_submit_is_pending(
+    database,
+) -> None:
+    """Blocker: the deal-list pass must honour the pending mark too.
+
+    A retained stream fill sets ``_reconciliation_required`` with no backoff,
+    so the very next listener loop runs ``reconcile_executions`` - while the
+    close submit may still be in flight. Booking the deal there would
+    mis-book our own exit exactly like the stream path used to.
+    """
+    import shared.database as db
+
+    entry_id = _persist_entry(database, qty=10.0)
+    exit_id = _persist_exit_signal(database, order_id=None)
+    adapter = _reconcilable_adapter(
+        database,
+        position_orders={POSITION_ID: [_entry_order(entry_id)]},
+        deal_list=[_close_deal()],
+        order_details={CLOSE_ORDER_ID: _closing_order()},
+    )
+    adapter._pending_close_positions[POSITION_ID] = {exit_id: time.monotonic()}
+
+    recovered = asyncio.run(adapter.reconcile_executions())
+
+    # Nothing booked, nothing flagged: the deal's window went back on the
+    # scan cursor instead.
+    assert recovered == 0
+    assert _ledger(database) == pytest.approx(10.0)
+    assert _signal_execution_rows(database, db.broker_close_signal_id(entry_id)) == []
+    assert _reconciliation_flags(database) == []
+    scan_state = database.get_live_adapter_state(ACCOUNT, "ctrader_broker_close_scan")
+    assert scan_state is not None
+    pending = scan_state.get("pending") or []
+    assert any(
+        int(start) <= T1_MS < int(end) for start, end in pending
+    ), f"deferred deal window missing from pending ranges: {pending}"
+
+    # Once the submit's outcome is known (mark lifted), the next pass books
+    # the deferred deal through the ordinary broker-close path.
+    adapter._pending_close_positions.clear()
+    asyncio.run(adapter.reconcile_executions())
+
+    assert _ledger(database) == pytest.approx(0.0)
+    assert len(_signal_execution_rows(database, db.broker_close_signal_id(entry_id))) == 1
+
+
+def test_a_close_fill_for_an_entry_owned_order_id_takes_the_broker_close_path(
+    database,
+) -> None:
+    """M2 pin: the broker-order-id fallback only attributes to an *exit*.
+
+    A position-close fill whose order id resolves to a signal the ledger
+    does not count as reducing must still take the broker-close path and
+    book against the position's real opener - never onto the entry signal,
+    where the fill would open quantity instead of closing it.
+    """
+    import shared.database as db
+
+    # The entry signal owns CLOSE_ORDER_ID: an order id a non-exit signal
+    # carries must not claim the close fill.
+    entry_id = _persist_entry(database, qty=10.0, order_id=CLOSE_ORDER_ID)
+    adapter = _adapter(database, position_orders={POSITION_ID: [_entry_order(entry_id)]})
+
+    asyncio.run(
+        adapter._persist_execution_event(
+            _event(_sdk_closing_order(), _close_deal())
+        )
+    )
+
+    # The fill booked as a broker-side close against the opener's ledger,
+    # not as another fill on the entry signal.
+    assert len(_signal_execution_rows(database, db.broker_close_signal_id(entry_id))) == 1
+    assert len(_signal_execution_rows(database, entry_id)) == 1
+    assert _ledger(database) == pytest.approx(0.0)
+    assert _reconciliation_flags(database) == []
+
+
+class _ClosePositionReq:
+    pass
+
+
+class _ExecutionEventPayload:
+    pass
+
+
+def _exit_submit_signal() -> LiveSignal:
+    return LiveSignal(
+        deployment_id=DEP_ENTRY,
+        symbol="AAPL",
+        action="sell",
+        theoretical_price=95.0,
+        timestamp=T1,
+        metadata={
+            "signal_intent": "exit",
+            "exit_only": True,
+            "risk_sizing_mode": "exit_only",
+            "position_id": POSITION_ID,
+        },
+    )
+
+
+def _close_submit_adapter(database, position_orders: dict[int, list[Any]] | None = None):
+    """An adapter wired for ``submit_order`` on a ClosePositionReq."""
+    adapter = _adapter(
+        database,
+        position_orders=position_orders or {POSITION_ID: []},
+    )
+    adapter._connected = True
+    adapter._authenticated = True
+    adapter._position_ids_by_symbol["AAPL"] = (POSITION_ID,)
+    adapter._ProtoOAClosePositionReq = _ClosePositionReq
+    adapter._ProtoOAExecutionEvent = _ExecutionEventPayload
+    return adapter
+
+
+def test_a_rejected_close_submit_clears_the_pending_mark(database) -> None:
+    """M3 pin: a definitive broker refusal created no order, so nothing can
+    fill - the pending mark lifts and a later broker-side close on the
+    position books normally."""
+    import shared.database as db
+    from live_runner.base_adapter import BrokerOrderRejectedError
+
+    entry_id = _persist_entry(database, qty=10.0)
+    adapter = _close_submit_adapter(
+        database, position_orders={POSITION_ID: [_entry_order(entry_id)]}
+    )
+
+    async def refuse(request: Any) -> Any:
+        raise BrokerOrderRejectedError("Order rejected", error_code="TEST")
+
+    adapter._submit_new_order_request = refuse  # type: ignore[assignment]
+    with pytest.raises(BrokerOrderRejectedError):
+        asyncio.run(adapter.submit_order(_exit_submit_signal(), qty=10.0))
+
+    assert not adapter._pending_close_position_active(POSITION_ID)
+    assert POSITION_ID not in adapter._pending_close_positions
+
+    # A later genuine broker-side close on the position is booked, not
+    # retained: the dead submit's mark no longer holds the guard.
+    asyncio.run(
+        adapter._persist_execution_event(
+            _event(_closing_order(), _close_deal())
+        )
+    )
+    assert len(_signal_execution_rows(database, db.broker_close_signal_id(entry_id))) == 1
+    assert _ledger(database) == pytest.approx(0.0)
+
+
+def test_a_successful_close_submit_clears_the_pending_mark(database) -> None:
+    """M5 pin: once the broker order id is persisted the mark has done its
+    job - a later genuine broker close on the same position books, it is
+    not retained as if a submit were still in flight."""
+    import shared.database as db
+
+    entry_id = _persist_entry(database, qty=10.0)
+    adapter = _close_submit_adapter(
+        database, position_orders={POSITION_ID: [_entry_order(entry_id)]}
+    )
+
+    async def accept(request: Any) -> Any:
+        return SimpleNamespace(orderId=CLOSE_ORDER_ID)
+
+    adapter._submit_new_order_request = accept  # type: ignore[assignment]
+    order_id = asyncio.run(adapter.submit_order(_exit_submit_signal(), qty=10.0))
+    assert order_id == str(CLOSE_ORDER_ID)
+
+    assert not adapter._pending_close_position_active(POSITION_ID)
+    assert POSITION_ID not in adapter._pending_close_positions
+
+    # A genuine broker-side close (an order id no signal owns) on the same
+    # position takes the ordinary broker-close path.
+    broker_close_order_id = 999
+    asyncio.run(
+        adapter._persist_execution_event(
+            _event(
+                _closing_order(order_id=broker_close_order_id),
+                _close_deal(order_id=broker_close_order_id, deal_id=9002),
+            )
+        )
+    )
+    close_rows = _signal_execution_rows(database, db.broker_close_signal_id(entry_id))
+    assert [row.dedupe_key for row in close_rows] == ["ctrader:deal:9002"]
+    assert _ledger(database) == pytest.approx(0.0)
+
+
+def test_a_failed_order_id_persist_rolls_back_the_order_map(
+    database, monkeypatch
+) -> None:
+    """M6 pin: when persisting the broker order id fails, the in-memory
+    ownership maps roll back with it - a fill must not resolve to a signal
+    whose order id was never durably recorded."""
+    import live_runner.ctrader_adapter as adapter_module
+
+    entry_id = _persist_entry(database, qty=10.0)
+    adapter = _close_submit_adapter(
+        database, position_orders={POSITION_ID: [_entry_order(entry_id)]}
+    )
+
+    async def accept(request: Any) -> Any:
+        return SimpleNamespace(orderId=CLOSE_ORDER_ID)
+
+    adapter._submit_new_order_request = accept  # type: ignore[assignment]
+    monkeypatch.setattr(
+        adapter_module, "set_live_signal_broker_order_id", lambda *a, **k: False
+    )
+
+    with pytest.raises(RuntimeError, match="Failed to persist"):
+        asyncio.run(adapter.submit_order(_exit_submit_signal(), qty=10.0))
+
+    assert CLOSE_ORDER_ID not in adapter._order_id_to_signal_id
+    assert CLOSE_ORDER_ID not in adapter._order_id_to_symbol
+    # The pending mark stays: the submit's outcome is unknown, so fills on
+    # the position keep being retained until reconciliation recovers the id.
+    assert adapter._pending_close_position_active(POSITION_ID)
+
+
+def test_an_unknown_outcome_close_submit_keeps_the_mark_and_parks_budget_free(
+    database,
+) -> None:
+    """Should-fix: an UNKNOWN submit outcome (transport failure, not a
+    refusal) keeps the mark for its TTL - but the retained fill parks in
+    ``_unresolved_execution_events`` WITHOUT spending the retry budget, so
+    the listener cannot crash-loop for the mark's whole lifetime."""
+    from live_runner.ctrader_adapter import _PendingCloseFillRetentionError
+
+    entry_id = _persist_entry(database, qty=10.0)
+    adapter = _close_submit_adapter(
+        database, position_orders={POSITION_ID: [_entry_order(entry_id)]}
+    )
+
+    async def lose_connection(request: Any) -> Any:
+        raise RuntimeError("connection lost before the broker answered")
+
+    adapter._submit_new_order_request = lose_connection  # type: ignore[assignment]
+    with pytest.raises(RuntimeError, match="connection lost"):
+        asyncio.run(adapter.submit_order(_exit_submit_signal(), qty=10.0))
+
+    # Unknown outcome: the mark stays (bounded by the TTL).
+    assert adapter._pending_close_position_active(POSITION_ID)
+
+    event = _event(_sdk_closing_order(), _close_deal())
+    with pytest.raises(_PendingCloseFillRetentionError):
+        asyncio.run(adapter._persist_execution_event(event))
+
+    # What listen_executions does with that error: park, budget-free.
+    adapter._park_pending_close_fill(event)
+    assert event in adapter._unresolved_execution_events
+    assert id(event) in adapter._pending_close_fill_event_ids
+    assert adapter._reconciliation_required is True
+    assert id(event) not in adapter._execution_retry_counts
+
+    # A reconciliation pass requeues the parked fill without spending budget.
+    async def no_op_reconcile() -> int:
+        return 0
+
+    adapter.reconcile_executions = no_op_reconcile  # type: ignore[assignment]
+    adapter._reconciliation_retry_at = 0.0
+    asyncio.run(adapter._run_pending_reconciliation(2))
+
+    assert adapter._execution_queue.get_nowait() is event
+    assert id(event) not in adapter._execution_retry_counts
+    assert adapter._pending_close_fill_event_ids == set()
+    assert adapter._reconciliation_required is False
+
+    # ``_ack_execution_event`` forgets a parked id as well: the id() is only
+    # meaningful while the event is referenced, and a stale entry would
+    # budget-free-requeue an unrelated fill that reuses the address.
+    adapter._pending_close_fill_event_ids.add(id(event))
+    adapter._execution_retry_counts[id(event)] = 1
+    adapter._ack_execution_event(event)
+    assert id(event) not in adapter._pending_close_fill_event_ids
+    assert id(event) not in adapter._execution_retry_counts
+
+
+def test_the_listener_parks_a_pending_close_fill_without_spending_budget(
+    database, monkeypatch
+) -> None:
+    """Should-fix 3 pin: ``listen_executions`` must recognise
+    ``_PendingCloseFillRetentionError`` and park the fill budget-free on a
+    paced reconcile - not requeue it against ``EXECUTION_RETRY_LIMIT`` (the
+    crash loop the mark's TTL would cause) and not run a full broker
+    reconcile on every iteration."""
+    from live_runner import ctrader_adapter as module
+    from live_runner.ctrader_adapter import _PendingCloseFillRetentionError
+
+    adapter = _adapter(database)
+    adapter._connected = True
+    adapter._authenticated = True
+    event = _event(_sdk_closing_order(), _close_deal())
+    persist_calls = 0
+    reconcile_calls = 0
+
+    async def _persist(received: Any) -> None:
+        nonlocal persist_calls
+        assert received is event
+        persist_calls += 1
+        raise _PendingCloseFillRetentionError(
+            "cTrader fill closes a position whose own close order is "
+            "still in flight; retaining the event for reconciliation."
+        )
+
+    async def _reconcile(*, max_signals: int = 200) -> int:
+        nonlocal reconcile_calls
+        reconcile_calls += 1
+        # A parked fill must pace reconciliation, not run it every pass:
+        # raising keeps the listener from hot-looping on a broken pacing
+        # mutant long enough for the assertions below to observe it.
+        raise RuntimeError("reconcile ran while a fill was parked")
+
+    async def _sleep(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(adapter, "_persist_execution_event", _persist)
+    monkeypatch.setattr(adapter, "reconcile_executions", _reconcile)
+    monkeypatch.setattr(module.asyncio, "sleep", _sleep)
+    adapter._execution_queue.put_nowait(event)
+
+    started = time.monotonic()
+    # The listener loops forever; the outer timeout cancels it while it
+    # waits on the (now empty) execution queue.
+    with pytest.raises(asyncio.TimeoutError):
+        asyncio.run(asyncio.wait_for(adapter.listen_executions(), timeout=0.5))
+
+    # Parked once, budget-free: the event is never re-persisted, the retry
+    # budget is untouched, and the listener cannot crash-loop for the
+    # mark's whole TTL.
+    assert persist_calls == 1
+    assert event in adapter._unresolved_execution_events
+    assert id(event) in adapter._pending_close_fill_event_ids
+    assert adapter._execution_retry_counts == {}
+    # Paced: the next reconcile is ~30 s out, so parking does not turn the
+    # listener into one full broker reconcile per iteration.
+    assert reconcile_calls == 0
+    assert adapter._reconciliation_required is True
+    assert (
+        module._PENDING_CLOSE_FILL_RECONCILE_SECONDS - 1.0
+        < adapter._reconciliation_retry_at - started
+        <= module._PENDING_CLOSE_FILL_RECONCILE_SECONDS + 1.0
+    )
+
+
+def test_clearing_the_last_pending_mark_expedites_parked_fill_reconciliation(
+    database,
+) -> None:
+    """A9 pin: when the last pending mark lifts while fills are parked, the
+    next reconcile is expedited (``_reconciliation_retry_at = 0``) instead of
+    waiting out the paced interval."""
+    exit_id = _persist_exit_signal(
+        database, order_id=None, metadata_extra={"position_id": POSITION_ID}
+    )
+    adapter = _adapter(database)
+    adapter._pending_close_positions[POSITION_ID] = {exit_id: time.monotonic()}
+    event = _event(_sdk_closing_order(), _close_deal())
+    adapter._unresolved_execution_events.append(event)
+    adapter._pending_close_fill_event_ids.add(id(event))
+    adapter._reconciliation_required = True
+    adapter._reconciliation_retry_at = time.monotonic() + 30.0
+
+    adapter._clear_pending_close_mark(POSITION_ID, exit_id)
+
+    assert POSITION_ID not in adapter._pending_close_positions
+    assert adapter._reconciliation_retry_at == 0.0
+    assert adapter._reconciliation_required is True
+
+
+def test_reconciliation_prunes_ids_of_parked_events_that_left_the_deque(
+    database,
+) -> None:
+    """A17 pin: ``_pending_close_fill_event_ids`` must only name events still
+    in ``_unresolved_execution_events`` - a stale id would budget-free-requeue
+    an unrelated fill that later reuses the address."""
+    adapter = _adapter(database)
+    parked = object()
+    stuck = object()
+    # One free queue slot: the parked fill requeues into it, the ordinary
+    # retained fill finds the queue full and stays in the deque.
+    adapter._execution_queue = asyncio.Queue(maxsize=2)
+    adapter._execution_queue.put_nowait(object())
+    adapter._unresolved_execution_events.extend([parked, stuck])
+    adapter._pending_close_fill_event_ids.add(id(parked))
+    adapter._reconciliation_required = True
+    adapter._reconciliation_retry_at = 0.0
+
+    async def no_op_reconcile() -> int:
+        return 0
+
+    adapter.reconcile_executions = no_op_reconcile  # type: ignore[assignment]
+    asyncio.run(adapter._run_pending_reconciliation(2))
+
+    assert list(adapter._unresolved_execution_events) == [stuck]
+    assert id(parked) not in adapter._pending_close_fill_event_ids
+    assert adapter._reconciliation_required is True
+
+
+def test_a_recovered_close_order_id_clears_the_pending_mark(database) -> None:
+    """Should-fix: when reconciliation recovers and persists the close's
+    broker order id, the pending mark lifts - parked fills can attribute as
+    soon as the order id is known instead of waiting out the TTL."""
+    exit_id = _persist_exit_signal(
+        database, order_id=None, metadata_extra={"position_id": POSITION_ID}
+    )
+    adapter = _adapter(database)
+    adapter._pending_close_positions[POSITION_ID] = {exit_id: time.monotonic()}
+
+    async def recovered_order_id(*_args: Any, **_kwargs: Any) -> str:
+        return str(CLOSE_ORDER_ID)
+
+    adapter._recover_broker_order_id = recovered_order_id  # type: ignore[assignment]
+    recovered = asyncio.run(adapter._recover_and_persist_broker_order_id(exit_id))
+
+    assert recovered == str(CLOSE_ORDER_ID)
+    assert POSITION_ID not in adapter._pending_close_positions
+    assert adapter._order_id_to_signal_id[CLOSE_ORDER_ID] == exit_id
+    assert database.get_live_signal_broker_order_id(exit_id) == str(CLOSE_ORDER_ID)
+
+
+def test_a_recovered_persisted_signal_order_id_clears_the_pending_mark(
+    database,
+) -> None:
+    """Same lift on the duplicate-signal recovery path."""
+    exit_id = _persist_exit_signal(
+        database, order_id=None, metadata_extra={"position_id": POSITION_ID}
+    )
+    adapter = _adapter(database)
+    adapter._pending_close_positions[POSITION_ID] = {exit_id: time.monotonic()}
+
+    async def recovered_order_id(*_args: Any, **_kwargs: Any) -> str:
+        return str(CLOSE_ORDER_ID)
+
+    adapter._recover_broker_order_id = recovered_order_id  # type: ignore[assignment]
+    recovered = asyncio.run(
+        adapter._recover_persisted_signal_order_id(
+            exit_id,
+            signal_timestamp=T1,
+            unrecovered_error="unrecovered",
+            unpersisted_error="unpersisted",
+        )
+    )
+
+    assert recovered == str(CLOSE_ORDER_ID)
+    assert POSITION_ID not in adapter._pending_close_positions
+
+
+def test_a_duplicate_signal_with_persisted_order_id_clears_the_pending_mark(
+    database,
+) -> None:
+    """Pre-mortem: the duplicate early-return must lift the mark too - the
+    close's broker order id is already known, so a genuine broker-side close
+    on the position must not stay parked until the TTL."""
+    exit_id = _persist_exit_signal(
+        database,
+        order_id=CLOSE_ORDER_ID,
+        metadata_extra={"position_id": POSITION_ID},
+    )
+    adapter = _adapter(database)
+    adapter._pending_close_positions[POSITION_ID] = {exit_id: time.monotonic()}
+
+    recovered = asyncio.run(adapter._recover_duplicate_signal_order_id(exit_id))
+
+    assert recovered == str(CLOSE_ORDER_ID)
+    assert POSITION_ID not in adapter._pending_close_positions
+    assert adapter._order_id_to_signal_id[CLOSE_ORDER_ID] == exit_id
+
+
+def test_an_exit_only_signal_without_risk_sizing_mode_still_lifts_the_mark(
+    database,
+) -> None:
+    """Pre-mortem: ``_persisted_exit_position_id`` must use the ledger's exit
+    predicate, not only ``risk_sizing_mode=exit_only`` - an ``exit_only``
+    signal with different sizing metadata is still a close the ledger
+    counts, so its pending mark must lift on order-id recovery."""
+    exit_id = _persist_exit_signal(
+        database,
+        order_id=CLOSE_ORDER_ID,
+        metadata_extra={
+            "risk_sizing_mode": "sized",
+            "position_id": POSITION_ID,
+        },
+    )
+    adapter = _adapter(database)
+    adapter._pending_close_positions[POSITION_ID] = {exit_id: time.monotonic()}
+
+    recovered = asyncio.run(adapter._recover_duplicate_signal_order_id(exit_id))
+
+    assert recovered == str(CLOSE_ORDER_ID)
+    assert POSITION_ID not in adapter._pending_close_positions
+
+
+def test_deal_list_reconcile_flags_an_ambiguous_broker_order_id(
+    database,
+) -> None:
+    """Pre-mortem BLOCK: ``broker_order_id`` is indexed, not unique - two
+    signals on the account can share one. The deal may be ours or a
+    broker-side close, so the pass must flag it for an operator rather than
+    book it against the wrong ledger side (or silently skip it as "ours")."""
+    entry_id = _persist_entry(database, qty=10.0)
+    first_exit = _persist_exit_signal(
+        database,
+        order_id=CLOSE_ORDER_ID,
+        metadata_extra={"position_id": POSITION_ID},
+    )
+    second_exit = _persist_exit_signal(
+        database,
+        order_id=CLOSE_ORDER_ID,
+        metadata_extra={"position_id": POSITION_ID},
+    )
+    assert first_exit != second_exit
+    adapter = _reconcilable_adapter(
+        database,
+        position_orders={POSITION_ID: [_entry_order(entry_id)]},
+        deal_list=[_close_deal()],
+    )
+
+    asyncio.run(adapter.reconcile_executions())
+
+    flags = _reconciliation_flags(database)
+    assert len(flags) == 1
+    assert flags[0]["detail"]["cause"] == "ambiguous_broker_order_id"
+    # The close was NOT booked: the entry stays open on the ledger.
+    assert _ledger(database) == pytest.approx(10.0)
 
 
 # ─── the reconciliation backfill ──────────────────────────────────────────────────────────────
