@@ -1686,12 +1686,6 @@ class DiscordSignalSource(BaseSignalSource):
         # Account (self-bot) token, both spellings: sent exactly as supplied.
         return token
 
-    #: Branch-side spelling of :meth:`_auth_header`; both names are kept so
-    #: either call site keeps working.
-    def _authorization_header(self) -> str:
-        """Alias of :meth:`_auth_header`."""
-        return self._auth_header()
-
     async def observe_channel_authors(
         self,
         channel_id: str,
