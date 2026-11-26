@@ -65,6 +65,7 @@ from shared.models import (  # noqa: F401 - re-exported for viewer/main.py and t
     Trade,
     resolve_defined_stat,
 )
+from shared.paths import PathContainmentError, safe_join
 from shared.strategy_registry import (
     DEFAULT_STRATEGIES_DIR,
     StrategyEntry,
@@ -275,23 +276,22 @@ def _safe_asset_id(raw_id: object) -> str:
 def _contained_asset_path(base_dir: Path, asset_id: object, suffix: str) -> Path | None:
     """Join ``asset_id`` onto ``base_dir`` if the result stays inside it.
 
-    The resolved candidate must be contained in the resolved base directory,
-    otherwise ``None`` is returned so the caller never builds a path from
-    raw input. This is the single implementation of the id→path containment
+    The id must pass :func:`_safe_asset_id` (one path segment, no separators),
+    and :func:`shared.paths.safe_join` owns the containment decision: the
+    resolved candidate must stay inside the resolved base directory, and the
+    id-derived file must not be a symlink because callers rename and delete
+    what this returns. ``None`` means the caller never builds a path from raw
+    input. This is the single implementation of the id→path containment
     contract (#222/#155, #230); ``viewer.main`` aliases it for the FastAPI
     routes.
     """
     normalized = _safe_asset_id(asset_id)
     if not normalized:
         return None
-    base = base_dir.resolve()
-    raw_candidate = base_dir / f"{normalized}{suffix}"
-    if raw_candidate.is_symlink():
+    try:
+        return safe_join(base_dir, f"{normalized}{suffix}", refuse_symlinks=True)
+    except PathContainmentError:
         return None
-    candidate = raw_candidate.resolve()
-    if candidate.parent != base:
-        return None
-    return candidate
 
 
 def _contained_backtest_result_path(backtest_id: object) -> Path | None:
@@ -428,17 +428,18 @@ def _strategy_path(identifier: str) -> Path | None:
     normalized = str(identifier or "").strip()
     if not normalized:
         return None
-    # Reject anything with path separators or ".." segments before joining:
-    # the registry matcher normalizes identifiers aggressively (punctuation
-    # is stripped, so "../demo.py" can alias "demo.py"), and pathlib also
-    # drops the base when joining an absolute path. Only a bare relative
-    # file name inside STRATEGIES_DIR may pass this branch.
-    if "/" in normalized or "\\" in normalized or normalized in {".", ".."}:
+    # Only a bare file name is accepted here. The registry matcher normalizes
+    # identifiers aggressively (punctuation is stripped, so "../demo.py" can
+    # alias "demo.py"), and a value with a separator could select a file in a
+    # subdirectory the registry does not know about. Containment itself is
+    # safe_join's decision.
+    if "/" in normalized or "\\" in normalized:
         return None
-    candidate = (STRATEGIES_DIR / normalized).resolve()
+    try:
+        candidate = safe_join(STRATEGIES_DIR, normalized)
+    except PathContainmentError:
+        return None
     if not candidate.is_file():
-        return None
-    if not candidate.is_relative_to(STRATEGIES_DIR.resolve()):
         return None
     return candidate
 
