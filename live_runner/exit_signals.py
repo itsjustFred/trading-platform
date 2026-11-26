@@ -117,10 +117,9 @@ class ExitBelowStepError(ValueError):
         self.qty_step = float(qty_step)
 
 
-# Deprecated alias for the pre-#278 name. Open PRs (#329, #369, #350, #367)
-# still import ``round_exit_qty_down`` from this module; main is not
-# branch-protected, so deleting it would break them silently on merge.
-# Remove this alias in a follow-up once those PRs have landed and migrated.
+# Deprecated alias for the previous name of ``floor_qty_to_step``. New code
+# should import ``floor_qty_to_step`` from ``shared.lot_grid`` directly;
+# ``pre_submit_caps`` still imports the alias from this module.
 round_exit_qty_down = floor_qty_to_step
 
 

@@ -570,17 +570,6 @@ class BaseLiveAdapter(ABC):
             f"{type(self).__name__} cannot report used margin"
         )
 
-    # ── Operator safety controls ──────────────────────────────────────────────────────────────
-    #
-    # Status semantics built on top of these:
-    #   PAUSED  -> stop opening new positions; orders and positions are left untouched, and the
-    #              deployment can be resumed.
-    #   STOPPED -> stop opening new positions, cancel every open order, then flatten every open
-    #              position. Deliberately not implicit in PAUSED, so pausing never liquidates.
-    #
-    # Adapters that cannot honour a control leave it unsupported so the caller fails loudly
-    # instead of reading a silent no-op as "nothing was open".
-
     # ── Stop amendment (live trailing stops, issue #167) ──────────────────────────────────────
     #
     # A trailing stop is executed live by moving the broker-side protective stop. An adapter
@@ -668,6 +657,17 @@ class BaseLiveAdapter(ABC):
             f"{type(self).__name__} cannot amend position take profits"
         )
 
+    # ── Operator safety controls ──────────────────────────────────────────────────────────────
+    #
+    # Status semantics built on top of these:
+    #   PAUSED  -> stop opening new positions; orders and positions are left untouched, and the
+    #              deployment can be resumed.
+    #   STOPPED -> stop opening new positions, cancel every open order, then flatten every open
+    #              position. Deliberately not implicit in PAUSED, so pausing never liquidates.
+    #
+    # Adapters that cannot honour a control leave it unsupported so the caller fails loudly
+    # instead of reading a silent no-op as "nothing was open".
+
     @property
     def supports_cancel_orders(self) -> bool:
         """Whether :meth:`cancel_open_orders` is implemented for this broker."""
@@ -747,6 +747,7 @@ class BaseLiveAdapter(ABC):
         """Fill in commissions the broker reports only after the fill. Returns the rows updated.
 
         A no-op by default: a broker that states its fee on the fill has nothing to backfill.
-        Alpaca posts crypto fees end of day and overrides this (#124).
+        Alpaca reports crypto fees only as ``CFEE`` activities posted in batches after the
+        fill, and overrides this (#124).
         """
         return 0

@@ -521,8 +521,8 @@ jobs:
           drop_retry_lines() {
             grep -v 'retrying (attempt' "$1" > "$1.final" || true
           }
-          # The agent has a shell and its stdout becomes a public PR comment (and, for the
-          # pre-mortem, an artifact). An `nvidia/...` run holds the key in this step's env,
+          # The agent has a shell and its stdout becomes a public PR comment and a
+          # workflow artifact. An `nvidia/...` run holds the key in this step's env,
           # so before anything is kept the captured streams are checked for it: a stream
           # that carries the key fails the step, which uploads and posts nothing (the later
           # steps only run on success), and the files are removed besides. Actions masks
