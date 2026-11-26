@@ -1,7 +1,7 @@
 # Cross-Engine Backtest Contract
 
 > **Freeze notice (#318, 2026-11-21).** Per
-> `docs/adr/0001-native-single-strategy-engine.md`, `native` is the single
+> `docs/adr/0002-native-single-strategy-engine.md`, `native` is the single
 > strategy engine going forward. `vectorbt`, `pynecore` and the LEAN *run*
 > path are frozen (bug fixes only, no new features) and scheduled for
 > removal; LEAN becomes import-only. This contract will shrink to native +
@@ -89,7 +89,7 @@ parent Cleanup 16 record.
   its `exit_order_type="level"` signal exits do honour gap → open, §2). PyneCore
   is frozen: its `_normalize_trade_exits` containment restates a
   level-violating leg to the recorded level only — no gap→open restatement
-  (frozen engines get fail-loud guards only, ADR 0001).
+  (frozen engines get fail-loud guards only, ADR 0002).
   SHORT exits buy the ask, so native adds the spread on top of the open on a
   gap fill exactly as on a level fill. A gap fill is a market fill, so a SHORT
   target gapped by less than the spread fills at `open + spread`, which can be
@@ -234,7 +234,7 @@ under `next_open` (e.g. `intraday_volatility_breakout` 1.2.0). `BacktestConfig`
 validation rejects `open` with a `ValueError` carrying that migration message
 (`contract.normalize_signal_exit_fill`).
 
-Per engine (ADR `docs/adr/0001-native-single-strategy-engine.md` — only native
+Per engine (ADR `docs/adr/0002-native-single-strategy-engine.md` — only native
 is under active development):
 
 - native: the exit signal is parked and executed at the next bar's open inside
@@ -588,7 +588,7 @@ persisted `equity_curve`, so that curve must show the paper PnL of open
 positions. **The native engine persists a mark-to-market (MTM) portfolio
 curve** (`runner/engines/mtm_equity.py`, single- and multi-symbol). The frozen
 vectorbt / pynecore / signal-replay adapters keep their realized-only curves
-until they are removed (ADR `docs/adr/0001-native-single-strategy-engine.md`),
+until they are removed (ADR `docs/adr/0002-native-single-strategy-engine.md`),
 so cross-engine stat comparisons must account for the different curve basis:
 
 - one observation per bar of the traded symbols plus every entry / exit-leg

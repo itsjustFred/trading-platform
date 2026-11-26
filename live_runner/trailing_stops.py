@@ -49,7 +49,7 @@ import pandas as pd
 
 from live_runner.base_adapter import BaseLiveAdapter, ProtectiveStop
 from live_runner.shutdown import BrokerMutationGate
-from live_runner.signal_sources.execution_timing import _timeframe_seconds
+from live_runner.signal_sources.execution_timing import timeframe_seconds
 from risk import RiskEngine, TradeSignal
 from shared.database import find_latest_filled_live_entry_signals
 from shared.logging import get_logger
@@ -322,7 +322,7 @@ class LiveTrailingStopManager:
     ) -> bool:
         seconds = [
             value
-            for value in (_timeframe_seconds(_signal_timeframe(item)) for item in deployments)
+            for value in (timeframe_seconds(_signal_timeframe(item)) for item in deployments)
             if value
         ]
         # A deployment without a usable timeframe still has to be visited so
@@ -629,7 +629,7 @@ class LiveTrailingStopManager:
             self._trails[key] = trail
 
         timeframe = _signal_timeframe(deployment)
-        bar_seconds = _timeframe_seconds(timeframe)
+        bar_seconds = timeframe_seconds(timeframe)
         if not bar_seconds:
             raise _TrailingFailure(
                 f"deployment timeframe {timeframe!r} has no bar length to trail on",

@@ -3008,3 +3008,159 @@ def test_adapter_state_keys_from_two_brokers_coexist_on_one_account(database) ->
     assert db.get_live_adapter_state(
         ACCOUNT, "alpaca_reprotect_reconcile_after"
     ) == {"mark": 2}
+
+
+# ─── #438 × #441 interaction: teardown vs pending close fills ────────────────────────────────
+
+
+def _teardown_combined_adapter(database, entry_id):
+    """An adapter wired for BOTH the #438 teardown path (real
+    ``_send_request`` deferred handling) and the #441 pending-close-fill
+    bookkeeping, on the isolated DB."""
+    adapter = _adapter(
+        database,
+        position_orders={POSITION_ID: [_entry_order(entry_id), _closing_order()]},
+        deal_list=[_close_deal()],
+        order_details={CLOSE_ORDER_ID: _closing_order()},
+        order_details_deals={CLOSE_ORDER_ID: [_close_deal()]},
+    )
+    adapter._connected = True
+    adapter._authenticated = True
+    adapter._position_ids_by_symbol["AAPL"] = (POSITION_ID,)
+    adapter._ProtoOAClosePositionReq = _ClosePositionReq
+    adapter._ProtoOAExecutionEvent = _ExecutionEventPayload
+    return adapter
+
+
+class _TrackedDeferred:
+    """Deferred stand-in that records errbacks and resolves a future."""
+
+    def __init__(self, loop):
+        self._future = loop.create_future()
+        self.called = False
+
+    def asFuture(self, _loop):
+        return self._future
+
+    def errback(self, exc):
+        self.called = True
+        if not self._future.done():
+            self._future.set_exception(exc)
+
+
+def _run_teardown_during_inflight_close(database, *, stream_first: bool):
+    """Drive the real path: ``submit_order`` sends the ClosePositionReq, the
+    real ``_send_request`` hands out a deferred on a fake client, and
+    ``_teardown_client()`` (#438) errbacks it while the submit is in flight.
+
+    The #441 pending mark must survive the teardown; the retained stream
+    fill is parked budget-free; after reconnect the reconcile pass recovers
+    the close order id and books the deal exactly once on the exit signal.
+    """
+    import shared.database as db
+    from live_runner.base_adapter import is_order_not_submitted
+    from live_runner.ctrader_adapter import (
+        CTraderConnectionLostError,
+        _PendingCloseFillRetentionError,
+    )
+    from live_runner.ctrader_adapter import (
+        CTraderLiveAdapter as _Real,
+    )
+
+    entry_id = _persist_entry(database, qty=10.0)
+    adapter = _teardown_combined_adapter(database, entry_id)
+    fake_send = adapter._send_request_with_refresh_retry
+    sent = []
+
+    async def routed(request, *, timeout_seconds=10, _depth=0):
+        if isinstance(request, _ClosePositionReq):
+            return await _Real._send_request(
+                adapter, request, timeout_seconds=timeout_seconds
+            )
+        return await fake_send(request, timeout_seconds=timeout_seconds)
+
+    adapter._send_request_with_refresh_retry = routed
+    signal = _exit_submit_signal()
+    exit_id = str(signal.id)
+    event = _event(_sdk_closing_order(), _close_deal())
+
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        adapter._loop = loop
+
+        def send(request, **_kw):
+            deferred = _TrackedDeferred(loop)
+            sent.append(deferred)
+            return deferred
+
+        adapter._client = SimpleNamespace(send=send, _responseDeferreds={})
+        task = asyncio.create_task(adapter.submit_order(signal, qty=10.0))
+        # submit_order does several asyncio.to_thread DB round-trips before
+        # the broker send; yield until the request lands or the task dies.
+        for _ in range(5000):
+            await asyncio.sleep(0)
+            if sent or task.done():
+                break
+        if not sent:
+            await task  # surfaces the real submit error
+        assert sent, "ClosePositionReq never reached the client"
+        if stream_first:
+            # Fill streamed while the submit is in flight: retained, parked.
+            with pytest.raises(_PendingCloseFillRetentionError):
+                await adapter._persist_execution_event(event)
+            adapter._park_pending_close_fill(event)
+        adapter._teardown_client()  # #438: errbacks the in-flight close
+        try:
+            await task
+        except CTraderConnectionLostError as exc:
+            assert not is_order_not_submitted(exc)
+        else:
+            raise AssertionError("submit did not fail with connection-lost")
+        # Mark survives the teardown; reconciliation is flagged.
+        assert adapter._pending_close_position_active(POSITION_ID)
+        assert adapter._reconciliation_required
+        if not stream_first:
+            # The fill arrives after the teardown (e.g. redelivered): still
+            # retained.
+            with pytest.raises(_PendingCloseFillRetentionError):
+                await adapter._persist_execution_event(event)
+            adapter._park_pending_close_fill(event)
+        # Reconnect, then the listener's reconcile pass.
+        adapter._client = object()
+        adapter._connected = True
+        adapter._authenticated = True
+        adapter._reconciliation_retry_at = 0.0
+        await adapter._run_pending_reconciliation(2)
+        assert not adapter._pending_close_position_active(POSITION_ID)
+        # Requeued parked event is processed again: attributes, dedupes.
+        requeued = adapter._execution_queue.get_nowait()
+        while requeued is not event:
+            requeued = adapter._execution_queue.get_nowait()
+        await adapter._persist_execution_event(requeued)
+        # Second reconcile pass must not double-book either.
+        adapter._reconciliation_required = True
+        adapter._reconciliation_retry_at = 0.0
+        await adapter._run_pending_reconciliation(2)
+
+    asyncio.run(scenario())
+    with db.get_session() as session:
+        rows = session.exec(
+            db.select(db.LiveExecutionModel).where(
+                db.LiveExecutionModel.dedupe_key == "ctrader:deal:9001"
+            )
+        ).all()
+    assert [r.signal_id for r in rows] == [exit_id]
+    assert database.get_live_signal_broker_order_id(exit_id) == str(CLOSE_ORDER_ID)
+    assert _signal_execution_rows(database, db.broker_close_signal_id(entry_id)) == []
+    assert _ledger(database) == pytest.approx(0.0)
+    assert _reconciliation_flags(database) == []
+
+
+def test_teardown_during_inflight_close_stream_fill_first(database) -> None:
+    """Stream fill arrives while the ClosePositionReq is still in flight."""
+    _run_teardown_during_inflight_close(database, stream_first=True)
+
+
+def test_teardown_during_inflight_close_fill_after_teardown(database) -> None:
+    """Stream fill arrives only after the teardown errbacked the submit."""
+    _run_teardown_during_inflight_close(database, stream_first=False)

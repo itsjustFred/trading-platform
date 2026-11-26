@@ -420,7 +420,7 @@ missed bars are never backfilled with orders. Missing, malformed, unclosed or
 out-of-window bars fail closed — no order is emitted.
 
 **Orders.** Emitted intents go through the daemon's
-`_submit_internal_strategy_signal` → `_trade_signal_to_live_signal` →
+`_submit_internal_strategy_signal` → `trade_signal_to_live_signal` →
 `_prepare_claim_and_submit_signal`, the same prepare/claim/submit path as
 Discord signals: live level resolution, risk sizing, the SL/TP guard, the
 promotion gate, the demo/paper hard block, the submission lease and adapter

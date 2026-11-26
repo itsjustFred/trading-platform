@@ -10,9 +10,9 @@ from runner.engine_pkg.trading_engine import _floor_to_lot_grid
 from scripts.regenerate_mt5_parity_artifacts import (
     COMPARISON_CASES,
     _build_trades,
-    _load_ohlcv,
     _price_unit_value,
     _round_mt5_lots,
+    load_ohlcv,
 )
 from shared.strategy_registry import (
     DEFAULT_STRATEGIES_DIR,
@@ -21,7 +21,7 @@ from shared.strategy_registry import (
 )
 
 
-def test_load_ohlcv_fills_sparse_canonical_ohlc_from_bid_columns(tmp_path: Path):
+def testload_ohlcv_fills_sparse_canonical_ohlc_from_bid_columns(tmp_path: Path):
     symbol_dir = tmp_path / "ohlcv" / "dukascopy" / "indices" / "US500"
     symbol_dir.mkdir(parents=True)
     timestamps = pd.date_range("2018-01-02 07:05", periods=3, freq="1min", tz="UTC")
@@ -50,7 +50,7 @@ def test_load_ohlcv_fills_sparse_canonical_ohlc_from_bid_columns(tmp_path: Path)
         }
     ).to_parquet(symbol_dir / "m1_bid.parquet", index=False)
 
-    frame = _load_ohlcv(tmp_path, "US500", "1m", "2018-01-02", "2018-01-03")
+    frame = load_ohlcv(tmp_path, "US500", "1m", "2018-01-02", "2018-01-03")
 
     assert len(frame) == 3
     assert frame["open"].tolist() == [2600.0, 2601.0, 2700.0]
@@ -59,7 +59,7 @@ def test_load_ohlcv_fills_sparse_canonical_ohlc_from_bid_columns(tmp_path: Path)
     assert frame["close"].tolist() == [2600.2, 2601.2, 2701.0]
 
 
-def test_load_ohlcv_uses_m1_bid_when_canonical_file_is_absent(tmp_path: Path):
+def testload_ohlcv_uses_m1_bid_when_canonical_file_is_absent(tmp_path: Path):
     symbol_dir = tmp_path / "ohlcv" / "dukascopy" / "forex" / "EURUSD"
     symbol_dir.mkdir(parents=True)
     timestamps = pd.date_range("2020-01-01", periods=2, freq="1min", tz="UTC")
@@ -74,7 +74,7 @@ def test_load_ohlcv_uses_m1_bid_when_canonical_file_is_absent(tmp_path: Path):
         }
     ).to_parquet(symbol_dir / "m1_bid.parquet", index=False)
 
-    frame = _load_ohlcv(tmp_path, "EURUSD", "1m", "2020-01-01", "2020-01-02")
+    frame = load_ohlcv(tmp_path, "EURUSD", "1m", "2020-01-01", "2020-01-02")
 
     assert frame["open"].tolist() == [1.10, 1.11]
     assert frame["close"].tolist() == [1.1005, 1.1105]
@@ -525,7 +525,7 @@ def test_regenerate_case_threads_the_case_broker_clock_into_the_strategy(monkeyp
         no_signal = pd.Series(False, index=df.index)
         return no_signal, no_signal.copy(), {}, []
 
-    monkeypatch.setattr(regen, "_load_ohlcv", fake_load_ohlcv)
+    monkeypatch.setattr(regen, "load_ohlcv", fake_load_ohlcv)
     monkeypatch.setattr(regen, "generate_signals", fake_generate_signals)
     monkeypatch.setattr(regen, "attach_daily_equity", lambda result, **kwargs: None)
 
