@@ -1448,13 +1448,14 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         # knows about (own refresh or adoption of a sibling's persisted pair);
         # 0.0 when none happened this process.
         self._token_pair_rotated_at = 0.0
-        # ``True`` from the moment an own token refresh starts until the
-        # re-auth confirms the new token (``_note_session_access_token``).
-        # ``ProtoOAAccountsTokenInvalidatedEvent`` names accounts, not
-        # tokens, so this explicit in-flight signal - not the token
-        # comparison - is what protects the window between refresh
+        # Depth counter: ``> 0`` from the moment an own token rotation
+        # starts until its re-auth completes. A counter, not a bool, so two
+        # concurrent auth-error rotations cannot clear each other's
+        # in-flight marker. ``ProtoOAAccountsTokenInvalidatedEvent`` names
+        # accounts, not tokens, so this explicit in-flight signal - not the
+        # token comparison - is what protects the window between refresh
         # completion and the AccountAuthRes from a teardown.
-        self._own_token_rotation_in_flight = False
+        self._own_token_rotation_in_flight = 0
         # ``time.monotonic()`` of the last session teardown or transport
         # loss; ``listen_executions`` waits out
         # ``_LISTENER_RECONNECT_MIN_INTERVAL_SECONDS`` from it before
@@ -1467,6 +1468,11 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         # tracks them itself to errback promptly instead of letting each
         # caller wait out its response timeout.
         self._in_flight_request_deferreds: set[Any] = set()
+        # Bumped by every ``_fail_in_flight_requests`` run; ``_send_request``
+        # compares it across the send→track window so a deferred created
+        # while teardown was already failing the previous batch is failed
+        # promptly instead of sitting out its response timeout.
+        self._in_flight_fail_generation = 0
         self._symbol_name_to_id: dict[str, int] = {}
         # #125: pending get_quote calls by symbolId, and one lock per symbol
         # (cTrader allows a single spot subscription per symbol and session).
@@ -1738,7 +1744,6 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._session_access_token = (
             access_token if access_token is not None else self.access_token
         )
-        self._own_token_rotation_in_flight = False
 
     def _clear_session_rotation_state(self) -> None:
         """Drop the recorded session token and any in-flight rotation marker.
@@ -1752,7 +1757,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         as a backstop for any future path that forgets.
         """
         self._session_access_token = ""
-        self._own_token_rotation_in_flight = False
+        self._own_token_rotation_in_flight = 0
 
     def _adopt_persisted_token_pair(self) -> bool:
         """Adopt the token pair persisted in the accounts env file when it differs.
@@ -1817,9 +1822,9 @@ class CTraderLiveAdapter(BaseLiveAdapter):
 
         - a refresh is in flight on this adapter (``_refresh_lock`` held);
         - this adapter's own token rotation is still being re-authenticated
-          (``_own_token_rotation_in_flight``: set when the refresh starts and
-          cleared by ``_note_session_access_token`` once the AccountAuthRes
-          confirms the new token - this covers the gap between refresh
+          (``_own_token_rotation_in_flight``: a depth counter incremented
+          when the refresh starts and decremented when the rotation's
+          re-auth completes - this covers the gap between refresh
           completion and re-auth that a token comparison cannot);
         - the session already re-authenticated on the current access token
           and a token-pair rotation completed within
@@ -1836,10 +1841,10 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             return "a token refresh is in flight on this adapter"
         if self._own_token_rotation_in_flight:
             if not self._connected:
-                # No live session can be mid-rotation: a flag still set here
+                # No live session can be mid-rotation: a count still set here
                 # was left behind by a session-death path and would suppress
                 # every later invalidation event. Clear it rather than skip.
-                self._own_token_rotation_in_flight = False
+                self._own_token_rotation_in_flight = 0
             else:
                 return (
                     "this adapter's own token rotation is being "
@@ -2384,12 +2389,30 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             f"{self.ctid_trader_account_id}-{self._client_msg_token}-"
             f"{type(request).__name__}-{self._client_msg_seq}"
         )
-        deferred = self._client.send(
+        client = self._client
+        fail_generation = self._in_flight_fail_generation
+        deferred = client.send(
             request,
             clientMsgId=client_msg_id,
             responseTimeoutInSeconds=timeout_seconds,
         )
         self._in_flight_request_deferreds.add(deferred)
+        if self._in_flight_fail_generation != fail_generation:
+            # ``_fail_in_flight_requests`` ran between send() returning and
+            # the deferred being tracked: it can no longer see this deferred,
+            # which would sit until its own response timeout. Fail it now.
+            self._in_flight_request_deferreds.discard(deferred)
+            errback = getattr(deferred, "errback", None)
+            if callable(errback):
+                with contextlib.suppress(Exception):
+                    errback(
+                        CTraderConnectionLostError(
+                            "cTrader connection lost before the response arrived"
+                        )
+                    )
+            raise CTraderConnectionLostError(
+                "cTrader connection lost before the response arrived"
+            )
         try:
             response_message = await deferred.asFuture(self._loop)
         except Exception as exc:  # except-kind: money-decision
@@ -2493,17 +2516,19 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         or re-auth raised propagates.
 
         ``_own_token_rotation_in_flight`` spans the whole refresh+re-auth
-        window - set here and cleared unconditionally by the ``finally``
-        (``_note_session_access_token`` also clears it on success, which the
-        ``finally`` then re-affirms) - so a
-        ``ProtoOAAccountsTokenInvalidatedEvent`` landing anywhere inside it
-        (including between refresh completion and the AccountAuthRes) is
-        recognised as our own rotation echo, not a fresh invalidation. The
-        ``finally`` is deliberate: a flag left set makes
+        window - incremented here and decremented unconditionally by the
+        ``finally``. It is a depth counter, not a bool: two requests can hit
+        an auth error concurrently and run overlapping rotations, and a
+        bool would let the first ``finally`` clear the second rotation's
+        marker. While the count is non-zero a
+        ``ProtoOAAccountsTokenInvalidatedEvent`` landing anywhere inside the
+        window (including between refresh completion and the AccountAuthRes)
+        is recognised as our own rotation echo, not a fresh invalidation.
+        The ``finally`` is deliberate: a count left set makes
         ``_token_invalidation_skip_reason`` ignore every later invalidation
         event, so a dead session would never be torn down.
         """
-        self._own_token_rotation_in_flight = True
+        self._own_token_rotation_in_flight += 1
         try:
             refreshed = await self._refresh_access_token(
                 failed_access_token=failed_access_token
@@ -2533,7 +2558,11 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             self._note_session_access_token(auth_token)
             return True
         finally:
-            self._own_token_rotation_in_flight = False
+            # Clamped: a session-death path may have zeroed the counter
+            # while this rotation was still unwinding.
+            self._own_token_rotation_in_flight = max(
+                0, self._own_token_rotation_in_flight - 1
+            )
 
     async def _send_account_auth_request(self, *, timeout_seconds: int = 15) -> Any:
         account_auth_req = self._ProtoOAAccountAuthReq()
@@ -3277,6 +3306,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         UNKNOWN outcome (the request may already have been written) - never
         as not-submitted and never as a broker refusal.
         """
+        self._in_flight_fail_generation += 1
         pending: list[Any] = []
         seen: set[int] = set()
         adapter_pending = list(self._in_flight_request_deferreds)

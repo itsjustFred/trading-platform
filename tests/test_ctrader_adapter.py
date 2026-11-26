@@ -1072,6 +1072,99 @@ def test_token_invalidation_during_reauth_does_not_adopt_sibling_pair(
     assert adapter._session_access_token == "new_access"
 
 
+def test_concurrent_rotations_keep_invalidation_skip_until_last_finishes(
+    tmp_path,
+) -> None:
+    """Two requests can hit an auth error at once and run overlapping
+    rotations. ``_own_token_rotation_in_flight`` is a depth counter: the
+    first rotation's ``finally`` must not clear the second's marker, or an
+    invalidation event during the surviving rotation would be treated as a
+    fresh invalidation and tear down the live session."""
+    from ctrader_open_api.messages.OpenApiMessages_pb2 import (
+        ProtoOAAccountsTokenInvalidatedEvent,
+    )
+
+    adapter, client, ProtoMessage = _lifecycle_event_adapter()
+    env_path = tmp_path / ".accounts.env"
+    env_path.write_text(
+        "CTRADER_ACCESS_TOKEN=old_access\nCTRADER_REFRESH_TOKEN=old_refresh\n",
+        encoding="utf-8",
+    )
+    adapter.accounts_env_path = env_path
+    adapter.access_token = "old_access"
+    adapter.refresh_token = "old_refresh"
+    adapter._session_access_token = "old_access"
+
+    sent: list[object] = []
+    gate_a = asyncio.Event()
+    gate_b = asyncio.Event()
+    auth_reqs = 0
+
+    async def _fake_send(request, **_kwargs):
+        nonlocal auth_reqs
+        sent.append(request)
+        if isinstance(request, _StubRefreshTokenReq):
+            return _StubRefreshTokenRes()
+        if isinstance(request, _StubAccountAuthReq):
+            auth_reqs += 1
+            if auth_reqs == 1:
+                await gate_a.wait()
+            else:
+                await gate_b.wait()
+            return _StubAccountAuthRes()
+        raise AssertionError(f"unexpected request: {type(request).__name__}")
+
+    adapter._ProtoOARefreshTokenReq = _StubRefreshTokenReq
+    adapter._ProtoOARefreshTokenRes = _StubRefreshTokenRes
+    adapter._ProtoOAAccountAuthReq = _StubAccountAuthReq
+    adapter._ProtoOAAccountAuthRes = _StubAccountAuthRes
+    adapter._send_request = _fake_send
+
+    async def _wait_for_auth_reqs(count: int) -> None:
+        for _ in range(1000):
+            if auth_reqs >= count:
+                return
+            await asyncio.sleep(0)
+        raise AssertionError(f"expected {count} re-auth requests, got {auth_reqs}")
+
+    async def _run() -> None:
+        task_a = asyncio.create_task(
+            adapter._rotate_token_pair_and_reauthenticate()
+        )
+        await _wait_for_auth_reqs(1)
+        task_b = asyncio.create_task(
+            adapter._rotate_token_pair_and_reauthenticate()
+        )
+        await _wait_for_auth_reqs(2)
+        assert adapter._own_token_rotation_in_flight == 2
+
+        # Rotation A completes while B is still re-authenticating.
+        gate_a.set()
+        assert await task_a is True
+        assert adapter._own_token_rotation_in_flight == 1
+
+        # Neutralise the grace window so ONLY the in-flight marker can
+        # protect the session from this event.
+        adapter._token_pair_rotated_at = 0.0
+        adapter._on_message(
+            client,
+            _wire_payload(
+                ProtoMessage,
+                ProtoOAAccountsTokenInvalidatedEvent(
+                    ctidTraderAccountIds=[46736452], reason="token refreshed"
+                ),
+            ),
+        )
+        assert adapter._client is client
+        assert adapter._connected is True
+
+        gate_b.set()
+        assert await task_b is True
+        assert adapter._own_token_rotation_in_flight == 0
+
+    asyncio.run(_run())
+
+
 def test_refresh_returns_true_for_stale_session_pair_without_spending_refresh(
     tmp_path,
 ) -> None:
@@ -1286,13 +1379,13 @@ def test_token_invalidation_skip_reason_self_heals_latched_flag_on_dead_session(
         app_id="app", app_secret="secret", access_token="token", account_id="1"
     )
     adapter._connected = True
-    adapter._own_token_rotation_in_flight = True
+    adapter._own_token_rotation_in_flight = 1
     assert adapter._token_invalidation_skip_reason() is not None
 
     adapter._connected = False
-    adapter._own_token_rotation_in_flight = True
+    adapter._own_token_rotation_in_flight = 1
     assert adapter._token_invalidation_skip_reason() is None
-    assert adapter._own_token_rotation_in_flight is False
+    assert adapter._own_token_rotation_in_flight == 0
 
 
 def test_token_invalidation_own_rotation_grace_has_a_sane_floor() -> None:
@@ -1641,6 +1734,55 @@ def test_fail_in_flight_requests_tolerates_unexpected_response_deferreds(
             "Could not enumerate in-flight" in record.getMessage()
             for record in caplog.records
         )
+
+    asyncio.run(_run())
+
+
+def test_send_request_fails_fast_when_teardown_lands_during_send() -> None:
+    """If ``_fail_in_flight_requests`` runs inside ``client.send`` (a teardown
+    or transport loss landing in the send→track window), the new deferred is
+    invisible to that pass; ``_send_request`` must fail it promptly rather
+    than let the caller wait out its response timeout."""
+    from live_runner.ctrader_adapter import CTraderConnectionLostError
+
+    async def _run() -> None:
+        adapter = CTraderLiveAdapter(
+            app_id="app", app_secret="secret", access_token="token", account_id="1"
+        )
+        adapter._loop = asyncio.get_running_loop()
+
+        class _Deferred:
+            called = False
+
+            def __init__(self) -> None:
+                self.errbacks: list[BaseException] = []
+
+            def asFuture(self, _loop):
+                raise AssertionError("deferred must be failed before await")
+
+            def errback(self, exc: BaseException) -> None:
+                self.called = True
+                self.errbacks.append(exc)
+
+        deferred = _Deferred()
+
+        class _Client:
+            _responseDeferreds: dict = {}
+
+            def send(self, _request, **_kwargs):
+                # Simulate teardown failing the previous batch while this
+                # send is in flight.
+                adapter._fail_in_flight_requests()
+                return deferred
+
+        adapter._client = _Client()
+
+        with pytest.raises(CTraderConnectionLostError):
+            await adapter._send_request(object(), timeout_seconds=15)
+
+        assert deferred.called
+        assert isinstance(deferred.errbacks[0], CTraderConnectionLostError)
+        assert adapter._in_flight_request_deferreds == set()
 
     asyncio.run(_run())
 
