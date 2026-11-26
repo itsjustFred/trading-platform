@@ -5060,7 +5060,9 @@ def install_legacy_task_hooks() -> None:
 
     Explicit injection (called from lifespan startup) instead of import-time
     attribute reassignment: behavior no longer depends on which module was
-    imported first and the wrapper chain is visible to static analysis.
+    imported first and the wrapper chain is visible to static analysis. It must
+    run before any helper that creates or updates task records — writes made
+    before installation land on the in-memory originals and never persist.
     """
     global _LEGACY_HOOKS_INSTALLED
     if _LEGACY_HOOKS_INSTALLED:

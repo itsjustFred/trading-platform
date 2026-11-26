@@ -90,7 +90,7 @@ function assert(cond, msg) {
   });
 
   await test('Symbol autocomplete works', async () => {
-    // Modal should still be open from previous test
+    // Depends on the previous test leaving the create modal open.
     const input = page.locator('input[placeholder*="AAPL"]');
     if (await input.count() > 0) {
       await input.fill('');

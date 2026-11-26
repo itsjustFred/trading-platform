@@ -570,17 +570,6 @@ class BaseLiveAdapter(ABC):
             f"{type(self).__name__} cannot report used margin"
         )
 
-    # ── Operator safety controls ──────────────────────────────────────────────────────────────
-    #
-    # Status semantics built on top of these:
-    #   PAUSED  -> stop opening new positions; orders and positions are left untouched, and the
-    #              deployment can be resumed.
-    #   STOPPED -> stop opening new positions, cancel every open order, then flatten every open
-    #              position. Deliberately not implicit in PAUSED, so pausing never liquidates.
-    #
-    # Adapters that cannot honour a control leave it unsupported so the caller fails loudly
-    # instead of reading a silent no-op as "nothing was open".
-
     # ── Stop amendment (live trailing stops, issue #167) ──────────────────────────────────────
     #
     # A trailing stop is executed live by moving the broker-side protective stop. An adapter
@@ -667,6 +656,17 @@ class BaseLiveAdapter(ABC):
         raise NotImplementedError(
             f"{type(self).__name__} cannot amend position take profits"
         )
+
+    # ── Operator safety controls ──────────────────────────────────────────────────────────────
+    #
+    # Status semantics built on top of these:
+    #   PAUSED  -> stop opening new positions; orders and positions are left untouched, and the
+    #              deployment can be resumed.
+    #   STOPPED -> stop opening new positions, cancel every open order, then flatten every open
+    #              position. Deliberately not implicit in PAUSED, so pausing never liquidates.
+    #
+    # Adapters that cannot honour a control leave it unsupported so the caller fails loudly
+    # instead of reading a silent no-op as "nothing was open".
 
     @property
     def supports_cancel_orders(self) -> bool:
