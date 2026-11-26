@@ -58,6 +58,11 @@ fails on high-severity `pip-audit`/`npm audit` findings. See
 [docs/dependency-security.md](docs/dependency-security.md) for the policy
 and the accepted-risk pins.
 
+Pull requests and pushes to `main` are also scanned for committed secrets
+with gitleaks (`.github/workflows/secret-scan.yml`, config `.gitleaks.toml`);
+run the same check locally with
+`gitleaks git --log-opts="origin/main..HEAD" --redact .` (adjust base)
+
 ## Data Directory
 
 All runtime data (OHLCV, backtests, catalogs) lives in `DATA_DIR` (default: `./data` relativ zum Projekt-Root):
