@@ -224,10 +224,10 @@ def test_risk_engine_percent_fallback_stop_price(
     assert sized.decision is not None
     assert sized.decision.stop_price_used == pytest.approx(expected)
     assert sized.decision.metadata["stop_source"] == "fallback_percent"
-    # The side effect this proposal removes: pinned here, inverted in the
-    # sizing-return refactor.
-    assert signal.stop_loss == pytest.approx(expected)
-    assert signal.metadata["resolved_stop_loss"] == pytest.approx(expected)
+    # The resolved stop is returned, not written onto the input signal.
+    assert sized.resolved_stop_loss == pytest.approx(expected)
+    assert signal.stop_loss is None
+    assert "resolved_stop_loss" not in signal.metadata
 
 
 @pytest.mark.parametrize(("action", "expected"), [("buy", 97.0), ("sell", 103.0)])
@@ -377,7 +377,7 @@ def test_native_engine_fill_time_fallback_stop_re_derives_from_fill(
 # ---------------------------------------------------------------------------
 
 
-def test_sizing_returns_the_resolved_stop_and_the_legacy_signal_id() -> None:
+def test_sizing_returns_the_resolved_stop_without_hidden_channels() -> None:
     engine = RiskEngine(RiskConfig())
     signal = TradeSignal(
         action="buy",
@@ -404,11 +404,14 @@ def test_sizing_returns_the_resolved_stop_and_the_legacy_signal_id() -> None:
     assert sized.decision.stop_price_used == pytest.approx(98.0)
     assert sized.decision.risk_distance == pytest.approx(2.0)
     assert sized.decision.metadata["capped_by_notional"] is True
-    # Hidden channels: the legacy id is cached in metadata and the resolved
-    # stop is written back onto the input signal.
-    assert signal.metadata["_risk_legacy_signal_id"] == sized.decision.signal_id
-    assert signal.stop_loss == pytest.approx(98.0)
-    assert signal.metadata["resolved_stop_loss"] == pytest.approx(98.0)
+    # The full result is on the return value: resolved stop and signal id.
+    assert sized.resolved_stop_loss == pytest.approx(98.0)
+    assert sized.decision.signal_id == RiskEngine._signal_id(signal)
+    assert sized.decision.signal_id.startswith("legacy:")
+    # ... and the input signal is untouched (no hidden channels).
+    assert signal.stop_loss is None
+    assert "resolved_stop_loss" not in signal.metadata
+    assert "_risk_legacy_signal_id" not in signal.metadata
 
 
 def test_sizing_on_an_explicit_stop_leaves_the_stop_alone() -> None:

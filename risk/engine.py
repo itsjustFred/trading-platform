@@ -36,7 +36,7 @@ class RiskEngine:
         self,
         *,
         entry_price: float,
-        atr: object = None,
+        atr: Any = None,
         stop_distance: float | None = None,
     ) -> float:
         """The distance a fallback stop is placed at.
@@ -73,7 +73,7 @@ class RiskEngine:
         *,
         action: str,
         entry_price: float,
-        atr: object = None,
+        atr: Any = None,
         stop_distance: float | None = None,
     ) -> float:
         """The protective stop used when a signal carries none.
@@ -126,23 +126,24 @@ class RiskEngine:
 
     @staticmethod
     def _signal_id(signal: TradeSignal) -> str:
+        """The decision's signal id: explicit metadata, or a stable legacy id.
+
+        Pure over the signal: the engine used to cache the id in the signal
+        metadata because it also wrote the resolved stop back onto the signal
+        (G03). Neither side effect exists anymore.
+        """
         explicit = signal.metadata.get("signal_id") or signal.metadata.get("source_signal_id")
         if explicit:
             return str(explicit)
-        cached = signal.metadata.get("_risk_legacy_signal_id")
-        if cached:
-            return str(cached)
         stop = "none" if signal.stop_loss is None else f"{float(signal.stop_loss):.12g}"
         take_profit = (
             "none" if signal.take_profit is None else f"{float(signal.take_profit):.12g}"
         )
-        signal_id = (
+        return (
             "legacy:"
             f"{signal.symbol}:{signal.timeframe}:{signal.action}:"
             f"{signal.entry_price:.12g}:{stop}:{take_profit}:{signal.identity}"
         )
-        signal.metadata["_risk_legacy_signal_id"] = signal_id
-        return signal_id
 
     def _decision(
         self,
@@ -193,6 +194,10 @@ class RiskEngine:
             risk_percent=risk_percent,
             risk_reward_ratio=risk_reward_ratio,
             decision=decision,
+            # The stop the decision used is the resolved stop (signal stop or
+            # the fallback), so callers read it off the result instead of the
+            # engine writing it back onto the input signal (G03).
+            resolved_stop_loss=decision.stop_price_used,
         )
 
     @staticmethod
@@ -501,8 +506,6 @@ class RiskEngine:
                 extra={"data": {"symbol": signal.symbol, "stop_source": stop_source}},
             )
             stop_loss = self._fallback_stop_loss(signal)
-            signal.stop_loss = stop_loss
-            signal.metadata["resolved_stop_loss"] = stop_loss
         enforce_stop_direction = bool(signal.metadata.get("enforce_stop_direction", False))
         if enforce_stop_direction and not self._stop_matches_direction(signal, stop_loss):
             distance = abs(signal.entry_price - stop_loss)

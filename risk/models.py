@@ -153,6 +153,12 @@ class SizedOrder:
     risk_percent: float
     risk_reward_ratio: float | None
     decision: RiskDecision | None = None
+    #: The stop price the engine sized on: the signal's own stop, or the
+    #: fallback stop the engine resolved. ``None`` when the order carried no
+    #: stop (a rejected order still reports the stop the decision recorded).
+    #: Returned explicitly so callers never have to read the input signal back
+    #: (improvement-run G03).
+    resolved_stop_loss: float | None = None
 
     def __post_init__(self) -> None:
         self.position_size = _finite_nonnegative(self.position_size, "position_size")
@@ -162,6 +168,11 @@ class SizedOrder:
             None
             if self.risk_reward_ratio is None
             else _finite_nonnegative(self.risk_reward_ratio, "risk_reward_ratio")
+        )
+        self.resolved_stop_loss = (
+            None
+            if self.resolved_stop_loss is None
+            else _finite_positive(self.resolved_stop_loss, "resolved_stop_loss")
         )
 
 

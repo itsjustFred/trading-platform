@@ -1121,7 +1121,7 @@ def size_live_signal_for_submission(
         else None
     )
     metadata["risk_timeframe"] = resolved_timeframe
-    sized_stop = sized_order.signal.stop_loss
+    sized_stop = sized_order.resolved_stop_loss
     if sized_stop is not None:
         metadata["resolved_stop_loss"] = float(sized_stop)
     else:
