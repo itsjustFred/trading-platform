@@ -32,6 +32,7 @@ from pydantic import (
 )
 
 from shared.atomic_io import write_text_atomically
+from shared.paths import PathContainmentError, safe_join
 from shared.trailing import (
     supertrend_flip_opted_in,
     validate_live_deployment_trailing_override,
@@ -1253,11 +1254,15 @@ class BacktestResult:
             # S8707: the unconfined branch is intentional — CLI callers pass
             # operator-chosen paths, and only viewer id-derived paths pass
             # root= to confine the read to their data directory (#230).
+            # Resolved first so a relative path keeps its old meaning (cwd-
+            # relative), then checked with the shared containment helper. The
+            # root itself is allowed here because the is_file() check below
+            # answers a directory with FileNotFoundError, as before.
             resolved = p.resolve()
-            if not resolved.is_relative_to(Path(root).resolve()):
-                raise ValueError(f"Backtest result path escapes root {root}: {path}")
-            # Read the canonical path the check just approved.
-            p = resolved
+            try:
+                p = safe_join(root, resolved, allow_absolute=True, allow_base=True)
+            except PathContainmentError as exc:
+                raise ValueError(f"Backtest result path escapes root {root}: {path}") from exc
         if not p.is_file():
             raise FileNotFoundError(f"Backtest result file not found: {path}")
         return cls.from_json(p.read_text(encoding="utf-8"))

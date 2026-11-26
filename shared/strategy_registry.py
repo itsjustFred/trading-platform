@@ -16,6 +16,7 @@ from typing import Any
 
 from shared.atomic_io import write_text_atomically
 from shared.models import StrategyType
+from shared.paths import PathContainmentError, safe_join
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_STRATEGIES_DIR = PROJECT_ROOT / "strategies"
@@ -167,10 +168,10 @@ def _contained_strategy_source(path: Path, strategies_dir: Path) -> str | None:
     only ever inspects the strategy tree, never arbitrary files.
     """
     try:
-        root = strategies_dir.resolve()
-        resolved = path.resolve()
-        resolved.relative_to(root)
-    except (OSError, ValueError):
+        # The strategies dir itself is allowed: _read_source answers a directory
+        # with an OSError, which callers already treat as "unreadable".
+        resolved = safe_join(strategies_dir, path, allow_absolute=True, allow_base=True)
+    except PathContainmentError:
         return None
     return _read_source(resolved)
 
