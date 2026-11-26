@@ -4,6 +4,12 @@ Previously duplicated verbatim in both modules (the grid copy existed only to
 avoid importing ``runner.cli``, which itself imports the grid). Adapters are
 imported lazily inside ``get_engine`` so selecting an engine does not pull in
 every engine's dependencies.
+
+Callers bind the name with ``from runner.engines.registry import get_engine``,
+so patching ``runner.engines.registry.get_engine`` does NOT propagate: tests
+and callers must patch the name on the importing module
+(``runner.cli.get_engine``, ``runner.backtest_grid.get_engine``, ...), which
+is where the existing monkeypatch sites already point.
 """
 
 from __future__ import annotations

@@ -22,8 +22,9 @@ signal-replay product:
   accept `--engine native` or any adapter).
 - **pynecore** (`pynecore_adapter.py`, 1422 LOC): runs the external `pyne` CLI
   for two demo strategies (`pynecore_orb`, `pynecore_sma_crossover`).
-- **LEAN** (`lean_adapter.py`, 185 LOC): a subprocess into an external
-  `~/Desktop/custom_lean_integration`; also used as an import/reference path.
+- **LEAN** (`lean_adapter.py`, 185 LOC): a subprocess into an external LEAN
+  project (`LEAN_PROJECT_DIR`, default `DATA_DIR/lean_project`; historically
+  `~/Desktop/custom_lean_integration`); also used as an import/reference path.
 - **signal replay** (`signal_replay_adapter.py`, 1431 LOC): a different
   product — it backtests live Discord signal-bot payloads with its own
   documented fill model. Live trading never calls any engine.
