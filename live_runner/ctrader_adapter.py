@@ -256,7 +256,13 @@ _SHARED_TOKEN_REFRESH_LOCKS: dict[tuple[asyncio.AbstractEventLoop, str], asyncio
 
 
 def _shared_token_refresh_lock(accounts_env_path: Path) -> asyncio.Lock:
-    key = (asyncio.get_running_loop(), str(accounts_env_path))
+    # Canonicalize so adapters constructed with differently-formed paths to
+    # the same env file (relative vs absolute, symlink variants) share one
+    # lock - otherwise their refreshes are not serialized.
+    key = (
+        asyncio.get_running_loop(),
+        str(accounts_env_path.expanduser().resolve()),
+    )
     lock = _SHARED_TOKEN_REFRESH_LOCKS.get(key)
     if lock is None:
         lock = asyncio.Lock()
@@ -3079,10 +3085,15 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             if not deferreds:
                 return
             pending = list(deferreds.values())
-        except Exception:  # except-kind: loop-survival
+        except Exception as exc:  # except-kind: loop-survival
             # A ctrader-open-api bump that renames or reshapes
             # ``_responseDeferreds`` must not abort the rest of teardown
-            # (``stopService``, the event clear and the listener wake).
+            # (``stopService``, the event clear and the listener wake), but
+            # the missed errbacks must not be silent either.
+            logger.warning(
+                "Could not enumerate in-flight cTrader requests during teardown",
+                extra={"data": {"error": str(exc)}},
+            )
             return
         for deferred in pending:
             try:
@@ -3118,9 +3129,17 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             pass
         # Wake ``listen_executions`` so the teardown is noticed now - the
         # listener would otherwise sleep out its 30 s ``queue.get`` timeout
-        # before reconnecting and reconciling the gap.
-        with contextlib.suppress(asyncio.QueueFull):
+        # before reconnecting and reconciling the gap. If the queue is full
+        # the wake is dropped, so flag reconciliation explicitly.
+        self._reconciliation_required = True
+        try:
             self._execution_queue.put_nowait(_EXECUTION_RECONCILE_WAKE)
+        except asyncio.QueueFull:
+            logger.warning(
+                "cTrader execution queue full during teardown; "
+                "listener wake dropped, reconciliation already flagged",
+                extra={"data": {"account_id": self.ctid_trader_account_id}},
+            )
 
     async def _recover_broker_order_id(
         self,
