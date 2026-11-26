@@ -1522,6 +1522,30 @@ def test_an_unclassifiable_execution_event_aborts_the_flatten() -> None:
         _run(flatten)
 
 
+def test_an_execution_type_outside_the_enum_is_unclassifiable() -> None:
+    """A value the loaded enum does not know may be a future rejection type."""
+    from types import SimpleNamespace
+
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOAOrderType
+
+    adapter = _control_adapter(
+        orders=[_order(881, ProtoOAOrderType.LIMIT)]
+    )
+    # Duck-typed event + enum: the class is unloaded so the attribute sniff
+    # applies, and 99 is not a member of the loaded enum.
+    adapter._ProtoOAExecutionEvent = None
+    adapter._ProtoOAExecutionType = SimpleNamespace(
+        ORDER_REJECTED=7, ORDER_CANCEL_REJECTED=8, ORDER_FILLED=3
+    )
+    adapter.exec_event[881] = SimpleNamespace(
+        ctidTraderAccountId=46736452, executionType=99, errorCode="FUTURE_TYPE"
+    )
+
+    sweep = adapter.cancel_open_orders()
+    with pytest.raises(RuntimeError, match="could not be classified"):
+        _run(sweep)
+
+
 def test_an_orphaned_protection_cancel_rejected_is_a_failure() -> None:
     """The same refusal check covers every `_cancel_order_id` caller."""
     from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOAOrderType

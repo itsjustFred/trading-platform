@@ -4520,8 +4520,8 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             and getattr(response, "ctidTraderAccountId", None) is not None
         )
         if is_execution_event:
-            rejected = self._is_rejected_execution_event(response)
-            if rejected is None:
+            rejection, unclassifiable = self._execution_event_rejection(response)
+            if unclassifiable:
                 # The event's type cannot be classified (proto types not fully
                 # loaded, or an unreadable executionType): it may be the
                 # ORDER_REJECTED refusal this path exists to catch, so it must
@@ -4532,22 +4532,28 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                     "executionType could not be classified; the outcome is "
                     "unknown and must be reconciled."
                 )
-            if rejected:
+            if rejection is not None:
                 # Unlike the OrderErrorEvent above, the event typically still
                 # carries an `order` object with a broker-assigned orderId, so
                 # the orderId cannot decide: definiteness comes from the
                 # order's terminal status and the absence of any created
-                # state instead.
+                # state instead. Only ORDER_REJECTED can be definitive here -
+                # ORDER_CANCEL_REJECTED describes a refused cancel, which the
+                # state checks were not built to prove, so it stays an
+                # unknown outcome.
                 error_code = str(getattr(response, "errorCode", "") or "")
                 message = (
-                    f"Order rejected ({error_code or 'ORDER_REJECTED'}): "
+                    f"Order rejected ({error_code or rejection}): "
                     f"{getattr(response, 'description', '') or 'no description'}"
                 )
                 self._classify_and_raise_refusal(
                     message,
                     error_code=error_code,
-                    definitive=self._execution_rejection_is_definitive(
-                        response, request
+                    definitive=(
+                        rejection == "ORDER_REJECTED"
+                        and self._execution_rejection_is_definitive(
+                            response, request
+                        )
                     ),
                 )
 
@@ -4564,52 +4570,69 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             and isinstance(request, self._ProtoOAClosePositionReq)
         )
 
-    def _execution_event_rejection(self, event: Any) -> str | None:
-        """The rejection ``executionType`` name, ``"unknown"`` or ``None``.
+    @staticmethod
+    def _execution_type_members(enum: Any) -> list[tuple[str, int]]:
+        """``(name, number)`` pairs for an execution-type enum or test double.
 
-        ``None`` means the event is not a rejection at all. Both rejection
-        types count: ``ORDER_REJECTED`` refuses the operation itself and
-        ``ORDER_CANCEL_REJECTED`` refuses a cancel - the proto defines no
-        amend-specific rejection, so a refused ``ProtoOAAmendPositionSLTPReq``
-        or ``ProtoOAAmendOrderReq`` surfaces as one of the two (#439).
-        ``"unknown"`` means the proto types are not fully loaded or the
-        event's ``executionType`` cannot be read: the caller must treat the
-        response as an unknown outcome, never as a success.
+        The real ``ProtoOAExecutionType`` is an ``EnumTypeWrapper`` with a
+        ``DESCRIPTOR``; test doubles are plain namespaces, where ``dir``
+        yields the members. Anything unreadable is skipped - an empty result
+        makes the caller fail closed.
+        """
+        descriptor = getattr(enum, "DESCRIPTOR", None)
+        values = getattr(descriptor, "values_by_name", None)
+        if values is not None:
+            return [(name, int(member.number)) for name, member in values.items()]
+        members: list[tuple[str, int]] = []
+        for name in dir(enum):
+            if name.startswith("_"):
+                continue
+            try:
+                members.append((name, int(getattr(enum, name))))
+            except Exception:  # except-kind: money-decision
+                continue
+        return members
+
+    def _execution_event_rejection(self, event: Any) -> tuple[str | None, bool]:
+        """Classify an execution event's ``executionType``.
+
+        Returns ``(rejection_name, False)`` for a rejection, ``(None, False)``
+        for a classified non-rejection and ``(None, True)`` when the type
+        cannot be classified. A rejection is any enum member whose name
+        contains ``REJECT`` - today ``ORDER_REJECTED`` (the operation itself
+        was refused) and ``ORDER_CANCEL_REJECTED`` (a cancel was refused);
+        the proto defines no amend-specific rejection, so a refused
+        ``ProtoOAAmendPositionSLTPReq`` or ``ProtoOAAmendOrderReq`` surfaces
+        as one of them (#439). Deriving the set from the enum keeps a future
+        rejection type from silently passing as success.
+
+        ``(None, True)`` - the unclassifiable outcome - covers proto types
+        not fully loaded, an unreadable ``executionType``, and a value that
+        is not a member of the loaded enum at all: the caller must treat it
+        as an unknown outcome, never as a success.
         """
         enum = getattr(self, "_ProtoOAExecutionType", None)
         if enum is None:
-            return "unknown"
+            return None, True
         try:
             value = int(getattr(event, "executionType", -1))
         except Exception:  # except-kind: money-decision
-            # Any unreadable type is "unclassifiable" (unknown), never a
-            # pass: the caller must not let the event through as success.
-            return "unknown"
-        for name in ("ORDER_REJECTED", "ORDER_CANCEL_REJECTED"):
-            member = getattr(enum, name, None)
-            if member is None:
-                return "unknown"
-            try:
-                if value == int(member):
-                    return name
-            except (TypeError, ValueError):
-                return "unknown"
-        return None
-
-    def _is_rejected_execution_event(self, event: Any) -> bool | None:
-        """Whether the event rejects the request; ``None`` when unclassifiable.
-
-        ``None`` means the proto type was not fully loaded or the event's
-        ``executionType`` cannot be read - the caller must treat the response
-        as an unknown outcome rather than letting it pass as submitted.
-        """
-        rejection = self._execution_event_rejection(event)
-        if rejection == "unknown":
-            return None
-        return rejection is not None
+            # Any unreadable type is "unclassifiable", never a pass: the
+            # caller must not let the event through as success.
+            return None, True
+        members = self._execution_type_members(enum)
+        if not members:
+            return None, True
+        known = {number for _, number in members}
+        if value not in known:
+            return None, True
+        for name, number in members:
+            if number == value and "REJECT" in name:
+                return name, False
+        return None, False
 
     def _execution_rejection_is_definitive(self, event: Any, request: Any) -> bool:
-        """Whether a rejection execution event proves nothing was opened.
+        """Whether an ORDER_REJECTED execution event proves nothing was opened.
 
         Safe means two things: the order can never execute, and no state was
         created. The event's ``order`` must report ``ORDER_STATUS_REJECTED``
@@ -5546,9 +5569,10 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         trading refusals on the cancel, flatten and amend paths
         (``MARKET_CLOSED``, ``POSITION_NOT_FOUND``, ``TRADING_BAD_VOLUME``,
         ...) either as a `ProtoOAOrderErrorEvent` or as a correlated
-        `ProtoOAExecutionEvent` whose ``executionType`` is ``ORDER_REJECTED``
-        or ``ORDER_CANCEL_REJECTED`` - a refused amend surfaces as one of the
-        two because the proto defines no amend-specific rejection (#439).
+        `ProtoOAExecutionEvent` whose ``executionType`` is a rejection - any
+        enum member named ``*REJECT*`` (today ``ORDER_REJECTED`` and
+        ``ORDER_CANCEL_REJECTED``; the proto defines no amend-specific
+        rejection, so a refused amend surfaces as one of them, #439).
         Either payload means the operation changed nothing, so the refusal
         raises `CTraderApiError` exactly like the OrderErrorEvent did: the
         sweeps record the item as failed - a refused cancel leaves the order
@@ -5582,8 +5606,8 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         )
         if not is_execution_event:
             return
-        rejection = self._execution_event_rejection(response)
-        if rejection == "unknown":
+        rejection, unclassifiable = self._execution_event_rejection(response)
+        if unclassifiable:
             raise RuntimeError(
                 "cTrader control response was an execution event whose "
                 "executionType could not be classified; the outcome is "
