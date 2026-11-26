@@ -207,3 +207,45 @@ def test_contained_client_data_file_rejects_unusable_paths(monkeypatch, tmp_path
     assert (
         viewer_app_module._contained_client_data_file(raw, allowed_suffix=".csv") is None
     )
+
+
+def test_contained_client_data_file_resolves_a_relative_path_from_cwd(
+    monkeypatch, tmp_path
+):
+    """A relative client path is cwd-relative, not DATA_DIR-relative.
+
+    The viewer's cwd is not the data directory, so a relative value never
+    resolved inside it and was refused. Anchoring it at ``DATA_DIR`` instead
+    would accept ``ohlcv/x.parquet`` on four routes.
+    """
+    data_dir = tmp_path / "data"
+    (data_dir / "ohlcv").mkdir(parents=True)
+    (data_dir / "ohlcv" / "x.parquet").write_text("", encoding="utf-8")
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.setattr(viewer_app_module, "DATA_DIR", data_dir)
+    monkeypatch.chdir(elsewhere)
+
+    assert (
+        viewer_app_module._contained_client_data_file(
+            "ohlcv/x.parquet", allowed_suffix=".parquet"
+        )
+        is None
+    )
+
+
+def test_contained_client_data_file_accepts_a_dotdot_that_resolves_inside(
+    monkeypatch, tmp_path
+):
+    """An absolute path with a ``..`` that resolves inside was accepted before."""
+    data_dir = tmp_path / "data"
+    (data_dir / "ohlcv").mkdir(parents=True)
+    target = data_dir / "ohlcv" / "x.parquet"
+    target.write_text("", encoding="utf-8")
+    monkeypatch.setattr(viewer_app_module, "DATA_DIR", data_dir)
+    with_dotdot = str(data_dir / "ohlcv" / ".." / "ohlcv" / "x.parquet")
+
+    assert (
+        viewer_app_module._contained_client_data_file(with_dotdot, allowed_suffix=".parquet")
+        == target.resolve()
+    )

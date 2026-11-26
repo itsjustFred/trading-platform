@@ -103,6 +103,38 @@ def test_load_strategy_meta_without_literal(tmp_path: Path) -> None:
     assert load_strategy_meta(strategy_dir / "dynamic_meta.py", strategy_dir) == {}
 
 
+def test_load_strategy_meta_resolves_a_relative_path_from_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A relative strategy path keeps its old meaning: relative to the cwd.
+
+    ``scripts/regenerate_backtests.py``, ``scripts/engine_speed_benchmark.py``
+    and the matrix runner pass paths such as
+    ``strategies/example_sma/example_sma.py`` while running from the repo root.
+    Joining that onto ``strategies_dir`` a second time would look in
+    ``strategies/strategies/...``, read nothing, and silently return ``{}``
+    (and ``MARKET_DATA`` from the type fallback).
+    """
+    from shared.models import StrategyType
+    from shared.strategy_registry import detect_strategy_type, load_strategy_meta
+
+    strategies_dir = tmp_path / "strategies"
+    strategy_dir = strategies_dir / "relative_strategy"
+    strategy_dir.mkdir(parents=True)
+    (strategy_dir / "relative_strategy.py").write_text(
+        "STRATEGY_META = {'name': 'Relative', 'strategy_type': 'signal_processor'}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    relative = Path("strategies") / "relative_strategy" / "relative_strategy.py"
+
+    assert load_strategy_meta(relative, strategies_dir) == {
+        "name": "Relative",
+        "strategy_type": "signal_processor",
+    }
+    assert detect_strategy_type(relative, strategies_dir) == StrategyType.SIGNAL_PROCESSOR
+
+
 def test_detect_strategy_type_is_static(tmp_path: Path) -> None:
     """Type detection reads STRATEGY_META statically; falls back to MARKET_DATA."""
     from shared.models import StrategyType
