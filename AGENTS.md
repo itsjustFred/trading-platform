@@ -1,7 +1,7 @@
 # AGENTS.md
 
 This repo executes live trades as well as critical backtests and has a very high standard for correctness, reliability, clarity, maintainability and testing.
-Production and CI run on Linux only; Windows is used only for MT5 backtests, so scripts need not be Windows/macOS-portable — but Windows-only code paths and their tests (e.g. MT5/cTrader host handling) are still required.
+Production and CI run on Linux only; Windows is used only for MT5 backtests, so scripts need not be Windows/macOS-portable — Windows-specific code is kept only where the MT5 backtest path needs it.
 When creating an issue or PR, mention model as well as harness at the bottom of its body. If using t3code, include that as well, but don't leave out original harness.
 Unless explicitly told, never push directly to main.
 Use conventional commit style messages unless not appropriate.
