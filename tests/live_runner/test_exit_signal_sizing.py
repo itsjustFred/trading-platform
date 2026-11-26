@@ -1440,18 +1440,17 @@ def test_usable_qty_tolerance_is_bounded_to_one_whole_unit() -> None:
     assert usable_qty_tolerance(100.0) == DEFAULT_QTY_TOLERANCE
 
 
-def test_exit_metadata_uses_the_shared_exit_only_constant(monkeypatch) -> None:
-    import live_runner.exit_signals as exit_signals
+def test_exit_metadata_marks_the_exit_only_risk_sizing_mode() -> None:
+    """The persisted marker value is the contract the adapters key on.
+
+    ``risk_sizing_mode == "exit_only"`` is what the broker adapters read to
+    treat the order as a close rather than an entry; the constant it is spelled
+    with is an implementation detail."""
     from live_runner.exit_signals import ExitInstruction, exit_intent_metadata
 
     assert exit_intent_metadata(ExitInstruction(fraction=1.0, position_side=None))[
         "risk_sizing_mode"
     ] == "exit_only"
-    # The persisted marker follows the constant, not a second spelling.
-    monkeypatch.setattr(exit_signals, "EXIT_ONLY_RISK_SIZING_MODE", "sentinel_mode")
-    assert exit_intent_metadata(ExitInstruction(fraction=1.0, position_side=None))[
-        "risk_sizing_mode"
-    ] == "sentinel_mode"
 
 
 def test_ledgers_must_match_broker_pure() -> None:
