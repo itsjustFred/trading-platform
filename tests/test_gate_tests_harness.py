@@ -221,15 +221,13 @@ def test_full_roster(tmp_path: Path) -> None:
     The gate runner excludes this case when it runs the harness self-check, so there is no cycle:
     the script runs the unit cases above, and this case runs the script.
     """
-    # The sandboxed environment for the runner and every gate it spawns: the allowlist
-    # drops BASE_URL and PERMA_ALLOW_LIVE_VIEWER_WRITES, and the data roots are this
-    # test's so no gate can reach the checkout's data dir.
-    env = sandboxed_env(
-        PYTHON=sys.executable,
-        DATA_DIR=str(tmp_path),
-        TRADING_DATA_DIR=str(tmp_path),
-        LOG_DIR=str(tmp_path / "logs"),
-    )
+    # The sandboxed environment for the runner and every gate it spawns: the allowlist drops
+    # BASE_URL and PERMA_ALLOW_LIVE_VIEWER_WRITES, and the data roots are the session sandbox's,
+    # which no gate can write the checkout's data through. The child does not share the
+    # sandbox: every gate that runs a suite runs it as its own pytest process, and that process
+    # must build the suite sandbox a standalone run builds - its own session, its own forced
+    # data roots - rather than inherit one it did not establish.
+    env = sandboxed_env(PYTHON=sys.executable, shares_sandbox=False)
     result = subprocess.run(
         ["bash", str(GATE_SCRIPT)],
         capture_output=True,

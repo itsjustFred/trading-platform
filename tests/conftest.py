@@ -243,7 +243,7 @@ SANDBOX_HOME.mkdir(parents=True, exist_ok=True)
 CHILD_SANDBOX_SHIM_DIR = _SESSION_ROOT / "child-sandbox"
 
 
-def sandboxed_env(**overrides: str) -> dict[str, str]:
+def sandboxed_env(*, shares_sandbox: bool = True, **overrides: str) -> dict[str, str]:
     """The environment a subprocess a test starts must be handed.
 
     A child inherits this process's environment but none of its guards: the audit
@@ -261,6 +261,12 @@ def sandboxed_env(**overrides: str) -> dict[str, str]:
     override is prepended rather than replaced, so a test that deliberately puts
     another tree on the path (the import-origin probe) keeps that shadowing while
     the shim stays in front of it.
+
+    ``shares_sandbox=False`` is for a child that runs the repo's own suite as a
+    pytest process: such a child loads this conftest through pytest, and sharing
+    the parent's session directory would give it the parent's session instead of
+    its own - so it gets the swept environment and sets up its own sandbox, the
+    way a standalone run does.
     """
     env = {name: value for name, value in os.environ.items() if _is_allowlisted_env(name)}
     env["DATA_DIR"] = os.environ["DATA_DIR"]
@@ -277,11 +283,17 @@ def sandboxed_env(**overrides: str) -> dict[str, str]:
     else:
         env.pop("USERPROFILE", None)
     caller_pythonpath = overrides.pop("PYTHONPATH", None)
-    pythonpath = [str(CHILD_SANDBOX_SHIM_DIR), str(PROJECT_ROOT)]
+    pythonpath = [str(PROJECT_ROOT)]
+    if shares_sandbox:
+        # The shim first: sitecustomize is the first one found on sys.path, and the caller's
+        # own path (a foreign tree in the import-origin probe) still shadows the repo's.
+        pythonpath.insert(0, str(CHILD_SANDBOX_SHIM_DIR))
     if caller_pythonpath:
         pythonpath.insert(0, caller_pythonpath)
     env["PYTHONPATH"] = os.pathsep.join(pythonpath)
     env.update(overrides)
+    if not shares_sandbox:
+        return env
     if overrides:
         # Named, not just applied: the child imports this file through the shim, and its sweep
         # must keep the variables the naming test meant it to see. A child that starts its own
@@ -320,6 +332,7 @@ def _write_child_sandbox_shim() -> None:
         "    _spec = importlib.util.spec_from_file_location('tp_test_conftest', _path)\n"
         "    _module = importlib.util.module_from_spec(_spec)\n"
         "    sys.modules['tp_test_conftest'] = _module\n"
+        "    sys.modules['tests.conftest'] = _module\n"
         "    _spec.loader.exec_module(_module)\n",
         encoding="utf-8",
     )

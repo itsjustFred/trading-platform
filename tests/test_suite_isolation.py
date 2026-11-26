@@ -908,7 +908,9 @@ def test_the_integration_module_is_skipped_without_the_opt_in() -> None:
         capture_output=True,
         text=True,
         timeout=300,
-        env=sandboxed_env(),
+        # The child runs the repo's suite as its own pytest process, so it builds its
+        # own sandbox instead of sharing this session.
+        env=sandboxed_env(shares_sandbox=False),
         check=False,
     )
     combined = result.stdout + result.stderr
@@ -959,7 +961,8 @@ def test_a_deselected_integration_test_makes_no_http_call() -> None:
             cwd=str(Path(__file__).resolve().parents[1]),
             capture_output=True,
             text=True,
-            env=sandboxed_env(TP_INTEGRATION_BASE_URL=base_url),
+            # Same as the opt-in case above: a pytest child builds its own sandbox.
+            env=sandboxed_env(TP_INTEGRATION_BASE_URL=base_url, shares_sandbox=False),
             timeout=300,
             check=False,
         )
