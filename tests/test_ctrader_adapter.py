@@ -6501,3 +6501,38 @@ def test_order_rejected_execution_unanswerable_position_presence_stays_unknown()
     with pytest.raises(RuntimeError, match="Order rejected") as excinfo:
         asyncio.run(submission)
     assert not isinstance(excinfo.value, BrokerOrderRejectedError)
+
+
+def test_order_cancel_rejected_close_submit_stays_an_unknown_outcome() -> None:
+    """#439: ORDER_CANCEL_REJECTED on a ClosePositionReq is a refusal, but not
+    a *definitive* one - the state checks prove nothing for a refused cancel,
+    so the outcome stays unknown (RuntimeError) for reconciliation rather
+    than a BrokerOrderRejectedError that would clear the pending-close mark.
+    """
+    from ctrader_open_api.messages.OpenApiMessages_pb2 import (
+        ProtoOAClosePositionReq,
+        ProtoOAExecutionEvent,
+    )
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import (
+        ProtoOAExecutionType,
+        ProtoOAOrderStatus,
+    )
+
+    from live_runner.base_adapter import BrokerOrderRejectedError
+
+    adapter = _execution_event_response_adapter(
+        ProtoOAExecutionEvent(
+            ctidTraderAccountId=1,
+            executionType=ProtoOAExecutionType.ORDER_CANCEL_REJECTED,
+            order=_rejected_order(status=ProtoOAOrderStatus.ORDER_STATUS_REJECTED),
+            errorCode="ORDER_NOT_FOUND",
+        )
+    )
+    request = ProtoOAClosePositionReq(
+        ctidTraderAccountId=1, positionId=123, volume=1000
+    )
+    submission = adapter._submit_new_order_request(request)
+
+    with pytest.raises(RuntimeError, match="Order rejected") as excinfo:
+        asyncio.run(submission)
+    assert not isinstance(excinfo.value, BrokerOrderRejectedError)
