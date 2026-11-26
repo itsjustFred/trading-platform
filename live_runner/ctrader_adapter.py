@@ -7892,6 +7892,22 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             if now - marked_at > _PENDING_CLOSE_POSITION_TTL_SECONDS
         ]:
             del marks[signal_id]
+            # An expired mark means a submit's broker outcome stayed unknown
+            # past the TTL: retention is gone, so a later fill on this
+            # position books as a broker-side close. Surface it - silent
+            # expiry would hide exactly the mis-booking the mark prevents.
+            logger.warning(
+                "cTrader pending close mark expired before the submit's "
+                "broker order id was known; fills on the position may book "
+                "as broker-side closes",
+                extra={
+                    "data": {
+                        "account_id": self.account_config_id,
+                        "position_id": position_id,
+                        "signal_id": signal_id,
+                    }
+                },
+            )
         if not marks:
             self._pending_close_positions.pop(position_id, None)
             return False

@@ -5818,8 +5818,9 @@ def is_exit_only_signal_metadata(metadata: Mapping[str, Any]) -> bool:
     exit_only = metadata.get("exit_only")
     if isinstance(exit_only, str):
         # JSON metadata can carry "false" as a string, which bool() would
-        # count as an exit; normalise the common truthy tokens instead.
-        exit_only = exit_only.strip().lower() in {"1", "true", "yes"}
+        # count as an exit; normalise against the same truthy tokens the
+        # rest of the codebase accepts for boolean config.
+        exit_only = exit_only.strip().lower() in {"1", "true", "yes", "y", "on"}
     return bool(exit_only) or (
         str(metadata.get("risk_sizing_mode") or "").strip().lower() == "exit_only"
     )

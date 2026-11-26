@@ -776,9 +776,14 @@ def test_a_close_fill_during_an_in_flight_submit_is_retained_not_booked(
     assert _ledger(database) == pytest.approx(0.0)
 
 
-def test_an_expired_pending_mark_does_not_hold_a_broker_close(database) -> None:
+def test_an_expired_pending_mark_does_not_hold_a_broker_close(
+    database, caplog
+) -> None:
     """A pending mark only covers the submit window: once it expires a close
-    on the position takes the ordinary broker-close path again."""
+    on the position takes the ordinary broker-close path again - and the
+    expiry is logged so the lost retention is operator-visible."""
+    import logging
+
     import shared.database as db
 
     entry_id = _persist_entry(database, qty=10.0)
@@ -787,10 +792,14 @@ def test_an_expired_pending_mark_does_not_hold_a_broker_close(database) -> None:
         "00000000-0000-4000-8000-000000000000": time.monotonic() - 7200.0
     }
 
-    asyncio.run(adapter._persist_execution_event(_event(_sdk_closing_order(), _close_deal())))
+    with caplog.at_level(logging.WARNING):
+        asyncio.run(adapter._persist_execution_event(_event(_sdk_closing_order(), _close_deal())))
 
     assert len(_signal_execution_rows(database, db.broker_close_signal_id(entry_id))) == 1
     assert _ledger(database) == pytest.approx(0.0)
+    assert any(
+        "pending close mark expired" in record.getMessage() for record in caplog.records
+    )
 
 
 def test_restart_reconcile_of_an_attributed_close_fill_has_no_dedupe_collision(
