@@ -428,6 +428,7 @@ _PUSH_VALUE_OPTS = {"-o"}
 
 def _check_git_push(rest: list[str], cwd: Path) -> str | None:
     force = False
+    bulk = False
     positionals: list[str] = []
     i = 0
     end_opts = False
@@ -445,6 +446,8 @@ def _check_git_push(rest: list[str], cwd: Path) -> str | None:
             name = tok.split("=", 1)[0]
             if name.startswith("--force"):
                 force = True
+            if name in ("--mirror", "--all", "--prune"):
+                bulk = True
             if name in _PUSH_VALUE_LONGS and "=" not in tok:
                 i += 2
             else:
@@ -463,6 +466,12 @@ def _check_git_push(rest: list[str], cwd: Path) -> str | None:
         return (
             "blocked: force pushes are not allowed (including "
             "--force-with-lease and `+refspec`). Ask the maintainer to push "
+            "instead."
+        )
+    if bulk:
+        return (
+            "blocked: `git push --mirror/--all/--prune` pushes or deletes "
+            "every ref, including `main`. Push your branch and open a PR "
             "instead."
         )
 
