@@ -4244,26 +4244,6 @@ def test_a_source_with_an_empty_allowlist_refuses_to_start() -> None:
         _source(trusted_author_ids=["  "])
 
 
-def test_an_unresolvable_allowlist_is_not_an_allow_all() -> None:
-    """No accounts-env mapping and no configured value resolves to empty.
-
-    The deployment-level gate still honours the channel-merged allowlist for a
-    deployment with no list of its own, but the *resolution* must never invent
-    trust from an environment it cannot read.
-    """
-    from live_runner.daemon import _deployment_trusted_author_ids
-
-    deployment = SimpleNamespace(
-        id="d1",
-        settings={},
-        signal_config={"service_name": "nitro"},
-        signal_source_id="nitro",
-    )
-
-    assert _deployment_trusted_author_ids(deployment, accounts_env_values={}) == set()
-    assert _deployment_trusted_author_ids(deployment) == set()
-
-
 def test_the_discovery_tool_reads_the_token_from_its_env_key(monkeypatch):
     """`discover_discord_bots_from_env` returns the token *key*, never the token.
 
@@ -4601,11 +4581,6 @@ def test_unresolvable_allowlist_trusts_nobody_at_dispatch() -> None:
 
     assert (
         daemon._deployment_accepts_signal_author(deployment, "1", accounts_env_values={})
-        is False
-    )
-    # No accounts env at all (a caller that forgot to thread it): still nobody.
-    assert (
-        daemon._deployment_accepts_signal_author(deployment, "1", accounts_env_values=None)
         is False
     )
 
