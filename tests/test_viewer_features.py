@@ -358,6 +358,15 @@ def test_static_spa_middleware_returns_404_for_missing_js_asset(viewer_client):
     assert resp.status_code == 404
 
 
+def test_static_spa_middleware_reports_missing_frontend_build(viewer_client, monkeypatch, tmp_path):
+    import viewer.main as viewer_app_module
+
+    monkeypatch.setattr(viewer_app_module, "STATIC_DIR", tmp_path)
+    resp = viewer_client.get("/strategies")
+    assert resp.status_code == 503
+    assert "frontend not built" in resp.text.lower()
+
+
 def test_data_download_rejects_dates_before_genesis(viewer_client, tmp_path):
     (tmp_path / "dukascopy_genesis.json").write_text(json.dumps({
         "EURUSD": {
