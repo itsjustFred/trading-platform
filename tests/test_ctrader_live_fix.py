@@ -1613,6 +1613,61 @@ def test_an_execution_type_outside_the_enum_is_unclassifiable() -> None:
         _run(sweep)
 
 
+def test_an_unknown_cancel_outcome_aborts_the_sweep() -> None:
+    """A RuntimeError from one cancel must propagate, not be swallowed per item."""
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOAOrderType
+
+    adapter = _control_adapter(
+        orders=[
+            _order(895, ProtoOAOrderType.LIMIT),
+            _order(896, ProtoOAOrderType.LIMIT),
+        ]
+    )
+
+    async def _unknown(order_id: int) -> None:
+        raise RuntimeError(f"outcome of cancelling {order_id} is unknown")
+
+    adapter._cancel_order_id = _unknown
+
+    with pytest.raises(RuntimeError, match="unknown"):
+        _run(adapter.cancel_open_orders())
+    # The second order was never attempted.
+    assert adapter.sent == []
+
+
+def test_an_unknown_flatten_outcome_aborts_the_sweep() -> None:
+    """Same invariant on the flatten path: unknown is not failed, not done."""
+    adapter = _control_adapter(positions=[_position(897, 1000)])
+
+    async def _send_unknown(request: Any, **_kwargs: Any) -> Any:
+        raise RuntimeError("close outcome is unknown")
+
+    adapter._send_request_with_refresh_retry = _send_unknown
+
+    with pytest.raises(RuntimeError, match="unknown"):
+        _run(adapter.close_all_positions())
+
+
+def test_an_execution_type_alias_with_an_unknown_name_is_unclassifiable() -> None:
+    """A number shared by a known non-rejection and an unknown name fails closed.
+
+    The non-rejection side is a subset check: every name the value resolves
+    to must be a known non-rejection, so `{ORDER_FILLED, FUTURE_OUTCOME}`
+    is unclassifiable rather than a pass.
+    """
+    from types import SimpleNamespace
+
+    from live_runner.ctrader_adapter import CTraderLiveAdapter
+
+    adapter = CTraderLiveAdapter.__new__(CTraderLiveAdapter)
+    adapter._ProtoOAExecutionType = SimpleNamespace(
+        ORDER_FILLED=3, FUTURE_OUTCOME=3
+    )
+    event = SimpleNamespace(ctidTraderAccountId=46736452, executionType=3)
+
+    assert adapter._execution_event_rejection(event) == (None, True)
+
+
 def test_an_execution_event_without_an_account_id_still_classifies() -> None:
     """`executionType` alone marks an execution event when the class is unloaded.
 

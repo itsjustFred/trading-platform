@@ -1800,6 +1800,16 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             ProtoOAAccountsTokenInvalidatedEvent().payloadType
         )
 
+        # Refusal classification depends on reading every execution-type
+        # member; an enum shape this adapter cannot enumerate would make
+        # every control response fail closed at request time, so fail at
+        # load instead.
+        if not self._execution_type_members(ProtoOAExecutionType):
+            raise RuntimeError(
+                "ProtoOAExecutionType member extraction returned nothing; "
+                "refusal classification cannot run against this proto build."
+            )
+
     def _raise_if_terminal_auth_failed(self) -> None:
         if not self._terminal_auth_failure_reason:
             return
