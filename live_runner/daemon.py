@@ -2641,6 +2641,12 @@ async def prepare_order_with_risk(
     metadata["entry_price"] = float(entry_price)
     metadata["stop_loss"] = float(stop_loss)
     metadata["resolved_stop_loss"] = float(stop_loss)
+    # No surviving trailing mode owns its own take-profit exits: the removed
+    # ``supertrend_flip`` workflow was the only one, and it used to strip
+    # ``take_profit`` here because a broker TP would flatten the position
+    # before its own exit logic ran. Any future mode that manages partial
+    # exits itself must restore that conditional strip (plus the unbounded-TP
+    # policy) keyed to a per-mode flag.
     if take_profit is not None:
         metadata["take_profit"] = float(take_profit)
     else:

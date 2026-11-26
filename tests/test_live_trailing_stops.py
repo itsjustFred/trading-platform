@@ -1732,7 +1732,7 @@ def test_entry_signal_lookup_ignores_zero_fill_executions(isolated_db) -> None:
     assert found["AAPL"]["signal_id"] == str(probe.entry.id)
 
 
-# ── a persisted removed-mode entry fails closed, loudly ─────────────────────
+# ── a persisted removed-mode entry has nothing to trail ─────────────────────
 
 _REMOVED_FLIP_CONFIG = {
     "mode": "supertrend_flip",
@@ -1744,12 +1744,14 @@ _REMOVED_FLIP_CONFIG = {
 }
 
 
-def test_persisted_removed_mode_entry_is_surfaced_never_amended(
+def test_persisted_removed_mode_entry_is_not_trailed(
     live: _Live, surfaced
 ) -> None:
     """A stored entry still naming the removed ``supertrend_flip`` mode can
-    never be trailed: the trail refuses it (fail closed) and reports the
-    failure instead of silently skipping or amending the stop."""
+    never be trailed: the order is already at the broker, so the trail
+    treats the position as having no trailing config — the same skip the
+    percent trail gave flip positions on main — instead of recording a
+    failure on every pass for the life of the position."""
     manager = LiveTrailingStopManager()
     live.add_signal(
         "buy",
@@ -1763,6 +1765,5 @@ def test_persisted_removed_mode_entry_is_surfaced_never_amended(
     assert live.client.replace_calls == []
     assert live.client.cancelled == []
     assert live.client.stop_prices() == [98.0]
-    assert surfaced, "the removed mode must be surfaced, not silently skipped"
-    assert any("removed" in error for _msg, context in surfaced for error in [context["error"]])
+    assert not surfaced, "a persisted removed-mode row must not fail every pass"
 
