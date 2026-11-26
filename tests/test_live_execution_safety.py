@@ -3758,7 +3758,6 @@ def test_ctrader_request_build_refusal_persists_no_signal_row(monkeypatch):
             self.timeInForce = 0
             self.clientOrderId = ""
             self.relativeStopLoss = 0
-            self.relativeTakeProfit = 0
 
     adapter._ProtoOANewOrderReq = _NewOrderReq
     adapter._ProtoOAOrderType = SimpleNamespace(MARKET=1)
@@ -4028,6 +4027,11 @@ def _make_ctrader_request_builder_adapter():
             self.clientOrderId = ""
             self.stopLoss = 0
             self.takeProfit = 0
+
+        def HasField(self, name: str) -> bool:
+            # Proto-presence double: relativeStopLoss/relativeTakeProfit are
+            # deliberately absent from __init__ so presence tracks assignment.
+            return name in self.__dict__
 
     adapter._ProtoOANewOrderReq = _NewOrderReq
     adapter._ProtoOAOrderType = SimpleNamespace(MARKET=1)
@@ -5065,7 +5069,9 @@ def test_ctrader_sub_tick_stop_loss_is_refused_on_stop_only_order() -> None:
         adapter._build_new_order_request(_ethusd_signal(1925.50 - 0.004, None), symbol_id=9)
     request = adapter._build_new_order_request(_ethusd_signal(1925.49, None), symbol_id=9)
     assert request.relativeStopLoss == 1000
-    assert request.relativeTakeProfit == 0
+    # "No take profit" is an ABSENT field, never a present zero: the broker
+    # rejects a present relativeTakeProfit <= 0 ("SL/TP have to be positive").
+    assert not request.HasField("relativeTakeProfit")
 
 
 @pytest.mark.parametrize(
@@ -5256,7 +5262,58 @@ def test_unbounded_tp_policy_builds_stop_only_requests() -> None:
     )
     request = cadapter._build_new_order_request(csignal, symbol_id=7)
     assert request.relativeStopLoss == 5000
-    assert request.relativeTakeProfit == 0
+    # Absent, not zero: a present relativeTakeProfit of 0 is a broker rejection.
+    assert not request.HasField("relativeTakeProfit")
+
+
+def test_ctrader_unbounded_tp_leaves_relative_take_profit_unset_on_the_wire() -> None:
+    """Live soak regression (2026-11-25): cTrader rejected the order with
+    INVALID_REQUEST "SL/TP have to be positive" because the builder assigned
+    ``relativeTakeProfit = 0``. On the proto2 optional int64 field a present
+    zero is a VALUE, not "no TP" - the field must be absent. This test uses
+    the real generated message so ``HasField`` is the wire truth, not a fake.
+    """
+    from ctrader_open_api.messages.OpenApiMessages_pb2 import ProtoOANewOrderReq
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import (
+        ProtoOAOrderType,
+        ProtoOATimeInForce,
+        ProtoOATradeSide,
+    )
+
+    _module, adapter = _make_ctrader_request_builder_adapter()
+    adapter._ProtoOANewOrderReq = ProtoOANewOrderReq
+    adapter._ProtoOAOrderType = ProtoOAOrderType
+    adapter._ProtoOATradeSide = ProtoOATradeSide
+    adapter._ProtoOATimeInForce = ProtoOATimeInForce
+
+    unbounded = LiveSignal(
+        deployment_id="dep-1",
+        symbol="EURUSD",
+        action="buy",
+        theoretical_price=1.1,
+        timestamp=datetime.now(timezone.utc),
+        metadata={
+            "qty": 1.0,
+            "stop_loss": 1.05,
+            "take_profit_policy": "unbounded_exit_on_opposite_signal",
+        },
+    )
+    request = adapter._build_new_order_request(unbounded, symbol_id=7)
+    assert request.HasField("relativeStopLoss")
+    assert request.relativeStopLoss == 5000
+    assert not request.HasField("relativeTakeProfit")
+
+    bounded = LiveSignal(
+        deployment_id="dep-1",
+        symbol="EURUSD",
+        action="buy",
+        theoretical_price=1.1,
+        timestamp=datetime.now(timezone.utc),
+        metadata={"qty": 1.0, "stop_loss": 1.05, "take_profit": 1.2},
+    )
+    bounded_request = adapter._build_new_order_request(bounded, symbol_id=7)
+    assert bounded_request.HasField("relativeTakeProfit")
+    assert bounded_request.relativeTakeProfit == 10_000
 
 
 def test_is_unbounded_tp_rejects_non_dict_metadata() -> None:

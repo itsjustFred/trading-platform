@@ -71,6 +71,28 @@ def is_order_not_submitted(exc: BaseException) -> bool:
     return bool(getattr(exc, _ORDER_NOT_SUBMITTED_ATTR, False))
 
 
+class BrokerOrderRejectedError(RuntimeError):
+    """The broker received the order request and definitively refused it.
+
+    Distinct from a pre-request failure marked by :func:`order_not_submitted`:
+    the request DID reach the broker, but the broker's correlated answer was
+    a refusal (cTrader ``ProtoOAOrderErrorEvent`` as the response payload),
+    not an acceptance - so nothing was opened (entry) or closed (exit) and
+    the outcome is as certain as a pre-request refusal. A caller may release
+    its submission lease and record the signal as rejected instead of holding
+    it for reconciliation.
+
+    Adapters raise this ONLY when the refusal is provably tied to the request
+    that was sent: a timeout, a transport failure, or an error event that
+    cannot be correlated to this order stays an ordinary exception (unknown
+    outcome), never this type.
+    """
+
+    def __init__(self, message: str, *, error_code: str = "") -> None:
+        self.error_code = str(error_code or "").strip()
+        super().__init__(message)
+
+
 def is_unbounded_tp(metadata: object) -> bool:
     """Whether metadata declares the explicit unbounded-TP policy."""
     if not isinstance(metadata, dict):

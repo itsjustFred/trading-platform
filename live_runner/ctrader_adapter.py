@@ -25,6 +25,7 @@ from live_runner.base_adapter import (
     ORDER_STATE_TERMINAL,
     ORDER_STATE_WORKING,
     BaseLiveAdapter,
+    BrokerOrderRejectedError,
     BrokerOrderView,
     ControlOutcome,
     LivePipValue,
@@ -512,7 +513,7 @@ def _relative_distance(
 
     Floors toward the entry so a stop never widens beyond the risk the position was
     sized for. A stop under one tick is refused; a take-profit under one tick is
-    sent as one tick (0 would mean "no TP").
+    sent as one tick.
     """
     leg = "SL" if is_stop else "TP"
     if math.isnan(price) or math.isinf(price) or price <= 0:
@@ -561,12 +562,22 @@ class _SpotWaiter:
     received_at: datetime | None = None
 
 
-def _present_proto_field(payload: Any, name: str) -> Any | None:
+# Sentinel returned by ``_present_proto_field`` when field presence cannot be
+# proven. For refusal classification "absent" would release the order lease,
+# so an unanswerable ``HasField`` must read as "present / unknown" instead.
+_PRESENT_BUT_UNKNOWN = object()
+
+
+def _present_proto_field(
+    payload: Any, name: str, *, fail_closed: bool = False
+) -> Any | None:
     """The field's value when it was sent, else ``None``.
 
     Spot ``bid``/``ask`` are ``optional uint64``: ``HasField`` tells an omitted
     side from a sent one. A payload without ``HasField`` (a test double) falls
-    back to attribute presence.
+    back to attribute presence. With ``fail_closed`` a ``HasField`` failure
+    reports the field as present but unknown (the sentinel) rather than
+    absent, for callers where "absent" is the unsafe direction.
     """
     has_field = getattr(payload, "HasField", None)
     if has_field is not None:
@@ -574,6 +585,8 @@ def _present_proto_field(payload: Any, name: str) -> Any | None:
             if not bool(has_field(name)):
                 return None
         except (TypeError, ValueError):
+            if fail_closed:
+                return _PRESENT_BUT_UNKNOWN
             return None
     return getattr(payload, name, None)
 
@@ -3502,12 +3515,17 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             signal, stop_loss, take_profit
         )
         request.relativeStopLoss = relative_stop
-        request.relativeTakeProfit = relative_take
+        if relative_take is not None and relative_take > 0:
+            # proto2 optional int64: assigning 0 would make the field PRESENT
+            # and the broker validates a present relativeTakeProfit as > 0
+            # ("SL/TP have to be positive"). "No take profit" means the field
+            # is absent, so it is only ever assigned a positive distance.
+            request.relativeTakeProfit = relative_take
         return request
 
     def _resolve_relative_sl_tp(
         self, signal: LiveSignal, stop_loss: float, take_profit: float | None
-    ) -> tuple[int, int]:
+    ) -> tuple[int, int | None]:
         """Convert absolute SL/TP prices into cTrader relative units.
 
         Per the cTrader Open API docs, ProtoOANewOrderReq's absolute
@@ -3523,8 +3541,13 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         to the symbol grid of ``10 ** (5 - price_digits)`` units (1 when the symbol
         is finer than 5 digits), i.e. toward the entry, so the real risk never
         exceeds the sized risk (docs/live-risk-consistency.md). A take-profit under
-        one tick is sent as one tick (0 would mean "no TP"); a stop-loss under one
-        tick is refused, because widening it would exceed the sized risk.
+        one tick is sent as one tick; a stop-loss under one tick is refused,
+        because widening it would exceed the sized risk.
+
+        Returns ``(relative_stop, relative_take)`` where ``relative_take`` is
+        ``None`` for the explicit unbounded-TP policy: the caller must leave
+        ``relativeTakeProfit`` unset on the wire, because a present zero is a
+        broker rejection, not "no take profit".
         """
         reference_price = float(signal.theoretical_price)
         if not math.isfinite(reference_price) or reference_price <= 0:
@@ -3554,9 +3577,10 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 f"reference={reference_price!r}; refusing to submit."
             )
         if take_profit is None:
-            # C1: explicit unbounded policy — stop-only order. cTrader treats
-            # a zero relativeTakeProfit as "no take profit".
-            return (distance(stop_loss, is_stop=True), 0)
+            # C1: explicit unbounded policy — stop-only order. cTrader has no
+            # "no take profit" value for a present field: the field must be
+            # left unset entirely (None here -> the caller never assigns it).
+            return (distance(stop_loss, is_stop=True), None)
         take_outward = take_profit - reference_price if buy else reference_price - take_profit
         if take_outward <= 0:
             raise ValueError(
@@ -3573,8 +3597,32 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             self._raise_terminal_auth_from_api_error(exc)
             raise
         if isinstance(response, self._ProtoOAOrderErrorEvent):
-            raise RuntimeError(
-                f"Order rejected ({response.errorCode}): {response.description or 'no description'}"
+            # The response is correlated to THIS request by clientMsgId, but
+            # only an error event with no broker order id is a clean refusal:
+            # a non-zero orderId means the broker created an order record, and
+            # for a new-order request a non-zero positionId is not provably
+            # pre-position either. A close request echoes positionId, so only
+            # its orderId decides. Timeouts and transport failures still
+            # propagate as ordinary exceptions (unknown outcome): the request
+            # may have landed.
+            order_id = _present_proto_field(response, "orderId", fail_closed=True)
+            position_id = _present_proto_field(response, "positionId", fail_closed=True)
+            is_close_position = (
+                self._ProtoOAClosePositionReq is not None
+                and isinstance(request, self._ProtoOAClosePositionReq)
+            )
+            definitive_refusal = order_id in (None, 0) and (
+                is_close_position or position_id in (None, 0)
+            )
+            message = (
+                f"Order rejected ({getattr(response, 'errorCode', '') or ''}): "
+                f"{getattr(response, 'description', '') or 'no description'}"
+            )
+            if not definitive_refusal:
+                raise RuntimeError(message)
+            raise BrokerOrderRejectedError(
+                message,
+                error_code=str(getattr(response, "errorCode", "") or ""),
             )
         return response
 
