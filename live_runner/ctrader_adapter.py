@@ -1459,7 +1459,9 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         # ``time.monotonic()`` of the last session teardown or transport
         # loss; ``listen_executions`` waits out
         # ``_LISTENER_RECONNECT_MIN_INTERVAL_SECONDS`` from it before
-        # reconnecting so a flapping broker cannot spin the loop.
+        # reconnecting so a flapping broker cannot spin the loop. This is
+        # monotonic history for the process lifetime - never reset on
+        # (re)connect, or the floor silently disappears.
         self._last_session_teardown_at = 0.0
         # Deferreds handed out by ``_client.send`` and still awaiting a
         # response. Upstream ``Client._disconnected`` clears
@@ -2390,6 +2392,9 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             f"{type(request).__name__}-{self._client_msg_seq}"
         )
         client = self._client
+        # Capture BEFORE send: moving this after ``client.send`` would miss a
+        # ``_fail_in_flight_requests`` that ran during the send, leaving the
+        # new deferred untracked until its response timeout.
         fail_generation = self._in_flight_fail_generation
         deferred = client.send(
             request,
