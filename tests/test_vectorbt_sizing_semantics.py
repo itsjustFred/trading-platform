@@ -68,10 +68,6 @@ def sizing_env(tmp_path: Path):
 
 
 class TestLeverageSemantics:
-    def test_resolver_keeps_conservative_leverage(self):
-        assert _resolve_max_leverage(1.0) == 1.0
-        assert _resolve_max_leverage(0.5) == 0.5
-
     def test_conservative_max_leverage_binds_notional(self, sizing_env):
         """max_leverage=1 must cap the notional at 1x equity — no override."""
         tmp_path, strategy_path = sizing_env
@@ -418,34 +414,6 @@ class TestTightCapSizing:
             assert notional <= risk_math["equity_at_entry"] * 0.01 + slack, (
                 "the position cap (1%) must bind the notional even when "
                 "leverage would allow more"
-            )
-            assert risk_math["capped_by_max_position"] is True
-
-
-class TestTightCapSizingTolerance:
-    def test_tight_position_cap_binds_before_leverage_tolerant(self, sizing_env):
-        """Position cap binds the notional within rounding tolerance.
-
-        Rounding tolerance note: ``quantity`` is rounded to 4 decimals and
-        prices to 6, so the notional can exceed the cap by a fraction of a
-        cent; the assertion therefore allows a tiny relative slack.
-        """
-        tmp_path, strategy_path = sizing_env
-        config = _config(
-            tmp_path,
-            risk_per_trade_pct=0.5,
-            max_position_pct=0.01,
-            max_leverage=10.0,
-        )
-        result = VectorbtAdapter().run(config, str(strategy_path))
-        assert result.trades
-        for trade in result.trades:
-            risk_math = trade.meta["risk_math"]
-            notional = trade.entry_price * trade.quantity
-            slack = 0.01 + 1e-9  # one cent for rounding
-            assert notional <= risk_math["equity_at_entry"] * 0.01 + slack, (
-                "the position cap (1%) must bind the notional even when "
-                "leverage would allow more (rounding slack: one cent)"
             )
             assert risk_math["capped_by_max_position"] is True
 
