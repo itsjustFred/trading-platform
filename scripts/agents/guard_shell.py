@@ -749,6 +749,8 @@ def _check_main_env_command(argv: list[str]) -> str | None:
                 f"extras the live daemon needs); {_MAIN_HINT}."
             )
         if sub in _UV_ENV_BLOCKED:
+            if "--dry-run" in rest or "--check" in rest:
+                return None  # read-only: resolves/reports, writes nothing
             return (
                 f"blocked: `uv {sub}` changes the shared venv or the "
                 f"daemon's checkout; {_MAIN_HINT}."
@@ -886,6 +888,17 @@ def _eval_argv(
         while i < len(args):
             tok = args[i]
             if tok == "-m" and i + 1 < len(args):
+                m_idx = i
+                break
+            # Clustered form (`-Im pip`): 'm' last, no value-taking letter before it.
+            if (
+                tok.startswith("-")
+                and not tok.startswith("--")
+                and len(tok) > 1
+                and tok.endswith("m")
+                and not any(ch in "WXc" for ch in tok[1:-1])
+                and i + 1 < len(args)
+            ):
                 m_idx = i
                 break
             if tok == "-c" or (not tok.startswith("-") and tok != "-"):
