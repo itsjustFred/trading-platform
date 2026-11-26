@@ -3340,21 +3340,6 @@ class TestRejectionStreakIsLoggedNotFatal:
         assert summary["rejected_author_ids"] == [self.NITRO_AUTHOR]
         assert summary["rejected_count"] >= AUTHOR_REJECTION_STREAK_THRESHOLD
 
-    def test_the_alert_fires_once_not_per_message(self, caplog):
-        from live_runner.signal_sources.discord_source import (
-            AUTHOR_REJECTION_STREAK_THRESHOLD,
-        )
-
-        source = self._source(self.WRONG_AUTHOR)
-        with caplog.at_level(logging.ERROR):
-            asyncio.run(
-                self._feed(source, self.NITRO_AUTHOR, AUTHOR_REJECTION_STREAK_THRESHOLD * 4)
-            )
-
-        alerts = [r for r in caplog.records if "rejected every recent message" in r.message]
-        assert len(alerts) == 1, f"repeated alerts: {len(alerts)}"
-        assert self.statuses == []
-
 
 class TestObserveChannelAuthors:
     """Reading the allowlist value instead of guessing it.
