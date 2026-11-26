@@ -1,26 +1,33 @@
-"""Characterization of every strict boolean parser on the live path (G08).
+"""One strict parser for the money path's boolean env vars (G08).
 
 ``CTRADER_DEMO``, ``ALPACA_PAPER`` and ``allow_short`` decide whether the
-platform trades real money, so every parser that reads them has to reject the
-same typo'd value with the same operator-facing message. That contract was
-implemented several times in ``live_runner``; these tests pin each copy's
-behaviour BEFORE the copies are replaced by
-:func:`live_runner.credential_env.parse_bool_env`, so the merge can only be a
-no-op.
+platform trades real money, so a typo'd value has to raise. The parser that
+does it used to live in four places in ``live_runner``; it now lives once, in
+:func:`live_runner.credential_env.parse_bool_env`. This suite pins it from the
+caller side, so the merge cannot be undone silently:
 
-The parsers that stay deliberately unmerged (a different error type, a
-different operator-facing message, or a value domain that is not an env var)
-are pinned here too, so a later attempt to merge them has the same baseline.
+* every recognized token, both defaults and the exact rejection message of the
+  canonical parser - characterized before the copies were replaced, so the
+  merge had to be a no-op;
+* every former caller - preflight and daemon credential resolution, both
+  adapter constructors, both Alpaca credential readers,
+  ``_deployment_allows_short`` and ``_deployment_wait_for_candle_close`` -
+  rejecting ``"ture"`` with the canonical message;
+* ``loss_breaker._env_bool``, the one copy that stays: same tokens, its own
+  (shorter) operator-facing message, pinned as a maintainer decision.
+``risk.models._parse_bool`` and ``shared.sentry._parse_bool`` are pinned in
+their own test files - they do not parse env vars.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from types import ModuleType
 
 import pytest
 
-from live_runner import alpaca_adapter, daemon, loss_breaker, preflight
+from live_runner import alpaca_adapter, ctrader_adapter, daemon, loss_breaker, preflight
 from live_runner.credential_env import parse_bool_env
 from live_runner.ctrader_adapter import CTraderLiveAdapter
 from shared.models import LiveDeploymentConfig
@@ -288,3 +295,27 @@ def test_loss_breaker_rejects_the_same_typo_with_its_own_message() -> None:
         )
 
     assert str(excinfo.value) == _loss_breaker_error("LOSS_BREAKER_ENABLED", "ture")
+
+
+# ─── the merge must not be undone by a fresh copy ────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "module",
+    [ctrader_adapter, preflight, daemon, alpaca_adapter],
+    ids=["ctrader_adapter", "preflight", "daemon", "alpaca_adapter"],
+)
+def test_no_live_runner_module_keeps_a_private_bool_env_parser(
+    module: ModuleType,
+) -> None:
+    """Every former copy is gone and must not come back as a fifth one.
+
+    A private copy is how the daemon's lenient variant appeared in the first
+    place: it accepted every unrecognized token as ``False``, so a typo'd
+    ``CTRADER_DEMO`` would have disabled demo trading silently.
+    """
+
+    for name in ("_parse_bool_env", "_parse_strict_bool_env", "_env_bool"):
+        assert not hasattr(module, name), f"{module.__name__} still defines {name}"
+    for name in ("_TRUE_BOOL_TOKENS", "_FALSE_BOOL_TOKENS"):
+        assert not hasattr(module, name), f"{module.__name__} still defines {name}"
