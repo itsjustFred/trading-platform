@@ -554,3 +554,47 @@ def test_no_module_spells_out_the_allowlist_outside_the_shared_module() -> None:
         f"Sites removed: {stale}. Drop them from EXEMPT_ALIAS_VOCABULARIES, or "
         "restore the vocabulary they guarded."
     )
+
+
+def test_alpaca_rewrites_every_alias_from_the_shared_resolution() -> None:
+    """`_round_bracket_levels_in_place` reads the level through the shared resolver.
+
+    The tick rounding rewrites EVERY alias of the level it resolved, so a signal
+    that published ``sl_price``/``tp_price`` only persists and submits the same
+    rounded level the resolver read. Called before persistence (B-8), a
+    malformed alias must refuse here rather than reach the broker.
+    """
+    from live_runner import alpaca_adapter as module
+
+    signal = LiveSignal(
+        deployment_id="dep-1",
+        symbol="AAPL",
+        action="buy",
+        theoretical_price=354.85,
+        timestamp=datetime.now(timezone.utc),
+        metadata={"sl_price": 354.75300000000004, "tp_price": 369.04400000000004},
+    )
+    metadata = dict(signal.metadata or {})
+
+    module._round_bracket_levels_in_place(  # noqa: SLF001 - the caller under test
+        metadata, entry_price=354.85, signal=signal
+    )
+
+    # Buy: the stop rounds UP toward the entry (less risk than sized), the
+    # target rounds DOWN (never beyond the requested level).
+    for key in module.SL_METADATA_KEYS:
+        if key in metadata:
+            assert metadata[key] == pytest.approx(354.76), key
+    for key in module.TP_METADATA_KEYS:
+        if key in metadata:
+            assert metadata[key] == pytest.approx(369.04), key
+    assert metadata["stop_loss"] == pytest.approx(354.76)
+    assert metadata["take_profit"] == pytest.approx(369.04)
+
+    broken = dict(
+        signal.metadata or {}, stop_loss="not-a-price", stop_price="still-one-alias"
+    )
+    with pytest.raises(ValueError, match="Invalid stop_loss"):
+        module._round_bracket_levels_in_place(  # noqa: SLF001 - the caller under test
+            broken, entry_price=354.85, signal=signal
+        )
