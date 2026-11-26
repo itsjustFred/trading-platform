@@ -1045,11 +1045,16 @@ def _payload_ctid_trader_account_id(payload: Any) -> int:
     ``ProtoOAErrorRes.ctidTraderAccountId`` is proto3-optional: unset reads back
     as ``0``, which is never a real cTrader account id, so ``0`` doubles as
     "not set" and the caller only compares when the result is non-zero.
+    Non-positive values are clamped to ``0`` for the same reason
+    ``_payload_ctid_trader_account_ids`` drops them: a negative id cannot be
+    proven foreign, and treating it as a foreign account would silently drop
+    (e.g.) a disconnect event that should tear the session down.
     """
     try:
-        return int(getattr(payload, "ctidTraderAccountId", 0) or 0)
+        account_id = int(getattr(payload, "ctidTraderAccountId", 0) or 0)
     except (TypeError, ValueError):
         return 0
+    return account_id if account_id > 0 else 0
 
 
 def _payload_ctid_trader_account_ids(payload: Any) -> tuple[int, ...]:
@@ -3099,6 +3104,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 extra={"data": {"error": str(exc)}},
             )
             return
+        errback_failures = 0
         for deferred in pending:
             try:
                 deferred.errback(
@@ -3107,7 +3113,13 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                     )
                 )
             except Exception:  # except-kind: loop-survival
-                pass
+                errback_failures += 1
+        if errback_failures:
+            logger.warning(
+                "Could not errback %d in-flight cTrader request(s) during "
+                "teardown; their awaiters will hit their own timeout",
+                errback_failures,
+            )
 
     def _teardown_client(self) -> None:
         """Drop the current client and ask Twisted to stop its service so a later
@@ -3134,8 +3146,11 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         # Wake ``listen_executions`` so the teardown is noticed now - the
         # listener would otherwise sleep out its 30 s ``queue.get`` timeout
         # before reconnecting and reconciling the gap. If the queue is full
-        # the wake is dropped, so flag reconciliation explicitly.
+        # the wake is dropped, so flag reconciliation explicitly. Clear any
+        # stale retry backoff too, or the flagged reconcile would wait out a
+        # prior failure's ``_reconciliation_retry_at``.
         self._reconciliation_required = True
+        self._reconciliation_retry_at = 0.0
         try:
             self._execution_queue.put_nowait(_EXECUTION_RECONCILE_WAKE)
         except asyncio.QueueFull:
