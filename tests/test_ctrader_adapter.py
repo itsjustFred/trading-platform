@@ -1822,6 +1822,49 @@ def test_send_request_fails_fast_when_teardown_lands_during_send() -> None:
     asyncio.run(_run())
 
 
+def test_fail_in_flight_requests_warns_when_client_lacks_response_deferreds(
+    caplog,
+) -> None:
+    """A ctrader-open-api bump that removes ``_responseDeferreds`` entirely
+    must still errback adapter-tracked deferreds AND log a warning - the
+    missed client-side enumeration cannot be silent."""
+    import logging
+
+    from live_runner.ctrader_adapter import CTraderConnectionLostError
+
+    async def _run() -> None:
+        adapter = CTraderLiveAdapter(
+            app_id="app", app_secret="secret", access_token="token", account_id="1"
+        )
+        adapter._loop = asyncio.get_running_loop()
+
+        class _Deferred:
+            called = False
+            errbacks: list[BaseException] = []
+
+            def errback(self, exc: BaseException) -> None:
+                self.called = True
+                self.errbacks.append(exc)
+
+        deferred = _Deferred()
+        adapter._in_flight_request_deferreds.add(deferred)
+
+        class _Client:
+            pass  # no _responseDeferreds attribute at all
+
+        with caplog.at_level(logging.WARNING, logger="trading.live-runner"):
+            adapter._fail_in_flight_requests(client=_Client())
+
+        assert deferred.called
+        assert isinstance(deferred.errbacks[0], CTraderConnectionLostError)
+        assert any(
+            "exposes no _responseDeferreds" in record.getMessage()
+            for record in caplog.records
+        )
+
+    asyncio.run(_run())
+
+
 def test_on_disconnected_flags_reconciliation_and_wakes_listener() -> None:
     """A plain transport loss can hide missed executions exactly like a
     session teardown: the listener must be woken and broker reconciliation
