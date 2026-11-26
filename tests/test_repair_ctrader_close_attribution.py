@@ -27,6 +27,7 @@ from shared.database import (
     LiveExecutionModel,
     LiveSignalModel,
     get_session,
+    list_live_deployment_open_position_lots,
 )
 from shared.models import LiveExecution, LiveSignal
 from tests.conftest import seed_live_deployments
@@ -81,6 +82,7 @@ def _persist_exit_signal(
     database,
     *,
     deployment_id: str = DEP,
+    symbol: str = "AAPL",
     order_id: str = CLOSE_ORDER_ID,
     action: str = "sell",
     metadata_extra: dict[str, Any] | None = None,
@@ -89,6 +91,7 @@ def _persist_exit_signal(
     return _persist_signal(
         database,
         deployment_id=deployment_id,
+        symbol=symbol,
         action=action,
         order_id=order_id,
         metadata_extra={
@@ -410,3 +413,75 @@ def test_a_close_signal_with_a_refused_fill_is_not_deleted(database) -> None:
     assert _signal(database, close_id) is not None
     assert len(_executions_for(database, close_id)) == 1
     assert len(_executions_for(database, exit_id)) == 1
+
+
+def test_an_untargeted_move_is_refused_when_a_stamp_would_apply(database) -> None:
+    """S7 pin: when the repair must stamp ``parent_signal_id`` on the owner,
+    an *untargeted* close fill cannot move - the stamp applies to the whole
+    signal, so the moved fill would become attributed where it was not
+    before, changing the ledger."""
+    entry_id = _persist_entry(database)
+    exit_id = _persist_exit_signal(database)
+    targeted_close = _broker_close_signal(database, parent_id=entry_id)
+    untargeted_close = _broker_close_signal(database, parent_id="")
+    _persist_execution(database, signal_id=targeted_close, dedupe_key="ctrader:deal:9001")
+    _persist_execution(database, signal_id=untargeted_close, dedupe_key="ctrader:deal:9002")
+    targeted_execution_id = str(_executions_for(database, targeted_close)[0].id)
+
+    report = repair.repair_ctrader_close_attribution(apply=True)
+
+    assert [m["execution_id"] for m in report["moves"]] == [targeted_execution_id]
+    assert [r["reason"] for r in report["refusals"]] == [
+        "would_be_attributed_by_repair"
+    ]
+    assert report["refusals"][0]["close_signal_id"] == untargeted_close
+    # The targeted fill moved and the owner was stamped; the untargeted fill
+    # and its synthetic signal are untouched.
+    assert len(_executions_for(database, exit_id)) == 1
+    assert len(_executions_for(database, untargeted_close)) == 1
+    assert _signal(database, untargeted_close) is not None
+    owner = _signal(database, exit_id)
+    assert owner is not None
+    assert (owner.metadata_json or {}).get(BROKER_CLOSE_PARENT_SIGNAL_KEY) == entry_id
+
+
+def test_a_symbol_mismatch_is_refused(database) -> None:
+    """S8 pin: a close fill can only move onto an owner of the same symbol -
+    attribution across symbols would corrupt both ledgers."""
+    entry_id = _persist_entry(database)
+    _persist_exit_signal(database, symbol="MSFT")
+    close_id = _broker_close_signal(database, parent_id=entry_id)
+    _persist_execution(database, signal_id=close_id)
+
+    report = repair.repair_ctrader_close_attribution(apply=True)
+
+    assert report["moves"] == []
+    assert [r["reason"] for r in report["refusals"]] == ["symbol_mismatch"]
+    assert _executions_for(database, close_id)[0].signal_id == close_id
+
+
+def test_apply_keeps_the_open_position_lots_identical(database) -> None:
+    """Ledger identity: moving a targeted close fill onto its exit owner and
+    stamping ``parent_signal_id`` must leave the deployment's open position
+    lots exactly as they were - the fill keeps crediting the same entry."""
+    entry_id = _persist_entry(database)
+    _persist_execution(
+        database,
+        signal_id=entry_id,
+        dedupe_key="ctrader:deal:entry",
+        broker_order_id="111",
+        qty=10.0,
+    )
+    _persist_exit_signal(database)
+    close_id = _broker_close_signal(database, parent_id=entry_id)
+    _persist_execution(database, signal_id=close_id, qty=4.0)
+
+    before = list_live_deployment_open_position_lots(DEP, "AAPL")
+    assert before and before[0]["signal_id"] == entry_id
+
+    report = repair.repair_ctrader_close_attribution(apply=True)
+    assert len(report["moves"]) == 1
+    assert len(report["metadata_updates"]) == 1
+
+    after = list_live_deployment_open_position_lots(DEP, "AAPL")
+    assert after == before

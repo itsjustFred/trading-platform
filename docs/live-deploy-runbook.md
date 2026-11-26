@@ -1589,8 +1589,11 @@ signals ... the fill is NOT stored".
 The adapter now attributes a fill whose `clientOrderId` names no signal by
 its **broker order id** instead: the in-memory order→signal map first, then
 the `broker_order_id` persisted on the signal row — and only when that
-signal's metadata marks it as an exit (`signal_intent=exit`, `exit_only`,
-or `risk_sizing_mode=exit_only`). A fill arriving while its close submit is
+signal's metadata marks it as an exit **the way the ledger defines one**
+(`exit_only` or `risk_sizing_mode=exit_only` — `shared.database.
+is_exit_only_signal_metadata`, the same predicate `_position_lot_entries`
+uses, so a fill can never be attributed onto a signal the ledger would count
+as an entry). A fill arriving while its close submit is
 still in flight (order id not yet persisted) is retained for reconciliation
 rather than booked as a broker-side close; the pending mark expires after
 `_PENDING_CLOSE_POSITION_TTL_SECONDS` (1 h) so a stuck submit cannot hold a
@@ -1612,12 +1615,29 @@ Every applied repair writes a `live_control_audit` row
 (`action=broker_close_attribution_repair`).
 
 ```bash
-# Report only - writes nothing:
+# Report only - writes no data (init_db can still apply pending schema
+# migrations, so run it on a quiesced daemon like any other process start):
 uv run python -m scripts.repair_ctrader_close_attribution
 
 # Apply the moves, stamps, deletions and audit rows in one transaction:
 uv run python -m scripts.repair_ctrader_close_attribution --apply
 ```
+
+**Operator steps, in order:**
+
+1. **Deploy this build and restart the daemon FIRST.** An old build keeps
+   mis-booking every new cTrader close as it arrives; repairing before the
+   new attribution code is live just refills the same hole.
+2. Take a `.backup` of `backtests.db` (the script's own snapshot discipline
+   applies: copy, dry-run, review, apply).
+3. Prefer running the script with the **daemon stopped**. A concurrent write
+   does not corrupt anything - the whole repair is one transaction with
+   foreign keys on, so a racing write only makes the commit fail and roll
+   back - but a stopped daemon makes that impossible rather than unlikely.
+4. The report is printed as JSON on **stdout**; log lines go to **stderr**,
+   so `... | jq` works. Review `moves`, `metadata_updates`,
+   `deleted_signals`, `refusals` and `unmatched` before `--apply`.
+5. Re-run the dry-run afterwards: an applied repair reports zero moves.
 
 Review the dry-run report first: `moves` lists each fill that would change
 owner, `metadata_updates` each `parent_signal_id` stamp, `deleted_signals`

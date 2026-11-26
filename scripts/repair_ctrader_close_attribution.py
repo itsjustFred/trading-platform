@@ -35,6 +35,9 @@ claiming one owner. Refused rows are reported and left untouched.
 Dry-run discipline: without ``--apply`` nothing is written - the script only
 reports what it would move. Every applied repair writes a
 ``live_control_audit`` row (``action=broker_close_attribution_repair``).
+"Writes nothing" covers DATA: ``init_db()`` still runs first and can apply
+pending schema migrations to the target database, exactly like any other
+process start - run the dry-run on a stopped or otherwise quiesced daemon.
 
 Usage:
     python -m scripts.repair_ctrader_close_attribution            # report only
@@ -81,8 +84,9 @@ from shared.database import (
     LiveSignalModel,
     get_session,
     init_db,
+    is_exit_only_signal_metadata,
 )
-from shared.logging import get_logger
+from shared.logging import get_logger, route_console_logs_to_stderr
 
 logger = get_logger("scripts.repair-ctrader-close-attribution")
 
@@ -107,12 +111,17 @@ def _reduction_target(metadata: dict[str, Any]) -> str:
 
 
 def _is_exit_signal_metadata(metadata: dict[str, Any]) -> bool:
-    """Mirror of the adapter's exit-signal check (``_metadata_is_exit_signal``)."""
-    return (
-        str(metadata.get("signal_intent") or "") == "exit"
-        or bool(metadata.get("exit_only"))
-        or str(metadata.get("risk_sizing_mode") or "").strip().lower() == "exit_only"
-    )
+    """The ledger's own exit predicate (``shared.database``).
+
+    Deliberately NOT a looser local mirror: the repair moves fills onto the
+    owner only when the ledger will count them as reducing, so the test is
+    ``is_exit_only_signal_metadata`` itself - ``exit_only`` or
+    ``risk_sizing_mode=exit_only``. A signal marked only
+    ``signal_intent=exit`` is an entry lot to the ledger, and attributing a
+    close fill to it would flip the ledger the repair promises to keep
+    identical.
+    """
+    return is_exit_only_signal_metadata(metadata)
 
 
 def _candidate_owners(
@@ -138,13 +147,81 @@ def _owner_preexisting_executions(session: Session, owner_id: str) -> int:
     )
 
 
-def _plan_moves(session: Session) -> dict[str, Any]:
-    """Classify every execution on a broker-close signal: move, refuse or skip.
+def _classify_close_execution(
+    session: Session,
+    *,
+    close: LiveSignalModel,
+    broker_order_id: str,
+) -> tuple[str, Any]:
+    """``("unmatched:<reason>" | "refused:ambiguous_owner" | "owner", resolved)``.
 
-    Returns ``{"moves", "refusals", "unmatched", "close_signals"}`` where a
-    move is ``{"execution", "close", "owner", "parent", "metadata_parent"}``
-    and ``metadata_parent`` is the ``parent_signal_id`` the repair must stamp
-    on the owner so its fills keep crediting the same entry (``None`` = no
+    Resolves the unique same-deployment owner of the execution's broker order
+    id; ``resolved`` is the owner model, the owner list for an ambiguous
+    match, or ``None``.
+    """
+    if not broker_order_id:
+        return "unmatched:empty_broker_order_id", None
+    owners = _candidate_owners(
+        session,
+        deployment_id=str(close.deployment_id),
+        broker_order_id=broker_order_id,
+        exclude_id=str(close.id),
+    )
+    if not owners:
+        return "unmatched:no_same_deployment_owner", None
+    if len(owners) > 1:
+        return "refused:ambiguous_owner", owners
+    return "owner", owners[0]
+
+
+def _first_pass_move_refusal(
+    *, close: LiveSignalModel, owner: LiveSignalModel
+) -> str | None:
+    """The first-pass refusal reason for an execution's resolved owner."""
+    owner_metadata = _metadata(owner)
+    close_metadata = _metadata(close)
+    parent = str(close_metadata.get(BROKER_CLOSE_PARENT_SIGNAL_KEY) or "").strip()
+    owner_target = _reduction_target(owner_metadata)
+    if not _is_exit_signal_metadata(owner_metadata):
+        return "owner_not_exit_signal"
+    if str(owner.action or "").strip().lower() != str(
+        close.action or ""
+    ).strip().lower():
+        # The synthetic close's action IS the reducing side; an owner
+        # with a different action would flip the ledger's sign.
+        return "action_mismatch"
+    if str(owner.symbol or "").strip().upper() != str(
+        close.symbol or ""
+    ).strip().upper():
+        return "symbol_mismatch"
+    if owner_target and owner_target != parent:
+        # The owner already credits a different entry: moving would
+        # re-attribute the fill.
+        return "attribution_conflict"
+    if owner_target and not parent:
+        # The synthetic fill was unattributed (FIFO); the owner's
+        # target would newly attribute it.
+        return "attribution_conflict"
+    return None
+
+
+def _plan_first_pass_moves(
+    session: Session,
+) -> tuple[
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[LiveSignalModel],
+    dict[str, list[LiveExecutionModel]],
+]:
+    """Classify every execution on a broker-close signal: candidate move,
+    unmatched or refused - before the per-owner stamp decision.
+
+    Returns ``(moves, refusals, unmatched, close_signals,
+    executions_by_close)`` where a move is
+    ``{"execution", "close", "owner", "parent", "metadata_parent"}`` and
+    ``metadata_parent`` is the ``parent_signal_id`` the repair must stamp on
+    the owner so its fills keep crediting the same entry (``None`` = no
     metadata change needed).
     """
     close_signals = list(
@@ -176,72 +253,73 @@ def _plan_moves(session: Session) -> dict[str, Any]:
                 "dedupe_key": execution.dedupe_key,
                 "filled_qty": float(execution.filled_qty or 0.0),
             }
-            if not broker_order_id:
+            outcome, resolved = _classify_close_execution(
+                session, close=close, broker_order_id=broker_order_id
+            )
+            if outcome == "unmatched:empty_broker_order_id":
                 unmatched.append({**base, "reason": "empty_broker_order_id"})
                 continue
-            owners = _candidate_owners(
-                session,
-                deployment_id=str(close.deployment_id),
-                broker_order_id=broker_order_id,
-                exclude_id=str(close.id),
-            )
-            if not owners:
+            if outcome == "unmatched:no_same_deployment_owner":
                 unmatched.append({**base, "reason": "no_same_deployment_owner"})
                 continue
-            if len(owners) > 1:
+            if outcome == "refused:ambiguous_owner":
                 refusals.append(
                     {
                         **base,
                         "reason": "ambiguous_owner",
-                        "owner_signal_ids": sorted(str(o.id) for o in owners),
+                        "owner_signal_ids": sorted(str(o.id) for o in resolved),
                     }
                 )
                 continue
-            owner = owners[0]
-            owner_metadata = _metadata(owner)
-            close_metadata = _metadata(close)
-            parent = str(close_metadata.get(BROKER_CLOSE_PARENT_SIGNAL_KEY) or "").strip()
-            owner_target = _reduction_target(owner_metadata)
-            reason = None
-            if not _is_exit_signal_metadata(owner_metadata):
-                reason = "owner_not_exit_signal"
-            elif str(owner.action or "").strip().lower() != str(
-                close.action or ""
-            ).strip().lower():
-                # The synthetic close's action IS the reducing side; an owner
-                # with a different action would flip the ledger's sign.
-                reason = "action_mismatch"
-            elif str(owner.symbol or "").strip().upper() != str(
-                close.symbol or ""
-            ).strip().upper():
-                reason = "symbol_mismatch"
-            elif owner_target and owner_target != parent:
-                # The owner already credits a different entry: moving would
-                # re-attribute the fill.
-                reason = "attribution_conflict"
-            elif owner_target and not parent:
-                # The synthetic fill was unattributed (FIFO); the owner's
-                # target would newly attribute it.
-                reason = "attribution_conflict"
+            owner = resolved
+            assert isinstance(owner, LiveSignalModel)
+            reason = _first_pass_move_refusal(close=close, owner=owner)
             if reason is not None:
                 refusals.append(
                     {**base, "reason": reason, "owner_signal_id": str(owner.id)}
                 )
                 continue
+            close_metadata = _metadata(close)
             moves.append(
                 {
                     "execution": execution,
                     "close": close,
                     "owner": owner,
-                    "parent": parent,
+                    "parent": str(
+                        close_metadata.get(BROKER_CLOSE_PARENT_SIGNAL_KEY) or ""
+                    ).strip(),
                     "metadata_parent": None,
                 }
             )
+    return moves, refusals, unmatched, close_signals, executions_by_close
 
-    # Second pass, per owner: decide whether the owner's fills keep crediting
-    # the same entry, and whether a ``parent_signal_id`` stamp on the owner is
-    # needed and safe. ``moves`` still holds every candidate; ``accepted``
-    # collects the ones that survive.
+
+def _refuse_owner_move(
+    move: dict[str, Any], reason: str, *, owner_id: str, refusals: list[dict[str, Any]]
+) -> None:
+    refusals.append(
+        {
+            "execution_id": str(move["execution"].id),
+            "close_signal_id": str(move["close"].id),
+            "broker_order_id": str(move["execution"].broker_order_id or "")
+            .strip(),
+            "dedupe_key": move["execution"].dedupe_key,
+            "filled_qty": float(move["execution"].filled_qty or 0.0),
+            "reason": reason,
+            "owner_signal_id": owner_id,
+        }
+    )
+
+
+def _plan_owner_moves(
+    session: Session,
+    moves: list[dict[str, Any]],
+    refusals: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Second pass, per owner: decide whether the owner's fills keep crediting
+    the same entry, and whether a ``parent_signal_id`` stamp on the owner is
+    needed and safe. Returns the moves that survive.
+    """
     moves_by_owner: dict[str, list[dict[str, Any]]] = {}
     for move in moves:
         moves_by_owner.setdefault(str(move["owner"].id), []).append(move)
@@ -252,20 +330,6 @@ def _plan_moves(session: Session) -> dict[str, Any]:
         owner_target = _reduction_target(_metadata(owner))
         targeted = [m for m in owner_moves if str(m["parent"]).strip()]
         untargeted = [m for m in owner_moves if not str(m["parent"]).strip()]
-
-        def _refuse(move: dict[str, Any], reason: str, *, _owner_id: str = owner_id) -> None:
-            refusals.append(
-                {
-                    "execution_id": str(move["execution"].id),
-                    "close_signal_id": str(move["close"].id),
-                    "broker_order_id": str(move["execution"].broker_order_id or "")
-                    .strip(),
-                    "dedupe_key": move["execution"].dedupe_key,
-                    "filled_qty": float(move["execution"].filled_qty or 0.0),
-                    "reason": reason,
-                    "owner_signal_id": _owner_id,
-                }
-            )
 
         if owner_target or not targeted:
             # ``owner_target`` non-empty means the first pass already proved
@@ -284,7 +348,7 @@ def _plan_moves(session: Session) -> dict[str, Any]:
             reason = "owner_has_other_fills"
         if reason is not None:
             for move in targeted:
-                _refuse(move, reason)
+                _refuse_owner_move(move, reason, owner_id=owner_id, refusals=refusals)
             accepted.extend(untargeted)
             continue
 
@@ -295,8 +359,26 @@ def _plan_moves(session: Session) -> dict[str, Any]:
         # The stamp applies to the whole signal: fills that named no parent
         # would become attributed, so they cannot move.
         for move in untargeted:
-            _refuse(move, "would_be_attributed_by_repair")
+            _refuse_owner_move(
+                move, "would_be_attributed_by_repair", owner_id=owner_id, refusals=refusals
+            )
 
+    return accepted
+
+
+def _plan_moves(session: Session) -> dict[str, Any]:
+    """Classify every execution on a broker-close signal: move, refuse or skip.
+
+    Returns ``{"moves", "refusals", "unmatched", "close_signals"}`` where a
+    move is ``{"execution", "close", "owner", "parent", "metadata_parent"}``
+    and ``metadata_parent`` is the ``parent_signal_id`` the repair must stamp
+    on the owner so its fills keep crediting the same entry (``None`` = no
+    metadata change needed).
+    """
+    moves, refusals, unmatched, close_signals, executions_by_close = (
+        _plan_first_pass_moves(session)
+    )
+    accepted = _plan_owner_moves(session, moves, refusals)
     return {
         "moves": accepted,
         "refusals": refusals,
@@ -450,6 +532,8 @@ def main() -> int:
         help="Write the repair. Without it the script only reports (default).",
     )
     args = parser.parse_args()
+    # The report is the CLI's stdout contract (``| jq``): logs go to stderr.
+    route_console_logs_to_stderr()
     report = repair_ctrader_close_attribution(apply=args.apply)
     print(json.dumps(report, indent=2, sort_keys=True, default=str))
     return 0

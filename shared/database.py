@@ -4716,7 +4716,7 @@ def list_live_deployment_unfilled_entry_order_refs(
             continue
         metadata_dict = metadata if isinstance(metadata, dict) else {}
         is_close = (
-            _is_exit_only_signal_metadata(metadata_dict)
+            is_exit_only_signal_metadata(metadata_dict)
             or str(source or "") == BROKER_CLOSE_SIGNAL_SOURCE
         )
         if is_close:
@@ -4891,7 +4891,7 @@ def _position_lot_entries(
     for signal_id, sig_symbol, timestamp, action, broker_order_id, source, metadata in signal_rows:
         metadata_dict = metadata if isinstance(metadata, dict) else {}
         is_close = (
-            _is_exit_only_signal_metadata(metadata_dict)
+            is_exit_only_signal_metadata(metadata_dict)
             or str(source or "") == BROKER_CLOSE_SIGNAL_SOURCE
         )
         if is_close:
@@ -5805,7 +5805,16 @@ def get_live_signal_metadata(signal_id: str) -> dict[str, Any] | None:
 _ENTRY_SIGNAL_SCAN_PAGE_SIZE = 25
 
 
-def _is_exit_only_signal_metadata(metadata: Mapping[str, Any]) -> bool:
+def is_exit_only_signal_metadata(metadata: Mapping[str, Any]) -> bool:
+    """Whether signal metadata marks a ledger-reducing (exit-only) signal.
+
+    This is THE exit predicate: ``_position_lot_entries`` and the open-entry
+    counts treat exactly these signals as closes, so any other consumer that
+    needs "would the ledger count this fill as reducing" - the cTrader
+    close-fill attribution and the close-attribution repair script - must use
+    this same test or the two sides can disagree about which side of the
+    ledger a fill lands on.
+    """
     return bool(metadata.get("exit_only")) or (
         str(metadata.get("risk_sizing_mode") or "").strip().lower() == "exit_only"
     )
@@ -5880,7 +5889,7 @@ def _newest_filled_entry_signal(
         rows = session.exec(statement.offset(offset).limit(_ENTRY_SIGNAL_SCAN_PAGE_SIZE)).all()
         for row in rows:
             metadata = dict(row.metadata_json or {})
-            if _is_exit_only_signal_metadata(metadata):
+            if is_exit_only_signal_metadata(metadata):
                 continue
             timestamp = row.timestamp
             if timestamp.tzinfo is None:
@@ -8859,7 +8868,7 @@ def _live_slippage_decomposition(
     quote_price = _usable_quote_price(signal.entry_quote_price)
     has_snapshot = bid is not None and ask is not None and quote_price is not None
     metadata = signal.metadata_json or {}
-    is_exit = _is_exit_only_signal_metadata(metadata) or str(
+    is_exit = is_exit_only_signal_metadata(metadata) or str(
         metadata.get("signal_intent") or ""
     ) == "exit"
     result: dict[str, Any] = {
