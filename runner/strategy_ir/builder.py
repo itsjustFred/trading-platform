@@ -215,8 +215,6 @@ def _exit_signals_from_markdown(markdown_doc: str) -> list[ExitSignal]:
 
 def _engine_hint(engine: str) -> EngineHint:
     normalized = (engine or "").strip().lower()
-    if normalized == EngineHint.NATIVE.value:
-        return EngineHint.NATIVE
     if normalized == EngineHint.VECTORBT.value:
         return EngineHint.VECTORBT
     if normalized == EngineHint.PYNECORE.value:

@@ -1,7 +1,6 @@
 """Strategy IR package."""
 
 from runner.strategy_ir.builder import build_strategy_ir
-from runner.strategy_ir.codegen_native import generate_native_strategy_code
 from runner.strategy_ir.codegen_vectorbt import generate_vectorbt_strategy_code
 from runner.strategy_ir.models import (
     Condition,
@@ -46,7 +45,6 @@ __all__ = [
     "StateTransition",
     "StrategyIR",
     "build_strategy_ir",
-    "generate_native_strategy_code",
     "generate_vectorbt_strategy_code",
     "normalize_strategy_meta_payload",
     "CodegenRoute",
