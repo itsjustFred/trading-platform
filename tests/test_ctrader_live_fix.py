@@ -1614,6 +1614,30 @@ def test_an_execution_type_outside_the_enum_is_unclassifiable() -> None:
         _run(sweep)
 
 
+def test_an_execution_event_without_an_account_id_still_classifies() -> None:
+    """`executionType` alone marks an execution event when the class is unloaded.
+
+    Requiring `ctidTraderAccountId` too would let a partially-populated event
+    bypass classification entirely and pass as a completed cancel.
+    """
+    from types import SimpleNamespace
+
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOAOrderType
+
+    adapter = _control_adapter(
+        orders=[_order(871, ProtoOAOrderType.LIMIT)]
+    )
+    adapter._ProtoOAExecutionEvent = None
+    adapter._ProtoOAExecutionType = SimpleNamespace(
+        ORDER_REJECTED=7, ORDER_CANCEL_REJECTED=8, ORDER_FILLED=3
+    )
+    adapter.exec_event[871] = SimpleNamespace(executionType=99)
+
+    sweep = adapter.cancel_open_orders()
+    with pytest.raises(RuntimeError, match="could not be classified"):
+        _run(sweep)
+
+
 def test_an_unclassifiable_execution_event_is_not_misread_as_an_order_error() -> None:
     """`errorCode` + `description` + `executionType` is an execution event.
 

@@ -4544,13 +4544,14 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             )
         # Only ProtoOAExecutionEvent carries ``executionType`` in the proto
         # schema, so this attribute sniff is a fallback for an unloaded class,
-        # not a general detector: an unclassifiable event must fail closed
-        # below, never pass as submitted.
+        # not a general detector: ``executionType`` alone decides (requiring
+        # more attributes would let a partially-populated event bypass
+        # classification and pass as submitted), and an unclassifiable event
+        # must fail closed below, never pass.
         is_execution_event = (
             isinstance(response, self._ProtoOAExecutionEvent)
             if self._ProtoOAExecutionEvent is not None
             else getattr(response, "executionType", None) is not None
-            and getattr(response, "ctidTraderAccountId", None) is not None
         )
         if is_execution_event:
             rejection, unclassifiable = self._execution_event_rejection(response)
@@ -5660,14 +5661,15 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             )
         # Only ProtoOAExecutionEvent carries ``executionType`` in the proto
         # schema, so this attribute sniff is a fallback for an unloaded class,
-        # not a general detector: an unclassifiable event must fail closed
+        # not a general detector: ``executionType`` alone decides (requiring
+        # more attributes would let a partially-populated event bypass
+        # classification), and an unclassifiable event must fail closed
         # below, never pass as done.
         execution_event_type = getattr(self, "_ProtoOAExecutionEvent", None)
         is_execution_event = (
             isinstance(response, execution_event_type)
             if execution_event_type is not None
             else getattr(response, "executionType", None) is not None
-            and getattr(response, "ctidTraderAccountId", None) is not None
         )
         if not is_execution_event:
             return
