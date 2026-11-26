@@ -573,7 +573,7 @@ def _instrument_qty_step(adapter: BaseLiveAdapter, symbol: str) -> float | None:
         return None
     try:
         step = float(method(symbol))
-    except Exception as exc:
+    except Exception as exc:  # except-kind: money-decision - keeps the expectation (fail closed)
         # One misbehaving adapter/symbol must not abort the whole account
         # pass: an unusable step keeps the expectation (fail closed).
         # (asyncio.CancelledError is BaseException and still propagates.)
