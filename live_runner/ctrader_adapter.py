@@ -1882,8 +1882,8 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         before the re-auth await, which ``_own_token_rotation_in_flight``
         (a depth counter) spans instead.
         """
-        return self._refresh_lock.locked() or bool(
-            self._own_token_rotation_in_flight
+        return self._refresh_lock.locked() or (
+            self._own_token_rotation_in_flight > 0
         )
 
     def _token_invalidation_skip_reason(self) -> str | None:

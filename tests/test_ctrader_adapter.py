@@ -1530,6 +1530,21 @@ def test_token_invalidation_self_heals_latched_flag_on_dead_session() -> None:
     assert adapter._token_invalidation_skip_reason() is None
 
 
+def test_negative_rotation_counter_does_not_count_as_in_flight() -> None:
+    """``_own_token_rotation_in_flight`` is a depth counter clamped at 0 by
+    the rotation ``finally``, but the predicate must not rely on that clamp
+    alone: ``bool(-1)`` is True, so a negative count would suppress every
+    later invalidation event forever. ``> 0`` keeps a corrupted counter on
+    the safe side (treated as no rotation in flight)."""
+    adapter = CTraderLiveAdapter(
+        app_id="app", app_secret="secret", access_token="token", account_id="1"
+    )
+    adapter._connected = True
+    adapter._own_token_rotation_in_flight = -1
+    assert adapter._token_rotation_in_flight() is False
+    assert adapter._token_invalidation_skip_reason() is None
+
+
 def test_token_invalidation_self_heals_stale_session_token_on_dead_session() -> None:
     """A death path that clears the counter but leaves ``_session_access_token``
     would still let the grace branch skip a genuine invalidation: the stale
