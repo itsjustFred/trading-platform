@@ -53,7 +53,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Literal, Mapping
 
-from runner.approval_gate import _atomic_write_json, _relative_name, sha256_of
+from runner.approval_gate import atomic_write_json, relative_name, sha256_of
 
 LEDGER_SUFFIX = ".promoted.json"
 LEDGER_VERSION = 1
@@ -764,7 +764,7 @@ def _record_problem(
     if record.get("kind") != kind:
         return "the promotion was recorded for a different kind of target"
     # A ledger copied next to another file never legitimises that file.
-    if record.get("file") != _relative_name(path, root):
+    if record.get("file") != relative_name(path, root):
         return "the ledger names a different file"
     try:
         _valid_reviewer(record.get("promoted_by"))
@@ -952,7 +952,7 @@ def promote(
 
     record: dict[str, Any] = {
         "kind": kind,
-        "file": _relative_name(target, root),
+        "file": relative_name(target, root),
         "file_sha256": file_sha256,
         "parameters": bound_parameters,
         "parameters_sha256": bound_parameters_sha256,
@@ -979,5 +979,5 @@ def promote(
             if item.get("file_sha256") == file_sha256
             and item.get("parameters_sha256") != bound_parameters_sha256
         ]
-    _atomic_write_json(ledger, {"version": LEDGER_VERSION, "promotions": [*kept, record]})
+    atomic_write_json(ledger, {"version": LEDGER_VERSION, "promotions": [*kept, record]})
     return record

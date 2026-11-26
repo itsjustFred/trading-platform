@@ -55,14 +55,14 @@ def approve_strategy(
             f"Generated strategy provenance is missing or invalid: {path}"
         )
     record: dict[str, Any] = {
-        "file": _relative_name(path, strategies_root),
+        "file": relative_name(path, strategies_root),
         "sha256": digest,
         "approved_by": reviewer,
         "approved_at": datetime.now(timezone.utc).isoformat(),
         "generated": generated,
     }
     ledger = path.with_name(path.name + LEDGER_SUFFIX)
-    _atomic_write_json(ledger, record)
+    atomic_write_json(ledger, record)
     return record
 
 
@@ -120,12 +120,12 @@ def mark_generated_strategy(
 ) -> dict[str, Any]:
     path = Path(strategy_path)
     record = {
-        "file": _relative_name(path, strategies_root),
+        "file": relative_name(path, strategies_root),
         "marked_at": datetime.now(timezone.utc).isoformat(),
         "state": "awaiting_approval",
         "provenance": "auto_agent",
     }
-    _atomic_write_json(generated_marker_path_for(path), record)
+    atomic_write_json(generated_marker_path_for(path), record)
     return record
 
 
@@ -276,13 +276,13 @@ def _valid_generated_marker(
             f"Generated strategy marker has an invalid timestamp: {marker_path}"
         )
     if strategies_root is not None:
-        if relative != _relative_name(path, strategies_root):
+        if relative != relative_name(path, strategies_root):
             raise StrategyNotApprovedError(
                 f"Generated strategy marker provenance does not match the file: {marker_path}"
             )
     elif len(relative.split("/")) > 1:
         derived_root = _marker_strategies_root(path, record)
-        if derived_root is None or relative != _relative_name(path, derived_root):
+        if derived_root is None or relative != relative_name(path, derived_root):
             raise StrategyNotApprovedError(
                 f"Generated strategy marker provenance does not match the file: {marker_path}"
             )
@@ -315,7 +315,7 @@ def _matching_record(
     if not reviewer or reviewer.casefold() == "unspecified":
         return None
 
-    if str(record.get("file") or "") != _relative_name(path, strategies_root):
+    if str(record.get("file") or "") != relative_name(path, strategies_root):
         return None
 
     if str(record.get("sha256") or "") != sha256_of(path):
@@ -327,7 +327,7 @@ def sha256_of(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def _relative_name(path: Path, strategies_root: Path | str | None) -> str:
+def relative_name(path: Path, strategies_root: Path | str | None) -> str:
     if strategies_root is None:
         return path.name
     try:
@@ -357,7 +357,7 @@ def _marker_strategies_root(
     return root
 
 
-def _atomic_write_json(path: Path, record: dict[str, Any]) -> None:
+def atomic_write_json(path: Path, record: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary_path: Path | None = None
     try:
