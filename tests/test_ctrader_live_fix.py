@@ -1338,6 +1338,33 @@ def test_a_cancel_refused_with_an_order_error_event_is_a_failure() -> None:
     assert outcome.complete is False
 
 
+def test_a_refusal_shaped_response_fails_closed_when_the_error_class_is_unloaded() -> None:
+    """With `_ProtoOAOrderErrorEvent` unset, isinstance cannot rule a refusal out.
+
+    A real `ProtoOAOrderErrorEvent` carries `errorCode` + `description` and no
+    `executionType`, so a response with that shape must still count as a
+    refusal rather than passing as a completed control.
+    """
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOAOrderType
+
+    adapter = _control_adapter(
+        orders=[
+            _order(611, ProtoOAOrderType.LIMIT),
+            _order(612, ProtoOAOrderType.LIMIT),
+        ]
+    )
+    adapter._ProtoOAOrderErrorEvent = None
+    adapter.exec_event[611] = SimpleNamespace(
+        errorCode="ORDER_NOT_FOUND", description="refused 611"
+    )
+
+    outcome = _run(adapter.cancel_open_orders())
+
+    assert outcome.completed == 1
+    assert outcome.failed == ("611",)
+    assert outcome.complete is False
+
+
 def test_orphaned_protection_cancel_refused_with_an_order_error_event_is_a_failure() -> None:
     from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOAOrderType
 
@@ -1390,6 +1417,27 @@ def _execution_type(name: str) -> int:
     from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOAExecutionType
 
     return int(getattr(ProtoOAExecutionType, name))
+
+
+def test_execution_type_classifier_covers_every_proto_member() -> None:
+    """A proto bump adding an execution type must fail loudly here, not pass as success."""
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOAExecutionType
+
+    from live_runner.ctrader_adapter import (
+        _NON_REJECTION_EXECUTION_TYPES,
+        CTraderLiveAdapter,
+    )
+
+    members = CTraderLiveAdapter._execution_type_members(ProtoOAExecutionType)
+    assert members, "proto enum member extraction returned nothing"
+    names = {name for name, _ in members}
+    unclassified = names - _NON_REJECTION_EXECUTION_TYPES - {
+        name for name in names if "REJECT" in name
+    }
+    assert not unclassified, (
+        "new ProtoOAExecutionType members need a refusal/non-rejection "
+        f"decision: {sorted(unclassified)}"
+    )
 
 
 def test_a_cancel_refused_with_order_cancel_rejected_is_a_failure() -> None:

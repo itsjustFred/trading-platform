@@ -4601,12 +4601,15 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             descriptor = getattr(enum, "DESCRIPTOR", None)
             values = getattr(descriptor, "values_by_name", None)
             if values is not None:
-                return [
-                    (name, int(member.number))
-                    for name, member in values.items()
-                ]
+                try:
+                    return [
+                        (name, int(member.number))
+                        for name, member in values.items()
+                    ]
+                except Exception:  # except-kind: money-decision
+                    pass  # fall through to the dir-based extraction
         except Exception:  # except-kind: money-decision
-            return []
+            pass
         members: list[tuple[str, int]] = []
         for name in dir(enum):
             if name.startswith("_"):
@@ -5618,10 +5621,25 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         SL/TP before believing anything.
         """
         event_type = getattr(self, "_ProtoOAOrderErrorEvent", None)
-        if event_type is not None and isinstance(response, event_type):
+        if event_type is not None:
+            if isinstance(response, event_type):
+                raise CTraderApiError(
+                    error_code=str(getattr(response, "errorCode", "")),
+                    description=str(getattr(response, "description", ""))
+                    or "no description",
+                )
+        elif (
+            getattr(response, "errorCode", None) is not None
+            and getattr(response, "description", None) is not None
+        ):
+            # The error-event class is not loaded, so isinstance cannot
+            # prove this is NOT a ProtoOAOrderErrorEvent - and a real one
+            # carries exactly this shape (errorCode + description, no
+            # executionType). Fail closed: a refusal must never pass as done.
             raise CTraderApiError(
                 error_code=str(getattr(response, "errorCode", "")),
-                description=str(getattr(response, "description", "")) or "no description",
+                description=str(getattr(response, "description", ""))
+                or "no description",
             )
         # Only ProtoOAExecutionEvent carries ``executionType`` in the proto
         # schema, so this attribute sniff is a fallback for an unloaded class,
