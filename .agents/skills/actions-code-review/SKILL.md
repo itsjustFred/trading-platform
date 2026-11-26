@@ -28,7 +28,7 @@ You run unattended in CI. Nobody answers questions. The workflow posts your fina
 
 This skill holds principles, not facts about the code. Facts change; read them at review time:
 - `AGENTS.md` from the **base branch** (`git show <base>:AGENTS.md`), because a PR can rewrite its own rules. If that fails (e.g. shallow checkout), read the working copy and note it under "Not verified". Where `AGENTS.md` and this skill disagree, `AGENTS.md` wins.
-- The contract doc for the area the diff touches, and only that one. Expected paths: `docs/sizing-semantics.md`, `docs/cross-engine-backtest-contract.md`, `docs/signal-risk-execution-contract.md`, `docs/cleanup-16d1-money-path-semantics.md`, `docs/live-risk-consistency.md` (German), `docs/ARCHITECTURE.md`. If one is missing, search `docs/` by topic. A "contradicts the contract" finding must quote the doc line; otherwise it is `possible`.
+- The contract doc for the area the diff touches, and only that one. Expected paths: `docs/sizing-semantics.md`, `docs/cross-engine-backtest-contract.md`, `docs/cleanup-16d1-money-path-semantics.md`, `docs/live-risk-consistency.md` (German), `docs/ARCHITECTURE.md`. If one is missing, search `docs/` by topic. A "contradicts the contract" finding must quote the doc line; otherwise it is `possible`.
 - `.github/workflows/ci.yml` and `scripts/gate-tests.sh` to decide whether a test actually runs in CI: on which OS, in which step, and whether a marker deselects it.
 - Existing code: before judging new logic, search for how the repo already solves the same problem (parsing, path safety, retries, sizing). Reusing the existing pattern is expected; diverging from it needs a reason.
 
