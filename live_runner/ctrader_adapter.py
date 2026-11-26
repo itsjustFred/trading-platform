@@ -243,7 +243,9 @@ _EXECUTION_RECONCILE_WAKE = object()
 #: session down then would turn a recoverable submit into an unknown outcome.
 #: A genuinely invalidated current token still surfaces through the next
 #: request's auth error, which drives the refresh path - so a bounded window
-#: errs toward keeping a healthy session.
+#: errs toward keeping a healthy session. The window must stay larger than
+#: cTrader's invalidation-event delivery latency or a late echo for the OLD
+#: token would tear down the re-authenticated session.
 _TOKEN_INVALIDATION_OWN_ROTATION_GRACE_SECONDS = 60.0
 
 #: One refresh lock per (event loop, accounts env file). Every cTrader
@@ -252,6 +254,8 @@ _TOKEN_INVALIDATION_OWN_ROTATION_GRACE_SECONDS = 60.0
 #: spend the same refresh token concurrently and the loser would latch
 #: terminal. Keyed by loop because ``asyncio.Lock`` binds to the loop that
 #: first contends it; the daemon runs a single loop, so this is exact there.
+#: Adapters refreshing from more than one event loop in the same process are
+#: NOT serialized by this dict - that configuration is unsupported.
 _SHARED_TOKEN_REFRESH_LOCKS: dict[tuple[asyncio.AbstractEventLoop, str], asyncio.Lock] = {}
 
 
