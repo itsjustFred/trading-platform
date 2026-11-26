@@ -38,6 +38,7 @@ from tests.conftest import (
     TEST_DATA_DIR,
     TEST_LOG_DIR,
     diff_snapshots,
+    sandboxed_env,
     snapshot_tree,
 )
 
@@ -881,7 +882,7 @@ def test_the_integration_module_makes_no_connection_while_importing() -> None:
         cwd=str(Path(__file__).resolve().parents[1]),
         capture_output=True,
         text=True,
-        env={**os.environ, "TP_INTEGRATION_BASE_URL": "http://127.0.0.1:5556"},
+        env=sandboxed_env(TP_INTEGRATION_BASE_URL="http://127.0.0.1:5556"),
         timeout=120,
         check=False,
     )
@@ -892,8 +893,6 @@ def test_the_integration_module_makes_no_connection_while_importing() -> None:
 
 def test_the_integration_module_is_skipped_without_the_opt_in() -> None:
     """No default port: an unset TP_INTEGRATION_BASE_URL skips the module instead of guessing."""
-    env = {k: v for k, v in os.environ.items() if k != "TP_INTEGRATION_BASE_URL"}
-    env.pop("BASE_URL", None)
     result = subprocess.run(
         [
             sys.executable,
@@ -908,8 +907,8 @@ def test_the_integration_module_is_skipped_without_the_opt_in() -> None:
         cwd=str(Path(__file__).resolve().parents[1]),
         capture_output=True,
         text=True,
-        env=env,
         timeout=300,
+        env=sandboxed_env(),
         check=False,
     )
     combined = result.stdout + result.stderr
@@ -960,7 +959,7 @@ def test_a_deselected_integration_test_makes_no_http_call() -> None:
             cwd=str(Path(__file__).resolve().parents[1]),
             capture_output=True,
             text=True,
-            env={**os.environ, "TP_INTEGRATION_BASE_URL": base_url},
+            env=sandboxed_env(TP_INTEGRATION_BASE_URL=base_url),
             timeout=300,
             check=False,
         )
@@ -1125,6 +1124,11 @@ def _run_throwaway_suite(
         Path(suite_conftest.__file__).read_text(encoding="utf-8"), encoding="utf-8"
     )
     (project / "tests" / "test_throwaway.py").write_text(test_source, encoding="utf-8")
+    # Not sandboxed_env(): the throwaway project's own conftest is the copy under test, and a
+    # child shim would pre-load the repo's conftest into the child before pytest loads the
+    # copy - the run must exercise the copy exactly as a real run loads it. The inherited
+    # environment is already the swept one, and the copy sweeps it again.
+    # sandbox-env: throwaway suite loads its own copied conftest
     env = {**os.environ, "PYTHONPATH": str(_PROJECT_ROOT), **(env_extra or {})}
     return subprocess.run(
         [
