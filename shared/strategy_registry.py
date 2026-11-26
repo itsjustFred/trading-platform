@@ -168,10 +168,17 @@ def _contained_strategy_source(path: Path, strategies_dir: Path) -> str | None:
     only ever inspects the strategy tree, never arbitrary files.
     """
     try:
-        # The strategies dir itself is allowed: _read_source answers a directory
-        # with an OSError, which callers already treat as "unreadable".
-        resolved = safe_join(strategies_dir, path, allow_absolute=True, allow_base=True)
-    except PathContainmentError:
+        # Resolved first so a relative path keeps its old meaning: relative to
+        # the cwd, not to ``strategies_dir``. Callers pass
+        # ``strategies/<slug>/<slug>.py`` while running from the repo root, and
+        # joining that onto the strategies dir again would read nothing and
+        # silently return no metadata. The strategies dir itself is allowed:
+        # _read_source answers a directory with an OSError, which callers
+        # already treat as "unreadable".
+        resolved = safe_join(
+            strategies_dir, path.resolve(), allow_absolute=True, allow_base=True
+        )
+    except (PathContainmentError, OSError, RuntimeError):
         return None
     return _read_source(resolved)
 
