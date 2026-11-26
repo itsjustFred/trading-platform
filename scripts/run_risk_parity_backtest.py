@@ -30,7 +30,7 @@ from scipy.optimize import minimize
 
 # --- import-origin guard ---
 # `shared` must resolve to this checkout, not the installed package. The mechanism lives in
-# scripts/_import_origin.py; only the invocation is per script. scripts/ goes on sys.path - never
+# scripts/import_origin.py; only the invocation is per script. scripts/ goes on sys.path - never
 # the repo root, which would repair `import shared` and defeat the guard - so a direct run is
 # refused (exit 2) instead of mutating another tree's schema. See
 # tests/test_script_import_origin.py; run as:
@@ -41,7 +41,7 @@ from pathlib import Path as _path
 _scripts_dir = str(_path(__file__).resolve().parent)
 if _scripts_dir not in _sys.path:
     _sys.path.insert(0, _scripts_dir)
-import _import_origin as _guard
+import import_origin as _guard
 
 _guard.ensure_own_checkout("run_risk_parity_backtest")
 # --- end import-origin guard ---
@@ -51,8 +51,8 @@ _guard.ensure_own_checkout("run_risk_parity_backtest")
 # dropping it would take this script off the roster and out of the gate that keeps it alive.
 import shared  # noqa: F401
 from runner.risk_parity_optimizer import (
-    _project_to_capped_simplex,
     inverse_volatility_weights,
+    project_to_capped_simplex,
     resolve_weight_bounds,
 )
 from shared.constants import ensure_path_within_workspace
@@ -186,7 +186,7 @@ def calculate_risk_parity_weights(
         weights = inverse_volatility_weights(cov)
     # #129: the inverse-vol fallback ignores the bounds and SLSQP can overshoot
     # them by float noise; project onto the capped simplex on every path.
-    weights = _project_to_capped_simplex(
+    weights = project_to_capped_simplex(
         np.asarray(weights, dtype=float), lower=lower, upper=upper
     )
 

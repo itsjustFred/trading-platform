@@ -630,7 +630,7 @@ def _timeframe_age_budget_seconds(timeframe: str) -> float:
     # missed the `1m` entry and fell through to the 300.0 default: the same 1-minute candle got a
     # 600s effective staleness budget under `M1` and 300s under `1m`, because the daemon's caller
     # computes `max(300.0, 2.0 * budget)`. `normalize_timeframe` is what every other consumer uses -
-    # `execution_timing._timeframe_seconds` routes through it - so the two halves of the same signal
+    # `execution_timing.timeframe_seconds` routes through it - so the two halves of the same signal
     # path disagreed on what `M1` means. Two spellings of one timeframe must not buy two policies.
     normalized = normalize_timeframe(timeframe)
     seconds_by_timeframe = {
@@ -2465,7 +2465,7 @@ def _mint_signal_idempotency_key(
         metadata["legacy_idempotency_key"] = _key(raw_stamp)
 
 
-def _trade_signal_to_live_signal(
+def trade_signal_to_live_signal(
     signal: TradeSignal,
     deployment: LiveDeploymentConfig,
 ) -> LiveSignal:
@@ -2543,6 +2543,26 @@ ENTRY_DISPATCH_STATUSES = frozenset(LIVE_DISPATCH_ENTRY_STATUSES)
 #: and is absent: a stopped deployment is closed by the sweeps, not by signal.
 EXIT_DISPATCH_STATUSES = frozenset(LIVE_DISPATCH_EXIT_STATUSES)
 
+
+def _signal_is_exit(
+    action: str,
+    metadata: Mapping[str, object] | None,
+    deployment: LiveDeploymentConfig,
+) -> bool:
+    """Whether this deployment will dispatch the signal as a close (#126).
+
+    :func:`live_runner.exit_signals.is_exit_order` alone is not the whole answer: a
+    plain SELL on a deployment that cannot short is a full exit too, and that is
+    decided per deployment, in :func:`trade_signal_to_live_signal` (which stamps
+    ``exit_only``) - *after* the dispatch gates have already run. Answering it the
+    same way here is what keeps "dispatched as an exit" and "gated as an exit" from
+    drifting apart, and therefore what lets a pause reject entries while still
+    closing a position a plain sell was about to close.
+    """
+    if is_exit_order(action, metadata):
+        return True
+    closes_only = str(action or "").strip().lower() in {"sell", "short"}
+    return closes_only and not _deployment_allows_short(deployment)
 
 async def _renew_submission_claim_until_cancelled(token: str) -> None:
     """Keep a submission lease alive while the broker call is in flight.
@@ -2635,7 +2655,7 @@ async def _submit_internal_strategy_signal(
     The signal was produced by ``internal_strategy_runner`` on a closed bar;
     conversion, sizing, the submission claim and adapter persistence are the
     same shared submission path. The only internal-specific gate is the
-    short-side check: ``_trade_signal_to_live_signal`` would otherwise turn a
+    short-side check: ``trade_signal_to_live_signal`` would otherwise turn a
     SHORT entry on a long-only deployment into a full exit, which is the
     opposite of what the strategy asked for — skip it instead.
 
@@ -2677,7 +2697,7 @@ async def _submit_internal_strategy_signal(
             )
             return SUBMIT_OUTCOME_REFUSED
     try:
-        live_signal = _trade_signal_to_live_signal(trade_signal, deployment)
+        live_signal = trade_signal_to_live_signal(trade_signal, deployment)
     except ValueError:
         logger.exception(
             "Internal strategy signal failed conversion; skipping",

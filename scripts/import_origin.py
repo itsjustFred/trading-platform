@@ -19,7 +19,7 @@ threshold. The behaviour is unchanged; only its address moved.
 How each script reaches this module
 -----------------------------------
 The script's bootstrap cannot assume the repo root is importable, because that is exactly what is in
-doubt. Each script puts ``scripts/`` at the *front* of ``sys.path`` and imports ``_import_origin``
+doubt. Each script puts ``scripts/`` at the *front* of ``sys.path`` and imports ``import_origin``
 from there, so the copy next to the script is the one that runs - an installed module of the same
 name cannot answer first.
 
@@ -37,7 +37,7 @@ from pathlib import Path
 def repo_root() -> Path:
     """The checkout this file lives in, from its own location - never a literal.
 
-    ``<root>/scripts/_import_origin.py`` -> ``<root>/scripts`` -> ``<root>``. A literal would keep
+    ``<root>/scripts/import_origin.py`` -> ``<root>/scripts`` -> ``<root>``. A literal would keep
     passing after the repo moved, which is the failure the guard exists to prevent one level up:
     ``tests/test_script_import_origin.py::test_the_guard_compares_against_the_scripts_own_checkout``
     holds that derivation as a substring of this module, so it stays spelled out here.
@@ -100,7 +100,7 @@ def ensure_own_checkout(script: str) -> None:
 
 
 if __name__ == "__main__":
-    ensure_own_checkout("_import_origin")
+    ensure_own_checkout("import_origin")
     _expected, _actual = resolve_shared()
     print(f"expected shared/ : {_expected}")
     print(f"actually imported: {_actual}")

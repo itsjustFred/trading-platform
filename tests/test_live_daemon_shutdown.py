@@ -605,7 +605,7 @@ def test_submit_order_with_risk_counts_itself_in_flight(
 
     async def _probe() -> tuple[int, int, int]:
         coordinator.bind(asyncio.get_running_loop())
-        live_signal = daemon._trade_signal_to_live_signal(_trade_signal(), deployment)
+        live_signal = daemon.trade_signal_to_live_signal(_trade_signal(), deployment)
         submission = asyncio.create_task(
             daemon.submit_order_with_risk(
                 adapter,  # type: ignore[arg-type]
@@ -644,7 +644,7 @@ def test_submit_order_with_risk_is_refused_on_shutdown(
     coordinator = _new_coordinator()
     monkeypatch.setattr(daemon, "_ACTIVE_SHUTDOWN", coordinator)
     adapter = _GateAdapter()
-    live_signal = daemon._trade_signal_to_live_signal(_trade_signal(), deployment)
+    live_signal = daemon.trade_signal_to_live_signal(_trade_signal(), deployment)
     coordinator.request("SIGTERM")
 
     with pytest.raises(SubmissionRefusedError, match="shutting down"):
@@ -1153,7 +1153,7 @@ def test_a_dropped_exit_is_logged_as_an_error_that_the_position_stays_open(
     monkeypatch.setattr(daemon, "_ACTIVE_SHUTDOWN", coordinator)
     coordinator.request("SIGTERM")
     adapter = _GateAdapter()
-    live_signal = daemon._trade_signal_to_live_signal(_trade_signal(), deployment)
+    live_signal = daemon.trade_signal_to_live_signal(_trade_signal(), deployment)
 
     async def _prepared(*_args: Any, **_kwargs: Any) -> tuple[Any, float]:
         return live_signal, 1.0

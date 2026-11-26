@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 import math
 import os
@@ -924,7 +925,7 @@ async def _alpaca_roundtrip_check(
         )
     except Exception as exc:
         if order_id:
-            with contextlib_suppress():
+            with contextlib.suppress(Exception):
                 client.cancel_order_by_id(order_id)
         return SmokeCheck(check_name, False, {"order_id": order_id}, _public_error(exc))
 

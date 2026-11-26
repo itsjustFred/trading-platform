@@ -351,21 +351,21 @@ def _patch_ledger(
 
 def test_exit_signal_is_exit_only_even_when_shorting_is_allowed() -> None:
     """On a long+short deployment a plain sell is a real short. An exit is not."""
-    from live_runner.daemon import _trade_signal_to_live_signal
+    from live_runner.daemon import trade_signal_to_live_signal
 
-    live = _trade_signal_to_live_signal(_exit_trade_signal(), _deployment(allow_short=True))
+    live = trade_signal_to_live_signal(_exit_trade_signal(), _deployment(allow_short=True))
     assert live.metadata["exit_only"] is True
     assert live.metadata["risk_sizing_mode"] == "exit_only"
     assert live.metadata["signal_intent"] == "exit"
 
 
 def test_prepare_sizes_an_exit_from_the_own_ledger(monkeypatch) -> None:
-    from live_runner.daemon import _trade_signal_to_live_signal, prepare_order_with_risk
+    from live_runner.daemon import prepare_order_with_risk, trade_signal_to_live_signal
 
     deployment = _deployment(allow_short=True)
     calls = _patch_ledger(monkeypatch, deployment, 10.0, others={_OTHER: 15.0})
     adapter = _Adapter([{"symbol": "AAPL", "qty": 25.0}])
-    live = _trade_signal_to_live_signal(_exit_trade_signal(), deployment)
+    live = trade_signal_to_live_signal(_exit_trade_signal(), deployment)
 
     prepared, qty = asyncio.run(prepare_order_with_risk(adapter, deployment, live))
 
@@ -389,8 +389,8 @@ def test_exit_drops_spoofed_entry_gate_fields(monkeypatch) -> None:
     """
     from live_runner.daemon import (
         _ENTRY_QUOTE_METADATA_KEYS,
-        _trade_signal_to_live_signal,
         prepare_order_with_risk,
+        trade_signal_to_live_signal,
     )
 
     deployment = _deployment(allow_short=True)
@@ -401,7 +401,7 @@ def test_exit_drops_spoofed_entry_gate_fields(monkeypatch) -> None:
     trade_signal = dataclasses.replace(
         trade_signal, metadata={**trade_signal.metadata, **spoofed}
     )
-    live = _trade_signal_to_live_signal(trade_signal, deployment)
+    live = trade_signal_to_live_signal(trade_signal, deployment)
     assert all(live.metadata.get(key) == "spoofed" for key in _ENTRY_QUOTE_METADATA_KEYS)
 
     prepared, qty = asyncio.run(prepare_order_with_risk(adapter, deployment, live))
@@ -412,12 +412,12 @@ def test_exit_drops_spoofed_entry_gate_fields(monkeypatch) -> None:
 
 
 def test_prepare_takes_the_close_side_from_the_position(monkeypatch) -> None:
-    from live_runner.daemon import _trade_signal_to_live_signal, prepare_order_with_risk
+    from live_runner.daemon import prepare_order_with_risk, trade_signal_to_live_signal
 
     deployment = _deployment(allow_short=True)
     _patch_ledger(monkeypatch, deployment, -4.0)
     adapter = _Adapter([{"symbol": "AAPL", "qty": -4.0}])
-    live = _trade_signal_to_live_signal(_exit_trade_signal(side=None), deployment)
+    live = trade_signal_to_live_signal(_exit_trade_signal(side=None), deployment)
 
     prepared, qty = asyncio.run(prepare_order_with_risk(adapter, deployment, live))
 
@@ -426,12 +426,12 @@ def test_prepare_takes_the_close_side_from_the_position(monkeypatch) -> None:
 
 
 def test_prepare_partial_exit(monkeypatch) -> None:
-    from live_runner.daemon import _trade_signal_to_live_signal, prepare_order_with_risk
+    from live_runner.daemon import prepare_order_with_risk, trade_signal_to_live_signal
 
     deployment = _deployment()
     _patch_ledger(monkeypatch, deployment, 10.0)
     adapter = _Adapter([{"symbol": "AAPL", "qty": 10.0}])
-    live = _trade_signal_to_live_signal(_exit_trade_signal(fraction=0.5), deployment)
+    live = trade_signal_to_live_signal(_exit_trade_signal(fraction=0.5), deployment)
 
     _prepared, qty = asyncio.run(prepare_order_with_risk(adapter, deployment, live))
 
@@ -785,7 +785,7 @@ def test_claim_submit_records_the_decision_reason_for_definitive_refusals(
 
     deployment = _deployment()
     trade_signal = _exit_trade_signal() if is_exit else _discord_entry_trade_signal()
-    live_signal = daemon._trade_signal_to_live_signal(trade_signal, deployment)
+    live_signal = daemon.trade_signal_to_live_signal(trade_signal, deployment)
     adapter = _Adapter([])
     if broker_rejected:
         adapter.submit_order = _submit_raising(
@@ -1059,10 +1059,10 @@ def test_a_sell_exit_of_an_own_short_buys_it_back(monkeypatch) -> None:
 
 def test_a_sell_on_a_long_and_short_deployment_is_still_an_entry() -> None:
     """Only a deployment that cannot short turns a plain SELL into an exit."""
-    from live_runner.daemon import _trade_signal_to_live_signal
+    from live_runner.daemon import trade_signal_to_live_signal
     from live_runner.exit_signals import is_exit_order
 
-    live = _trade_signal_to_live_signal(
+    live = trade_signal_to_live_signal(
         _sell_trade_signal(), _deployment(allow_short=True)
     )
     assert not is_exit_order(live.action, live.metadata)

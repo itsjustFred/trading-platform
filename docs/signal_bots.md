@@ -319,7 +319,7 @@ Bedingung nennt, erzeugt eine neue Entry-Order.
   unterschieden wird je Deployment aus dem rohen Signal: der geparste Intent
   (`live_runner.exit_signals.is_exit_order`) **oder** ein plain `SELL`/`SHORT` auf
   einem Deployment, das nicht shorten darf - dieselbe Regel, die
-  `live_runner.daemon._trade_signal_to_live_signal` anwendet, nur vor den Gates
+  `live_runner.daemon.trade_signal_to_live_signal` anwendet, nur vor den Gates
   statt danach. `STOPPED` bleibt ausgeschlossen
   (STOP macht seine Position über die Cancel/Flatten-Sweeps dicht). Das gilt für
   jedes Pause, auch ein manuelles. Hintergrund: „stop opening new positions"
