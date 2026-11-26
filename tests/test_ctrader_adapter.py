@@ -714,6 +714,29 @@ def test_on_message_account_disconnect_event_without_account_id_drops_session() 
     _assert_session_dropped_for_reconnect(adapter)
 
 
+def test_on_message_account_disconnect_event_with_negative_account_id_drops_session() -> (
+    None
+):
+    """A negative ``ctidTraderAccountId`` cannot be proven foreign, so the
+    singular helper clamps it to ``0`` (unset) like the repeated-id helper:
+    the event is treated as an own-account disconnect, not ignored."""
+    from ctrader_open_api.messages.OpenApiMessages_pb2 import (
+        ProtoOAAccountDisconnectEvent,
+    )
+
+    adapter, client, ProtoMessage = _lifecycle_event_adapter()
+
+    adapter._on_message(
+        client,
+        _wire_payload(
+            ProtoMessage,
+            ProtoOAAccountDisconnectEvent(ctidTraderAccountId=-5),
+        ),
+    )
+
+    _assert_session_dropped_for_reconnect(adapter)
+
+
 def test_on_message_accounts_token_invalidated_event_with_zero_id_drops_session() -> None:
     """``ctidTraderAccountIds=[0]`` carries no real account id: like the
     singular helper's unset-``0``, it must not be treated as foreign."""
@@ -729,6 +752,30 @@ def test_on_message_accounts_token_invalidated_event_with_zero_id_drops_session(
             ProtoMessage,
             ProtoOAAccountsTokenInvalidatedEvent(
                 ctidTraderAccountIds=[0], reason="token revoked"
+            ),
+        ),
+    )
+
+    _assert_session_dropped_for_reconnect(adapter)
+
+
+def test_on_message_accounts_token_invalidated_event_with_negative_id_drops_session() -> (
+    None
+):
+    """``ctidTraderAccountIds=[-7]`` drops the non-positive entry like ``0``,
+    leaving no foreign id: the event must still tear the session down."""
+    from ctrader_open_api.messages.OpenApiMessages_pb2 import (
+        ProtoOAAccountsTokenInvalidatedEvent,
+    )
+
+    adapter, client, ProtoMessage = _lifecycle_event_adapter()
+
+    adapter._on_message(
+        client,
+        _wire_payload(
+            ProtoMessage,
+            ProtoOAAccountsTokenInvalidatedEvent(
+                ctidTraderAccountIds=[-7], reason="token revoked"
             ),
         ),
     )
@@ -1401,6 +1448,50 @@ def test_on_disconnected_errbacks_in_flight_request_deferreds() -> None:
         with pytest.raises(CTraderConnectionLostError):
             await send_task
         return deferred.errbacks[0]
+
+    asyncio.run(_run())
+
+
+def test_fail_in_flight_requests_tolerates_errback_failures(caplog) -> None:
+    """A deferred whose ``errback`` raises must not stop the remaining
+    in-flight requests from being failed; the failure is counted and
+    warned so the awaiters' own timeout is not a silent surprise."""
+    import logging
+
+    from live_runner.ctrader_adapter import CTraderConnectionLostError
+
+    async def _run() -> None:
+        adapter = CTraderLiveAdapter(
+            app_id="app", app_secret="secret", access_token="token", account_id="1"
+        )
+        adapter._loop = asyncio.get_running_loop()
+
+        class _Deferred:
+            called = False
+
+            def __init__(self, *, fail: bool = False) -> None:
+                self._fail = fail
+                self.errbacks: list[BaseException] = []
+
+            def errback(self, exc: BaseException) -> None:
+                if self._fail:
+                    raise RuntimeError("errback boom")
+                self.errbacks.append(exc)
+
+        bad = _Deferred(fail=True)
+        good = _Deferred()
+        adapter._in_flight_request_deferreds.update({bad, good})
+
+        with caplog.at_level(logging.WARNING, logger="trading.live-runner"):
+            adapter._fail_in_flight_requests()
+
+        assert len(good.errbacks) == 1
+        assert isinstance(good.errbacks[0], CTraderConnectionLostError)
+        assert adapter._in_flight_request_deferreds == set()
+        assert any(
+            "Could not errback 1 in-flight" in record.getMessage()
+            for record in caplog.records
+        )
 
     asyncio.run(_run())
 
