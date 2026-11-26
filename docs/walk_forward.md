@@ -174,6 +174,7 @@ min_deflated_sharpe: 0.90
 ```
 
 Defaults are shown above; only `train_split_pct` is required for backward compatibility (the remainder is split equally).
+
 ## Result diagnostics
 
 Every parameter-mode optimization emits a `diagnostics` block
@@ -192,6 +193,7 @@ selected; it reports how much the selection should be trusted.
                   "is_plateau": false, "sensitivity": 0.011 },
   "multiple_testing": { "n_trials": 8, "bonferroni_threshold": 0.00625,
                         "expected_max_under_null": 1.397,
+                        "significance_threshold": 1.812,
                         "survives_selection_bias": false },
   "survivorship": {}, "subperiod_stability": {}, "target_metric": "..."
 }
@@ -205,7 +207,9 @@ selected; it reports how much the selection should be trusted.
 - `walk_forward_folds` is **report-only**: fold boundaries inside the range
   before the test holdout and its embargo (`walk_forward_splits`, default 3,
   max 20). No per-fold performance is computed and no parameter is re-fitted —
-  `walk_forward_note` says so; it is not walk-forward evidence.
+  `walk_forward_note` says so; it is not walk-forward evidence. The folds are
+  sequential and disjoint, so they never overlap and no fold trains on an
+  earlier fold's held-out window.
 - `plateau` is centred on the trial the study selects (highest metric for a
   maximize target, lowest for `p_value`), along the most broadly varied
   parameter; `direction` is published. `is_plateau` is false when only the
@@ -213,10 +217,19 @@ selected; it reports how much the selection should be trusted.
   classic overfitting signature. No-trade penalty trials and internal params
   are excluded from the statistics (`n_no_trade_trials_excluded` reports how
   many).
-- `multiple_testing.survives_selection_bias` compares the observed metric with
-  the expected maximum of N trials under the null (Bonferroni threshold
-  `alpha / n_trials`). A best-of-N result below that expectation is consistent
-  with pure selection noise. It is `null` for single-trial studies.
+- `multiple_testing` corrects for selecting the best of N trials
+  (`multiple_testing_correction` in `runner/optimization_diagnostics.py`).
+  `expected_max_under_null` is the trial mean plus/minus σ times the expected
+  maximum of N standard normals under the null — informational only: it is the
+  centre of the best-of-N distribution, so about half of pure-noise searches
+  beat it; it is not a bar to clear. The actual bar is
+  `significance_threshold`: the Bonferroni-corrected one-sided quantile
+  `mean ± σ·z(1 − α/N)` of the trial metric distribution, measured from the
+  end the study selects from. `survives_selection_bias` is the observed metric
+  clearing that threshold in the study's direction (`null` for single-trial
+  studies). Exception: a bounded minimize metric — every trial value in
+  `[0, 1]`, e.g. `p_value` — gets the direct test `min(p) <= alpha / n_trials`
+  instead, because the z-bar is structurally unreachable for it.
 - `survivorship` reports what the stored data says about a universe that may
   not be point-in-time; `subperiod_stability` asks whether the winning value
   also wins in each sub-period (realized PnL, never a guess when no trial

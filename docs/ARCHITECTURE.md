@@ -68,12 +68,14 @@ security gate, not a style rule.
 LLM-generated strategy code is untrusted until a human approves it: drafts are
 statically screened (`runner/codegen_safety.py`), marked, and only runnable
 after a SHA256-bound approval (`runner/approval_gate.py`,
-`POST /api/strategies/{file}/approve`). Any new execution route for generated
+`POST /api/strategies/{file}/approve`) — any change to the file after approval
+invalidates it. Any new execution route for generated
 strategy files MUST call `runner.approval_gate.require_generated_strategy_approval`
 (or `runner.auto_agent.run_validated_backtest`) before importing or executing
 the module. Engine adapters and grid entry points re-check the approval as a
 second layer (`require_generated_strategy_approval` in each adapter and
-`runner/backtest_grid.py`); the auto-agent validation route runs the approved
+`runner/backtest_grid.py`), which also re-runs the `codegen_safety` source
+screening — defence in depth; the auto-agent validation route runs the approved
 backtest in a subprocess with an allowlisted environment
 (`runner/agent_process.build_backtest_child_env` — no API keys) and a
 wall-clock timeout.
