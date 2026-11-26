@@ -93,13 +93,27 @@ class TestSqlBuilders:
         query = captured["cmd"][captured["cmd"].index("-q") + 1]
         assert query == "SELECT DISTINCT act_symbol FROM `ohlcv`"
 
-    def test_no_raw_interpolated_sql_in_manager_source(self) -> None:
-        """Guard against regression to f-string SQL in dolthub_manager."""
-        import inspect
+    def test_export_symbol_csv_sends_the_escaped_select_to_dolt(
+        self, monkeypatch, tmp_path: Path
+    ) -> None:
+        """The per-symbol export must hand dolt the builder's escaped SQL.
 
-        source = inspect.getsource(dm)
-        assert "FROM {table_name}" not in source
-        assert "act_symbol='" not in source
+        A raw f-string at the call site is invisible to a source scan that only
+        knows two old spellings; capturing the actual ``-q`` argument catches
+        any spelling (DV-B27).
+        """
+        captured: dict[str, object] = {}
+
+        def fake_run_dolt(cmd, **kwargs):
+            captured["cmd"] = cmd
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        monkeypatch.setattr(dm, "run_dolt", fake_run_dolt)
+        dm._export_symbol_csv(tmp_path, "we`ird", "AAPL", tmp_path, tmp_path / "o.parquet")
+
+        query = captured["cmd"][captured["cmd"].index("-q") + 1]
+        assert query == build_ohlcv_select("we`ird", "AAPL")
+        assert "`we``ird`" in query and "'AAPL'" in query
 
 
 class TestDolthubDownloaderSql:
