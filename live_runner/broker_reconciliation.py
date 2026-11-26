@@ -405,6 +405,15 @@ def effective_reconciliation_config(
 
 
 def _requested_qty(metadata: Mapping[str, Any]) -> float | None:
+    """The qty the broker was asked for, from persisted signal metadata.
+
+    Adapters persist the normalized submitted qty under both ``qty`` and
+    ``explicit_qty`` (they are kept equal at write time - cTrader's
+    volume-grid floor, Alpaca's whole-share bracket floor). ``explicit_qty``
+    wins the lookup order for legacy rows that carry only one key; a row
+    whose two keys disagree is adapter corruption, not something to
+    reconcile around.
+    """
     for key in ("explicit_qty", "qty", "requested_qty"):
         raw = metadata.get(key)
         if raw is None or isinstance(raw, bool):

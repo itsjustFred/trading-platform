@@ -70,7 +70,7 @@ from shared.database import (
     set_live_signal_broker_order_id,
 )
 from shared.logging import get_logger
-from shared.lot_grid import floor_qty_to_step
+from shared.lot_grid import _STEP_NOISE, floor_qty_to_step
 from shared.models import (
     PRICE_ABSENT,
     PRICE_OBSERVED,
@@ -3318,12 +3318,17 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             # qty an ulp above the binding qty; anything more means volume
             # resolution rounded up. The allowance is absolute qty units
             # scaled to the grid step - a relative tolerance would hide a
-            # small overshoot on a large qty.
+            # small overshoot on a large qty. The band tracks the shared
+            # lot-grid floor's own noise constant (2x for float margin) so
+            # the two cannot drift apart.
             step_qty = float(max(int(scale.step_volume), 1)) / float(
                 scale.volume_per_qty
             )
             if submitted_qty > qty_value and not math.isclose(
-                submitted_qty, qty_value, rel_tol=0.0, abs_tol=2e-6 * step_qty
+                submitted_qty,
+                qty_value,
+                rel_tol=0.0,
+                abs_tol=2.0 * float(_STEP_NOISE) * step_qty,
             ):
                 # Volume resolution floors, so this can only happen if a
                 # future change rounds up: persisting an oversized qty would
