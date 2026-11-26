@@ -18,7 +18,7 @@ from typing import Any
 
 # --- import-origin guard ---
 # `shared` must resolve to this checkout, not the installed package. The mechanism lives in
-# scripts/_import_origin.py; only the invocation is per script. scripts/ goes on sys.path - never
+# scripts/import_origin.py; only the invocation is per script. scripts/ goes on sys.path - never
 # the repo root, which would repair `import shared` and defeat the guard - so a direct run is
 # refused (exit 2) instead of reading another tree's clock profiles. See
 # tests/test_script_import_origin.py; run as:
@@ -29,7 +29,7 @@ from pathlib import Path as _path
 _scripts_dir = str(_path(__file__).resolve().parent)
 if _scripts_dir not in _sys.path:
     _sys.path.insert(0, _scripts_dir)
-import _import_origin as _guard
+import import_origin as _guard
 
 _guard.ensure_own_checkout("mt5_report_dump")
 # --- end import-origin guard ---
@@ -43,7 +43,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from scripts._safe_path import reject_traversal
+from scripts.safe_path import reject_traversal
 from shared.atomic_io import write_text_atomically
 from validation.importers.mt5_xlsx import MT5XLSXImporter
 from validation.reference import ValidationReference
