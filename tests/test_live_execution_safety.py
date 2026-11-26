@@ -5650,6 +5650,42 @@ def test_ctrader_submit_refuses_a_normalized_qty_above_the_binding_qty(
     assert volumes == []
 
 
+def test_ctrader_submit_accepts_a_binding_qty_within_float_noise_below_a_grid_point(
+    monkeypatch,
+) -> None:
+    """The overshoot guard's tolerance band must admit float noise: a
+    risk-sized qty a hair below a grid point (2.0 - 1e-10) lands on that grid
+    point and is a legitimate submit, not an overshoot to refuse."""
+    _module, adapter, saved, volumes = _ctrader_submit_harness(monkeypatch)
+
+    assert (
+        asyncio.run(adapter.submit_order(_ctrader_entry_signal(), qty=2.0 - 1e-10))
+        == "777"
+    )
+
+    assert volumes == [2000]
+    assert saved[0].metadata["qty"] == pytest.approx(2.0)
+
+
+def test_ctrader_submit_refuses_a_sub_step_overshoot_of_the_binding_qty(
+    monkeypatch,
+) -> None:
+    """The tolerance band must stay far below one grid step: a resolution one
+    step (0.001 qty) above the grid floor of the binding qty overshoots it by
+    less than a step (2.001 vs 2.0007) and must still be refused before the
+    send, marked as provably not submitted."""
+    _module, adapter, saved, volumes = _ctrader_submit_harness(monkeypatch)
+    monkeypatch.setattr(adapter, "_resolve_order_volume", lambda _signal: 2_001)
+    submit = adapter.submit_order(_ctrader_entry_signal(), qty=2.0007)
+
+    with pytest.raises(ValueError, match="exceeds the binding qty") as excinfo:
+        asyncio.run(submit)
+
+    assert is_order_not_submitted(excinfo.value)
+    assert saved == []
+    assert volumes == []
+
+
 def test_ctrader_submit_refuses_when_qty_normalization_is_not_idempotent(
     monkeypatch,
 ) -> None:
