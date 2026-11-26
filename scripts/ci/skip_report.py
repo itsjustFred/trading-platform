@@ -9,9 +9,10 @@ The report is appended to ``$GITHUB_STEP_SUMMARY`` when that variable is set.
 
 Exit status is non-zero when a test on the money path was skipped for a reason
 that is not explicitly allowed. The money-path set is ``MUST_NOT_SKIP_PATTERNS``
-below; the allowed reasons are ``ALLOWED_SKIP_REASON_PATTERNS`` — today only
-the dataset gates (``TP_TEST_OHLCV_DIR`` and the downloaded differential
-real-data slice), whose coverage gap is tracked by #289.
+below; the allowed reasons are ``ALLOWED_SKIP_REASON_PATTERNS`` — gates that
+can never open in CI (dataset opt-ins, generated-but-uncommitted artifacts,
+the live production database, one documented engine limitation), whose
+coverage gap is tracked by #289.
 """
 
 from __future__ import annotations
@@ -100,16 +101,31 @@ MUST_NOT_SKIP_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
     )
 )
 
-#: Skip reasons a money-path test may still have in CI. These are the dataset
-#: gates: real-market-data tests skip when the local/CI dataset is absent.
-#: Closing that gap is #289's job, not this report's — everything else on the
-#: money path must run.
+#: Skip reasons a money-path test may still have in CI. These are gates that
+#: can never open in CI — closing them is #289's job, not this report's —
+#: everything else on the money path must run.
 ALLOWED_SKIP_REASON_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
     re.compile(pattern, re.IGNORECASE)
     for pattern in (
-        r"TP_TEST_OHLCV_DIR",  # strategy/dataset gate (tests/helpers, strategies/conftest)
-        r"differential real-data slice",  # scripts/fetch_differential_slice.py output
+        # The dataset gate: real-market-data tests skip when no local OHLCV
+        # dataset is exported. CI has none by design (#289).
+        r"TP_TEST_OHLCV_DIR",
+        # The downloaded differential real-data slice (scripts/
+        # fetch_differential_slice.py); absent on a Dukascopy outage.
+        r"differential real-data slice",
         r"DIFFERENTIAL_REAL_SLICE_CSV",
+        # MT5 parity artifacts are generated locally by
+        # scripts/regenerate_mt5_parity_artifacts.py and deliberately not
+        # committed, so no CI checkout can ever contain them.
+        r"not present in this checkout",
+        r"generated locally, not committed",
+        # Production-corpus drift checks need a copy of the live database,
+        # which is not in the repository and must never be opened by CI.
+        r"TRADING_PRODUCTION_DB",
+        # vectorbt cannot enforce protective exits without intrabar data —
+        # a documented engine limitation (test_differential_reference_
+        # strategies.py), not an environment gap CI could close.
+        r"vectorbt has no protective exits",
     )
 )
 
@@ -225,7 +241,12 @@ def build_report(skipped: list[SkippedTest], sources: list[str]) -> str:
     for reason in sorted(groups, key=lambda r: (-len(groups[r]), r)):
         members = groups[reason]
         money = any(is_money_path(t.classname) for t in members)
-        marker = " ⚠ money-path" if money else ""
+        if money and is_allowed_skip(reason):
+            marker = " · env-gated"
+        elif money:
+            marker = " ⚠ money-path"
+        else:
+            marker = ""
         examples = "<br>".join(
             f"`{_truncate(t.label, 80)}`" for t in members[:3]
         )

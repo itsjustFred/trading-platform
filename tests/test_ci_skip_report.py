@@ -87,12 +87,38 @@ def test_is_money_path_covers_live_runner_and_engine_tests() -> None:
     assert not is_money_path("tests.strategies.test_channel_breakout")
 
 
-def test_is_allowed_skip_only_for_dataset_gates() -> None:
+def test_is_allowed_skip_only_for_gates_ci_can_never_open() -> None:
     assert is_allowed_skip(
-        "missing OHLCV dataset for EURUSD/15m (point TP_TEST_OHLCV_DIR at a root)"
+        "missing OHLCV dataset for EURUSD/15m covering 2025-01-01..2025-03-31 "
+        "under /tmp/tp-pytest-session-x/data/ohlcv (point TP_TEST_OHLCV_DIR at "
+        "a local dataset root to use one)"
     )
     assert is_allowed_skip(
-        "the differential real-data slice is missing at /x (DIFFERENTIAL_REAL_SLICE_CSV)"
+        "the differential real-data slice is missing at /x "
+        "(DIFFERENTIAL_REAL_SLICE_CSV)"
+    )
+    # Real messages, verbatim from the tests that emit them.
+    assert is_allowed_skip(
+        "intraday_volatility_breakout_eurusd_h1.json not present in this checkout"
+    )
+    assert is_allowed_skip(
+        "intraday_volatility_breakout_sp500_m1.json not present (artifacts are "
+        "generated locally, not committed); run "
+        "scripts/regenerate_mt5_parity_artifacts.py"
+    )
+    assert is_allowed_skip(
+        "set TRADING_PRODUCTION_DB to a production copy to check the corpus"
+    )
+    assert is_allowed_skip(
+        "set TRADING_PRODUCTION_DB to a copy of production to re-verify its defaults"
+    )
+    assert is_allowed_skip(
+        "documented: vectorbt has no protective exits without intrabar data"
+    )
+    assert is_allowed_skip(
+        "No local 1h OHLCV parquet data under /tmp/tp-pytest-session-x/data/ohlcv: "
+        "set TP_TEST_OHLCV_DIR=/path/to/ohlcv to run this real-data smoke test "
+        "(the suite's DATA_DIR is a throwaway temp directory)"
     )
     assert not is_allowed_skip("pynecore is not installed in this environment")
     assert not is_allowed_skip("needs bash")
@@ -135,6 +161,23 @@ def test_build_report_groups_by_reason_and_marks_money_path(tmp_path: Path) -> N
     assert "money reason ⚠ money-path" in report
     assert "1 money-path test(s) skipped" in report
     assert "`tests.live_runner.test_x::t3`" in report
+
+
+def test_build_report_marks_allowed_money_path_groups_env_gated(tmp_path: Path) -> None:
+    path = _write(
+        tmp_path,
+        "junit.xml",
+        [
+            (
+                "tests.test_trade_engine",
+                "test_smoke",
+                "No local 1h OHLCV parquet data under /x: set TP_TEST_OHLCV_DIR=/d",
+            ),
+        ],
+    )
+    report = build_report(parse_junit(path), [str(path)])
+    assert "env-gated" in report
+    assert "⚠ money-path" not in report
 
 
 def test_main_writes_github_step_summary(tmp_path: Path, monkeypatch) -> None:
