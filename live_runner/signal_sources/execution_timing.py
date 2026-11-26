@@ -50,7 +50,12 @@ def _require_recognised_timeframe(timeframe: str, caller: str) -> None:
     )
 
 
-def _timeframe_seconds(timeframe: str) -> int | None:
+def timeframe_seconds(timeframe: str) -> int | None:
+    """Length of one bar of ``timeframe`` in seconds.
+
+    ``None`` for labels with no fixed bar length (``""``/``tick``) and for
+    anything the ``<n><unit>`` grammar does not parse.
+    """
     normalized = normalize_timeframe(timeframe)
     if normalized in {"", "tick"}:
         return None
@@ -74,17 +79,6 @@ def _timeframe_seconds(timeframe: str) -> int | None:
     if unit == "w":
         return count * 7 * 86400
     return None
-
-
-def timeframe_seconds(timeframe: str) -> int | None:
-    """Length of one bar of ``timeframe`` in seconds.
-
-    ``None`` for labels with no fixed bar length (``""``/``tick``) and for
-    anything the ``<n><unit>`` grammar does not parse. Public counterpart of
-    the private helper the live path uses internally, for offline tooling
-    that needs the same bar length (e.g. the signal-archive feature script).
-    """
-    return _timeframe_seconds(timeframe)
 
 
 def _next_candle_close(
@@ -113,7 +107,7 @@ def max_signal_age_seconds(timeframe: str) -> int | None:
     A 1h signal older than 60 minutes is discarded instead of trading
     immediately on stale information.
     """
-    return _timeframe_seconds(timeframe)
+    return timeframe_seconds(timeframe)
 
 
 def signal_is_fresh(
@@ -152,8 +146,8 @@ def signal_is_fresh(
 
 async def wait_for_candle_close(signal: TradeSignal, timeframe: str) -> None:
     """Wait until the next candle close for the given timeframe."""
-    timeframe_seconds = _timeframe_seconds(timeframe)
-    if timeframe_seconds is None:
+    bar_seconds = timeframe_seconds(timeframe)
+    if bar_seconds is None:
         # See `signal_is_fresh`. Returning here for an unrecognised label means
         # "no wait", which turns the operator's requested candle-close entry into
         # an immediate market order at a different price than the strategy was
@@ -163,7 +157,7 @@ async def wait_for_candle_close(signal: TradeSignal, timeframe: str) -> None:
 
     received_at = _parse_signal_timestamp(signal.metadata.get("received_at"))
     reference = received_at or datetime.now(timezone.utc)
-    close_at = _next_candle_close(reference, timeframe_seconds, timeframe=timeframe)
+    close_at = _next_candle_close(reference, bar_seconds, timeframe=timeframe)
     now = datetime.now(timezone.utc)
     delay = (close_at - now).total_seconds()
     if delay <= 0:

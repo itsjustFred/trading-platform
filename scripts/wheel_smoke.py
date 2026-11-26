@@ -58,7 +58,6 @@ RESOURCE_ENTRIES = (
     "signal_bots/rocketfuel/config.yaml",
     "strategies/pynecore_orb/pynecore_orb.toml",
     "strategies/pynecore_sma_crossover/pynecore_sma_crossover.toml",
-    "viewer/static/index.html",
 )
 
 
@@ -107,8 +106,6 @@ def smoke(wheel: Path) -> None:
                 "'config/dukascopy_genesis.json').is_file()\n"
                 "assert importlib.resources.files('signal_bots').joinpath("
                 "'nitro/config.yaml').is_file()\n"
-                "assert importlib.resources.files('viewer').joinpath("
-                "'static/index.html').is_file()\n"
             )
             subprocess.run(
                 [sys.executable, "-E", "-c", code, temp_dir],
