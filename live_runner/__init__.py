@@ -2,7 +2,8 @@
 
 from typing import Any
 
-__all__ = ["AlpacaLiveAdapter", "BaseLiveAdapter", "CTraderLiveAdapter"]
+# The names below are provided lazily by __getattr__, so F822 (preview) cannot see them.
+__all__ = ["AlpacaLiveAdapter", "BaseLiveAdapter", "CTraderLiveAdapter"]  # noqa: F822
 
 
 def __getattr__(name: str) -> Any:

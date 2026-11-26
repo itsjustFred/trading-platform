@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
-from live_runner.signal_sources.discord_source import _parse_trade_signal_from_message
+from live_runner.signal_sources.discord_source import parse_trade_signal_from_message
 
 
 def _message(content: str, channel_id: str = "123"):
@@ -15,7 +15,7 @@ def _message(content: str, channel_id: str = "123"):
 
 
 def test_discord_parser_parses_ramjet_oversold_buy() -> None:
-    signal = _parse_trade_signal_from_message(
+    signal = parse_trade_signal_from_message(
         _message("**$AAPL** is now oversold — buy signal\nPrice: $190.50"),
         default_timeframe="1h",
     )
@@ -29,7 +29,7 @@ def test_discord_parser_parses_ramjet_oversold_buy() -> None:
 
 
 def test_discord_parser_prefers_symbol_after_action_over_ramjet_label() -> None:
-    signal = _parse_trade_signal_from_message(
+    signal = parse_trade_signal_from_message(
         _message("RAM JET BUY AAPL @ 190.50"),
         default_timeframe="1h",
     )
@@ -41,7 +41,7 @@ def test_discord_parser_prefers_symbol_after_action_over_ramjet_label() -> None:
 
 
 def test_discord_parser_does_not_treat_lowercase_word_after_action_as_symbol() -> None:
-    signal = _parse_trade_signal_from_message(
+    signal = parse_trade_signal_from_message(
         _message("RAM JET buy at market @ 190.50"),
         default_timeframe="1h",
     )
@@ -53,7 +53,7 @@ def test_discord_parser_carries_the_parse_time_receipt_stamp() -> None:
     """#337: the source stamps ``received_at_local`` at parse time and carries
     it on the signal field - dropping either side would silently move
     ``message_received_at`` to the post-wait conversion time."""
-    signal = _parse_trade_signal_from_message(
+    signal = parse_trade_signal_from_message(
         _message("**$AAPL** is now oversold — buy signal\nPrice: $190.50"),
         default_timeframe="1h",
     )
@@ -66,7 +66,7 @@ def test_discord_parser_carries_the_parse_time_receipt_stamp() -> None:
 
 
 def test_discord_parser_parses_rocketfuel_momentum_reversal_sell() -> None:
-    signal = _parse_trade_signal_from_message(
+    signal = parse_trade_signal_from_message(
         _message("Rocket Fuel momentum reversal for **$TSLA** @ 180.25"),
         default_timeframe="1h",
     )
