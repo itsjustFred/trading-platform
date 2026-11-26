@@ -6752,6 +6752,7 @@ def _patch_heal_ledger(
     symbol: str = "NVDA",
     open_lots: list[dict] | None = None,
     pending_markers: list[dict] | None = None,
+    persisted_cancels: list[dict] | None = None,
     quote_bid: float = 149.0,
     quote_ask: float = 149.5,
     market_state: str = "open",
@@ -6800,6 +6801,15 @@ def _patch_heal_ledger(
         alpaca_module,
         "list_pending_exit_reprotections",
         lambda _account, **_k: list(pending_markers or []),
+    )
+    monkeypatch.setattr(
+        alpaca_module,
+        "list_live_control_audit",
+        lambda action=None, **_k: [
+            dict(row)
+            for row in (persisted_cancels or [])
+            if action is None or row.get("action") == action
+        ],
     )
     monkeypatch.setattr(
         alpaca_module,
@@ -7189,6 +7199,13 @@ def test_protective_stop_near_aged_expiry_is_replaced(monkeypatch) -> None:
         row.get("detail", {}).get("outcome") == "stop_replaced_before_aged_cancel"
         for row in audits
     )
+    # The cancel leaves a durable intent row so a crash before the
+    # replacement still reads as OUR cancel on the next process.
+    assert any(
+        row.get("action") == "alpaca_expired_stop_replace_cancel"
+        and row.get("target_id") == "expiring-stop-1"
+        for row in audits
+    )
 
 
 def test_protective_stop_aged_policy_cancel_leg_heals(monkeypatch) -> None:
@@ -7237,6 +7254,44 @@ def test_protective_stop_unproven_canceled_leg_alerts_only(
         "canceled_stop_unproven" in str(record.__dict__.get("data", {}))
         for record in caplog.records
     )
+
+
+def test_protective_stop_crash_between_replace_cancel_and_place_heals(
+    monkeypatch,
+) -> None:
+    """Crash window: the process died after canceling an expiring stop but
+    before placing its replacement. ``_heal_replaced_order_ids`` is empty in
+    the new process; the persisted cancel intent is the proof that lets the
+    ``canceled`` order heal instead of alerting as an operator cancel."""
+    entry_id = str(uuid4())
+    created = datetime.now(timezone.utc) - timedelta(days=86)
+    parent, leg = _expired_entry_parent(
+        entry_signal_id=entry_id, leg_status="canceled"
+    )
+    leg.id = "crashed-replace-stop"
+    leg.created_at = created
+    leg.canceled_at = datetime.now(timezone.utc)
+    client = _naked_position_client(parents=[parent])
+    persisted = [
+        {
+            "action": "alpaca_expired_stop_replace_cancel",
+            "target_id": "crashed-replace-stop",
+            "succeeded": True,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+    ]
+    _audits, adapter = _patch_heal_ledger(
+        monkeypatch,
+        ledger_qty=135.0,
+        entry_signal_id=entry_id,
+        persisted_cancels=persisted,
+    )
+    adapter._trading_client = client
+
+    _run_heal(adapter)
+
+    assert len(client.submitted) == 1
+    assert _tif_text(client.submitted[0]) == "gtc"
 
 
 def test_protective_stop_through_market_closes_at_market(

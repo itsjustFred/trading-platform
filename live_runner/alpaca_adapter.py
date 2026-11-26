@@ -81,6 +81,7 @@ from shared.database import (
     get_live_signal_metadata,
     get_live_signal_reconciliation_cursor,
     list_live_account_open_position_lots,
+    list_live_control_audit,
     list_live_executions_for_broker_orders,
     list_live_executions_missing_commission,
     list_live_signal_ids_for_reconciliation,
@@ -158,6 +159,16 @@ _EXPIRED_STOP_HEAL_INTERVAL_SECONDS = 300.0
 _EXPIRED_STOP_HEAL_LOCK_TIMEOUT_SECONDS = 30.0
 #: Audit action for the protective-stop self-heal.
 _EXPIRED_STOP_HEAL_AUDIT_ACTION = "alpaca_expired_entry_stop_heal"
+#: Audit action written when the heal cancels a working stop ahead of its
+#: aged-order expiry. The row is the durable proof - surviving a restart -
+#: that a later ``canceled`` order was canceled BY US for replacement, so the
+#: next process heals it instead of reading an unproven operator cancel.
+_EXPIRED_STOP_REPLACE_CANCEL_ACTION = "alpaca_expired_stop_replace_cancel"
+#: How long a replace-cancel intent stays heal-eligible proof. The cancel
+#: and the replacement are seconds apart; a day covers clock skew and a
+#: slow replacement pass without letting a stale intent bless an operator
+#: cancel weeks later.
+_EXPIRED_STOP_REPLACE_CANCEL_INTENT_TTL = timedelta(hours=24)
 #: Alpaca's aged-order policy cancels a GTC order ~90 days after creation;
 #: ``expires_at`` is the broker's own schedule when it reports one.
 _PROTECTIVE_ORDER_AGED_TTL = timedelta(days=90)
@@ -6488,7 +6499,9 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             after=await self._held_leg_scan_after(symbols),
         )
         now = datetime.now(timezone.utc)
-        replaced_ids = frozenset(self._heal_replaced_order_ids)
+        replaced_ids = frozenset(self._heal_replaced_order_ids) | (
+            await self._persisted_replace_cancel_ids()
+        )
         # A leg reachable both nested under its parent and as its own
         # top-level row must classify once, under the parent - the parent
         # linkage is what proves it is an entry's protection.
@@ -6523,6 +6536,59 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 scan=scan,
             )
         return scan
+
+    async def _persisted_replace_cancel_ids(self) -> set[str]:
+        """Order ids this adapter canceled for aged replacement in a past process.
+
+        ``_heal_replaced_order_ids`` is in-memory only: a crash between the
+        cancel and the replacement placement would leave the ``canceled``
+        order's ``canceled_at`` far from the expiry proof window, so it would
+        read as an unproven operator cancel - alerted, never healed. The
+        cancel writes a ``_EXPIRED_STOP_REPLACE_CANCEL_ACTION`` audit row
+        first, so the intent survives the restart. A read failure returns an
+        empty set: unproven cancels still alert rather than heal.
+        """
+        try:
+            rows = await asyncio.to_thread(
+                list_live_control_audit,
+                action=_EXPIRED_STOP_REPLACE_CANCEL_ACTION,
+                limit=1000,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # except-kind: money-decision
+            logger.warning(
+                "Alpaca protective-stop maintenance could not read replace "
+                "cancel intents",
+                extra={
+                    "data": {
+                        "account_id": self.account_id,
+                        "error": repr(exc),
+                    }
+                },
+            )
+            return set()
+        cutoff = (
+            datetime.now(timezone.utc)
+            - _EXPIRED_STOP_REPLACE_CANCEL_INTENT_TTL
+        )
+        ids: set[str] = set()
+        for row in rows:
+            if not row.get("succeeded"):
+                continue
+            created_raw = row.get("created_at")
+            try:
+                created = datetime.fromisoformat(str(created_raw))
+            except (TypeError, ValueError):
+                continue
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=timezone.utc)
+            if created < cutoff:
+                continue
+            target_id = str(row.get("target_id") or "").strip()
+            if target_id:
+                ids.add(target_id)
+        return ids
 
     async def maintain_protective_stops(self, *, force: bool = False) -> None:
         """One throttled protective-stop maintenance pass.
@@ -6856,9 +6922,14 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         )
         if working_stop is not None:
             coid = str(_order_attr(working_stop, "client_order_id", "") or "")
-            if _REPROTECT_CLIENT_ORDER_MARKER in coid:
+            if (
+                _REPROTECT_CLIENT_ORDER_MARKER in coid
+                and _reprotect_entry_candidate(coid) is not None
+            ):
                 # Our own earlier heal already covers the position: nothing
-                # to do and nothing wrong - informational only.
+                # to do and nothing wrong - informational only. The UUID
+                # prefix requirement keeps a foreign order that merely
+                # contains "-reprotect" in its client id from reading as ours.
                 logger.info(
                     "Alpaca protective-stop maintenance: %s is already "
                     "protected by re-protect order %s",
@@ -7438,6 +7509,22 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 {"leg_order_ids": leg_ids, "error": repr(exc)},
             )
             return
+        # Durable intent first: ``_heal_replaced_order_ids`` is in-memory, so
+        # a crash between this cancel and the replacement would otherwise
+        # leave the canceled order reading as an unproven operator cancel on
+        # the next process - alerted forever, never healed.
+        record_live_control_audit(
+            action=_EXPIRED_STOP_REPLACE_CANCEL_ACTION,
+            target_type="alpaca_order",
+            target_id=order_id,
+            actor="live-runner",
+            succeeded=True,
+            detail={
+                "account_id": self.account_id,
+                "symbol": symbol,
+                "leg_order_ids": leg_ids,
+            },
+        )
         self._heal_replaced_order_ids.add(order_id)
         for _attempt in range(3):
             try:

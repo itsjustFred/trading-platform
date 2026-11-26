@@ -7575,6 +7575,7 @@ def list_live_control_audit(
     *,
     limit: int = 100,
     target_id: str | None = None,
+    action: str | None = None,
 ) -> list[dict[str, Any]]:
     """Most recent first. Read-only; there is no delete path on purpose."""
     bounded = max(1, min(int(limit or 100), 1000))
@@ -7584,6 +7585,10 @@ def list_live_control_audit(
         if target_id:
             statement = statement.where(
                 LiveControlAuditModel.target_id == str(target_id).strip()
+            )
+        if action:
+            statement = statement.where(
+                LiveControlAuditModel.action == str(action).strip()
             )
         rows = session.exec(
             statement.order_by(LiveControlAuditModel.created_at.desc()).limit(bounded)

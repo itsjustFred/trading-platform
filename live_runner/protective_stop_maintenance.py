@@ -48,10 +48,23 @@ async def run_protective_stop_maintenance_loop(
                 maintain = getattr(adapter, "maintain_protective_stops", None)
                 if not callable(maintain):
                     continue
-                async with mutation_gate() as may_mutate:
-                    if not may_mutate:
-                        return
-                    await maintain()
+                try:
+                    async with mutation_gate() as may_mutate:
+                        if not may_mutate:
+                            return
+                        await maintain()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # except-kind: loop-survival
+                    logger.warning(
+                        "Protective-stop maintenance pass failed for an adapter",
+                        extra={
+                            "data": {
+                                "account_id": _account_id,
+                                "error": repr(exc),
+                            }
+                        },
+                    )
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # except-kind: loop-survival
