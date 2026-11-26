@@ -50,7 +50,6 @@ from live_runner.base_adapter import (
     QUOTE_TIME_RULE_INVALID,
     QUOTE_TIME_RULE_MISSING,
     QUOTE_TIME_RULE_STALE,
-    UNBOUNDED_TP_POLICY,
     BaseLiveAdapter,
     BrokerOrderRejectedError,
     LivePipValue,
@@ -169,11 +168,6 @@ from live_runner.stockkit_routing import (
     resolve_deployment_stockkit_route,
     validate_stockkit_deployment_route,
 )
-from live_runner.supertrend_flip import (
-    FLIP_SUPPORTED_BROKERS,
-    LiveSupertrendFlipManager,
-    run_flip_workflow_loop,
-)
 from live_runner.trailing_stops import (
     LiveTrailingStopManager,
     adapter_live_trailing_modes,
@@ -244,10 +238,7 @@ from shared.single_instance import (
 )
 from shared.trailing import (
     ANY_BROKER,
-    TRAILING_MODE_SUPERTREND_FLIP,
     TRAILING_SL_CONFIG_METADATA_KEY,
-    deployment_supertrend_flip_enabled,
-    normalize_trailing_mode,
     validate_live_deployment_trailing_mode,
     validate_trailing_sl_config,
 )
@@ -1011,7 +1002,7 @@ def _apply_signal_processor(
     # the signal.
     validate_trailing_sl_config(
         (processed.metadata or {}).get(TRAILING_SL_CONFIG_METADATA_KEY),
-        supported=_live_signal_trailing_modes(adapter, deployment),
+        supported=adapter_live_trailing_modes(adapter),
         context=(
             f"live deployment '{deployment.strategy_name}' ({deployment.id}) "
             f"signal processor '{processor_name}'"
@@ -1633,86 +1624,6 @@ def _describe_exit_rows(
         )
         for row in rows
     )
-
-
-def _live_signal_trailing_modes(
-    adapter: BaseLiveAdapter | None, deployment: LiveDeploymentConfig
-) -> frozenset[str]:
-    """Trailing modes a signal may request through THIS adapter+deployment.
-
-    ``adapter_live_trailing_modes`` covers the broker table plus the
-    adapter's stop-amendment capability. ``supertrend_flip`` is the single
-    exception (#168): the cTrader broker table lists it, but it runs ONLY for
-    a deployment carrying the explicit ``live_supertrend_flip`` settings
-    opt-in on a provably demo/paper cTrader account
-    (``supports_supertrend_flip`` + ``_adapter_is_demo``). Every other
-    combination resolves to the adapter's own modes - fail closed, exactly
-    the ``main`` behaviour for live and non-opted accounts.
-    """
-    modes = adapter_live_trailing_modes(adapter)
-    try:
-        flip_ok = (
-            str(getattr(adapter, "broker_name", "") or "").strip().lower()
-            in FLIP_SUPPORTED_BROKERS
-            and getattr(adapter, "supports_supertrend_flip", False) is True
-            and deployment_supertrend_flip_enabled(deployment)
-            and adapter is not None
-            and _adapter_is_demo(adapter)
-        )
-    except Exception:  # except-kind: money-decision
-        flip_ok = False
-    if flip_ok:
-        return modes | {TRAILING_MODE_SUPERTREND_FLIP}
-    return modes - {TRAILING_MODE_SUPERTREND_FLIP}
-
-
-def _flip_managed_entry(
-    adapter: BaseLiveAdapter | None,
-    deployment: LiveDeploymentConfig,
-    metadata: Mapping[str, Any],
-) -> bool:
-    """Whether this entry is managed by the live ``supertrend_flip`` workflow.
-
-    The same predicate ``_live_signal_trailing_modes`` uses to admit the
-    mode, plus the signal actually requesting it through its trailing
-    config. Only then is the broker take-profit stripped at submission:
-    the signal's ``take_profit`` IS TP1 - the level the manager itself
-    closes part of - so sending it as the order's broker TP would close
-    the whole position at TP1 and the workflow (breakeven, await-green,
-    flip exit) would never run (#168 maintainer default: the entry goes
-    to the broker stop-only, the manager owns TP1).
-    """
-    try:
-        trailing_cfg = metadata.get(TRAILING_SL_CONFIG_METADATA_KEY)
-        if not isinstance(trailing_cfg, Mapping):
-            return False
-        if (
-            normalize_trailing_mode(trailing_cfg.get("mode"))
-            != TRAILING_MODE_SUPERTREND_FLIP
-        ):
-            return False
-        return (
-            TRAILING_MODE_SUPERTREND_FLIP
-            in _live_signal_trailing_modes(adapter, deployment)
-        )
-    except Exception:  # except-kind: money-decision
-        return False
-
-
-async def _flip_exit_in_flight_check(
-    adapter: BaseLiveAdapter, deployment: LiveDeploymentConfig, symbol: str
-) -> bool:
-    """True when any exit for this deployment+symbol may still be working.
-
-    Wraps :func:`_ensure_no_exit_in_flight` for the flip manager: its own
-    working exit (``ExitInFlightError``) and other deployments' working exits
-    both mean "defer this close", never "submit anyway".
-    """
-    try:
-        others = await _ensure_no_exit_in_flight(adapter, deployment, symbol)
-    except ExitInFlightError:
-        return True
-    return bool(others)
 
 
 def _exit_targets_same_lot(row: Mapping[str, Any], target_signal_id: str | None) -> bool:
@@ -2487,7 +2398,7 @@ async def prepare_order_with_risk(
     # _apply_signal_processor).
     validate_trailing_sl_config(
         metadata.get(TRAILING_SL_CONFIG_METADATA_KEY),
-        supported=_live_signal_trailing_modes(adapter, deployment),
+        supported=adapter_live_trailing_modes(adapter),
         context=f"live deployment '{deployment.strategy_name}' ({deployment.id}) order submission",
     )
     validate_adapter_trailing_timeframe(
@@ -2715,7 +2626,6 @@ async def prepare_order_with_risk(
         stop_loss=stop_loss,
         take_profit=take_profit,
     )
-    flip_managed_entry = _flip_managed_entry(adapter, deployment, metadata)
     if take_profit is None and unbounded_tp:
         logger.warning(
             "Submitting live order with explicitly unbounded take profit "
@@ -2731,19 +2641,7 @@ async def prepare_order_with_risk(
     metadata["entry_price"] = float(entry_price)
     metadata["stop_loss"] = float(stop_loss)
     metadata["resolved_stop_loss"] = float(stop_loss)
-    if flip_managed_entry:
-        # #168 maintainer default: the broker order is STOP-ONLY. The
-        # signal's take_profit is TP1, which the flip manager closes part
-        # of itself - a broker TP at that level would flatten the whole
-        # position before breakeven/await-green/the flip exit can run.
-        # ``tp1_price`` stays in metadata for the manager; the explicit
-        # unbounded policy is what the adapters already honour as "no TP
-        # leg". ``take_profit`` itself is dropped so neither the order nor
-        # the persisted signal claims a full-position target.
-        metadata["take_profit_policy"] = UNBOUNDED_TP_POLICY
-        metadata.pop("take_profit", None)
-        metadata.pop("tp_price", None)
-    elif take_profit is not None:
+    if take_profit is not None:
         metadata["take_profit"] = float(take_profit)
     else:
         metadata.pop("take_profit", None)
@@ -2779,12 +2677,6 @@ async def prepare_order_with_risk(
         for key, value in {**sized_metadata, **preserved_metadata}.items()
         if key not in _ENTRY_STRIPPED_METADATA_KEYS
     }
-    if flip_managed_entry:
-        # The sized metadata is a copy of the incoming payload and can
-        # carry the TP aliases back in; the broker order must stay
-        # stop-only regardless of which alias the signal used.
-        final_metadata.pop("take_profit", None)
-        final_metadata.pop("tp_price", None)
     # The gate's and the pip value's figures are written last: a payload value
     # under one of these keys can neither shadow nor survive them.
     final_metadata.update(quote_metadata)
@@ -7863,25 +7755,6 @@ async def _run_daemon_locked(
                 ),
                 name="trailing-stops-loop",
             )
-            # #168: the live supertrend_flip workflow. The loop runs
-            # unconditionally but manages nothing unless a deployment carries
-            # the explicit settings opt-in (default off) AND its account's
-            # adapter is a demo/paper cTrader - the manager re-checks both, so
-            # this wiring cannot turn the mode on by itself.
-            flip_task = asyncio.create_task(
-                run_flip_workflow_loop(
-                    LiveSupertrendFlipManager(
-                        mutation_gate=_broker_mutation,
-                        exit_lock=_exit_lock,
-                        exit_in_flight_check=_flip_exit_in_flight_check,
-                    ),
-                    eligible_adapters=lambda: _trailing_eligible_adapters(
-                        active_adapters
-                    ),
-                    current_deployments=lambda: list(deployment_snapshot),
-                ),
-                name="supertrend-flip-loop",
-            )
             commission_task = asyncio.create_task(
                 _backfill_commissions_loop(active_adapters), name="commission-backfill"
             )
@@ -7908,7 +7781,6 @@ async def _run_daemon_locked(
                 service_sync_task,
                 balance_task,
                 trailing_task,
-                flip_task,
                 commission_task,
                 reconciliation_task,
                 internal_strategy_task,

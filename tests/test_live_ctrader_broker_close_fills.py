@@ -2096,10 +2096,10 @@ def test_the_exit_ledger_mismatch_alert_also_flags_reconciliation(database) -> N
     assert flags[0]["detail"]["cause"] == "exit_ledger_mismatch"
 
 
-# ─── flip first-sight provenance read (#168) ─────────────────────────────────
+# ─── position parent-signal provenance read ─────────────────────────────────
 
 
-def test_opening_signal_id_for_position_proves_the_single_opener(
+def test_resolve_position_parent_signal_proves_the_single_opener(
     database,
 ) -> None:
     """One persisted opening order -> its signal id; protection legs and
@@ -2116,17 +2116,17 @@ def test_opening_signal_id_for_position_proves_the_single_opener(
         },
     )
 
-    assert (
-        asyncio.run(adapter.opening_signal_id_for_position(POSITION_ID))
-        == signal_id
+    assert asyncio.run(adapter._resolve_position_parent_signal(POSITION_ID)) == (
+        signal_id,
+        "ok",
     )
 
 
-def test_opening_signal_id_for_position_manual_opener_proves_nothing(
+def test_resolve_position_parent_signal_manual_opener_proves_nothing(
     database,
 ) -> None:
-    """A manual/foreign opener (no persisted signal) returns ``None`` -
-    proven foreign, which the flip manager treats as fail-closed."""
+    """A manual/foreign opener (no persisted signal) resolves to no signal -
+    the caller treats that as fail-closed."""
     adapter = _adapter(
         database,
         position_orders={
@@ -2134,14 +2134,17 @@ def test_opening_signal_id_for_position_manual_opener_proves_nothing(
         },
     )
 
-    assert asyncio.run(adapter.opening_signal_id_for_position(POSITION_ID)) is None
+    assert asyncio.run(adapter._resolve_position_parent_signal(POSITION_ID)) == (
+        None,
+        "no_opening_order",
+    )
 
 
-def test_opening_signal_id_for_position_ambiguous_openers_prove_nothing(
+def test_resolve_position_parent_signal_ambiguous_openers_prove_nothing(
     database,
 ) -> None:
-    """Two distinct persisted openers -> ``None``: the book cannot say which
-    signal owns the position."""
+    """Two distinct persisted openers -> no attribution: the book cannot say
+    which signal owns the position."""
     first = _persist_entry(database, qty=10.0, order_id=555)
     second = _persist_entry(
         database, deployment_id=DEP_OTHER, qty=4.0, order_id=556
@@ -2156,10 +2159,13 @@ def test_opening_signal_id_for_position_ambiguous_openers_prove_nothing(
         },
     )
 
-    assert asyncio.run(adapter.opening_signal_id_for_position(POSITION_ID)) is None
+    assert asyncio.run(adapter._resolve_position_parent_signal(POSITION_ID)) == (
+        None,
+        "ambiguous_parent",
+    )
 
 
-def test_opening_signal_id_for_position_closing_orders_are_skipped(
+def test_resolve_position_parent_signal_closing_orders_are_skipped(
     database,
 ) -> None:
     """Only closingOrder=False rows can open a position: a position whose
@@ -2168,16 +2174,17 @@ def test_opening_signal_id_for_position_closing_orders_are_skipped(
         database, position_orders={POSITION_ID: [_closing_order()]}
     )
 
-    assert asyncio.run(adapter.opening_signal_id_for_position(POSITION_ID)) is None
+    assert asyncio.run(adapter._resolve_position_parent_signal(POSITION_ID)) == (
+        None,
+        "no_opening_order",
+    )
 
 
-def test_opening_signal_id_for_position_unreadable_raises(
+def test_resolve_position_parent_signal_unreadable_reports_the_cause(
     database,
 ) -> None:
-    """An unreadable order list RAISES (transient, retried by the caller)
-    instead of returning ``None`` (proven foreign)."""
-    from live_runner.ctrader_adapter import CTraderApiError
-
+    """An unreadable order list reports ``position_orders_unreadable`` - a
+    transient answer the caller can retry, distinct from proven foreign."""
     adapter = _adapter(database)
 
     async def _wrong_response(request: Any, **_kwargs: Any) -> Any:
@@ -2185,8 +2192,10 @@ def test_opening_signal_id_for_position_unreadable_raises(
 
     adapter._send_request_with_refresh_retry = _wrong_response  # type: ignore[method-assign]
 
-    with pytest.raises(CTraderApiError, match="unreadable"):
-        asyncio.run(adapter.opening_signal_id_for_position(POSITION_ID))
+    assert asyncio.run(adapter._resolve_position_parent_signal(POSITION_ID)) == (
+        None,
+        "position_orders_unreadable",
+    )
 
 
 # ─── bundle-74 findings: flags retry, stream window, scan cursor ────────────────────────────────

@@ -567,9 +567,8 @@ class RiskEngine:
         if price <= 0:
             raise ValueError("market_price must be > 0")
 
-        # #150 fail closed: an unknown mode, a malformed config, or a mode the
-        # engine cannot execute (e.g. supertrend_flip, which the replay adapter
-        # runs itself as a position workflow, #168) raises — the
+        # #150 fail closed: an unknown or removed mode, a malformed config, or
+        # a mode the engine cannot execute raises — the
         # old warned no-op traded signals without the trailing they requested.
         # Executing paths must gate their own supported set BEFORE calling this
         # (replay: shared.trailing.REPLAY_SUPPORTED_TRAILING_MODES) so the

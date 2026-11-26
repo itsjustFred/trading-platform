@@ -635,17 +635,13 @@ behavior**, not a bug to be fixed by silently changing one engine:
 |---|---|---|
 | native | next-bar-open | Signal on bar *N* — entry **and** market signal exit — fills at bar *N+1* open (2026-11-13); protective exits evaluated per bar, filling at the level on a touch and at the open on a gap. `exit_order_type="level"` exits fill at their level on the signal bar (§2). |
 | vectorbt (frozen) | next-bar-open entries / signal-bar-close exits | Entries fill at bar *N+1* open; signal exits keep the legacy trigger-bar `close` fill — `next_open` is refused outright and the `open` mode was removed (§2). Protective exits fill at the level on a touch and at the open on a gap-through-level (§2); frozen otherwise. |
-| signal-replay | same-bar-close | External signal payloads fill at the signal bar's close (entries and signal exits alike); slippage/delay recorded in `trade.meta`. Protective exits fill at the level on a touch and at the open on a gap. The `supertrend_flip` leg is the exception: it fills at the next bar's open (see below). |
+| signal-replay | same-bar-close | External signal payloads fill at the signal bar's close (entries and signal exits alike); slippage/delay recorded in `trade.meta`. Protective exits fill at the level on a touch and at the open on a gap. |
 | pynecore | post-hoc restatement | Pine execution produces exit prices that are then *recontained* to the recorded protective levels. |
 
-**`supertrend_flip` exit (signal-replay, #168).** The flip leg is a signal exit
-decided at the close of the first red bar after activation and filled at the
-OPEN of the next bar, so a flip on the last bar closes as `end_of_data` at that
-bar's close. This is the only replay *signal* exit that is not a level fill and
-not a same-bar-close fill (the level exits themselves can fill at the open on a
-gap — see the §1 gap rule below). The run-level `signal_exit_fill` stays `close` for replay
-(the replay has no `open` model); each flip trade records
-`meta["supertrend_flip"]["flip_exit_fill"] = "next_bar_open"`.
+The `supertrend_flip` workflow was removed (2026-11-26): the replay leg that
+filled at the next bar's open is gone along with the live workflow. A
+`trailing_mode: supertrend_flip` signal is refused before it reaches the
+replay engine.
 
 The workflow's level exits — the stop before and after TP1, and the TP1
 tranche — follow the §1 gap rule (#287): a bar

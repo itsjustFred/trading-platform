@@ -12,7 +12,6 @@ from collections import deque
 from collections.abc import Collection, Iterator, Mapping
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
-from decimal import ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP, Decimal
 from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
@@ -30,7 +29,6 @@ from live_runner.base_adapter import (
     ControlOutcome,
     LivePipValue,
     LiveQuote,
-    ProtectiveStop,
     coerce_positive_live_qty,
     commission_from_signed_cash_flow,
     is_unbounded_tp,
@@ -240,12 +238,6 @@ _PENDING_CLOSE_POSITION_TTL_SECONDS = 3600.0
 #: its submit's mark is still live. Budget-free parking would otherwise never
 #: re-arm the pass that can recover the close's broker order id.
 _PENDING_CLOSE_FILL_RECONCILE_SECONDS = 30.0
-#: Bounded broker-state confirmation for ProtoOAAmendPositionSLTPReq (#168):
-#: the request has no dedicated response, so the amended stop is confirmed by
-#: re-reading the position. The broker applies the amend asynchronously, so a
-#: few short-interval reads cover the apply window without stalling the trail.
-_AMEND_CONFIRM_ATTEMPTS = 8
-_AMEND_CONFIRM_INTERVAL_SECONDS = 0.4
 #: Sentinel queued on ``_execution_queue`` to wake ``listen_executions`` for a
 #: pending broker reconciliation instead of letting it sleep out the 30 s
 #: ``queue.get`` timeout. Never a real execution payload.
@@ -303,11 +295,9 @@ _TRENDBAR_PERIOD_SECONDS: dict[str, int] = {
     "MN1": 2_592_000,
 }
 
-#: Canonical deployment timeframes the cTrader adapter can serve for the
-#: live ``supertrend_flip`` workflow (#168). Only sub-day bars: the broker
-#: anchors ``4h``/``1d``/``1w`` to its server day/week, which is not provably
-#: the UTC alignment replay uses, so the flip workflow refuses them. The
-#: per-broker live-trailing table in ``shared.trailing`` mirrors this set.
+#: Canonical deployment timeframes the cTrader adapter can serve for market
+#: data (#168). Only sub-day bars: the broker anchors ``4h``/``1d``/``1w`` to
+#: its server day/week, which is not provably the UTC alignment replay uses.
 CTRADER_MARKET_DATA_TIMEFRAMES: frozenset[str] = frozenset(
     {"1m", "5m", "15m", "30m", "1h"}
 )
@@ -1282,13 +1272,6 @@ class CTraderLiveAdapter(BaseLiveAdapter):
     """cTrader live adapter backed by OpenApiPy."""
 
     broker_name = "ctrader"
-    # `supports_stop_amendment` (#168): a cTrader position's SL/TP is amended
-    # in place through ProtoOAAmendPositionSLTPReq - the broker replaces the
-    # protective levels atomically, so the previous stop keeps working until
-    # the new one is accepted and stays if the request is refused. The adapter
-    # confirms every amendment by re-reading the position from the broker
-    # before reporting success; an unconfirmed outcome raises instead of
-    # claiming the stop moved.
 
     def __init__(
         self,
@@ -1498,7 +1481,6 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._ProtoOAGetTrendbarsReq: Any = None
         self._ProtoOAGetTrendbarsRes: Any = None
         self._ProtoOATrendbarPeriod: Any = None
-        self._ProtoOAAmendPositionSLTPReq: Any = None
 
         self._heartbeat_payload_type: int | None = None
         self._spot_payload_type: int | None = None
@@ -1517,7 +1499,6 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             from ctrader_open_api.messages.OpenApiMessages_pb2 import (
                 ProtoOAAccountAuthReq,
                 ProtoOAAccountAuthRes,
-                ProtoOAAmendPositionSLTPReq,
                 ProtoOAApplicationAuthReq,
                 ProtoOAApplicationAuthRes,
                 ProtoOACancelOrderReq,
@@ -1614,7 +1595,6 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._ProtoOAUnsubscribeSpotsReq = ProtoOAUnsubscribeSpotsReq
         self._ProtoOAGetTrendbarsReq = ProtoOAGetTrendbarsReq
         self._ProtoOAGetTrendbarsRes = ProtoOAGetTrendbarsRes
-        self._ProtoOAAmendPositionSLTPReq = ProtoOAAmendPositionSLTPReq
         self._ProtoOATrendbarPeriod = ProtoOATrendbarPeriod
 
         self._heartbeat_payload_type = ProtoHeartbeatEvent().payloadType
@@ -4057,12 +4037,12 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 await self._unsubscribe_spot(symbol_id)
 
     def supports_market_data_timeframe(self, timeframe: str) -> bool:
-        """Whether :meth:`get_market_data` can serve ``timeframe`` (#168).
+        """Whether :meth:`get_market_data` can serve ``timeframe``.
 
-        Only canonical deployment spellings count: the per-broker trailing
-        table and the deployment gates compare the raw timeframe string, so
-        an alias like ``60min`` must not pass here and then fail there (or
-        vice versa). ``get_market_data`` itself accepts the aliases.
+        Only canonical deployment spellings count: the per-broker gates
+        compare the raw timeframe string, so an alias like ``60min`` must
+        not pass here and then fail there (or vice versa).
+        ``get_market_data`` itself accepts the aliases.
         """
         normalized = str(timeframe or "").strip().lower()
         return normalized in CTRADER_MARKET_DATA_TIMEFRAMES
@@ -4074,7 +4054,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         timeframe: str,
         limit: int = 200,
     ) -> pd.DataFrame:
-        """Recent closed trendbars for ``symbol`` on ``timeframe`` (#168).
+        """Recent closed trendbars for ``symbol`` on ``timeframe``.
 
         Fetches ``ProtoOAGetTrendbarsReq`` history and decodes the
         delta-encoded ``ProtoOATrendbar`` rows into the same OHLCV frame
@@ -4113,8 +4093,8 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         now = _utc_now()
         # The window is wider than count*period on purpose: weekends and
         # session gaps mean `count` calendar periods hold fewer bars, and a
-        # too-narrow window would silently truncate the history the
-        # supertrend warm-up needs.
+        # too-narrow window would silently truncate the history a strategy's
+        # indicator warm-up needs.
         window_seconds = period_seconds * bounded_limit * 3
         request = self._ProtoOAGetTrendbarsReq()
         request.ctidTraderAccountId = self.ctid_trader_account_id
@@ -5377,10 +5357,10 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         if int(getattr(trade_data, "tradeSide", 0) or 0) == self._ProtoOATradeSide.SELL:
             qty = -qty
         normalized_symbol = str(symbol).strip().upper()
-        # The flip workflow's fallback-TP removal verifies the broker TP
-        # is the one it placed before clearing anything (#168 review):
-        # the position read must carry the TP so a foreign TP fails
-        # closed instead of being silently removed.
+        # The position read carries the broker TP so a caller that manages
+        # the position's exits can verify the TP is the one it placed before
+        # changing anything: a foreign TP fails closed instead of being
+        # silently overwritten.
         broker_tp = (
             parse_optional(getattr(position, "takeProfit", None))
             if self._has_proto_field(position, "takeProfit")
@@ -5407,566 +5387,6 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             "position_id": position_id if position_id > 0 else 0,
             "volume": int(volume),
         }
-
-    # ── Protective stops / in-place SL-TP amendment (#168) ──────────────────────
-    #
-    # cTrader has no standalone protective-stop order: a position's stopLoss /
-    # takeProfit live on the position itself and are amended atomically through
-    # ProtoOAAmendPositionSLTPReq. The previous levels keep working until the
-    # broker accepts the new ones, and a refused request changes nothing.
-    # These primitives exist ONLY for the opt-in live ``supertrend_flip``
-    # workflow on demo/paper accounts: the adapter deliberately does NOT
-    # declare ``supports_stop_amendment``, so the percent-trailing path and
-    # the broker reconciler treat every cTrader account exactly as on main.
-    # ``supports_supertrend_flip`` is the single capability the flip manager
-    # and the daemon's signal gates check, and it is demo-only.
-
-    @property
-    def supports_supertrend_flip(self) -> bool:
-        """Live flip workflow requires a provably demo/paper account."""
-        return self.demo is True
-
-    async def list_protective_stops(self) -> list[ProtectiveStop]:
-        """One amendable protective stop per open position that has one.
-
-        Synthesized from ``ProtoOAPosition.stopLoss``: ``order_id`` is the
-        broker ``positionId`` (there is no separate stop order to name), and
-        ``side`` is the order side that would reduce the position - ``sell``
-        for a long, ``buy`` for a short. Read from the broker on every call,
-        so a restart continues from broker state.
-
-        A position with no stop is simply not listed - the caller reports the
-        missing protection. A position whose broker-native trailing stop is
-        active is also not listed: that mechanism is not an absolute-price
-        amend, so offering it would let a trail overwrite a level the broker
-        manages itself. Anything structurally unreadable (no trade data, an
-        unknown symbol or side) raises: a stop that cannot be named cannot be
-        safely amended, and the whole listing failing is the loud answer.
-        """
-        open_positions = await self._fetch_open_positions()
-        stops: list[ProtectiveStop] = []
-        for position in open_positions:
-            stop = self._position_protective_stop(position)
-            if stop is not None:
-                stops.append(stop)
-        return stops
-
-    def _position_protective_stop(self, position: Any) -> ProtectiveStop | None:
-        """The amendable protective stop of one open position, or ``None``.
-
-        ``None`` covers the two skip cases - a broker-native trailing stop
-        (not an absolute-price amend) and a position carrying no stopLoss at
-        all. Anything structurally unreadable raises instead: a stop that
-        cannot be named cannot be safely amended.
-        """
-        position_id = self._positive_int(getattr(position, "positionId", 0))
-        trade_data = getattr(position, "tradeData", None)
-        if position_id is None or trade_data is None:
-            raise ValueError(
-                "cTrader open position is missing positionId or tradeData; "
-                "refusing to report protective stops for an unattributable position"
-            )
-        if bool(getattr(position, "trailingStopLoss", False)):
-            return None
-        if not self._has_proto_field(position, "stopLoss"):
-            return None
-        stop_price = parse_optional(getattr(position, "stopLoss", None))
-        if stop_price is None or stop_price <= 0:
-            raise ValueError(
-                f"cTrader position {position_id} carries an unreadable stopLoss "
-                f"({getattr(position, 'stopLoss', None)!r}); refusing to guess it"
-            )
-        symbol_id = self._positive_int(getattr(trade_data, "symbolId", 0))
-        if symbol_id is None:
-            raise ValueError(
-                f"cTrader position {position_id} has no readable symbolId; "
-                "refusing to report its protective stop"
-            )
-        symbol = self._symbol_name_for_id(symbol_id).strip().upper()
-        stop_side = self._stop_side_for_position(position_id, trade_data)
-        qty: float | None = None
-        try:
-            volume = parse_money(getattr(trade_data, "volume", 0))
-            qty = _broker_volume_to_qty(
-                volume, self._scale_for(symbol).volume_per_qty
-            )
-        except (TypeError, ValueError):
-            qty = None
-        return ProtectiveStop(
-            order_id=str(position_id),
-            symbol=symbol,
-            side=stop_side,
-            stop_price=stop_price,
-            qty=qty,
-        )
-
-    def _stop_side_for_position(self, position_id: int, trade_data: Any) -> str:
-        """The order side that reduces this position - ``sell`` long, ``buy`` short."""
-        trade_side = self._positive_int(getattr(trade_data, "tradeSide", 0))
-        if trade_side == int(self._ProtoOATradeSide.BUY):
-            return "sell"
-        if trade_side == int(self._ProtoOATradeSide.SELL):
-            return "buy"
-        raise ValueError(
-            f"cTrader position {position_id} has unreadable tradeSide "
-            f"({getattr(trade_data, 'tradeSide', None)!r}); cannot tell "
-            "which side its stop protects"
-        )
-
-    def round_stop_price(self, stop: ProtectiveStop, price: float) -> float:
-        """Round a computed stop onto the symbol's price grid, away from market.
-
-        Same convention as the Alpaca adapter: floor for a ``sell`` stop,
-        ceiling for a ``buy`` stop, so the rounded stop is never tighter than
-        the computed one.
-        """
-        value = float(price)
-        if not math.isfinite(value) or value <= 0:
-            raise ValueError(
-                f"Invalid stop price for {stop.symbol}: {price!r}; refusing to amend."
-            )
-        digits = self._scale_for(stop.symbol).price_digits
-        tick = Decimal(1).scaleb(-max(0, int(digits)))
-        # Float noise is removed first (101.96999999999998 is 101.97): flooring
-        # the raw float would otherwise give away a whole tick to a rounding
-        # artefact of the stop arithmetic.
-        rounding = ROUND_FLOOR if stop.side == "sell" else ROUND_CEILING
-        rounded = float(Decimal(repr(round(value, 8))).quantize(tick, rounding=rounding))
-        if rounded <= 0:
-            raise ValueError(
-                f"Stop price for {stop.symbol} rounds to {rounded!r}; refusing to amend."
-            )
-        return rounded
-
-    async def _fetch_open_position(self, position_id: int) -> Any | None:
-        """The open ``ProtoOAPosition`` with this id, or ``None`` when closed."""
-        for position in await self._fetch_open_positions():
-            if self._positive_int(getattr(position, "positionId", 0)) == position_id:
-                return position
-        return None
-
-    async def _confirm_position_stop(
-        self, position_id: int, expected_price: float, *, digits: int
-    ) -> float | None:
-        """The broker-reported stop once it matches ``expected_price``.
-
-        ``None`` while the broker has not yet shown the amended stop; the
-        caller bounds the wait. A position that is gone returns a separate
-        sentinel through the caller's own read - this only answers "does the
-        open position carry the new stop".
-        """
-        position = await self._fetch_open_position(position_id)
-        if position is None:
-            return None
-        if not self._has_proto_field(position, "stopLoss"):
-            return None
-        broker_price = parse_optional(getattr(position, "stopLoss", None))
-        if broker_price is None or broker_price <= 0:
-            return None
-        tolerance = float(Decimal(1).scaleb(-max(0, int(digits)))) * 0.5 + 1e-12
-        if math.isclose(broker_price, expected_price, rel_tol=0.0, abs_tol=tolerance):
-            return broker_price
-        return None
-
-    async def amend_protective_stop(
-        self, stop: ProtectiveStop, new_stop_price: float
-    ) -> ProtectiveStop:
-        """Move a position's stop loss to ``new_stop_price``, TP preserved.
-
-        Sends ``ProtoOAAmendPositionSLTPReq`` with the new absolute stop and
-        the position's current take profit echoed back unchanged (unset when
-        the position has none, which the broker reads as "no TP" either way).
-        The request has no dedicated response message, so the outcome is
-        confirmed by re-reading the position: only a broker-reported stop at
-        the requested price counts as amended. Any send failure that is not a
-        definite broker refusal (timeout, dropped connection, malformed
-        response) is verified the same way - if the state shows the new stop
-        the amendment did land; if it cannot be confirmed this raises and the
-        caller keeps treating the previous broker state as the truth.
-        """
-        position_id = self._positive_int(getattr(stop, "order_id", None))
-        if position_id is None:
-            raise ValueError(
-                f"cTrader protective stop for {stop.symbol} has no usable "
-                f"position id ({stop.order_id!r}); refusing to amend."
-            )
-        if self._ProtoOAAmendPositionSLTPReq is None:
-            raise RuntimeError("cTrader amend-position-SLTP request type is not loaded")
-        # Read the position first: it connects/authenticates (so the symbol
-        # scale is broker-sourced), proves the position is still open, and
-        # supplies the TP and protection flags to echo back unchanged.
-        position = await self._fetch_open_position(position_id)
-        if position is None:
-            raise RuntimeError(
-                f"cTrader position {position_id} ({stop.symbol}) is no longer open; "
-                "there is no stop to amend."
-            )
-        digits = self._scale_for(stop.symbol).price_digits
-        price = self.round_stop_price(stop, new_stop_price)
-
-        request = self._build_amend_position_request(position_id, price, position)
-        send_error = await self._send_amend_position_request(request)
-        return await self._confirmed_amendment(
-            position_id=position_id,
-            price=price,
-            digits=digits,
-            stop=stop,
-            send_error=send_error,
-        )
-
-    def _build_amend_position_request(
-        self, position_id: int, price: float, position: Any
-    ) -> Any:
-        """The SLTP amendment: new absolute stop, TP and flags echoed back."""
-        request = self._ProtoOAAmendPositionSLTPReq()
-        request.ctidTraderAccountId = self.ctid_trader_account_id
-        request.positionId = position_id
-        request.stopLoss = float(price)
-        if self._has_proto_field(position, "takeProfit"):
-            current_tp = parse_optional(getattr(position, "takeProfit", None))
-            if current_tp is not None and current_tp > 0:
-                request.takeProfit = float(current_tp)
-        for field_name in (
-            "guaranteedStopLoss",
-            "trailingStopLoss",
-            "stopLossTriggerMethod",
-        ):
-            if self._has_proto_field(position, field_name):
-                setattr(request, field_name, getattr(position, field_name))
-        return request
-
-    async def _send_amend_position_request(self, request: Any) -> BaseException | None:
-        """Send the amendment; the send error when the outcome is ambiguous.
-
-        ``None`` means the broker answered without an order-error event. A
-        definite ``CTraderApiError`` refusal propagates (the broker changed
-        nothing); anything else - timeout, transport failure, malformed
-        response - comes back as the exception for the caller to resolve
-        against broker state.
-        """
-        try:
-            response = await self._send_request_with_refresh_retry(
-                request, timeout_seconds=10
-            )
-            self._raise_if_order_error_event(response)
-        except CTraderApiError as exc:
-            # A definite refusal: the broker changed nothing, the previous
-            # stop is still in force.
-            self._raise_terminal_auth_from_api_error(exc)
-            raise
-        except Exception as exc:  # except-kind: money-decision
-            # Timeout, transport failure or an unparseable response: the
-            # request may or may not have landed. Broker state decides below.
-            return exc
-        return None
-
-    async def _confirmed_amendment(
-        self,
-        *,
-        position_id: int,
-        price: float,
-        digits: int,
-        stop: ProtectiveStop,
-        send_error: BaseException | None,
-    ) -> ProtectiveStop:
-        """Poll broker state until the new stop shows, or fail closed."""
-        confirmed_price: float | None = None
-        for attempt in range(_AMEND_CONFIRM_ATTEMPTS):
-            try:
-                confirmed_price = await self._confirm_position_stop(
-                    position_id, price, digits=digits
-                )
-            except asyncio.CancelledError:
-                raise
-            except Exception:  # except-kind: money-decision
-                confirmed_price = None
-            if confirmed_price is not None:
-                break
-            if attempt + 1 < _AMEND_CONFIRM_ATTEMPTS:
-                await asyncio.sleep(_AMEND_CONFIRM_INTERVAL_SECONDS)
-        if confirmed_price is None:
-            position_now = await self._fetch_open_position(position_id)
-            if position_now is None:
-                raise RuntimeError(
-                    f"cTrader position {position_id} ({stop.symbol}) closed while its "
-                    "stop was being amended; the amendment outcome is moot but the "
-                    "close itself must be reconciled."
-                )
-            detail = f" send error: {send_error!r}" if send_error is not None else ""
-            raise RuntimeError(
-                f"cTrader did not confirm the stop amendment for position "
-                f"{position_id} ({stop.symbol}): broker still reports stopLoss "
-                f"{getattr(position_now, 'stopLoss', None)!r}, requested {price!r}.{detail}"
-            )
-        return ProtectiveStop(
-            order_id=str(position_id),
-            symbol=stop.symbol,
-            side=stop.side,
-            stop_price=confirmed_price,
-            qty=stop.qty,
-        )
-
-    async def amend_position_take_profit(
-        self, position_id: int, take_profit: float | None
-    ) -> float | None:
-        """Set (or clear) a position's take profit; the stop is preserved exactly.
-
-        ``take_profit=None`` removes the TP; a price sets it. The position's
-        current ``stopLoss`` is echoed back verbatim into the same atomic
-        ``ProtoOAAmendPositionSLTPReq``, so the stop can never be dropped or
-        loosened by this call - and a position whose stop cannot be read is
-        refused outright. Exists for the flip workflow's fallback TP (#168):
-        placed when the workflow halts or gives up so the position keeps an
-        upside exit, and amended away again before the workflow resumes.
-
-        Confirmed by re-reading the position: only a broker-reported
-        ``takeProfit`` at the requested level (or absent/zero for a clear)
-        counts. Same ambiguity rule as :meth:`amend_protective_stop`: a send
-        failure that is not a definite broker refusal is verified against
-        broker state, and an unconfirmed outcome raises.
-        """
-        pid = self._positive_int(position_id)
-        if pid is None:
-            raise ValueError(
-                f"cTrader position id {position_id!r} is not usable; "
-                "refusing to amend its take profit."
-            )
-        if self._ProtoOAAmendPositionSLTPReq is None:
-            raise RuntimeError("cTrader amend-position-SLTP request type is not loaded")
-        position, symbol, digits, stop_price, current_tp = (
-            await self._position_tp_amend_context(pid)
-        )
-        target = (
-            self._round_take_profit(symbol, take_profit)
-            if take_profit is not None
-            else None
-        )
-        tolerance = float(Decimal(1).scaleb(-max(0, int(digits)))) * 0.5 + 1e-12
-        noop, noop_result = self._tp_amend_noop(target, current_tp, tolerance)
-        if noop:
-            return noop_result
-
-        request = self._build_position_tp_request(pid, position, stop_price, target)
-        send_error = await self._send_amend_position_request(request)
-        confirmed = await self._confirmed_tp_amendment(
-            position_id=pid,
-            symbol=symbol,
-            expected=target,
-            digits=digits,
-            expected_stop=stop_price,
-            send_error=send_error,
-        )
-        return None if target is None else float(confirmed)
-
-    async def _position_tp_amend_context(
-        self, pid: int
-    ) -> tuple[Any, str, int, float, float | None]:
-        """``(position, symbol, price_digits, stop, current TP)`` for an amend.
-
-        Every refusal lives here: a gone position, an unreadable symbolId,
-        or a missing/non-positive ``stopLoss`` (the amend echoes the stop
-        verbatim, so without a readable one it could clear protection).
-        """
-        position = await self._fetch_open_position(pid)
-        if position is None:
-            raise RuntimeError(
-                f"cTrader position {pid} is no longer open; "
-                "there is no take profit to amend."
-            )
-        trade_data = getattr(position, "tradeData", None)
-        symbol_id = (
-            self._positive_int(getattr(trade_data, "symbolId", 0))
-            if trade_data is not None
-            else None
-        )
-        if symbol_id is None:
-            raise ValueError(
-                f"cTrader position {pid} has no readable symbolId; "
-                "refusing to amend its take profit."
-            )
-        symbol = self._symbol_name_for_id(symbol_id).strip().upper()
-        digits = self._scale_for(symbol).price_digits
-        stop_price = (
-            parse_optional(getattr(position, "stopLoss", None))
-            if self._has_proto_field(position, "stopLoss")
-            else None
-        )
-        if stop_price is None or stop_price <= 0:
-            raise ValueError(
-                f"cTrader position {pid} ({symbol}) has no readable stopLoss "
-                "to preserve; refusing to amend its take profit."
-            )
-        current_tp = (
-            parse_optional(getattr(position, "takeProfit", None))
-            if self._has_proto_field(position, "takeProfit")
-            else None
-        )
-        return position, symbol, digits, stop_price, current_tp
-
-    @staticmethod
-    def _tp_amend_noop(
-        target: float | None, current_tp: float | None, tolerance: float
-    ) -> tuple[bool, float | None]:
-        """``(handled, result)``: True when the broker already matches - no write."""
-        if target is None:
-            if current_tp is None or current_tp <= 0:
-                return True, None  # already clear: idempotent, no write
-            return False, None
-        if (
-            current_tp is not None
-            and current_tp > 0
-            and math.isclose(current_tp, target, rel_tol=0.0, abs_tol=tolerance)
-        ):
-            return True, float(current_tp)  # already at the target: no write
-        return False, None
-
-    def _round_take_profit(self, symbol: str, price: float) -> float:
-        """Quantize a take-profit onto the symbol's price grid (nearest tick)."""
-        value = float(price)
-        if not math.isfinite(value) or value <= 0:
-            raise ValueError(
-                f"Invalid take-profit price for {symbol}: {price!r}; "
-                "refusing to amend."
-            )
-        digits = self._scale_for(symbol).price_digits
-        tick = Decimal(1).scaleb(-max(0, int(digits)))
-        rounded = float(
-            Decimal(repr(round(value, 8))).quantize(tick, rounding=ROUND_HALF_UP)
-        )
-        if rounded <= 0:
-            raise ValueError(
-                f"Take-profit price for {symbol} rounds to {rounded!r}; "
-                "refusing to amend."
-            )
-        return rounded
-
-    def _build_position_tp_request(
-        self,
-        position_id: int,
-        position: Any,
-        stop_price: float,
-        take_profit: float | None,
-    ) -> Any:
-        """The SLTP amendment: stop echoed verbatim, TP set or cleared."""
-        request = self._ProtoOAAmendPositionSLTPReq()
-        request.ctidTraderAccountId = self.ctid_trader_account_id
-        request.positionId = position_id
-        request.stopLoss = float(stop_price)
-        if take_profit is not None:
-            request.takeProfit = float(take_profit)
-        for field_name in (
-            "guaranteedStopLoss",
-            "trailingStopLoss",
-            "stopLossTriggerMethod",
-        ):
-            if self._has_proto_field(position, field_name):
-                setattr(request, field_name, getattr(position, field_name))
-        return request
-
-    async def _confirm_position_tp(
-        self,
-        position_id: int,
-        expected: float | None,
-        *,
-        digits: int,
-        expected_stop: float,
-    ) -> float | None:
-        """The broker-reported TP once it matches ``expected`` AND the stop survived.
-
-        ``expected=None`` confirms an absent/zero ``takeProfit`` and reports
-        ``0.0``; ``None`` means "not yet" (or the position is gone - the
-        caller's final read distinguishes the two, same as the stop path).
-        The amend echoes ``stopLoss`` verbatim, so confirmation also requires
-        the broker stop to still sit at ``expected_stop`` within tick
-        tolerance: a TP that landed while the stop was dropped or moved is
-        NOT a confirmed amendment.
-        """
-        position = await self._fetch_open_position(position_id)
-        if position is None:
-            return None
-        broker_tp = (
-            parse_optional(getattr(position, "takeProfit", None))
-            if self._has_proto_field(position, "takeProfit")
-            else None
-        )
-        tp_ok = (
-            (broker_tp is None or broker_tp <= 0)
-            if expected is None
-            else (
-                broker_tp is not None
-                and broker_tp > 0
-                and math.isclose(
-                    broker_tp,
-                    expected,
-                    rel_tol=0.0,
-                    abs_tol=float(Decimal(1).scaleb(-max(0, int(digits)))) * 0.5
-                    + 1e-12,
-                )
-            )
-        )
-        if not tp_ok:
-            return None
-        broker_stop = (
-            parse_optional(getattr(position, "stopLoss", None))
-            if self._has_proto_field(position, "stopLoss")
-            else None
-        )
-        if broker_stop is None or not math.isclose(
-            broker_stop,
-            expected_stop,
-            rel_tol=0.0,
-            abs_tol=float(Decimal(1).scaleb(-max(0, int(digits)))) * 0.5 + 1e-12,
-        ):
-            return None
-        if expected is None:
-            return 0.0
-        return float(broker_tp) if broker_tp is not None else None
-
-    async def _confirmed_tp_amendment(
-        self,
-        *,
-        position_id: int,
-        symbol: str,
-        expected: float | None,
-        digits: int,
-        expected_stop: float,
-        send_error: BaseException | None,
-    ) -> float:
-        """Poll broker state until the TP shows (or clears), or fail closed."""
-        confirmed: float | None = None
-        for attempt in range(_AMEND_CONFIRM_ATTEMPTS):
-            try:
-                confirmed = await self._confirm_position_tp(
-                    position_id,
-                    expected,
-                    digits=digits,
-                    expected_stop=expected_stop,
-                )
-            except asyncio.CancelledError:
-                raise
-            except Exception:  # except-kind: money-decision
-                confirmed = None
-            if confirmed is not None:
-                break
-            if attempt + 1 < _AMEND_CONFIRM_ATTEMPTS:
-                await asyncio.sleep(_AMEND_CONFIRM_INTERVAL_SECONDS)
-        if confirmed is None:
-            position_now = await self._fetch_open_position(position_id)
-            if position_now is None:
-                raise RuntimeError(
-                    f"cTrader position {position_id} ({symbol}) closed while its "
-                    "take profit was being amended; the amendment outcome is moot "
-                    "but the close itself must be reconciled."
-                )
-            detail = f" send error: {send_error!r}" if send_error is not None else ""
-            raise RuntimeError(
-                f"cTrader did not confirm the take-profit amendment for position "
-                f"{position_id} ({symbol}): broker still reports takeProfit "
-                f"{getattr(position_now, 'takeProfit', None)!r} and stopLoss "
-                f"{getattr(position_now, 'stopLoss', None)!r}, requested TP "
-                f"{expected!r} with stop {expected_stop!r}.{detail}"
-            )
-        return confirmed
 
     async def _persist_execution_event(self, event: Any) -> None:
         execution_type = int(event.executionType)
@@ -6371,27 +5791,6 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         if not candidates:
             return None, "no_opening_order"
         return None, "ambiguous_parent"
-
-    async def opening_signal_id_for_position(self, position_id: int) -> str | None:
-        """Public provenance read for the flip manager's first-sight bind (#168).
-
-        Reuses the broker-close attribution path: exactly one persisted
-        opening signal may claim the position. ``None`` means proven
-        foreign/ambiguous - the broker read the position's orders and none
-        (or several) resolve to a persisted signal. An UNREADABLE order list
-        raises ``CTraderApiError`` instead: the caller retries a transient
-        read failure rather than treating it as proven foreign ownership.
-        """
-        signal_id, cause = await self._resolve_position_parent_signal(
-            int(position_id)
-        )
-        if cause == "position_orders_unreadable":
-            raise CTraderApiError(
-                "ORDER_LIST_UNREADABLE",
-                f"cTrader position orders for position {position_id} are "
-                "unreadable; provenance cannot be proven this pass",
-            )
-        return signal_id
 
     @staticmethod
     def _broker_close_dedupe_key(deal: Any | None) -> str | None:

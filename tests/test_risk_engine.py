@@ -1020,11 +1020,11 @@ class TestIssueC1FallbackGuards:
                 current_exposure=0.0,
             )
 
-    def test_unsupported_trailing_mode_rejected(self) -> None:
+    def test_removed_trailing_mode_rejected(self) -> None:
         """#150 (decided behaviour change): the old warned no-op is gone.
 
-        supertrend_flip is a known mode no executing path supports yet (#168);
-        the engine refuses it instead of trading the signal untrailed.
+        supertrend_flip was removed; the engine refuses it — naming the
+        removed mode — instead of trading the signal untrailed.
         """
         signal = self._signal(trailing_sl_config={"mode": "supertrend_flip"})
         signal.stop_loss = 98.0

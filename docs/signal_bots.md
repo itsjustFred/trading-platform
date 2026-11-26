@@ -39,8 +39,8 @@ pro Bot.
 ### RamJet
 - **Status:** Aktiv, registriert
 - **Features:** ATR + Supertrend BUY-only Setup mit TP1; Trailing-Modus konfigurierbar
-- **Trailing-Modus (`trailing_mode`):** `none` (Default), `percent` (benötigt `trailing_percent`
-  in (0, 1)) oder `supertrend_flip`. Der Modus ist eine Einstellung des Bots bzw. des Deployments
+- **Trailing-Modus (`trailing_mode`):** `none` (Default) oder `percent` (benötigt `trailing_percent`
+  in (0, 1)). Der Modus ist eine Einstellung des Bots bzw. des Deployments
   (`signal_config.signal_processor_config.trailing_mode`), nicht fest verdrahtet. Zentrale
   Definition: `shared/trailing.py`.
   - **Fail closed:** Ein unbekannter Modus oder einer, den der ausführende Pfad nicht kann, wird
@@ -50,52 +50,15 @@ pro Bot.
     (`signal_config.signal_processor_config.trailing_mode`) als auch aus dem Default der eigenen
     Bot-Config gelesen — der Prozessor des Deployments wird dafür genauso gebaut wie vom Daemon
     (`shared/trailing.py: validate_live_deployment_trailing_mode`).
-  - **Unterstützt:** Replay-Backtest `none`, `percent`, `supertrend_flip`. Live je Broker: Alpaca `none`, `percent`;
+  - **Unterstützt:** Replay-Backtest `none`, `percent`. Live je Broker: Alpaca `none`, `percent`;
     cTrader nur `none` (der Daemon hat keine cTrader-Marktdaten zum Nachziehen). `percent` wird
     live pro geschlossener Kerze des Signal-Timeframes mit derselben Arithmetik wie im Replay
     nachgezogen und der Stop beim Broker ersetzt; Details und Betriebsgrenzen in
-    `docs/live-deploy-runbook.md` ("Live Trailing Stops"). `supertrend_flip` wird live auf keinem
-    Broker ausgeführt und dort abgelehnt (Grund und Design-Vorschlag im Runbook).
-  - **`supertrend_flip` im Replay (#168):**
-    1. TP1: Teilausstieg von `tp1_exit_percent` (Bruchteil, 0.5 = halbe Position) zu `tp1_price`
-       — öffnet die Kerze über `tp1_price`, füllt der Teilausstieg zum OPEN der Kerze
-       (Gap-Regel #287), sonst zum Level — in ganzen Shares: `qty * Bruchteil` abgerundet, wie im Original-Bot
-       (`int(qty * tp1_exit_percent)`, `shared/trailing.tp1_partial_quantity`). Ergibt sich 0
-       (z. B. 1 Share bei 0.5), wird der Teilausstieg übersprungen, genau wie im Original-Bot:
-       kein Verkauf, kein Einstands-Stop, und der restliche Workflow (Aktivierung, Flip) startet
-       nicht. Die Position bleibt voll unter ihrem ursprünglichen Stop; im Trade-Meta steht
-       dann `supertrend_flip.tp1_skipped_time` (und `tp1_time` bleibt leer).
-    2. Danach Stop auf Einstand (Entry-Preis), wenn `breakeven_after_tp1`; wirksam ab der Kerze
-       nach der TP1-Kerze.
-    3. Aktivierung: erste geschlossene Kerze NACH der TP1-Kerze, deren Supertrend bereit und
-       grün ist. Die TP1-Kerze selbst wird nach dem TP1-Fill nicht mehr ausgewertet — nichts, was
-       in oder an der TP1-Kerze nach dem Fill passiert, darf den Trail bewegen oder auslösen.
-       "Nicht bereit" (Warm-up) zählt weder als grün noch als rot.
-    4. Ausstieg: erste bereite rote Kerze nach der Aktivierung; der Rest wird zum OPEN der
-       folgenden Kerze geschlossen (der Flip ist erst beim Schluss der Flip-Kerze bekannt). Ist die
-       Flip-Kerze die letzte Kerze der Daten, wird die Position wie jede andere am Datenende
-       geschlossen (`end_of_data`).
-    - Ein Signal ohne `stop_loss` wird abgelehnt: vor TP1 ist der Stop der einzige Schutz,
-      der Workflow setzt keinen eigenen.
-    - Stop und TP1 in derselben Kerze: Stop zuerst (Konvention des Adapters,
-      `resolve_same_bar_exit`); dann gibt es kein TP1. Ausnahme Gap (#287):
-      öffnet die Kerze bereits jenseits eines Levels (über TP1 bzw. unter dem
-      Stop), zählt der OPEN als erstes Ereignis der Kerze — der durchbrochene
-      Level füllt zum OPEN (`resolve_protective_exit` prüft die Lücke vor der
-      Stop-zuerst-Regel), auch wenn die Kerze später den anderen Level berührt.
-      Ausnahme innerhalb der Flip-Logik: nach einem TP1-Gap bleibt der Rest der
-      Position mit seinem ursprünglichen Stop für den Rest derselben Kerze
-      geschützt — der OTO-Stop steht auf dem Ausgangslevel und die
-      Breakeven-Änderung greift erst ab der nächsten Kerze; ein späterer
-      Same-Bar-Trade durch den Stop schließt den Rest zum Stop-Preis.
-    - Supertrend: dieselbe Implementierung wie der Processor (`calculate_supertrend`), mit
-      `supertrend_period`/`supertrend_multiplier` aus `trailing_sl_config`, nur aus geschlossenen
-      Kerzen.
-    - Ein Trade mit mehreren Exits (`tp1`, dann `supertrend_flip`/`breakeven_stop`/`stop_loss`/
-      `end_of_data`); der TP1-Tranche ist auf ganze Shares abgerundet, MFE/MAE werden nach dem
-      Teilausstieg auf den verbleibenden Shares gemessen und die Equity-Kurve bucht die
-      gefloorten Beine. Gebühren einmal zum mengengewichteten Exit-Preis. Fehlende oder ungültige
-      Parameter brechen den Lauf ab (keine erfundenen Defaults). Nur Long-Einstiege.
+    `docs/live-deploy-runbook.md` ("Live Trailing Stops").
+  - **`supertrend_flip` entfernt:** Der Modus existiert nicht mehr — weder im Replay noch live
+    (Entscheidung 2026-11-26). Eine Konfiguration oder ein Signal, das ihn weiterhin nennt, wird
+    mit einem "removed"-Fehler abgelehnt; ein Deployment mit dem `live_supertrend_flip`
+    Opt-in ebenfalls.
   - Mit dem Default `none` läuft RamJet bewusst nur mit dem initialen ATR-Stop.
 - **Last-Run:** Über Health-Check-Job validierbar
 

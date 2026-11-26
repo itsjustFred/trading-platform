@@ -862,48 +862,6 @@ def test_idle_daemon_stops_after_the_signal_and_exits_zero(isolated_db_sandbox: 
     assert daemon._SHUTDOWN.requested is True
 
 
-def test_supertrend_flip_loop_is_wired_and_stops_with_the_daemon(
-    isolated_db_sandbox: Any,
-) -> None:
-    """#168: the flip loop runs under the daemon's lifecycle.
-
-    The loop existing is not the opt-in: with no deployment carrying
-    ``settings.live_supertrend_flip`` it manages nothing (the manager's own
-    tests pin that gate). This test only proves the daemon starts the loop
-    and drains it like every other broker-touching loop.
-    """
-    database, _, _ = isolated_db_sandbox
-    database.init_db()
-    coordinator = daemon._SHUTDOWN
-    seen: dict[str, Any] = {}
-
-    async def _probe() -> int:
-        task = asyncio.get_running_loop().create_task(
-            daemon.run_daemon(
-                accounts_env=ACCOUNTS_ENV,
-                install_signal_handlers=False,
-                drain_timeout_seconds=1.0,
-                cleanup_timeout_seconds=1.0,
-            )
-        )
-        await asyncio.sleep(0.3)
-        seen["running"] = any(
-            t.get_name() == "supertrend-flip-loop" for t in asyncio.all_tasks()
-        )
-        coordinator.request("SIGTERM")
-        code = await asyncio.wait_for(task, timeout=30)
-        seen["lingering"] = [
-            t.get_name()
-            for t in asyncio.all_tasks()
-            if t.get_name() == "supertrend-flip-loop"
-        ]
-        return code
-
-    assert asyncio.run(_probe()) == EXIT_OK
-    assert seen["running"] is True
-    assert seen["lingering"] == []
-
-
 def test_gate_follows_an_injected_coordinator(isolated_db_sandbox: Any) -> None:
     """Regression: the submission gate and the drain must share one coordinator.
 

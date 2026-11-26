@@ -33,8 +33,8 @@ from pydantic import (
 
 from shared.atomic_io import write_text_atomically
 from shared.trailing import (
-    supertrend_flip_opted_in,
     validate_live_deployment_trailing_override,
+    validate_no_removed_flip_opt_in,
 )
 
 #: Validation-context flag set when a deployment is rehydrated from the DB.
@@ -261,7 +261,7 @@ class LiveDeploymentConfig(BaseModel):
     def _validate_trailing_mode_override(self, info: ValidationInfo) -> "LiveDeploymentConfig":
         # Issue #150 fail closed, first stage: only the account id is known
         # here, not its broker, so this rejects a trailing mode that NO live
-        # broker executes (unknown modes, supertrend_flip). Live support is
+        # broker executes (unknown or removed modes). Live support is
         # per broker (#167): the broker-aware stage runs where the account is
         # resolved (`create_live_deployment`, `update_live_deployment_account`,
         # `parse_live_deployments_config`) and again at signal time against
@@ -275,10 +275,13 @@ class LiveDeploymentConfig(BaseModel):
         # logs the row at load.
         if isinstance(info.context, dict) and info.context.get(STORED_ROW_CONTEXT):
             return self
+        validate_no_removed_flip_opt_in(
+            self.settings,
+            context=f"live deployment '{self.strategy_name}'",
+        )
         validate_live_deployment_trailing_override(
             self.signal_config,
             context=f"live deployment '{self.strategy_name}'",
-            flip_opted_in=supertrend_flip_opted_in(self.settings),
         )
         return self
 

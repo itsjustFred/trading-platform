@@ -2076,47 +2076,6 @@ def test_multi_lot_cap_is_refused_on_alpaca(tmp_path: Path) -> None:
     assert (str(deployment.id), "open_position_cap") in runner._reported
 
 
-def test_multi_lot_cap_is_refused_with_supertrend_flip(tmp_path: Path) -> None:
-    """#382 maintainer default: cap > 1 cannot combine with the live
-    ``supertrend_flip`` opt-in - the flip workflow manages exactly one
-    position per symbol."""
-    path = _strategy_file(tmp_path, META)
-    sent, submit = _collect()
-    runner = _runner(submit, path=path, module=_module_with(_entry_strategy))
-    deployment = _deployment(
-        settings={
-            "internal_max_open_per_symbol": 2,
-            "live_supertrend_flip": "true",
-        }
-    )
-
-    asyncio.run(
-        runner.run_once(
-            [deployment], {"acct-1": FakeAdapter()}, now=BASE + timedelta(seconds=70)
-        )
-    )
-
-    assert sent == []
-    assert (str(deployment.id), "open_position_cap") in runner._reported
-
-
-def test_flip_opt_in_with_single_lot_cap_still_enters(tmp_path: Path) -> None:
-    """The refusal is cap-scoped: the flip opt-in alone (cap 1) is the
-    maintainer-approved #168 shape and must keep trading."""
-    path = _strategy_file(tmp_path, META)
-    sent, submit = _collect()
-    runner = _runner(submit, path=path, module=_module_with(_entry_strategy))
-    deployment = _deployment(settings={"live_supertrend_flip": "yes"})
-
-    asyncio.run(
-        runner.run_once(
-            [deployment], {"acct-1": FakeAdapter()}, now=BASE + timedelta(seconds=70)
-        )
-    )
-
-    assert len(sent) == 1
-
-
 def test_strategy_exit_cancels_working_entry_orders(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
