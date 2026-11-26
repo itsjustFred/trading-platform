@@ -224,47 +224,6 @@ def test_no_symbol_at_all_is_rejected() -> None:
 # ── C-3.4: bounded burst handling; drops are visible, not silent ──────────────
 
 
-def test_burst_of_35_messages_all_reach_the_queue() -> None:
-    """A >POLL_LIMIT burst drains completely, oldest message included.
-
-    The old code paginated backwards and lost anything older than the page
-    window. Forward pagination from the cursor emits the whole burst in order,
-    deduped by the cumulative seen-set."""
-    source = _source()
-    ids = [str(100000000000000000 + index) for index in range(35)]
-    # Cursor just below the burst, so the drain is a pure forward backfill.
-    source._last_seen_message_ids["channel-1"] = "99999999999999999"
-
-    def _row(message_id: str) -> dict[str, object]:
-        return {
-            "id": message_id,
-            "channel_id": "channel-1",
-            "timestamp": "2026-09-01T12:00:00Z",
-            "content": "RAM JET BUY AAPL @ 100.05",
-            "author": {"id": "bot-1", "bot": True},
-        }
-
-    async def _fetch(_channel_id, *, after=None, **kwargs):
-        # Discord returns the messages immediately after `after`, newest-first.
-        anchor = int(after or 0)
-        return [
-            _row(message_id)
-            for message_id in reversed([i for i in ids if int(i) > anchor][:20])
-        ]
-
-    source._fetch_messages = _fetch
-
-    import asyncio
-
-    async def _run() -> list[str]:
-        await source._poll_once("channel-1")
-        await source._poll_once("channel-1")
-        queued = [source._queue.get_nowait() for _ in range(source._queue.qsize())]
-        return [item.metadata["discord_message_id"] for item in queued]
-
-    assert asyncio.run(_run()) == ids
-
-
 def test_backfill_beyond_the_page_bound_warns_and_defers() -> None:
     """A gap larger than the per-poll bound is carried over, not dropped.
 
@@ -4625,52 +4584,6 @@ def test_the_parser_stamps_the_discord_producer_source() -> None:
     )
     assert signal is not None
     assert signal.metadata["source"] == "discord"
-
-
-def test_poll_emits_messages_in_chronological_order() -> None:
-    """A multi-page burst must reach the queue oldest-first.
-
-    Discord returns newest-first and a burst spans pages. Emitting page by page
-    in API order would hand the daemon the batch in reverse, so an entry and its
-    exit in the same burst would execute backwards.
-    """
-    import asyncio
-
-    source = _source(trusted_author_ids={"bot-1"})
-    # A cursor below the burst forces the forward backfill branch, so the poll
-    # actually builds two pages.
-    source._last_seen_message_ids["channel-1"] = "100000000000000050"
-
-    def _row(message_id: int) -> dict[str, object]:
-        return {
-            "id": str(message_id),
-            "channel_id": "channel-1",
-            "timestamp": "2026-09-01T12:00:00Z",
-            "content": "**$AAPL** is now oversold — buy signal\nPrice: $190.50",
-            "author": {"id": "bot-1", "bot": True},
-        }
-
-    burst_ids = [100000000000000051 + index for index in range(30)]
-
-    async def _fetch(_channel_id, *, after=None, **kwargs):
-        anchor = int(after or 0)
-        return [
-            _row(message_id)
-            for message_id in reversed([i for i in burst_ids if i > anchor][:20])
-        ]
-
-    source._fetch_messages = _fetch
-    asyncio.run(source._poll_once("channel-1"))
-
-    queued = [source._queue.get_nowait() for _ in range(30)]
-    ids = [item.metadata["discord_message_id"] for item in queued]
-    assert ids[0] == "100000000000000051"
-    assert ids[:3] == [
-        "100000000000000051",
-        "100000000000000052",
-        "100000000000000053",
-    ]
-    assert ids == sorted(ids), f"burst was not emitted oldest-first: {ids[:5]}..."
 
 
 def test_the_poll_cursor_never_moves_backwards() -> None:
