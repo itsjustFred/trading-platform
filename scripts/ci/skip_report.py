@@ -207,6 +207,22 @@ def _skipped_reason(skipped: ET.Element) -> str:
     return _reason_from_skipped_text((skipped.text or "").strip())
 
 
+def _module_from_case(classname: str, name: str) -> str:
+    """Best-effort dotted module path for a skipped testcase.
+
+    Normal testcases carry the dotted module in ``classname``; a module
+    skipped at collection carries it in ``name`` instead. pytest's
+    ``mangle_test_address`` already emits dotted paths, but normalise
+    separators and a trailing ``.py`` so a path-shaped value from another
+    pytest version still classifies as money-path rather than slipping
+    through as an unmatched module.
+    """
+    module = (classname or name).replace("/", ".").replace("\\", ".")
+    if module.endswith(".py"):
+        module = module[: -len(".py")]
+    return module
+
+
 def parse_junit(path: Path) -> list[SkippedTest]:
     """Every skipped testcase in one pytest JUnit XML file."""
     root = ET.parse(path).getroot()
@@ -219,7 +235,7 @@ def parse_junit(path: Path) -> list[SkippedTest]:
             name = (case.get("name") or "").strip()
             skipped.append(
                 SkippedTest(
-                    module=classname or name,
+                    module=_module_from_case(classname, name),
                     name=name,
                     reason=_skipped_reason(child),
                     kind=(child.get("type") or "").strip() or "pytest.skip",

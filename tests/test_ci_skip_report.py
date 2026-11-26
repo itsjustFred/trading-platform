@@ -132,6 +132,24 @@ def test_parse_junit_collection_skip_uses_name_as_module(tmp_path: Path) -> None
     assert main([str(junit)]) == 1
 
 
+def test_parse_junit_collection_skip_with_path_shaped_name(tmp_path: Path) -> None:
+    """If a pytest version emits the module as a path instead of a dotted
+    name, separators and ``.py`` are normalised so the money-path match
+    still fires."""
+    path = tmp_path / "junit.xml"
+    path.write_text(
+        '<testsuite><testcase classname="" name="tests/live_runner/test_x.py">'
+        '<skipped message="collection skipped">('
+        "'tests/live_runner/test_x.py', 1, \"Skipped: could not import 'nope'\""
+        ")</skipped></testcase></testsuite>",
+        encoding="utf-8",
+    )
+    (test,) = parse_junit(path)
+    assert test.module == "tests.live_runner.test_x"
+    assert is_money_path(test.module)
+    assert violations([test]) == [test]
+
+
 def test_parse_junit_xfail_is_not_a_violation(tmp_path: Path) -> None:
     path = tmp_path / "junit.xml"
     path.write_text(
