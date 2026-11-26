@@ -227,7 +227,11 @@ UNRESOLVED_EXECUTION_EVENT_LIMIT = 1000
 #: after an unknown-outcome submit until reconciliation persists the broker
 #: order id - a fill on the position can only be retained, not attributed.
 #: The mark expires so a failed submit cannot hold a genuine broker-side
-#: close on the position out of the stream path indefinitely.
+#: close on the position out of the stream path indefinitely. The TTL is a
+#: bound, not a guarantee: a submit whose broker outcome stays unknown past
+#: it loses retention, and a later fill on the position books as a
+#: broker-side close - acceptable because an unknown-outcome submit is
+#: already an operator-visible reconciliation case.
 _PENDING_CLOSE_POSITION_TTL_SECONDS = 3600.0
 #: How often a parked pending-close fill triggers a reconciliation pass while
 #: its submit's mark is still live. Budget-free parking would otherwise never
@@ -6685,7 +6689,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         flagged_deal_ids: set[int],
         order_window: tuple[int, int] | None = None,
         pace: dict[str, Any] | None = None,
-        deferred_close_deals: list[Any] | None = None,
+        deferred_close_deals: list[Any],
     ) -> int:
         """Book one deal-list close the stream missed, or flag it (#144).
 
@@ -6757,8 +6761,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             # would mis-book our own exit as a broker-side close, the exact
             # bug the pending mark exists to prevent. Defer the deal's
             # window instead of booking or flagging it.
-            if deferred_close_deals is not None:
-                deferred_close_deals.append(deal)
+            deferred_close_deals.append(deal)
             return 0
         if position_id not in parent_cache:
             parent_cache[position_id] = await self._resolve_position_parent_signal(
@@ -8044,6 +8047,11 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         if len(self._unresolved_execution_events) >= UNRESOLVED_EXECUTION_EVENT_LIMIT:
             # Degenerate overflow: the deque is full, so fall back to the
             # budgeted path rather than dropping the fill.
+            logger.warning(
+                "cTrader pending-close fill park overflowed the unresolved "
+                "deque; falling back to the budgeted requeue",
+                extra={"data": {"account_id": self.ctid_trader_account_id}},
+            )
             if not self._requeue_execution_event(event):
                 raise RuntimeError(
                     "cTrader execution event could not be requeued after "
