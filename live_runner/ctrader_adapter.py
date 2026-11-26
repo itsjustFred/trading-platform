@@ -5701,10 +5701,12 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             )
         if rejection is not None:
             error_code = str(getattr(response, "errorCode", "") or "") or rejection
+            detail = str(getattr(response, "description", "") or "")
             raise CTraderApiError(
                 error_code=error_code,
                 description=(
                     f"cTrader execution event {rejection} refused the request"
+                    + (f": {detail}" if detail else "")
                 ),
             )
 
