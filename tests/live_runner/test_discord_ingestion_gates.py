@@ -187,6 +187,12 @@ def test_parser_rejects_signal_with_thousands_corrupted_price() -> None:
 # ── C-3.3: fallback ticker extraction must go ─────────────────────────────────
 
 
+def test_fallback_uppercase_symbol_stage_is_gone() -> None:
+    """Decision Record #2: the parser must reject ambiguous/fallback ticker
+    extraction. `WARN`, `ON`, `IS` prose must never mint a ticker."""
+    assert not hasattr(ds, "_fallback_uppercase_symbol")
+
+
 def test_prose_never_mints_a_ticker() -> None:
     message = _message("WARNING ALL ALERT THE MARKET IS NOW RISK ON @ 100.00")
     signal = _parse_trade_signal_from_message(
@@ -222,6 +228,47 @@ def test_no_symbol_at_all_is_rejected() -> None:
 
 
 # ── C-3.4: bounded burst handling; drops are visible, not silent ──────────────
+
+
+def test_burst_of_35_messages_all_reach_the_queue() -> None:
+    """A >POLL_LIMIT burst drains completely, oldest message included.
+
+    The old code paginated backwards and lost anything older than the page
+    window. Forward pagination from the cursor emits the whole burst in order,
+    deduped by the cumulative seen-set."""
+    source = _source()
+    ids = [str(100000000000000000 + index) for index in range(35)]
+    # Cursor just below the burst, so the drain is a pure forward backfill.
+    source._last_seen_message_ids["channel-1"] = "99999999999999999"
+
+    def _row(message_id: str) -> dict[str, object]:
+        return {
+            "id": message_id,
+            "channel_id": "channel-1",
+            "timestamp": "2026-09-01T12:00:00Z",
+            "content": "RAM JET BUY AAPL @ 100.05",
+            "author": {"id": "bot-1", "bot": True},
+        }
+
+    async def _fetch(_channel_id, *, after=None, **kwargs):
+        # Discord returns the messages immediately after `after`, newest-first.
+        anchor = int(after or 0)
+        return [
+            _row(message_id)
+            for message_id in reversed([i for i in ids if int(i) > anchor][:20])
+        ]
+
+    source._fetch_messages = _fetch
+
+    import asyncio
+
+    async def _run() -> list[str]:
+        await source._poll_once("channel-1")
+        await source._poll_once("channel-1")
+        queued = [source._queue.get_nowait() for _ in range(source._queue.qsize())]
+        return [item.metadata["discord_message_id"] for item in queued]
+
+    assert asyncio.run(_run()) == ids
 
 
 def test_backfill_beyond_the_page_bound_warns_and_defers() -> None:
@@ -1169,34 +1216,25 @@ def test_transient_reconnect_failure_is_retried_on_next_sync(monkeypatch) -> Non
 # ── #81: auth scheme, env expansion, env allowlist ────────────────────────────
 
 class TestIssue81AuthScheme:
-    @pytest.mark.parametrize(
-        ("auth_scheme", "token", "expected"),
-        [
-            # Account tokens ("raw" is the historical spelling, "account" the
-            # explicit one — same credential kind) are sent verbatim, even when
-            # the pasted value already carries a "Bot " prefix.
-            ("raw", "abc", "abc"),
-            ("raw", "Bot abc", "Bot abc"),
-            ("account", "abc", "abc"),
-            ("account", "Bot abc", "Bot abc"),
-            # Bot tokens get the "Bot " prefix, never doubled.
-            ("bot", "abc", "Bot abc"),
-            ("bot", "Bot abc", "Bot abc"),
-        ],
-    )
-    def test_authorization_header_matches_the_credential_kind(
-        self, auth_scheme: str, token: str, expected: str
-    ) -> None:
-        source = _source(token=token, auth_scheme=auth_scheme)
-        assert source._auth_header() == expected
+    def test_raw_scheme_sends_token_as_is(self) -> None:
+        source = _source(token="user-token-abc", auth_scheme="raw")
+        assert source._auth_header() == "user-token-abc"
 
     def test_default_scheme_is_raw(self) -> None:
         source = _source(token="user-token-abc")
         assert source.auth_scheme == "raw"
         assert source._auth_header() == "user-token-abc"
 
+    def test_bot_scheme_prefixes_bot(self) -> None:
+        source = _source(token="bot-token-abc", auth_scheme="bot")
+        assert source._auth_header() == "Bot bot-token-abc"
+
+    def test_bot_scheme_does_not_double_prefix(self) -> None:
+        source = _source(token="Bot bot-token-abc", auth_scheme="bot")
+        assert source._auth_header() == "Bot bot-token-abc"
+
     def test_unknown_scheme_raises(self) -> None:
-        with pytest.raises(ValueError, match="Unsupported Discord auth_scheme"):
+        with pytest.raises(ValueError, match="discord_auth_scheme"):
             _source(auth_scheme="bearer")
 
 
@@ -2019,6 +2057,68 @@ def test_dispatch_discards_stale_signals() -> None:
     assert submitted == []
 
 
+# ─── Credential type: bot tokens and account tokens are not interchangeable ──
+
+
+def test_bot_token_is_sent_with_the_bot_prefix():
+    from live_runner.signal_sources.discord_source import DiscordSignalSource
+
+    # Merge resolution: the scheme is now configured explicitly. With no
+    # configuration the resolved default is "raw" (a user/account token, sent
+    # verbatim), so relying on the default here would no longer exercise the
+    # "Bot " prefix at all. The unconfigured default is covered by
+    # `TestIssue81AuthScheme::test_default_scheme_is_raw`.
+    source = DiscordSignalSource(
+        bot_name="NITRO",
+        token="abc123",
+        channel_id="1",
+        trusted_author_ids=["1"],
+        auth_scheme="bot",
+    )
+    assert source._authorization_header() == "Bot abc123"
+
+
+def test_account_token_is_sent_raw():
+    """An account token must NOT carry the "Bot " prefix or Discord answers 401."""
+    from live_runner.signal_sources.discord_source import DiscordSignalSource
+
+    source = DiscordSignalSource(
+        bot_name="NITRO",
+        token="abc123",
+        channel_id="1",
+        trusted_author_ids=["1"],
+        auth_scheme="account",
+    )
+    assert source._authorization_header() == "abc123"
+
+
+def test_preset_scheme_in_token_is_not_double_prefixed():
+    from live_runner.signal_sources.discord_source import DiscordSignalSource
+
+    for scheme in ("bot", "account"):
+        source = DiscordSignalSource(
+            bot_name="NITRO",
+            token="Bot preset",
+            channel_id="1",
+            trusted_author_ids=["1"],
+            auth_scheme=scheme,
+        )
+        assert source._authorization_header() == "Bot preset"
+
+
+def test_unknown_auth_scheme_is_rejected():
+    from live_runner.signal_sources.discord_source import DiscordSignalSource
+
+    with pytest.raises(ValueError, match="Unsupported Discord auth_scheme"):
+        DiscordSignalSource(
+            bot_name="NITRO",
+            token="t",
+            channel_id="1",
+            trusted_author_ids=["1"],
+            auth_scheme="bearer",
+        )
+
+
 def _no_auth_scheme_in_environment(monkeypatch) -> None:
     monkeypatch.delenv("DISCORD_AUTH_SCHEME", raising=False)
     monkeypatch.delenv("DISCORD_BOT_NITRO_AUTH_SCHEME", raising=False)
@@ -2837,6 +2937,25 @@ class TestPerBotAuthorAllowlist:
         assert self._resolve("rocketfuel", env) == {self.ROCKETFUEL_AUTHOR}
         assert self._resolve("ramjet", env) == {self.RAMJET_AUTHOR}
 
+    def test_another_bots_author_is_refused_when_a_per_bot_var_exists(self):
+        """The cross-bot case, stated as the property that matters."""
+        env = {
+            "DISCORD_BOT_NITRO_TRUSTED_AUTHOR_IDS": self.NITRO_AUTHOR,
+            "DISCORD_BOT_ROCKETFUEL_TRUSTED_AUTHOR_IDS": self.ROCKETFUEL_AUTHOR,
+        }
+
+        nitro = self._resolve("nitro", env)
+
+        assert self.ROCKETFUEL_AUTHOR not in nitro
+        assert self.RAMJET_AUTHOR not in nitro
+
+    def test_the_shared_var_still_works_for_a_single_bot_setup(self):
+        """Backwards compatibility: a one-bot deployment configures the original
+        name, and that must not be broken by adding the per-bot one."""
+        env = {"DISCORD_TRUSTED_AUTHOR_IDS": f"{self.NITRO_AUTHOR},{self.ROCKETFUEL_AUTHOR}"}
+
+        assert self._resolve("nitro", env) == {self.NITRO_AUTHOR, self.ROCKETFUEL_AUTHOR}
+
     def test_a_per_bot_var_wins_over_the_shared_one(self):
         env = {
             "DISCORD_BOT_NITRO_TRUSTED_AUTHOR_IDS": self.NITRO_AUTHOR,
@@ -3340,6 +3459,21 @@ class TestRejectionStreakIsLoggedNotFatal:
         assert summary["rejected_author_ids"] == [self.NITRO_AUTHOR]
         assert summary["rejected_count"] >= AUTHOR_REJECTION_STREAK_THRESHOLD
 
+    def test_the_alert_fires_once_not_per_message(self, caplog):
+        from live_runner.signal_sources.discord_source import (
+            AUTHOR_REJECTION_STREAK_THRESHOLD,
+        )
+
+        source = self._source(self.WRONG_AUTHOR)
+        with caplog.at_level(logging.ERROR):
+            asyncio.run(
+                self._feed(source, self.NITRO_AUTHOR, AUTHOR_REJECTION_STREAK_THRESHOLD * 4)
+            )
+
+        alerts = [r for r in caplog.records if "rejected every recent message" in r.message]
+        assert len(alerts) == 1, f"repeated alerts: {len(alerts)}"
+        assert self.statuses == []
+
 
 class TestObserveChannelAuthors:
     """Reading the allowlist value instead of guessing it.
@@ -3538,6 +3672,24 @@ def test_an_empty_per_bot_allowlist_means_trusts_nobody() -> None:
     ) == set(), "an explicitly empty per-bot allowlist widened to the shared list"
 
 
+def test_an_unset_per_bot_allowlist_still_falls_back_to_shared() -> None:
+    """Absent is not the same as empty, and the shared list stays a real fallback.
+
+    Single-bot setups configure only the shared variable; that must keep working,
+    or the change above would break every deployment that never opted in.
+    """
+    from live_runner.daemon import _resolve_discord_service_trusted_author_ids
+
+    service = SimpleNamespace(
+        id="svc", name="NITRO", config={}, status=daemon.ServiceStatus.RUNNING
+    )
+
+    resolved = _resolve_discord_service_trusted_author_ids(
+        service, accounts_env_values={"DISCORD_TRUSTED_AUTHOR_IDS": "1,2,3"}
+    )
+
+    assert resolved == {"1", "2", "3"}
+
 from live_runner.signal_sources.discord_source import (  # noqa: E402
     _BUY_NEGATED_RE,
     _detect_rocket_fuel_signal_type,
@@ -3560,10 +3712,6 @@ def test_a_negated_buy_instruction_does_not_open_a_long() -> None:
         "on EURUSD $1.0850 I should not long here",
         "wait on EURUSD, do not buy",
         "EURUSD is not a buy",
-        # Explicit buy directives with a negation still veto (the "add" target
-        # is what keeps "Do not add." from opening a long).
-        "AAPL buy signal @ 100. Do not add.",
-        "AAPL buy signal @ 100. Do not buy more.",
     ):
         signal_type = _detect_rocket_fuel_signal_type(content)
         assert _resolve_action(content, signal_type=signal_type) is None, (
@@ -3924,6 +4072,35 @@ class TestRealBugsFromThePreMortem:
     file keeps hitting: a second copy of a rule is a rule nobody maintains.
     """
 
+    def test_a_blank_per_bot_var_does_not_widen_on_the_deployment_path(self) -> None:
+        """`if per_service:` fell through to the shared list on a blank value.
+
+        Fixed on the *service* path in 626e485; missed here, on the path all three
+        live deployments use. So the same env file produced the right answer from
+        one code path and the wrong one from the other - Nitro trusting all three
+        bots' authors, which is the cross-bot trust the per-bot var exists to
+        prevent, and the fail-closed configuration being unreachable.
+        """
+        from live_runner.daemon import _deployment_trusted_author_ids
+
+        deployment = SimpleNamespace(
+            id="d1", settings={},
+            signal_config={"service_name": "NITRO"}, signal_source_id="nitro",
+        )
+        env = {
+            "DISCORD_BOT_NITRO_TRUSTED_AUTHOR_IDS": "",
+            "DISCORD_TRUSTED_AUTHOR_IDS": "1,2,3",
+        }
+
+        resolved = _deployment_trusted_author_ids(
+            deployment, accounts_env_values=env
+        )
+
+        assert resolved == set(), (
+            "a blank per-bot allowlist widened to the shared list on the "
+            f"deployment path: {sorted(resolved)}"
+        )
+
     def test_the_per_deployment_author_gate_is_not_inert(self) -> None:
         """The gate read os.environ, which never holds .accounts.env.
 
@@ -4013,6 +4190,32 @@ class TestStandardsReviewFindings:
             assert signal_type == "momentum_reversal"
             assert _resolve_action(content, signal_type=signal_type) == "sell", (
                 f"{content!r} dropped an exit signal"
+            )
+
+    def test_a_negation_vetoes_a_buy_even_with_an_explicit_buy_directive(self) -> None:
+        """Pins the *behaviour*, which is what the simplified condition now states.
+
+        The review found the old condition had a second conjunct,
+        `and not _reads_as_buy_directive(content)`, that could never be False -
+        `_reads_as_buy_directive` already short-circuits to False whenever the
+        negation matches. So the conjunct was dead, and the comment around it
+        described an escape hatch that did not exist: a reader would reasonably
+        believe an explicit buy directive could survive the veto. It cannot.
+
+        Worth being precise about why this test cannot catch that class of defect
+        by itself: the two conditions are *logically equivalent*, so no
+        behavioural test distinguishes them. Adding the conjunct back leaves the
+        whole suite green - verified. A misleading condition is a documentation
+        bug, and only the comment change fixes it.
+        """
+        for content in (
+            "AAPL buy signal @ 100. Do not add.",
+            "AAPL buy signal @ 100. Do not buy more.",
+            "on EURUSD $1.0850 this is not a buy signal",
+        ):
+            assert _BUY_NEGATED_RE.search(content), f"precondition: {content!r}"
+            assert _resolve_action(content, signal_type=None) is None, (
+                f"{content!r} opened a long despite an explicit negation"
             )
 
     def test_both_allowlist_paths_split_a_list_identically(self) -> None:
@@ -4205,6 +4408,26 @@ def test_a_source_with_an_empty_allowlist_refuses_to_start() -> None:
         _source(trusted_author_ids=set())
     with pytest.raises(ValueError, match="trusted"):
         _source(trusted_author_ids=["  "])
+
+
+def test_an_unresolvable_allowlist_is_not_an_allow_all() -> None:
+    """No accounts-env mapping and no configured value resolves to empty.
+
+    The deployment-level gate still honours the channel-merged allowlist for a
+    deployment with no list of its own, but the *resolution* must never invent
+    trust from an environment it cannot read.
+    """
+    from live_runner.daemon import _deployment_trusted_author_ids
+
+    deployment = SimpleNamespace(
+        id="d1",
+        settings={},
+        signal_config={"service_name": "nitro"},
+        signal_source_id="nitro",
+    )
+
+    assert _deployment_trusted_author_ids(deployment, accounts_env_values={}) == set()
+    assert _deployment_trusted_author_ids(deployment) == set()
 
 
 def test_the_discovery_tool_reads_the_token_from_its_env_key(monkeypatch):
@@ -4463,6 +4686,52 @@ def test_the_parser_stamps_the_discord_producer_source() -> None:
     assert signal.metadata["source"] == "discord"
 
 
+def test_poll_emits_messages_in_chronological_order() -> None:
+    """A multi-page burst must reach the queue oldest-first.
+
+    Discord returns newest-first and a burst spans pages. Emitting page by page
+    in API order would hand the daemon the batch in reverse, so an entry and its
+    exit in the same burst would execute backwards.
+    """
+    import asyncio
+
+    source = _source(trusted_author_ids={"bot-1"})
+    # A cursor below the burst forces the forward backfill branch, so the poll
+    # actually builds two pages.
+    source._last_seen_message_ids["channel-1"] = "100000000000000050"
+
+    def _row(message_id: int) -> dict[str, object]:
+        return {
+            "id": str(message_id),
+            "channel_id": "channel-1",
+            "timestamp": "2026-09-01T12:00:00Z",
+            "content": "**$AAPL** is now oversold — buy signal\nPrice: $190.50",
+            "author": {"id": "bot-1", "bot": True},
+        }
+
+    burst_ids = [100000000000000051 + index for index in range(30)]
+
+    async def _fetch(_channel_id, *, after=None, **kwargs):
+        anchor = int(after or 0)
+        return [
+            _row(message_id)
+            for message_id in reversed([i for i in burst_ids if i > anchor][:20])
+        ]
+
+    source._fetch_messages = _fetch
+    asyncio.run(source._poll_once("channel-1"))
+
+    queued = [source._queue.get_nowait() for _ in range(30)]
+    ids = [item.metadata["discord_message_id"] for item in queued]
+    assert ids[0] == "100000000000000051"
+    assert ids[:3] == [
+        "100000000000000051",
+        "100000000000000052",
+        "100000000000000053",
+    ]
+    assert ids == sorted(ids), f"burst was not emitted oldest-first: {ids[:5]}..."
+
+
 def test_the_poll_cursor_never_moves_backwards() -> None:
     """A page of older messages must not rewind the cursor.
 
@@ -4544,6 +4813,11 @@ def test_unresolvable_allowlist_trusts_nobody_at_dispatch() -> None:
 
     assert (
         daemon._deployment_accepts_signal_author(deployment, "1", accounts_env_values={})
+        is False
+    )
+    # No accounts env at all (a caller that forgot to thread it): still nobody.
+    assert (
+        daemon._deployment_accepts_signal_author(deployment, "1", accounts_env_values=None)
         is False
     )
 
