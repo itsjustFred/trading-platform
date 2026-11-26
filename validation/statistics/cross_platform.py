@@ -208,13 +208,13 @@ def _platform_return_context(platform_path: Path) -> dict[str, Any]:
     # The platform side recovers a book-level asset class from the OHLCV
     # path layout when metadata does not carry one; mirror that here so the
     # imported curve resolves the identical annualisation convention.
-    from runner.stats import _book_asset_class
+    from runner.stats import book_asset_class
 
     symbol_list = [str(symbol) for symbol in symbols if str(symbol or "").strip()]
     return {
         "symbols": symbol_list,
         "data_source": data_source,
-        "asset_class": _book_asset_class(
+        "asset_class": book_asset_class(
             meta_data, context, symbol_list, data_source, data_dir
         ),
         "data_dir": data_dir,

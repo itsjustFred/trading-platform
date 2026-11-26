@@ -8,6 +8,9 @@ This adapter bridges to existing LEAN infrastructure:
 4. Converts to universal format via lean_converter
 
 For Phase 1, this is a thin wrapper. Phase 2 will add Docker-based LEAN runs.
+
+The LEAN project directory comes from ``LEAN_PROJECT_DIR`` and defaults to
+``DATA_DIR / "lean_project"`` (previously a hard-coded ``~/Desktop`` path).
 """
 
 from __future__ import annotations
@@ -23,24 +26,18 @@ from pathlib import Path
 from runner.agent_process import build_backtest_child_env
 from runner.approval_gate import require_generated_strategy_approval
 from runner.converters.lean_converter import convert_lean_result
+from runner.engines import contract
 from runner.engines.base import (
     BacktestConfig,
     EngineAdapter,
     ProgressCallback,
     warn_if_engine_frozen,
 )
-from runner.engines import contract
+from shared import constants
 from shared.atomic_io import write_text_atomically
 from shared.models import BacktestResult
 
 logger = logging.getLogger(__name__)
-
-LEAN_PROJECT_DIR = Path(
-    os.environ.get(
-        "LEAN_PROJECT_DIR",
-        Path.home() / "Desktop" / "custom_lean_integration",
-    )
-)
 
 
 def _frozen_signal_exit_fill(config: BacktestConfig) -> BacktestConfig:
@@ -75,7 +72,14 @@ class LeanAdapter(EngineAdapter):
         return "lean"
 
     def __init__(self, lean_project_dir: str | Path | None = None):
-        self.project_dir = Path(lean_project_dir) if lean_project_dir else LEAN_PROJECT_DIR
+        # Resolved at call time, not import: DATA_DIR can be overridden per
+        # process via shared.constants.set_data_dir (test isolation).
+        env_dir = os.environ.get("LEAN_PROJECT_DIR")
+        self.project_dir = (
+            Path(lean_project_dir)
+            if lean_project_dir
+            else Path(env_dir) if env_dir else constants.DATA_DIR / "lean_project"
+        )
 
     def run(
         self,

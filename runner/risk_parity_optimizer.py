@@ -229,7 +229,7 @@ def inverse_volatility_weights(covariance: np.ndarray) -> np.ndarray:
     return inv_vol / np.sum(inv_vol)
 
 
-def _project_to_capped_simplex(values: np.ndarray, *, lower: float, upper: float) -> np.ndarray:
+def project_to_capped_simplex(values: np.ndarray, *, lower: float, upper: float) -> np.ndarray:
     """Euclidean projection onto {w : sum(w) == 1, lower <= w_i <= upper}.
 
     #129: clipping then renormalising can push weights back outside the cap
@@ -309,7 +309,7 @@ def solve_risk_parity_weights(
 
     # #129: project onto the capped simplex on every path so the returned
     # weights always sum to 1 inside [lower, upper].
-    return _project_to_capped_simplex(weights, lower=lower, upper=upper)
+    return project_to_capped_simplex(weights, lower=lower, upper=upper)
 
 
 def score_risk_parity_universe(

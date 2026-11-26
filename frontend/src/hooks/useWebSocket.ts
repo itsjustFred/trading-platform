@@ -308,7 +308,6 @@ export function useWebSocket<TMessage = unknown>(
     return true;
   }, []);
 
-  // Derived: an unmounted/disabled hook reports idle rather than a stale socket state.
   const active = enabled && url != null;
   const resolvedStatus: WebSocketStatus = active ? status : "idle";
   const resolvedIsConnected = active && isConnected;
