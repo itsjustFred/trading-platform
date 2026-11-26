@@ -9,7 +9,7 @@ B. Signal-driven exits fill at the NEXT bar's open, like entries. A signal on
    ``meta["signal_exit_deferred_to_end_of_data"]``.
 
 Covered engines: native ``TradeEngine`` (the only engine under development,
-ADR ``docs/adr/0001-native-single-strategy-engine.md``), ``SignalReplayAdapter``
+ADR ``docs/adr/0002-native-single-strategy-engine.md``), ``SignalReplayAdapter``
 (separate product, already gap-aware) and the shared ``contract`` primitives.
 The frozen vectorbt/pynecore adapters keep their level fills and legacy
 signal-exit convention and REFUSE ``signal_exit_fill="next_open"`` outright

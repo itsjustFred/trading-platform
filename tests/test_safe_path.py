@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from scripts._safe_path import UnsafePathError, reject_traversal, under_root
+from scripts.safe_path import UnsafePathError, reject_traversal, under_root
 
 
 def test_reject_traversal_refuses_a_dotdot_segment() -> None:

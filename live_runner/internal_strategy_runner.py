@@ -116,7 +116,7 @@ Risk-policy notes (maintainer decision 2026-11-22):
   delay, not a dropped signal (documented divergence).
 
 Submission: intents are handed to the daemon's ``submit_signal`` callback,
-which routes them through ``_trade_signal_to_live_signal`` and
+which routes them through ``trade_signal_to_live_signal`` and
 ``_prepare_claim_and_submit_signal`` — the same prepare/claim/submit path as
 Discord signals, so sizing, the SL/TP guard, promotion gate, submission lease
 and adapter persistence all apply unchanged.
@@ -146,7 +146,7 @@ from live_runner.promotion import (
     deployment_signal_processor_name,
     strategy_target,
 )
-from live_runner.signal_sources.execution_timing import _timeframe_seconds
+from live_runner.signal_sources.execution_timing import timeframe_seconds
 from live_runner.symbol_class import classify_symbol
 from risk.models import TradeSignal
 from runner.engine_pkg.trading_engine import TRADE_ENGINE_MAX_POSITIONS, TradeEngine
@@ -1660,7 +1660,7 @@ class InternalStrategyRunner:
                 timeframe = normalize_timeframe(deployment.timeframe)
                 if timeframe not in VALID_TIMEFRAMES:
                     raise ValueError(f"unsupported timeframe {deployment.timeframe!r}")
-                bar_seconds = _timeframe_seconds(timeframe)
+                bar_seconds = timeframe_seconds(timeframe)
                 if not bar_seconds:
                     raise ValueError(f"timeframe {timeframe!r} has no bar length")
                 symbols = _deployment_symbols(deployment)
