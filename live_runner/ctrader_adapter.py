@@ -3645,10 +3645,16 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 error_code=str(getattr(response, "errorCode", "") or ""),
                 definitive=definitive_refusal,
             )
-        if (
-            self._ProtoOAExecutionEvent is not None
-            and isinstance(response, self._ProtoOAExecutionEvent)
-        ):
+        # Only ProtoOAExecutionEvent carries ``executionType``. When the proto
+        # class itself is not loaded, sniff the attribute instead of skipping:
+        # an unclassifiable event must fail closed below, never pass as
+        # submitted.
+        is_execution_event = (
+            isinstance(response, self._ProtoOAExecutionEvent)
+            if self._ProtoOAExecutionEvent is not None
+            else getattr(response, "executionType", None) is not None
+        )
+        if is_execution_event:
             rejected = self._is_order_rejected_execution(response)
             if rejected is None:
                 # The event's type cannot be classified (proto types not fully
@@ -3738,6 +3744,9 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 return False
         except (TypeError, ValueError):
             return False
+        # ``is not None``, never truthiness: protobuf messages are falsy when
+        # empty, and an attached-but-empty deal is still an execution record
+        # whose presence cannot be proven harmless.
         if _present_proto_field(event, "deal", fail_closed=True) is not None:
             return False
         position = _present_proto_field(event, "position", fail_closed=True)
@@ -3746,7 +3755,9 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         if self._is_close_position_request(request):
             return True
         # For a new order ANY attached position - even one whose positionId
-        # reads as unset - is state the rejection must not have produced.
+        # reads as unset, and protobuf messages are falsy when empty so this
+        # must stay an identity check - is state the rejection must not have
+        # produced.
         return position is None
 
     def _handle_spot_event(self, payload: Any) -> None:

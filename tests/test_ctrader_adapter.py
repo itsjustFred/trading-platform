@@ -4225,3 +4225,62 @@ def test_unclassifiable_execution_event_response_stays_unknown() -> None:
     with pytest.raises(RuntimeError, match="could not be classified") as excinfo:
         asyncio.run(submission)
     assert not isinstance(excinfo.value, BrokerOrderRejectedError)
+
+
+def test_order_rejected_execution_with_empty_deal_stays_unknown() -> None:
+    """An attached-but-empty deal is still an execution record: not clean."""
+    from ctrader_open_api.messages.OpenApiMessages_pb2 import (
+        ProtoOAExecutionEvent,
+        ProtoOANewOrderReq,
+    )
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import (
+        ProtoOADeal,
+        ProtoOAExecutionType,
+        ProtoOAOrderStatus,
+    )
+
+    from live_runner.base_adapter import BrokerOrderRejectedError
+
+    adapter = _execution_event_response_adapter(
+        ProtoOAExecutionEvent(
+            ctidTraderAccountId=1,
+            executionType=ProtoOAExecutionType.ORDER_REJECTED,
+            order=_rejected_order(status=ProtoOAOrderStatus.ORDER_STATUS_REJECTED),
+            deal=ProtoOADeal(),
+            errorCode="TRADING_BAD_VOLUME",
+        )
+    )
+    submission = adapter._submit_new_order_request(ProtoOANewOrderReq())
+
+    with pytest.raises(RuntimeError, match="Order rejected") as excinfo:
+        asyncio.run(submission)
+    assert not isinstance(excinfo.value, BrokerOrderRejectedError)
+
+
+def test_order_rejected_execution_without_loaded_event_class_is_classified() -> None:
+    """executionType is unique to ExecutionEvent: sniff it when class is None."""
+    from ctrader_open_api.messages.OpenApiMessages_pb2 import (
+        ProtoOAExecutionEvent,
+        ProtoOANewOrderReq,
+    )
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import (
+        ProtoOAExecutionType,
+        ProtoOAOrderStatus,
+    )
+
+    from live_runner.base_adapter import BrokerOrderRejectedError
+
+    adapter = _execution_event_response_adapter(
+        ProtoOAExecutionEvent(
+            ctidTraderAccountId=1,
+            executionType=ProtoOAExecutionType.ORDER_REJECTED,
+            order=_rejected_order(status=ProtoOAOrderStatus.ORDER_STATUS_REJECTED),
+            errorCode="TRADING_BAD_VOLUME",
+        )
+    )
+    adapter._ProtoOAExecutionEvent = None
+    submission = adapter._submit_new_order_request(ProtoOANewOrderReq())
+
+    with pytest.raises(BrokerOrderRejectedError, match="Order rejected") as excinfo:
+        asyncio.run(submission)
+    assert excinfo.value.error_code == "TRADING_BAD_VOLUME"
