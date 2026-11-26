@@ -369,9 +369,10 @@ def _plan_owner_moves(
 def _plan_moves(session: Session) -> dict[str, Any]:
     """Classify every execution on a broker-close signal: move, refuse or skip.
 
-    Returns ``{"moves", "refusals", "unmatched", "close_signals"}`` where a
-    move is ``{"execution", "close", "owner", "parent", "metadata_parent"}``
-    and ``metadata_parent`` is the ``parent_signal_id`` the repair must stamp
+    Returns ``{"moves", "refusals", "unmatched", "close_signals",
+    "executions_by_close"}`` where a move is
+    ``{"execution", "close", "owner", "parent", "metadata_parent"}`` and
+    ``metadata_parent`` is the ``parent_signal_id`` the repair must stamp
     on the owner so its fills keep crediting the same entry (``None`` = no
     metadata change needed).
     """
