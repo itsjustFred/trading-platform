@@ -6,6 +6,7 @@ When creating an issue or PR, mention model as well as harness at the bottom of 
 Unless explicitly told, never push directly to main.
 Use conventional commit style messages unless not appropriate.
 If making changes, also check if you need to update other things such as docs, skills, etc.
+Before starting work, run `python scripts/agents/worktree_preflight.py` in your worktree; Claude Code sessions get the `scripts/agents/guard_shell.py` PreToolUse hook automatically via `.claude/settings.json` (other harnesses are not covered by the hook).
 
 ## Tests
 
