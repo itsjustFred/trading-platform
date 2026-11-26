@@ -15,6 +15,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
+from tests.conftest import sandboxed_env
 
 
 def test_watchdog_kills_child_that_streams_forever():
@@ -35,6 +36,7 @@ def test_watchdog_kills_child_that_streams_forever():
         stderr=subprocess.STDOUT,
         text=True,
         bufsize=1,
+        env=sandboxed_env(),
     )
     try:
         viewer_main._monitor_backtest_process(
@@ -62,6 +64,7 @@ def test_watchdog_does_not_kill_child_that_finishes_in_time():
         stderr=subprocess.STDOUT,
         text=True,
         bufsize=1,
+        env=sandboxed_env(),
     )
     try:
         outcome = viewer_main._monitor_backtest_process(
@@ -88,6 +91,7 @@ def test_watchdog_reports_timed_out_child():
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        env=sandboxed_env(),
     )
     outcome = None
     try:
@@ -127,6 +131,7 @@ def test_watchdog_does_not_kill_its_own_process_group():
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        env=sandboxed_env(),
     )
     import os
 
@@ -156,6 +161,7 @@ def test_watchdog_kills_child_group_when_child_is_group_leader():
         stderr=subprocess.STDOUT,
         text=True,
         start_new_session=True,
+        env=sandboxed_env(),
     )
     try:
         assert os.getpgid(proc.pid) == proc.pid
@@ -182,6 +188,7 @@ def test_watchdog_signals_timed_out_event_before_killing():
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        env=sandboxed_env(),
     )
     timed_out = threading.Event()
     try:
@@ -207,6 +214,7 @@ def test_watchdog_leaves_timed_out_event_clear_on_normal_exit():
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        env=sandboxed_env(),
     )
     timed_out = threading.Event()
     try:

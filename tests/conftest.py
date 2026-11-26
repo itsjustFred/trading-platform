@@ -159,7 +159,9 @@ os.environ.pop(ACCOUNTS_ENV_ENV_VAR, None)
 # HOME is not on the list: it is pointed at the session sandbox instead, so a test (or a child)
 # never reads the caller's home directory. The sandbox's own variables (DATA_DIR, LOG_DIR, the
 # OPS_ALERT_* filters) are, because the sweep runs after they were forced: they hold this
-# process's values by then, and a child that inherited them from sandboxed_env() must keep them.
+# process's values by then, and a child that inherited them from sandboxed_env() must keep them
+# - together with the names sandboxed_env() itself lists in TP_TEST_CHILD_ENV (see
+# :func:`sandboxed_env`).
 _SANDBOX_ENV_ALLOWLIST = frozenset(
     {
         "CI",
@@ -196,9 +198,21 @@ _SANDBOX_ENV_ALLOWLIST_PREFIXES = ("PYTHON", "LC_", "GITHUB_", "PYTEST_XDIST")
 SANDBOX_HOME = _SESSION_ROOT / "home"
 
 
+#: The names ``sandboxed_env()`` applied as overrides for one child, so the child's own
+#: sweep (which runs when the child imports this file) keeps what the parent chose for it.
+#: Without the handoff a ``JFOREX_JARS`` or ``TP_REPO_ROOT`` a test passed to its child would be
+#: deleted by the very guard meant to protect that child.
+CHILD_ENV_OVERRIDES_ENV_VAR = "TP_TEST_CHILD_ENV"
+
+
 def _is_allowlisted_env(name: str) -> bool:
     """Whether *name* is part of the environment the suite may observe."""
-    return name in _SANDBOX_ENV_ALLOWLIST or name.startswith(_SANDBOX_ENV_ALLOWLIST_PREFIXES)
+    if name in _SANDBOX_ENV_ALLOWLIST or name.startswith(_SANDBOX_ENV_ALLOWLIST_PREFIXES):
+        return True
+    if name == CHILD_ENV_OVERRIDES_ENV_VAR:
+        return True
+    inherited = os.environ.get(CHILD_ENV_OVERRIDES_ENV_VAR, "")
+    return bool(inherited) and name in inherited.split(",")
 
 
 def _enforce_env_allowlist() -> None:
@@ -268,6 +282,12 @@ def sandboxed_env(**overrides: str) -> dict[str, str]:
         pythonpath.insert(0, caller_pythonpath)
     env["PYTHONPATH"] = os.pathsep.join(pythonpath)
     env.update(overrides)
+    if overrides:
+        # Named, not just applied: the child imports this file through the shim, and its sweep
+        # must keep the variables the naming test meant it to see. A child that starts its own
+        # child adds to the list rather than replacing it.
+        inherited = [name for name in env.get(CHILD_ENV_OVERRIDES_ENV_VAR, "").split(",") if name]
+        env[CHILD_ENV_OVERRIDES_ENV_VAR] = ",".join(dict.fromkeys([*inherited, *overrides]))
     # The xdist identity belongs to the worker xdist started, never to a child of it: a
     # plain child that carries the marker would look like a worker to anything that
     # checks, and the marker has no meaning in a process execnet did not start.
@@ -563,7 +583,12 @@ def _isolate_accounts_env() -> None:
 
 
 class _ChildAccountsEnvLoader:
-    """Wrap one module loader so its accounts-env constants are patched after import."""
+    """Wrap one module loader so its accounts-env constants are patched after import.
+
+    Everything but ``exec_module`` is delegated, through ``__getattr__`` for the parts this
+    class does not name: ``python -m`` reads a loader's ``get_code``, and a wrapper that
+    only spoke the import protocol would break every ``-m`` child.
+    """
 
     def __init__(self, loader: object) -> None:
         self._loader = loader
@@ -578,6 +603,9 @@ class _ChildAccountsEnvLoader:
                 continue
             if _repo_secret_path(value) == REPO_ACCOUNTS_ENV:
                 setattr(module, name, ISOLATED_ACCOUNTS_ENV)
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._loader, name)
 
 
 class _ChildAccountsEnvFinder:

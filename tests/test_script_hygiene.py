@@ -18,6 +18,8 @@ from unittest.mock import patch
 import filelock as filelock_module
 import pytest
 
+from tests.conftest import sandboxed_env
+
 
 def _load_script(name: str):
     repo_root = Path(__file__).resolve().parents[1]
@@ -118,7 +120,8 @@ def test_acquire_lock_never_deletes_a_live_lock(queue_runner) -> None:
                 "time.sleep(15)\n"
             ),
             str(module.LOCK_PATH),
-        ]
+        ],
+        env=sandboxed_env(),
     )
     try:
         deadline = time.time() + 5

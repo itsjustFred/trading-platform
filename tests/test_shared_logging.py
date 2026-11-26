@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from shared.logging import JsonFormatter
+from tests.conftest import sandboxed_env
 
 
 def test_json_formatter_uses_required_timestamp_format():
@@ -197,6 +198,7 @@ def test_shipped_console_stream_default_is_stdout() -> None:
         text=True,
         check=True,
         cwd=Path(__file__).resolve().parents[1],
+        env=sandboxed_env(),
     )
 
     assert result.stdout.strip() == "stdout"
