@@ -20,7 +20,7 @@ import pandas as pd
 import pytest
 
 from runner.engines.base import BacktestConfig
-from runner.engines.vectorbt_adapter import VectorbtAdapter, _resolve_max_leverage
+from runner.engines.vectorbt_adapter import VectorbtAdapter, resolve_max_leverage
 from tests.helpers import deterministic_ohlcv_frame, sma_crossover_strategy_text, with_zero_fees
 from tests.helpers import write_ohlcv as _write_shared_ohlcv
 
@@ -69,8 +69,8 @@ def sizing_env(tmp_path: Path):
 
 class TestLeverageSemantics:
     def test_resolver_keeps_conservative_leverage(self):
-        assert _resolve_max_leverage(1.0) == 1.0
-        assert _resolve_max_leverage(0.5) == 0.5
+        assert resolve_max_leverage(1.0) == 1.0
+        assert resolve_max_leverage(0.5) == 0.5
 
     def test_conservative_max_leverage_binds_notional(self, sizing_env):
         """max_leverage=1 must cap the notional at 1x equity — no override."""

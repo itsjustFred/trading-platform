@@ -80,7 +80,7 @@ from live_runner.base_adapter import (
 )
 from live_runner.exit_signals import ExitBelowStepError
 from live_runner.shutdown import BrokerMutationGate
-from live_runner.signal_sources.execution_timing import _timeframe_seconds
+from live_runner.signal_sources.execution_timing import timeframe_seconds
 from live_runner.trailing_stops import (
     TRAILING_GIVE_UP_AFTER_SECONDS,
     TRAILING_GIVEN_UP_PROBE_SECONDS,
@@ -776,7 +776,7 @@ class LiveSupertrendFlipManager:
                 )
                 self._workflows.pop(key, None)
                 return
-            bar_seconds = _timeframe_seconds(deployment.signal_timeframe) or 0
+            bar_seconds = timeframe_seconds(deployment.signal_timeframe) or 0
             breakeven_due = self._breakeven_due(plan, state, bar_seconds, moment)
             stops_for_position: list[ProtectiveStop] | None = None
             if breakeven_due:
@@ -941,7 +941,7 @@ class LiveSupertrendFlipManager:
         if deployment is None:
             return None
         timeframe = deployment.signal_timeframe
-        if not _timeframe_seconds(timeframe):
+        if not timeframe_seconds(timeframe):
             raise _FlipFailure(
                 f"deployment timeframe {timeframe!r} has no bar length for the "
                 "flip workflow",

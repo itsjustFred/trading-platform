@@ -114,5 +114,5 @@ def test_agents_md_documents_the_dev_install() -> None:
     agents = (ROOT / "AGENTS.md").read_text(encoding="utf-8")
     # `--frozen` is part of the contract: without it a local sync can re-resolve
     # a different mypy than the one CI checks out with.
-    assert "uv sync --frozen --extra dev" in agents
+    assert "uv sync --frozen --all-extras" in agents
     assert "uv run mypy" in agents
