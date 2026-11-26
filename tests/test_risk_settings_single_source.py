@@ -477,3 +477,16 @@ def test_risk_engine_fallback_stop_rejects_unusable_atr(atr) -> None:
     engine = RiskEngine()
     with pytest.raises(ValueError, match="ATR value"):
         engine.fallback_stop(action="buy", entry_price=100.0, atr=atr)
+
+
+def test_backtest_notional_ceiling_deliberately_differs_from_live() -> None:
+    """The named backtest constant is not silently aligned with live.
+
+    Improvement-run G03: the backtest engine sizes with 1.0 while live
+    deployments default to 0.20; whether to align them is an open maintainer
+    decision, so the divergence is pinned rather than changed.
+    """
+    from runner.engine_pkg.trading_engine import BACKTEST_MAX_NOTIONAL_PER_TRADE
+
+    assert BACKTEST_MAX_NOTIONAL_PER_TRADE == 1.0
+    assert RiskConfig().max_notional_per_trade == 0.20

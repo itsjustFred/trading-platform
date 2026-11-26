@@ -63,6 +63,15 @@ logger = logging.getLogger(__name__)
 #: parameter: strategy ``parameters`` must not rewrite engine risk policy.
 TRADE_ENGINE_MAX_POSITIONS = 5
 
+#: The native backtest engine's per-trade notional ceiling, as a fraction of
+#: balance. It deliberately differs from the live default
+#: (``RiskConfig.max_notional_per_trade`` = 0.20): the backtest engine's
+#: leverage/margin policy is applied afterwards on free margin (#347), so this
+#: config value is a documented fallback rather than an active cap. Whether the
+#: backtest should use the live 0.20 instead is an OPEN maintainer decision
+#: (improvement-run G03, #431, #318) — the value is unchanged on purpose.
+BACKTEST_MAX_NOTIONAL_PER_TRADE = 1.0
+
 
 def _floor_to_lot_grid(size: float, lot_step: float) -> float:
     """Largest multiple of ``lot_step`` at or below ``size``, up to the snap band (#151, #278).
@@ -297,7 +306,7 @@ class TradeEngine:
                 max_total_exposure=total_exposure,
                 max_positions=max_positions,
                 default_sl_atr_multiplier=2.0,
-                max_notional_per_trade=1.0,
+                max_notional_per_trade=BACKTEST_MAX_NOTIONAL_PER_TRADE,
                 allow_fallback_stop=bool(self.config.allow_fallback_stop),
                 reject_missing_stop=bool(self.config.reject_missing_stop),
             )
