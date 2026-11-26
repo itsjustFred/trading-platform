@@ -8,6 +8,9 @@ This adapter bridges to existing LEAN infrastructure:
 4. Converts to universal format via lean_converter
 
 For Phase 1, this is a thin wrapper. Phase 2 will add Docker-based LEAN runs.
+
+The LEAN project directory comes from ``LEAN_PROJECT_DIR`` and defaults to
+``DATA_DIR / "lean_project"`` (previously a hard-coded ``~/Desktop`` path).
 """
 
 from __future__ import annotations
