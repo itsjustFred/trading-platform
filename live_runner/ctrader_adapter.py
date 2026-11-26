@@ -686,6 +686,12 @@ _REJECTION_EXECUTION_TYPES = frozenset(
 #: unclassifiable so a future enum member cannot pass as success. The two
 #: sets must stay disjoint - ``test_execution_type_classifier_covers_every_
 #: proto_member`` asserts every loaded member lands in exactly one of them.
+#: Classification rule for a new member: it is a refusal if the broker could
+#: be answering "no" to the request (rejected, refused, denied, failed); it
+#: belongs in ``_REJECTION_EXECUTION_TYPES``. Anything else - accepted,
+#: filled, replaced, cancelled, expired, partial fill, swap, deposit -
+#: belongs here. When in doubt leave it out of both: unclassifiable fails
+#: closed, miscatalogued-as-non-rejection passes a refusal as success.
 _NON_REJECTION_EXECUTION_TYPES = frozenset(
     {
         "ORDER_ACCEPTED",
