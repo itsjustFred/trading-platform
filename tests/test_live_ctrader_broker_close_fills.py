@@ -622,6 +622,36 @@ def test_own_close_fill_attributes_via_the_in_memory_order_map(database) -> None
     assert _ledger(database) == pytest.approx(0.0)
 
 
+def test_an_ambiguous_order_id_attributes_to_the_single_exit_owner(database) -> None:
+    """Pre-mortem: ``broker_order_id`` is not unique, so a recovered duplicate
+    can leave an entry and an exit signal sharing one order id. Only an
+    exit-only signal can claim a position-close fill this way - when exactly
+    one match is an exit it is the plausible owner; booking the fill as a
+    broker-side close would leave the real exit looking unfilled."""
+    import shared.database as db
+
+    entry_id = _persist_entry(database, qty=10.0)
+    exit_id = _persist_exit_signal(
+        database,
+        order_id=ENTRY_ORDER_ID,
+        metadata_extra={"position_id": POSITION_ID},
+    )
+    adapter = _adapter(database, position_orders={POSITION_ID: [_entry_order(entry_id)]})
+
+    asyncio.run(
+        adapter._persist_execution_event(
+            _event(
+                _sdk_closing_order(order_id=ENTRY_ORDER_ID),
+                _close_deal(order_id=ENTRY_ORDER_ID),
+            )
+        )
+    )
+
+    assert len(_signal_execution_rows(database, exit_id)) == 1
+    assert _signal_execution_rows(database, db.broker_close_signal_id(entry_id)) == []
+    assert _ledger(database) == pytest.approx(0.0)
+
+
 def test_a_broker_side_close_with_an_sdk_style_client_order_id_still_books(
     database,
 ) -> None:

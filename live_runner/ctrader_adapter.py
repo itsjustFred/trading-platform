@@ -7793,11 +7793,29 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             return None
         resolved = self._order_id_to_signal_id.get(order_id)
         if resolved is None:
-            resolved = await asyncio.to_thread(
-                find_live_signal_id_by_broker_order_id,
+            owner_ids = await asyncio.to_thread(
+                find_live_signal_ids_by_broker_order_id,
                 self.account_config_id,
                 str(order_id),
             )
+            if len(owner_ids) == 1:
+                resolved = owner_ids[0]
+            elif owner_ids:
+                # ``broker_order_id`` is indexed, not unique: a recovered
+                # duplicate can share one. Only an exit-only signal can
+                # claim a position-close fill this way, so when exactly one
+                # match is an exit it is the plausible owner; anything more
+                # ambiguous stays unresolved and takes the broker-close
+                # path, which resolves the position's real opener.
+                exit_owners: list[str] = []
+                for owner_id in owner_ids:
+                    owner_metadata = await asyncio.to_thread(
+                        get_live_signal_metadata, owner_id
+                    )
+                    if is_exit_only_signal_metadata(owner_metadata or {}):
+                        exit_owners.append(owner_id)
+                if len(exit_owners) == 1:
+                    resolved = exit_owners[0]
         if not resolved:
             return None
         metadata = await asyncio.to_thread(
