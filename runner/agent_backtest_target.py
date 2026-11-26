@@ -162,7 +162,7 @@ def _load_ohlcv_entries() -> list[dict]:
             entries = payload.get("ohlcv", []) if isinstance(payload, dict) else []
             if isinstance(entries, list) and entries:
                 return [entry for entry in entries if isinstance(entry, dict)]
-        except Exception:  # except-kind: best-effort - corrupt catalog falls back to the directory scan
+        except Exception:  # except-kind: best-effort - corrupt catalog falls back to scan
             logger.debug("Could not read OHLCV catalog %s", catalog_path, exc_info=True)
     return scan_ohlcv(DATA_DIR)
 

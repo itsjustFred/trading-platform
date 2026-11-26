@@ -2818,11 +2818,11 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 stop = getattr(client, "stopService", None)
                 if stop is not None:
                     stop()
-            except Exception:  # except-kind: loop-survival
+            except Exception:  # except-kind: loop-survival  # noqa: S110
                 pass
         try:
             self._connected_event.clear()
-        except Exception:  # except-kind: loop-survival
+        except Exception:  # except-kind: loop-survival  # noqa: S110
             pass
 
     async def _recover_broker_order_id(

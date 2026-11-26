@@ -837,7 +837,7 @@ def _resolve_return_convention(
                     data_dir=str(data_dir) if data_dir else "",
                 )
             )
-        except Exception:  # except-kind: best-effort - unresolved calendar counts as non-crypto daily
+        except Exception:  # except-kind: best-effort - counts as non-crypto daily
             logger.debug(
                 "Venue calendar resolution failed for %s", symbol, exc_info=True
             )

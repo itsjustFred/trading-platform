@@ -160,7 +160,7 @@ def _detect_date_range(symbols: list[str], timeframe: str, data_dir: str = "") -
                     "No timestamp column in %s; symbol %s cannot contribute a date range",
                     matches[0], symbol,
                 )
-        except Exception as e:  # except-kind: loop-survival - unreadable file is logged; the all-symbols check below refuses to fabricate a range
+        except Exception as e:  # except-kind: loop-survival - range completeness enforced below
             logger.warning("Could not read date range from %s: %s", matches[0], e, exc_info=True)
 
     # A symbol whose file could not be read must not silently shrink the
@@ -412,7 +412,7 @@ def cmd_run(args):
     if not getattr(args, "skip_sqlite", False):
         try:
             save_result_to_sqlite(result)
-        except Exception as exc:  # except-kind: best-effort - SQLite is secondary to the saved JSON artifact
+        except Exception as exc:  # except-kind: best-effort - SQLite persist is best-effort
             logger.warning("Could not persist backtest to SQLite: %s", exc, exc_info=True)
     logger.info(
         "Result: %d trades, total PnL: $%.2f", len(result.trades), sum(t.pnl for t in result.trades)

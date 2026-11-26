@@ -151,7 +151,7 @@ def run_strategy_grid(
                     "total_trades": _num_or_none("total_trades"),
                     "net_profit_pct": _derive_net_profit_pct(stats.get("total_return")),
                 }
-            except Exception as e:  # except-kind: loop-survival - cell error is recorded in the matrix output
+            except Exception as e:  # except-kind: loop-survival - error recorded in output
                 logger.exception("Matrix cell failed: %s/%s", symbol, timeframe)
                 results_matrix[symbol][timeframe] = {
                     "status": "error",
@@ -484,7 +484,7 @@ def run_backtest_matrix(
             continue
         try:
             meta = load_strategy_meta(path, strategies_dir)
-        except Exception as exc:  # except-kind: loop-survival - unloadable meta is recorded as a skipped strategy
+        except Exception as exc:  # except-kind: loop-survival - meta failure recorded as skipped
             skipped_strategies.append(
                 {"strategy": slug, "status": "skipped_unavailable", "error": str(exc)}
             )
@@ -588,7 +588,7 @@ def run_backtest_matrix(
                 entry = futures[future]
                 try:
                     handle_strategy_result(entry, future.result())
-                except Exception as exc:  # except-kind: loop-survival - strategy failure is logged and recorded as a failed row
+                except Exception as exc:  # except-kind: loop-survival - logged; failed row
                     logger.exception("Matrix strategy failed: %s", entry.slug)
                     all_rows.append(
                         {
@@ -606,7 +606,7 @@ def run_backtest_matrix(
             assert isinstance(entry, StrategyEntry)
             try:
                 handle_strategy_result(entry, _run_strategy_matrix_cell(**task))
-            except Exception as exc:  # except-kind: loop-survival - strategy failure is logged and recorded as a failed row
+            except Exception as exc:  # except-kind: loop-survival - logged; failed row
                 logger.exception("Matrix strategy failed: %s", entry.slug)
                 all_rows.append(
                     {

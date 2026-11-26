@@ -1525,12 +1525,12 @@ async def _cancel_stockkit_buy_order(
 ) -> None:
     try:
         await asyncio.to_thread(adapter._trading_client.cancel_order_by_id, buy_order_id)
-    except Exception:
+    except Exception:  # noqa: S110 - smoke cleanup probes are best-effort
         pass
     try:
         remaining = _position_qty_for_symbol(await adapter.get_positions(), symbol)
         details["remaining_qty"] = remaining
-    except Exception:
+    except Exception:  # noqa: S110 - position read is best-effort
         pass
 
 
@@ -1625,7 +1625,7 @@ async def _alpaca_stockkit_e2e(
         if adapter is not None:
             try:
                 await adapter.disconnect()
-            except Exception:
+            except Exception:  # noqa: S110 - disconnect cleanup is best-effort
                 pass
 
 

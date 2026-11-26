@@ -177,7 +177,7 @@ def _run_coroutine(coro: Any, *, timeout_seconds: float) -> Any:
         def _runner() -> None:
             try:
                 result["value"] = asyncio.run(asyncio.wait_for(coro, timeout=timeout_seconds))
-            except BaseException as exc:  # except-kind: propagate - bridge stores the error for the caller to re-raise  # pragma: no cover
+            except BaseException as exc:  # except-kind: propagate  # pragma: no cover
                 error["value"] = exc
             finally:
                 done.set()
@@ -282,7 +282,7 @@ class CopilotSDKProvider:
                 status = "unsupported_model"
             error_message = str(exc)
             raise
-        except Exception as exc:  # except-kind: propagate - classifies auth/model errors, then re-raises
+        except Exception as exc:  # except-kind: propagate - auth/model classified, re-raised
             if _is_auth_error(exc):
                 status = "auth_error"
                 error_message = AUTH_SESSION_ERROR

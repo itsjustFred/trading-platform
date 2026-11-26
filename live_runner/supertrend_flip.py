@@ -1309,7 +1309,7 @@ class LiveSupertrendFlipManager:
             candidate = (metadata or {}).get(self._state_key)
             if isinstance(candidate, dict):
                 return candidate
-        except Exception:  # except-kind: money-decision
+        except Exception:  # except-kind: money-decision  # noqa: S110
             pass
         return (entry.get("metadata") or {}).get(self._state_key)
 
@@ -3550,7 +3550,7 @@ class LiveSupertrendFlipManager:
                 value = float(probe(symbol))
                 if math.isfinite(value) and value > 0:
                     return value
-            except Exception:  # except-kind: money-decision
+            except Exception:  # except-kind: money-decision  # noqa: S110
                 pass
         return 1e-9
 
@@ -3563,7 +3563,7 @@ class LiveSupertrendFlipManager:
                 tick = float(tick_fn(symbol))
                 if math.isfinite(tick) and tick > 0:
                     return tick / 2.0
-            except Exception:  # except-kind: money-decision
+            except Exception:  # except-kind: money-decision  # noqa: S110
                 pass
         return 1e-9
 

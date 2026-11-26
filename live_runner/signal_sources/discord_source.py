@@ -1118,7 +1118,7 @@ def _report_parse_outcome(
         return
     try:
         outcome_sink(reason, detail)
-    except Exception:  # except-kind: loop-survival
+    except Exception:  # except-kind: loop-survival  # noqa: S110
         pass
 
 

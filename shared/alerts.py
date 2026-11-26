@@ -497,7 +497,7 @@ class AlertLogHandler(logging.Handler):
                         f"{dedup_key}|{json.dumps(scope, sort_keys=True, default=str)}"
                     )
             self._sink.submit(payload, dedup_key=dedup_key)
-        except Exception:
+        except Exception:  # noqa: S110
             # Alerting must never break the code path that logged the record.
             pass
 

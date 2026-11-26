@@ -163,6 +163,11 @@ select = [
     "RUF046",  # `int()` around a value that is already an integer
     "RUF059",  # unpacked variable that is never used
     "S307",    # eval()
+    # S110 only, not the rest of `S`: try-except-pass on a broad except is a
+    # swallowed failure, and every hit is either fixed or carries a justified
+    # `# noqa: S110`. The remaining bandit rules stay off for the same reason
+    # as the other families below (S101 alone fires ~9k times, all in tests).
+    "S110",    # try-except-pass
 ]
 
 # Families NOT enabled, and why each stays off rather than being fixed:
@@ -177,7 +182,8 @@ select = [
 #        3,400+ times on code that is correct, which would turn the advisory
 #        `ruff check .` step into noise nobody reads.
 #   S    S101 alone fires 9,091 times, every one of it in tests, where the
-#        assert IS the check.
+#        assert IS the check. S110 is enabled above; the rest of the family
+#        stays off for the same reason.
 #   RUF001-003 (ambiguous unicode), RUF022 (unsorted `__all__`), RUF100
 #        (unused noqa) are set-dependent or cosmetic; RUF100 in particular
 #        counts directives for rules that are not enabled, so its number would
@@ -216,7 +222,7 @@ select = [
 # Test doubles: class-level mutable attributes are per-test fixtures that are
 # never shared across instances in a way that matters, and test subprocesses
 # are asserted on via returncode/output rather than check=True.
-"tests/*" = ["RUF012", "PLW1510"]
+"tests/*" = ["RUF012", "PLW1510", "S110"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
