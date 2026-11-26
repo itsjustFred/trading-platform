@@ -69,6 +69,7 @@ from live_runner.credential_env import (
     discord_bot_env_canonical_name,
     discord_bot_env_key,
     load_accounts_env_values,
+    parse_bool_env,
     resolve_accounts_env_path,
     resolve_env_value,
 )
@@ -400,30 +401,6 @@ def _trailing_eligible_adapters(
     }
 
 
-def _parse_bool_env(value: str | None, *, default: bool = True) -> bool:
-    if value is None:
-        return default
-    return value.strip().lower() in {"1", "true", "yes", "on"}
-
-
-_TRUE_BOOL_TOKENS = {"1", "true", "yes", "y", "on"}
-_FALSE_BOOL_TOKENS = {"0", "false", "no", "n", "off"}
-
-
-def _parse_strict_bool_env(name: str, value: str | None, *, default: bool = True) -> bool:
-    if value is None:
-        return default
-    token = value.strip().lower()
-    if token in _TRUE_BOOL_TOKENS:
-        return True
-    if token in _FALSE_BOOL_TOKENS:
-        return False
-    valid = ", ".join(sorted(_TRUE_BOOL_TOKENS | _FALSE_BOOL_TOKENS))
-    raise ValueError(
-        f"Invalid boolean value for {name}: {value!r}. Valid values are: {valid}."
-    )
-
-
 def _raw_bool_text(value: object) -> str | None:
     """Normalize a config value to text for boolean parsing.
 
@@ -552,7 +529,7 @@ def _resolve_ctrader_credentials(
         return None
     raw_demo_value = env_values.get("CTRADER_DEMO")
     demo_value = raw_demo_value.strip() if isinstance(raw_demo_value, str) else None
-    demo = _parse_strict_bool_env("CTRADER_DEMO", demo_value, default=True)
+    demo = parse_bool_env("CTRADER_DEMO", demo_value, default=True)
     return app_id, app_secret, access_token, refresh_token, demo
 
 
@@ -709,7 +686,7 @@ def _deployment_allows_short(deployment: LiveDeploymentConfig) -> bool:
     settings = deployment.settings or {}
     configured = deployment.signal_config or {}
     value = configured.get("allow_short", settings.get("allow_short", False))
-    return _parse_strict_bool_env("allow_short", _raw_bool_text(value), default=False)
+    return parse_bool_env("allow_short", _raw_bool_text(value), default=False)
 
 
 def _deployment_wait_for_candle_close(
@@ -717,16 +694,16 @@ def _deployment_wait_for_candle_close(
 ) -> bool:
     configured = deployment.signal_config or {}
     if "wait_candle_close" in configured:
-        return _parse_strict_bool_env(
+        return parse_bool_env(
             "wait_candle_close", _raw_bool_text(configured.get("wait_candle_close")), default=False
         )
     if "wait_for_candle_close" in configured:
-        return _parse_strict_bool_env(
+        return parse_bool_env(
             "wait_for_candle_close",
             _raw_bool_text(configured.get("wait_for_candle_close")),
             default=False,
         )
-    return _parse_strict_bool_env(
+    return parse_bool_env(
         "DISCORD_WAIT_FOR_CANDLE_CLOSE",
         env_values.get("DISCORD_WAIT_FOR_CANDLE_CLOSE"),
         default=True,

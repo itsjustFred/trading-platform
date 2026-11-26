@@ -112,14 +112,6 @@ SHARED_PARSERS = [
         _canonical_error,
     ),
     BoolParser(
-        "daemon._parse_strict_bool_env",
-        "CTRADER_DEMO",
-        lambda name, raw, default: daemon._parse_strict_bool_env(  # noqa: SLF001
-            name, raw, default=default
-        ),
-        _canonical_error,
-    ),
-    BoolParser(
         "alpaca_adapter._parse_bool_env",
         "ALPACA_PAPER",
         lambda name, raw, default: alpaca_adapter._parse_bool_env(  # noqa: SLF001
