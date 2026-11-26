@@ -39,7 +39,11 @@ from live_runner.base_adapter import (
     order_not_submitted,
     validate_live_quote_prices,
 )
-from live_runner.credential_env import resolve_accounts_env_path, resolve_env_value
+from live_runner.credential_env import (
+    read_accounts_env_file,
+    resolve_accounts_env_path,
+    resolve_env_value,
+)
 from live_runner.exit_signals import ExitBelowStepError
 from shared import venue_calendar
 from shared.constants import DATA_DIR
@@ -99,6 +103,19 @@ class CTraderAuthTerminalError(RuntimeError):
     def __init__(self, message: str, *, error_code: str = "") -> None:
         self.error_code = str(error_code or "").strip()
         super().__init__(message)
+
+
+class CTraderConnectionLostError(ConnectionError):
+    """An in-flight cTrader request was abandoned by a session teardown.
+
+    Upstream ``Client._disconnected`` clears pending response Deferreds
+    without errbacking them, which would leave every in-flight
+    ``_send_request`` waiting out its own response timeout after the socket
+    is already gone. Teardown fails them with this instead. It is
+    deliberately a plain connection error: the request may already have been
+    written, so callers must treat the outcome as unknown - never as
+    provably-not-submitted and never as a broker refusal.
+    """
 
 
 _TRUE_BOOL_TOKENS = {"1", "true", "yes", "y", "on"}
@@ -217,6 +234,35 @@ _AMEND_CONFIRM_INTERVAL_SECONDS = 0.4
 #: pending broker reconciliation instead of letting it sleep out the 30 s
 #: ``queue.get`` timeout. Never a real execution payload.
 _EXECUTION_RECONCILE_WAKE = object()
+
+#: How long after our own token rotation (refresh or adoption of a sibling's
+#: persisted pair) a ``ProtoOAAccountsTokenInvalidatedEvent`` is treated as
+#: the echo of THAT rotation rather than a fresh invalidation of the current
+#: token. cTrader emits the event when a token is refreshed, so the echo can
+#: arrive after our re-auth and even after the resent request; tearing the
+#: session down then would turn a recoverable submit into an unknown outcome.
+#: A genuinely invalidated current token still surfaces through the next
+#: request's auth error, which drives the refresh path - so a bounded window
+#: errs toward keeping a healthy session.
+_TOKEN_INVALIDATION_OWN_ROTATION_GRACE_SECONDS = 60.0
+
+#: One refresh lock per (event loop, accounts env file). Every cTrader
+#: adapter in the process shares the same persisted token pair, and a cTrader
+#: refresh token is single-use: without serialization two adapters could
+#: spend the same refresh token concurrently and the loser would latch
+#: terminal. Keyed by loop because ``asyncio.Lock`` binds to the loop that
+#: first contends it; the daemon runs a single loop, so this is exact there.
+_SHARED_TOKEN_REFRESH_LOCKS: dict[tuple[asyncio.AbstractEventLoop, str], asyncio.Lock] = {}
+
+
+def _shared_token_refresh_lock(accounts_env_path: Path) -> asyncio.Lock:
+    key = (asyncio.get_running_loop(), str(accounts_env_path))
+    lock = _SHARED_TOKEN_REFRESH_LOCKS.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _SHARED_TOKEN_REFRESH_LOCKS[key] = lock
+    return lock
+
 
 # ── Trendbar market data (#168) ────────────────────────────────────────────────
 #
@@ -1001,13 +1047,19 @@ def _payload_ctid_trader_account_ids(payload: Any) -> tuple[int, ...]:
 
     ``ProtoOAAccountsTokenInvalidatedEvent`` carries a *repeated* account-id
     field, so the singular ``_payload_ctid_trader_account_id`` helper cannot
-    read it. An empty tuple means the event names no account: it cannot be
+    read it. Non-positive entries are dropped for the same reason the
+    singular helper treats ``0`` as unset: ``0`` is never a real cTrader
+    account id. An empty tuple means the event names no account: it cannot be
     proven foreign, so callers treat it like an own-account event.
     """
     try:
         return tuple(
-            int(account_id)
-            for account_id in (getattr(payload, "ctidTraderAccountIds", None) or ())
+            account_id
+            for account_id in (
+                int(raw_id)
+                for raw_id in (getattr(payload, "ctidTraderAccountIds", None) or ())
+            )
+            if account_id > 0
         )
     except (TypeError, ValueError):
         return ()
@@ -1336,6 +1388,16 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._authenticated = False
         self._connect_lock = asyncio.Lock()
         self._refresh_lock = asyncio.Lock()
+        # The access token the CURRENT session authenticated with ("" when no
+        # session is authenticated). ``ProtoOAAccountsTokenInvalidatedEvent``
+        # names accounts, not tokens, so the invalidation handler compares
+        # this against ``self.access_token`` to tell "our own refresh already
+        # replaced the dead token" apart from "the session's token died".
+        self._session_access_token = ""
+        # ``time.monotonic()`` of the last token-pair rotation this adapter
+        # knows about (own refresh or adoption of a sibling's persisted pair);
+        # 0.0 when none happened this process.
+        self._token_pair_rotated_at = 0.0
         self._symbol_name_to_id: dict[str, int] = {}
         # #125: pending get_quote calls by symbolId, and one lock per symbol
         # (cTrader allows a single spot subscription per symbol and session).
@@ -1596,6 +1658,96 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._terminal_auth_failure_code = _normalize_error_code(error_code)
         self._authenticated = False
 
+    def _note_session_access_token(self) -> None:
+        """Record the access token the current session authenticated with."""
+        self._session_access_token = self.access_token
+
+    def _adopt_persisted_token_pair(self) -> bool:
+        """Adopt the token pair persisted in the accounts env file when it differs.
+
+        Every cTrader adapter in the process shares ONE
+        ``CTRADER_ACCESS_TOKEN``/``CTRADER_REFRESH_TOKEN`` pair, and a cTrader
+        refresh rotates BOTH tokens and invalidates the old ones - so a
+        sibling adapter's refresh leaves this adapter's in-memory copy dead.
+        The accounts env file is the only place the rotated pair survives
+        (file-first credential precedence), so it is re-read here rather than
+        trusting memory. Token values are never logged.
+
+        Returns True when a different complete pair was adopted; the caller
+        then knows the previously held pair was stale and must not spend its
+        (possibly already-consumed) refresh token.
+        """
+        try:
+            file_values = read_accounts_env_file(self.accounts_env_path)
+        except Exception as exc:  # except-kind: money-decision
+            logger.warning(
+                "Could not re-read cTrader accounts env file for token adoption",
+                extra={
+                    "data": {
+                        "account_id": self.ctid_trader_account_id,
+                        "env_path": str(self.accounts_env_path),
+                        "error": str(exc),
+                    }
+                },
+            )
+            return False
+        file_access = str(file_values.get("CTRADER_ACCESS_TOKEN") or "").strip()
+        file_refresh = str(file_values.get("CTRADER_REFRESH_TOKEN") or "").strip()
+        if not file_access or not file_refresh:
+            return False
+        if file_access == self.access_token and file_refresh == self.refresh_token:
+            return False
+        self.access_token = file_access
+        self.refresh_token = file_refresh
+        self._token_pair_rotated_at = time.monotonic()
+        logger.info(
+            "Adopted newer persisted cTrader token pair",
+            extra={
+                "data": {
+                    "account_id": self.ctid_trader_account_id,
+                    "account_config_id": self.account_config_id,
+                    "env_path": str(self.accounts_env_path),
+                }
+            },
+        )
+        return True
+
+    def _token_invalidation_skip_reason(self) -> str | None:
+        """Why a token-invalidation event must NOT tear down this session.
+
+        ``ProtoOAAccountsTokenInvalidatedEvent`` names accounts, not tokens,
+        and cTrader emits it for EVERY token rotation - including the
+        ``_refresh_access_token`` this adapter (or a sibling sharing the same
+        persisted pair) just performed and the re-auth that followed. Tearing
+        down a session the refresh path already re-authenticated - or is
+        re-authenticating right now - would turn a recoverable submit into an
+        unknown outcome, so the teardown is skipped when:
+
+        - a refresh is in flight on this adapter (``_refresh_lock`` held);
+        - the in-memory access token differs from the token the session
+          authenticated with (a rotation happened but the session has not
+          re-authenticated with the new token yet - or a sibling rotated the
+          shared pair and this session is already dead, which the next
+          request's auth error heals through the refresh path);
+        - a token-pair rotation completed within
+          ``_TOKEN_INVALIDATION_OWN_ROTATION_GRACE_SECONDS`` (a late event
+          for the OLD token arriving after our re-auth).
+        """
+        if self._refresh_lock.locked():
+            return "a token refresh is in flight on this adapter"
+        if (
+            self._session_access_token
+            and self.access_token != self._session_access_token
+        ):
+            return "the session token is not the current access token"
+        rotated_at = self._token_pair_rotated_at
+        if rotated_at and (
+            time.monotonic() - rotated_at
+            < _TOKEN_INVALIDATION_OWN_ROTATION_GRACE_SECONDS
+        ):
+            return "a token rotation completed moments ago"
+        return None
+
     async def _refresh_access_token(self, *, failed_access_token: str | None = None) -> bool:
         """Refresh cTrader OAuth tokens via Open API and persist them safely."""
         if not self.refresh_token or self._ProtoOARefreshTokenReq is None:
@@ -1605,7 +1757,19 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             )
             return False
         refresh_token_before_lock = self.refresh_token
-        async with self._refresh_lock:
+        # All cTrader adapters share one persisted token pair and a cTrader
+        # refresh token is single-use: the per-file lock serializes refreshes
+        # so two adapters never spend the same refresh token concurrently.
+        async with _shared_token_refresh_lock(
+            self.accounts_env_path
+        ), self._refresh_lock:
+            # A sibling adapter may already have rotated the shared pair;
+            # the persisted file is the freshest truth. Adopting it IS the
+            # refresh outcome the callers need (they re-authenticate with
+            # ``self.access_token``), and it must happen BEFORE spending a
+            # refresh token that may already have been consumed.
+            if self._adopt_persisted_token_pair():
+                return True
             if failed_access_token is not None and self.access_token != failed_access_token:
                 return True
             if self.refresh_token != refresh_token_before_lock and self.access_token:
@@ -1670,6 +1834,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
 
             self.access_token = access_token
             self.refresh_token = refresh_token
+            self._token_pair_rotated_at = time.monotonic()
             # The accounts file is the source of truth (file-first precedence):
             # refreshed tokens are persisted above and must NOT be mirrored into
             # os.environ, where a stale copy would shadow the fresh file value
@@ -1898,14 +2063,24 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         """Server invalidated this account's access token
         (``ProtoOAAccountsTokenInvalidatedEvent``).
 
-        The dead token must never carry another order, so the whole session
-        is torn down: the next ``connect()`` re-authenticates, and the
-        account-auth failure it hits drives the existing
-        ``_refresh_access_token`` flow (which persists rotated tokens to the
-        accounts env file exactly as before). If the refresh cannot produce
-        usable credentials the existing terminal-auth path latches, and any
-        submit in between fails closed inside ``order_not_submitted`` -
-        provably before a request is written, never an unknown outcome.
+        The event names accounts, not tokens, and cTrader emits it for EVERY
+        token rotation - including the ``_refresh_access_token`` this adapter
+        just performed on this same connection. Tearing down a session the
+        refresh path already re-authenticated (or is re-authenticating right
+        now) would turn a recoverable submit into an unknown outcome, so the
+        teardown is skipped when ``_token_invalidation_skip_reason`` finds
+        the event is the echo of a rotation we already handled. Otherwise
+        the dead token must never carry another order: the session is torn
+        down and the next ``connect()`` re-authenticates.
+
+        Sibling caveat: every cTrader adapter shares ONE persisted token
+        pair, and a refresh by adapter A invalidates the tokens adapter B
+        holds in memory. B's own ``_refresh_access_token`` flow cannot heal
+        that on its own - B would spend an already-rotated refresh token and
+        latch terminal. ``_adopt_persisted_token_pair`` closes that gap: it
+        re-reads the accounts env file here (and before every refresh) and
+        adopts a newer pair, after which B's next auth failure re-authenticates
+        with the adopted access token instead of refreshing again.
         """
         account_ids = _payload_ctid_trader_account_ids(payload)
         if account_ids and self.ctid_trader_account_id not in account_ids:
@@ -1920,6 +2095,25 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             )
             return
         reason = str(getattr(payload, "reason", "") or "").strip()
+        # A sibling adapter may already have rotated the shared pair; adopt
+        # the persisted pair BEFORE deciding, so the token comparison below
+        # sees the freshest credentials.
+        self._adopt_persisted_token_pair()
+        skip_reason = self._token_invalidation_skip_reason()
+        if skip_reason is not None:
+            logger.info(
+                "cTrader accounts token invalidated event ignored: %s",
+                skip_reason,
+                extra={
+                    "data": {
+                        "account_id": self.ctid_trader_account_id,
+                        "account_config_id": self.account_config_id,
+                        "reason": reason,
+                        "payload_account_ids": list(account_ids),
+                    }
+                },
+            )
+            return
         logger.warning(
             "cTrader accounts token invalidated event (reason: %s); "
             "dropping the session so the next connect refreshes the token "
@@ -2128,6 +2322,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                             f"{type(account_auth_res).__name__}"
                         ) from exc
                     self._authenticated = True
+                    self._note_session_access_token()
                 return await self._send_request_with_refresh_retry(
                     request, timeout_seconds=timeout_seconds, _depth=_depth + 1
                 )
@@ -2167,6 +2362,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 raise RuntimeError(
                     f"Unexpected account auth response: {type(account_auth_res).__name__}"
                 )
+            self._note_session_access_token()
 
     async def _recover_account_auth_failure(self, exc: CTraderApiError) -> None:
         error_code = _normalize_error_code(exc.error_code)
@@ -2189,6 +2385,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 "Unexpected account auth response after refresh: "
                 f"{type(account_auth_res).__name__}"
             )
+        self._note_session_access_token()
 
     def _scale_for(self, symbol: str) -> SymbolScale:
         """Return the per-symbol broker scale, failing closed (#80).
@@ -2401,6 +2598,10 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         # _scale_for fall back to static scales that can misstate size.
         await self._load_symbol_props_into_cache(symbol_name_to_id)
         self._authenticated = True
+        # Covers the ALREADY_LOGGED_IN path too: no AccountAuthRes was
+        # confirmed there, so the current access token is the best record of
+        # what the session runs on (a wrong guess only errs toward teardown).
+        self._note_session_access_token()
 
     async def _load_symbol_props_into_cache(self, symbol_name_to_id: dict[str, int]) -> None:
         """Fetch full ProtoOASymbol properties per symbol id (#80).
@@ -2860,6 +3061,32 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         client.setMessageReceivedCallback(self._on_message)
         return client
 
+    @staticmethod
+    def _fail_in_flight_requests(client: Any) -> None:
+        """Errback every pending request deferred on ``client``.
+
+        Upstream ``Client._disconnected`` only ``clear()``s
+        ``_responseDeferreds`` without errbacking them, so each in-flight
+        ``_send_request`` would otherwise sit until its own ``addTimeout``
+        fires (up to the request timeout) even though the socket is already
+        gone. Failing them promptly frees callers sooner; the error is a
+        connection-lost, which every caller classifies as an UNKNOWN outcome
+        (the request may already have been written) - never as
+        not-submitted and never as a broker refusal.
+        """
+        deferreds = getattr(client, "_responseDeferreds", None)
+        if not deferreds:
+            return
+        for deferred in list(deferreds.values()):
+            try:
+                deferred.errback(
+                    CTraderConnectionLostError(
+                        "cTrader session torn down before the response arrived"
+                    )
+                )
+            except Exception:  # except-kind: loop-survival
+                pass
+
     def _teardown_client(self) -> None:
         """Drop the current client and ask Twisted to stop its service so a later
         connect() attempt can build a fresh one. Safe to call when no client exists.
@@ -2869,7 +3096,9 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._connected = False
         self._authenticated = False
         self._already_logged_in_notified = False
+        self._session_access_token = ""
         if client is not None:
+            self._fail_in_flight_requests(client)
             try:
                 stop = getattr(client, "stopService", None)
                 if stop is not None:
@@ -2880,6 +3109,11 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             self._connected_event.clear()
         except Exception:  # except-kind: loop-survival
             pass
+        # Wake ``listen_executions`` so the teardown is noticed now - the
+        # listener would otherwise sleep out its 30 s ``queue.get`` timeout
+        # before reconnecting and reconciling the gap.
+        with contextlib.suppress(asyncio.QueueFull):
+            self._execution_queue.put_nowait(_EXECUTION_RECONCILE_WAKE)
 
     async def _recover_broker_order_id(
         self,
@@ -3295,6 +3529,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._connected = False
         self._connected_event.clear()
         self._already_logged_in_notified = False
+        self._session_access_token = ""
         self._symbol_name_to_id.clear()
         self._order_id_to_signal_id.clear()
         self._position_ids_by_symbol.clear()
