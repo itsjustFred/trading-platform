@@ -3596,17 +3596,40 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         except CTraderApiError as exc:
             self._raise_terminal_auth_from_api_error(exc)
             raise
-        if isinstance(response, self._ProtoOAOrderErrorEvent):
-            # The response is correlated to THIS request by clientMsgId, but
-            # only an error event with no broker order id is a clean refusal:
+        self._raise_for_refused_submit_response(response, request)
+        return response
+
+    @staticmethod
+    def _raise_submit_refusal(
+        message: str, *, error_code: str, definitive: bool
+    ) -> None:
+        """A refusal is ``BrokerOrderRejectedError`` only when definitive."""
+        if not definitive:
+            raise RuntimeError(message)
+        raise BrokerOrderRejectedError(message, error_code=error_code)
+
+    def _raise_for_refused_submit_response(self, response: Any, request: Any) -> None:
+        """Raise for a correlated refusal payload; return for anything else.
+
+        cTrader answers a refused NewOrderReq/ClosePositionReq either with a
+        ProtoOAOrderErrorEvent or with a ProtoOAExecutionEvent whose
+        executionType is ORDER_REJECTED; both are matched to THIS request by
+        clientMsgId. Timeouts and transport failures never reach here: the
+        request may have landed, so they stay ordinary exceptions (unknown
+        outcome).
+        """
+        if self._ProtoOAOrderErrorEvent is not None and isinstance(
+            response, self._ProtoOAOrderErrorEvent
+        ):
+            # Only an error event with no broker order id is a clean refusal:
             # a non-zero orderId means the broker created an order record, and
             # for a new-order request a non-zero positionId is not provably
             # pre-position either. A close request echoes positionId, so only
-            # its orderId decides. Timeouts and transport failures still
-            # propagate as ordinary exceptions (unknown outcome): the request
-            # may have landed.
+            # its orderId decides.
             order_id = _present_proto_field(response, "orderId", fail_closed=True)
-            position_id = _present_proto_field(response, "positionId", fail_closed=True)
+            position_id = _present_proto_field(
+                response, "positionId", fail_closed=True
+            )
             definitive_refusal = order_id in (None, 0) and (
                 self._is_close_position_request(request)
                 or position_id in (None, 0)
@@ -3615,36 +3638,32 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 f"Order rejected ({getattr(response, 'errorCode', '') or ''}): "
                 f"{getattr(response, 'description', '') or 'no description'}"
             )
-            if not definitive_refusal:
-                raise RuntimeError(message)
-            raise BrokerOrderRejectedError(
+            self._raise_submit_refusal(
                 message,
                 error_code=str(getattr(response, "errorCode", "") or ""),
+                definitive=definitive_refusal,
             )
         if (
             self._ProtoOAExecutionEvent is not None
-            and self._ProtoOAExecutionType is not None
             and isinstance(response, self._ProtoOAExecutionEvent)
             and self._is_order_rejected_execution(response)
         ):
-            # cTrader also answers a refused NewOrderReq/ClosePositionReq with
-            # a ProtoOAExecutionEvent whose executionType is ORDER_REJECTED.
             # Unlike the OrderErrorEvent above, the event typically still
             # carries an `order` object with a broker-assigned orderId, so the
             # orderId cannot decide: definiteness comes from the order's
             # terminal status and the absence of any created state instead.
-            definitive_refusal = self._execution_rejection_is_definitive(
-                response, request
-            )
             error_code = str(getattr(response, "errorCode", "") or "")
             message = (
                 f"Order rejected ({error_code or 'ORDER_REJECTED'}): "
                 f"{getattr(response, 'description', '') or 'no description'}"
             )
-            if not definitive_refusal:
-                raise RuntimeError(message)
-            raise BrokerOrderRejectedError(message, error_code=error_code)
-        return response
+            self._raise_submit_refusal(
+                message,
+                error_code=error_code,
+                definitive=self._execution_rejection_is_definitive(
+                    response, request
+                ),
+            )
 
     def _is_close_position_request(self, request: Any) -> bool:
         return (
@@ -3653,11 +3672,12 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         )
 
     def _is_order_rejected_execution(self, event: Any) -> bool:
+        execution_type = getattr(self._ProtoOAExecutionType, "ORDER_REJECTED", None)
+        if execution_type is None:
+            return False
         try:
-            return int(getattr(event, "executionType", -1)) == int(
-                self._ProtoOAExecutionType.ORDER_REJECTED
-            )
-        except (TypeError, ValueError):
+            return int(getattr(event, "executionType", -1)) == int(execution_type)
+        except (AttributeError, TypeError, ValueError):
             return False
 
     def _execution_rejection_is_definitive(self, event: Any, request: Any) -> bool:
@@ -3678,12 +3698,16 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         if order is _PRESENT_BUT_UNKNOWN or order is None:
             return False
         status_enum = getattr(self, "_ProtoOAOrderStatus", None)
-        if status_enum is None:
+        rejected_status = (
+            getattr(status_enum, "ORDER_STATUS_REJECTED", None)
+            if status_enum is not None
+            else None
+        )
+        order_status = getattr(order, "orderStatus", None)
+        if order_status is None or rejected_status is None:
             return False
         try:
-            if int(getattr(order, "orderStatus", -1)) != int(
-                getattr(status_enum, "ORDER_STATUS_REJECTED", -1)
-            ):
+            if int(order_status) != int(rejected_status):
                 return False
         except (TypeError, ValueError):
             return False
