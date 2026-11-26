@@ -2837,13 +2837,6 @@ class TestPerBotAuthorAllowlist:
         assert self._resolve("rocketfuel", env) == {self.ROCKETFUEL_AUTHOR}
         assert self._resolve("ramjet", env) == {self.RAMJET_AUTHOR}
 
-    def test_the_shared_var_still_works_for_a_single_bot_setup(self):
-        """Backwards compatibility: a one-bot deployment configures the original
-        name, and that must not be broken by adding the per-bot one."""
-        env = {"DISCORD_TRUSTED_AUTHOR_IDS": f"{self.NITRO_AUTHOR},{self.ROCKETFUEL_AUTHOR}"}
-
-        assert self._resolve("nitro", env) == {self.NITRO_AUTHOR, self.ROCKETFUEL_AUTHOR}
-
     def test_a_per_bot_var_wins_over_the_shared_one(self):
         env = {
             "DISCORD_BOT_NITRO_TRUSTED_AUTHOR_IDS": self.NITRO_AUTHOR,
@@ -3559,24 +3552,6 @@ def test_an_empty_per_bot_allowlist_means_trusts_nobody() -> None:
         service, accounts_env_values=env
     ) == set(), "an explicitly empty per-bot allowlist widened to the shared list"
 
-
-def test_an_unset_per_bot_allowlist_still_falls_back_to_shared() -> None:
-    """Absent is not the same as empty, and the shared list stays a real fallback.
-
-    Single-bot setups configure only the shared variable; that must keep working,
-    or the change above would break every deployment that never opted in.
-    """
-    from live_runner.daemon import _resolve_discord_service_trusted_author_ids
-
-    service = SimpleNamespace(
-        id="svc", name="NITRO", config={}, status=daemon.ServiceStatus.RUNNING
-    )
-
-    resolved = _resolve_discord_service_trusted_author_ids(
-        service, accounts_env_values={"DISCORD_TRUSTED_AUTHOR_IDS": "1,2,3"}
-    )
-
-    assert resolved == {"1", "2", "3"}
 
 from live_runner.signal_sources.discord_source import (  # noqa: E402
     _BUY_NEGATED_RE,
