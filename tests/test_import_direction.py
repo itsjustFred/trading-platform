@@ -15,6 +15,7 @@ side effects.
 from __future__ import annotations
 
 import ast
+import functools
 import os
 from pathlib import Path
 
@@ -180,12 +181,14 @@ def _dynamic_import_target(node: ast.AST) -> str | None:
     return None
 
 
-def _cross_package_edges() -> list[tuple[str, str, Path, int]]:
+@functools.lru_cache(maxsize=1)
+def _cross_package_edges() -> tuple[tuple[str, str, Path, int], ...]:
     """All (importer module, imported module, file, line) edges between
     different top-level packages. Static ``import`` statements and dynamic
     ``import_module``/``__import__`` calls with a literal module name both
     count; a file that does not parse fails the guard rather than being
-    silently skipped."""
+    silently skipped. Cached: the AST scan costs several seconds and both
+    guard tests need the same result."""
     modules = _repo_modules()
     edges: set[tuple[str, str, Path, int]] = set()
     for module, path in modules.items():
@@ -208,7 +211,7 @@ def _cross_package_edges() -> list[tuple[str, str, Path, int]]:
                 if dst_package == src_package or dst_package not in LAYERS:
                     continue
                 edges.add((module, resolved, path, node.lineno))
-    return sorted(edges)
+    return tuple(sorted(edges))
 
 
 def _is_upward(edge: tuple[str, str, Path, int]) -> bool:
