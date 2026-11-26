@@ -3732,7 +3732,9 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             return None
         try:
             return int(getattr(event, "executionType", -1)) == int(execution_type)
-        except (AttributeError, TypeError, ValueError):
+        except Exception:  # except-kind: money-decision
+            # Any unreadable type is "unclassifiable" (None), never False:
+            # False would let the event pass through as a submitted order.
             return None
 
     def _execution_rejection_is_definitive(self, event: Any, request: Any) -> bool:
@@ -3748,6 +3750,12 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         position it failed to close, so position does not decide there -
         the same rule the OrderErrorEvent path applies to ``positionId``.
         Unanswerable field presence fails closed to "unknown".
+
+        Invariant: EVERY presence check in this method goes through
+        ``_present_proto_field_fail_closed`` and every attached-message check
+        stays an ``is not None`` identity test - protobuf messages are falsy
+        when empty, so truthiness would read an attached empty deal/position
+        as absent and could release the lease on a possible execution.
         """
         order = _present_proto_field_fail_closed(event, "order")
         if order is _PRESENT_BUT_UNKNOWN or order is None:
