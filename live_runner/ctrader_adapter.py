@@ -1727,9 +1727,17 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._terminal_auth_failure_code = _normalize_error_code(error_code)
         self._authenticated = False
 
-    def _note_session_access_token(self) -> None:
-        """Record the access token the current session authenticated with."""
-        self._session_access_token = self.access_token
+    def _note_session_access_token(self, access_token: str | None = None) -> None:
+        """Record the access token the current session authenticated with.
+
+        ``access_token`` overrides the recorded value: callers that just
+        confirmed an ``AccountAuthRes`` pass the token the request actually
+        carried, so a sibling-pair adoption during the flight cannot make
+        the record describe a token the session never authenticated with.
+        """
+        self._session_access_token = (
+            access_token if access_token is not None else self.access_token
+        )
         self._own_token_rotation_in_flight = False
 
     def _adopt_persisted_token_pair(self) -> bool:
@@ -2418,49 +2426,74 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             error_text = str(exc)
             if not _is_terminal_auth_error(error_code, error_text):
                 raise
-            # Mark the rotation+re-auth window BEFORE the refresh starts so a
-            # ``ProtoOAAccountsTokenInvalidatedEvent`` landing anywhere in it
-            # (including between refresh completion and the AccountAuthRes)
-            # is recognised as our own rotation echo, not a fresh invalidation.
-            self._own_token_rotation_in_flight = True
-            try:
-                refreshed = await self._refresh_access_token(
-                    failed_access_token=access_token_before_send
-                )
-            except BaseException:  # except-kind: money-decision
-                self._own_token_rotation_in_flight = False
+            if not await self._rotate_token_pair_and_reauthenticate(
+                failed_access_token=access_token_before_send
+            ):
                 raise
-            if not refreshed:
-                self._own_token_rotation_in_flight = False
-                raise
-            # Token was refreshed successfully; re-authorize the account and
-            # retry once with the new token.
             if (
                 self._ProtoOAAccountAuthReq is not None
                 and self._ProtoOAAccountAuthRes is not None
             ):
-                try:
-                    account_auth_res = await self._send_account_auth_request(
-                        timeout_seconds=15
-                    )
-                except BaseException:  # except-kind: money-decision
-                    self._own_token_rotation_in_flight = False
-                    raise
-                if not isinstance(account_auth_res, self._ProtoOAAccountAuthRes):
-                    self._own_token_rotation_in_flight = False
-                    raise RuntimeError(
-                        "Unexpected account auth response after refresh: "
-                        f"{type(account_auth_res).__name__}"
-                    ) from exc
                 self._authenticated = True
-                self._note_session_access_token()
-            else:
-                # No re-auth will run, so nothing will note the new session
-                # token; the flag must not outlive this rotation attempt.
-                self._own_token_rotation_in_flight = False
             return await self._send_request_with_refresh_retry(
                 request, timeout_seconds=timeout_seconds, _depth=_depth + 1
             )
+
+    async def _rotate_token_pair_and_reauthenticate(
+        self, *, failed_access_token: str | None = None
+    ) -> bool:
+        """Refresh-or-adopt the shared token pair and re-authenticate the account.
+
+        Returns True when the pair is usable: either the account re-auth
+        request was confirmed (``_note_session_access_token`` records the
+        token the request actually carried), or the OpenAPI auth types are
+        not loaded and the caller retries the original request. Returns
+        False when no usable pair could be produced; whatever the refresh
+        or re-auth raised propagates.
+
+        ``_own_token_rotation_in_flight`` spans the whole refresh+re-auth
+        window - set here, cleared by ``_note_session_access_token`` on
+        success or explicitly on every failure exit - so a
+        ``ProtoOAAccountsTokenInvalidatedEvent`` landing anywhere inside it
+        (including between refresh completion and the AccountAuthRes) is
+        recognised as our own rotation echo, not a fresh invalidation.
+        """
+        self._own_token_rotation_in_flight = True
+        try:
+            refreshed = await self._refresh_access_token(
+                failed_access_token=failed_access_token
+            )
+        except BaseException:  # except-kind: money-decision
+            self._own_token_rotation_in_flight = False
+            raise
+        if not refreshed:
+            self._own_token_rotation_in_flight = False
+            return False
+        if (
+            self._ProtoOAAccountAuthReq is None
+            or self._ProtoOAAccountAuthRes is None
+        ):
+            # No re-auth will run, so nothing will note the new session
+            # token; the flag must not outlive this rotation attempt.
+            self._own_token_rotation_in_flight = False
+            return True
+        # The token the AccountAuthReq carries is fixed at send time; a
+        # sibling-pair adoption during the flight must not make the session
+        # record describe a token the session never authenticated with.
+        auth_token = self.access_token
+        try:
+            account_auth_res = await self._send_account_auth_request(timeout_seconds=15)
+        except BaseException:  # except-kind: money-decision
+            self._own_token_rotation_in_flight = False
+            raise
+        if not isinstance(account_auth_res, self._ProtoOAAccountAuthRes):
+            self._own_token_rotation_in_flight = False
+            raise RuntimeError(
+                "Unexpected account auth response after refresh: "
+                f"{type(account_auth_res).__name__}"
+            )
+        self._note_session_access_token(auth_token)
+        return True
 
     async def _send_account_auth_request(self, *, timeout_seconds: int = 15) -> Any:
         account_auth_req = self._ProtoOAAccountAuthReq()
@@ -2487,6 +2520,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             )
 
     async def _send_account_auth_with_recovery(self) -> None:
+        auth_token = self.access_token
         try:
             account_auth_res = await self._send_account_auth_request(timeout_seconds=15)
         except CTraderApiError as exc:
@@ -2496,7 +2530,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 raise RuntimeError(
                     f"Unexpected account auth response: {type(account_auth_res).__name__}"
                 )
-            self._note_session_access_token()
+            self._note_session_access_token(auth_token)
 
     async def _recover_account_auth_failure(self, exc: CTraderApiError) -> None:
         error_code = _normalize_error_code(exc.error_code)
@@ -2509,33 +2543,10 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             return
         if not _is_terminal_auth_error(error_code, error_text):
             raise exc
-        # Same rotation+re-auth window marker as
-        # ``_send_request_with_refresh_retry``: an invalidation event
-        # arriving before the AccountAuthRes confirms the new token is the
-        # echo of THIS rotation, not a fresh invalidation.
-        self._own_token_rotation_in_flight = True
-        try:
-            refreshed = await self._refresh_access_token()
-        except BaseException:  # except-kind: money-decision
-            self._own_token_rotation_in_flight = False
-            raise
-        if not refreshed:
-            self._own_token_rotation_in_flight = False
+        if not await self._rotate_token_pair_and_reauthenticate():
             reason = exc.description or error_text or _CTRADER_AUTH_FAILURE_FALLBACK
             self._mark_terminal_auth_failure(reason, error_code=error_code)
             raise CTraderAuthTerminalError(reason, error_code=error_code) from exc
-        try:
-            account_auth_res = await self._send_account_auth_request(timeout_seconds=15)
-        except BaseException:  # except-kind: money-decision
-            self._own_token_rotation_in_flight = False
-            raise
-        if not isinstance(account_auth_res, self._ProtoOAAccountAuthRes):
-            self._own_token_rotation_in_flight = False
-            raise RuntimeError(
-                "Unexpected account auth response after refresh: "
-                f"{type(account_auth_res).__name__}"
-            )
-        self._note_session_access_token()
 
     def _scale_for(self, symbol: str) -> SymbolScale:
         """Return the per-symbol broker scale, failing closed (#80).
@@ -3759,6 +3770,12 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._unresolved_execution_events.clear()
         self._terminal_auth_failure_reason = ""
         self._terminal_auth_failure_code = ""
+        # A deliberate disconnect leaves the same in-flight requests pending
+        # as a transport loss: fail them now instead of letting each caller
+        # wait out its response timeout. ``_on_disconnected`` cannot cover
+        # this path - ``self._client`` is already None here, so its
+        # identity check returns early.
+        self._fail_in_flight_requests(client)
 
         if client is None:
             return

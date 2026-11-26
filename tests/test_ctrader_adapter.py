@@ -347,6 +347,27 @@ def test_on_message_accepts_error_res_without_account_id(caplog) -> None:
     assert not any("different account" in record.getMessage() for record in caplog.records)
 
 
+class _StubRefreshTokenReq:
+    def __init__(self) -> None:
+        self.refreshToken = ""
+
+
+class _StubRefreshTokenRes:
+    accessToken = "new_access"
+    refreshToken = "new_refresh"
+    expiresIn = 2628000
+
+
+class _StubAccountAuthReq:
+    def __init__(self) -> None:
+        self.ctidTraderAccountId = 0
+        self.accessToken = ""
+
+
+class _StubAccountAuthRes:
+    pass
+
+
 def _lifecycle_event_adapter(account_id: int = 46736452):
     """Adapter wired for the server lifecycle events with real proto classes."""
     from ctrader_open_api.messages.OpenApiMessages_pb2 import (
@@ -865,23 +886,6 @@ def test_token_invalidation_between_refresh_and_reauth_keeps_session(
     adapter.refresh_token = "old_refresh"
     adapter._session_access_token = "old_access"
 
-    class _RefreshReq:
-        def __init__(self) -> None:
-            self.refreshToken = ""
-
-    class _RefreshRes:
-        accessToken = "new_access"
-        refreshToken = "new_refresh"
-        expiresIn = 2628000
-
-    class _AccountAuthReq:
-        def __init__(self) -> None:
-            self.ctidTraderAccountId = 0
-            self.accessToken = ""
-
-    class _AccountAuthRes:
-        pass
-
     order_request = object()
     sent: list[object] = []
     auth_gate = asyncio.Event()
@@ -892,17 +896,17 @@ def test_token_invalidation_between_refresh_and_reauth_keeps_session(
             if sent.count(order_request) == 1:
                 raise CTraderApiError("CH_ACCESS_TOKEN_INVALID", "expired")
             return "order_response"
-        if isinstance(request, _RefreshReq):
-            return _RefreshRes()
-        if isinstance(request, _AccountAuthReq):
+        if isinstance(request, _StubRefreshTokenReq):
+            return _StubRefreshTokenRes()
+        if isinstance(request, _StubAccountAuthReq):
             await auth_gate.wait()
-            return _AccountAuthRes()
+            return _StubAccountAuthRes()
         raise AssertionError(f"unexpected request: {type(request).__name__}")
 
-    adapter._ProtoOARefreshTokenReq = _RefreshReq
-    adapter._ProtoOARefreshTokenRes = _RefreshRes
-    adapter._ProtoOAAccountAuthReq = _AccountAuthReq
-    adapter._ProtoOAAccountAuthRes = _AccountAuthRes
+    adapter._ProtoOARefreshTokenReq = _StubRefreshTokenReq
+    adapter._ProtoOARefreshTokenRes = _StubRefreshTokenRes
+    adapter._ProtoOAAccountAuthReq = _StubAccountAuthReq
+    adapter._ProtoOAAccountAuthRes = _StubAccountAuthRes
     adapter._send_request = _fake_send
 
     async def _run() -> object:
@@ -910,10 +914,10 @@ def test_token_invalidation_between_refresh_and_reauth_keeps_session(
             adapter._send_request_with_refresh_retry(order_request)
         )
         for _ in range(1000):
-            if any(isinstance(r, _AccountAuthReq) for r in sent):
+            if any(isinstance(r, _StubAccountAuthReq) for r in sent):
                 break
             await asyncio.sleep(0)
-        assert any(isinstance(r, _AccountAuthReq) for r in sent), (
+        assert any(isinstance(r, _StubAccountAuthReq) for r in sent), (
             "re-auth request was never sent"
         )
         adapter._on_message(
@@ -958,22 +962,13 @@ def test_refresh_returns_true_for_stale_session_pair_without_spending_refresh(
     )
     adapter._session_access_token = "old_session_token"
 
-    class _RefreshReq:
-        def __init__(self) -> None:
-            self.refreshToken = ""
-
-    class _RefreshRes:
-        accessToken = "unused"
-        refreshToken = "unused"
-        expiresIn = 1
-
     async def _unexpected_send(*_args, **_kwargs):
         raise AssertionError(
             "refresh request sent although the session only needs re-auth"
         )
 
-    adapter._ProtoOARefreshTokenReq = _RefreshReq
-    adapter._ProtoOARefreshTokenRes = _RefreshRes
+    adapter._ProtoOARefreshTokenReq = _StubRefreshTokenReq
+    adapter._ProtoOARefreshTokenRes = _StubRefreshTokenRes
     adapter._send_request = _unexpected_send
 
     assert asyncio.run(adapter._refresh_access_token()) is True
@@ -1095,23 +1090,6 @@ def test_token_invalidation_adopted_pair_reauths_without_refresh(
     class _AppAuthRes:
         pass
 
-    class _AccountAuthReq:
-        def __init__(self) -> None:
-            self.ctidTraderAccountId = 0
-            self.accessToken = ""
-
-    class _AccountAuthRes:
-        pass
-
-    class _RefreshReq:
-        def __init__(self) -> None:
-            self.refreshToken = ""
-
-    class _RefreshRes:
-        accessToken = "unused"
-        refreshToken = "unused"
-        expiresIn = 1
-
     class _SymbolsReq:
         pass
 
@@ -1122,8 +1100,8 @@ def test_token_invalidation_adopted_pair_reauths_without_refresh(
         sent.append(request)
         if isinstance(request, _AppAuthReq):
             return _AppAuthRes()
-        if isinstance(request, _AccountAuthReq):
-            return _AccountAuthRes()
+        if isinstance(request, _StubAccountAuthReq):
+            return _StubAccountAuthRes()
         if isinstance(request, _SymbolsReq):
             return _SymbolsRes()
         raise AssertionError(
@@ -1132,10 +1110,10 @@ def test_token_invalidation_adopted_pair_reauths_without_refresh(
 
     adapter._ProtoOAApplicationAuthReq = _AppAuthReq
     adapter._ProtoOAApplicationAuthRes = _AppAuthRes
-    adapter._ProtoOAAccountAuthReq = _AccountAuthReq
-    adapter._ProtoOAAccountAuthRes = _AccountAuthRes
-    adapter._ProtoOARefreshTokenReq = _RefreshReq
-    adapter._ProtoOARefreshTokenRes = _RefreshRes
+    adapter._ProtoOAAccountAuthReq = _StubAccountAuthReq
+    adapter._ProtoOAAccountAuthRes = _StubAccountAuthRes
+    adapter._ProtoOARefreshTokenReq = _StubRefreshTokenReq
+    adapter._ProtoOARefreshTokenRes = _StubRefreshTokenRes
     adapter._ProtoOASymbolsListReq = _SymbolsReq
     adapter._ProtoOASymbolsListRes = _SymbolsRes
     adapter._send_request = _fake_send
@@ -1157,11 +1135,22 @@ def test_token_invalidation_adopted_pair_reauths_without_refresh(
 
     asyncio.run(adapter.connect())
 
-    account_auth_reqs = [r for r in sent if isinstance(r, _AccountAuthReq)]
+    account_auth_reqs = [r for r in sent if isinstance(r, _StubAccountAuthReq)]
     assert len(account_auth_reqs) == 1
     assert account_auth_reqs[0].accessToken == "file_access"
-    assert not any(isinstance(r, _RefreshReq) for r in sent)
+    assert not any(isinstance(r, _StubRefreshTokenReq) for r in sent)
     assert adapter._session_access_token == "file_access"
+
+
+def test_token_invalidation_own_rotation_grace_has_a_sane_floor() -> None:
+    """The grace window must stay larger than cTrader's invalidation-event
+    delivery latency: a late echo for the OLD token arriving after our
+    re-auth must not tear down the re-authenticated session. cTrader
+    publishes no bound, so pin a conservative floor well above observed
+    delivery."""
+    from live_runner import ctrader_adapter as module
+
+    assert module._TOKEN_INVALIDATION_OWN_ROTATION_GRACE_SECONDS >= 30.0
 
 
 def test_refresh_adopts_persisted_pair_without_spending_refresh_token(tmp_path) -> None:
