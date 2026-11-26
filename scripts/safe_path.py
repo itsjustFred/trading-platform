@@ -21,7 +21,7 @@ from pathlib import Path
 
 # --- import-origin guard ---
 # `shared` must resolve to this checkout, not the installed package. The mechanism lives in
-# scripts/_import_origin.py; only the invocation is per module. scripts/ goes on sys.path - never
+# scripts/import_origin.py; only the invocation is per module. scripts/ goes on sys.path - never
 # the repo root, which would repair `import shared` and defeat the guard - so a direct run is
 # refused (exit 2) instead of reading another tree's `shared`. This is a helper module, not an
 # entry point: when a guarded script imports it, that script's own guard has already passed and
@@ -33,9 +33,9 @@ from pathlib import Path as _path
 _scripts_dir = str(_path(__file__).resolve().parent)
 if _scripts_dir not in _sys.path:
     _sys.path.insert(0, _scripts_dir)
-import _import_origin as _guard
+import import_origin as _guard
 
-_guard.ensure_own_checkout("_safe_path")
+_guard.ensure_own_checkout("safe_path")
 # --- end import-origin guard ---
 
 from shared.paths import PathContainmentError, safe_join
