@@ -2915,8 +2915,21 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             take_profit_leg = (
                 None if exit_only else TakeProfitRequest(limit_price=take_profit_price)
             )
+        # Entries ride GTC so the SL/TP legs survive the session close: a DAY
+        # bracket/OTO's stop leg expires at 4pm ET and leaves the filled
+        # position naked overnight (paper soak 2026-11-25). Alpaca accepts
+        # ``gtc`` on bracket/OTO parents, market parent included (its order
+        # docs restrict advanced-order TIF to day/gtc and allow gtc on market
+        # orders); ``extended_hours`` stays False. A bare exit-only market
+        # order keeps DAY: it carries no resting leg to protect, it is meant
+        # to fill in the session it was submitted, and a DAY expiry surfaces
+        # an unfilled exit through the terminal-order reconciliation rather
+        # than silently carrying a stale exit into a later session.
+        entry_time_in_force = (
+            time_in_force.DAY if exit_only else time_in_force.GTC
+        )
         return market_request_cls(
-            time_in_force=time_in_force.DAY,
+            time_in_force=entry_time_in_force,
             extended_hours=False,
             order_class=order_class,
             take_profit=take_profit_leg,
@@ -5792,7 +5805,9 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 side=order_side.SELL
                 if live.stop_side == "sell"
                 else order_side.BUY,
-                time_in_force=time_in_force.DAY,
+                # GTC: a DAY stop expires at the close and the refused close
+                # would leave the position naked overnight (2026-11-25 soak).
+                time_in_force=time_in_force.GTC,
                 stop_price=stop_price,
             )
             await asyncio.to_thread(client.submit_order, order_data=request)
