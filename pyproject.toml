@@ -239,9 +239,6 @@ explicit-preview-rules = true
 # enforces).
 "tests/**" = ["PLC2701"]
 
-[tool.pytest.ini_options]
-testpaths = ["tests"]
-
 [tool.mypy]
 python_version = "3.12"
 # Scope is deliberately narrow: the packages whose type errors can become a
