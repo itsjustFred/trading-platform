@@ -4315,3 +4315,111 @@ def test_order_rejected_execution_unanswerable_order_presence_stays_unknown() ->
     with pytest.raises(RuntimeError, match="Order rejected") as excinfo:
         asyncio.run(submission)
     assert not isinstance(excinfo.value, BrokerOrderRejectedError)
+
+
+def test_order_error_event_unanswerable_order_id_presence_stays_unknown() -> None:
+    """HasField raising AttributeError on orderId alone must fail closed."""
+    from ctrader_open_api.messages.OpenApiMessages_pb2 import ProtoOANewOrderReq
+
+    from live_runner.base_adapter import BrokerOrderRejectedError
+
+    class _OrderIdPresenceUnknownEvent:
+        errorCode = "INVALID_REQUEST"
+        description = "orderId presence unavailable"
+
+        def HasField(self, name: str) -> bool:
+            if name == "orderId":
+                raise AttributeError("orderId presence unavailable")
+            if name == "positionId":
+                return False
+            raise ValueError(f"unexpected HasField({name})")
+
+    adapter = _order_error_response_adapter(_OrderIdPresenceUnknownEvent())
+    adapter._ProtoOAOrderErrorEvent = _OrderIdPresenceUnknownEvent
+    submission = adapter._submit_new_order_request(ProtoOANewOrderReq())
+
+    with pytest.raises(RuntimeError, match="Order rejected") as excinfo:
+        asyncio.run(submission)
+    assert not isinstance(excinfo.value, BrokerOrderRejectedError)
+
+
+def test_order_error_event_unanswerable_position_id_presence_stays_unknown() -> None:
+    """HasField raising AttributeError on positionId alone must fail closed."""
+    from ctrader_open_api.messages.OpenApiMessages_pb2 import ProtoOANewOrderReq
+
+    from live_runner.base_adapter import BrokerOrderRejectedError
+
+    class _PositionIdPresenceUnknownEvent:
+        errorCode = "INVALID_REQUEST"
+        description = "positionId presence unavailable"
+
+        def HasField(self, name: str) -> bool:
+            if name == "positionId":
+                raise AttributeError("positionId presence unavailable")
+            if name == "orderId":
+                return False
+            raise ValueError(f"unexpected HasField({name})")
+
+    adapter = _order_error_response_adapter(_PositionIdPresenceUnknownEvent())
+    adapter._ProtoOAOrderErrorEvent = _PositionIdPresenceUnknownEvent
+    submission = adapter._submit_new_order_request(ProtoOANewOrderReq())
+
+    with pytest.raises(RuntimeError, match="Order rejected") as excinfo:
+        asyncio.run(submission)
+    assert not isinstance(excinfo.value, BrokerOrderRejectedError)
+
+
+def test_execution_event_with_unreadable_execution_type_stays_unknown() -> None:
+    """A loaded enum plus an unreadable executionType is unclassifiable."""
+    from ctrader_open_api.messages.OpenApiMessages_pb2 import ProtoOANewOrderReq
+
+    from live_runner.base_adapter import BrokerOrderRejectedError
+
+    class _UnreadableTypeEvent:
+        errorCode = "TRADING_BAD_VOLUME"
+
+        @property
+        def executionType(self):
+            raise ValueError("executionType unreadable")
+
+        def HasField(self, _name: str) -> bool:
+            return False
+
+    adapter = _execution_event_response_adapter(_UnreadableTypeEvent())
+    adapter._ProtoOAExecutionEvent = _UnreadableTypeEvent
+    submission = adapter._submit_new_order_request(ProtoOANewOrderReq())
+
+    with pytest.raises(RuntimeError, match="could not be classified") as excinfo:
+        asyncio.run(submission)
+    assert not isinstance(excinfo.value, BrokerOrderRejectedError)
+
+
+def test_order_rejected_execution_without_rejected_status_constant_stays_unknown() -> None:
+    """A status enum lacking ORDER_STATUS_REJECTED cannot prove rejection."""
+    from types import SimpleNamespace as _SN
+
+    from ctrader_open_api.messages.OpenApiMessages_pb2 import (
+        ProtoOAExecutionEvent,
+        ProtoOANewOrderReq,
+    )
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import (
+        ProtoOAExecutionType,
+        ProtoOAOrderStatus,
+    )
+
+    from live_runner.base_adapter import BrokerOrderRejectedError
+
+    adapter = _execution_event_response_adapter(
+        ProtoOAExecutionEvent(
+            ctidTraderAccountId=1,
+            executionType=ProtoOAExecutionType.ORDER_REJECTED,
+            order=_rejected_order(status=ProtoOAOrderStatus.ORDER_STATUS_REJECTED),
+            errorCode="TRADING_BAD_VOLUME",
+        ),
+        order_status=_SN(ORDER_STATUS_ACCEPTED=1),
+    )
+    submission = adapter._submit_new_order_request(ProtoOANewOrderReq())
+
+    with pytest.raises(RuntimeError, match="Order rejected") as excinfo:
+        asyncio.run(submission)
+    assert not isinstance(excinfo.value, BrokerOrderRejectedError)
