@@ -7278,6 +7278,7 @@ def test_protective_stop_crash_between_replace_cancel_and_place_heals(
             "target_id": "crashed-replace-stop",
             "succeeded": True,
             "created_at": datetime.now(timezone.utc).isoformat(),
+            "detail": {"account_id": "heal-test-account"},
         }
     ]
     _audits, adapter = _patch_heal_ledger(

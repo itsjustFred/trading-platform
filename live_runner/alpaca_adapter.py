@@ -1668,8 +1668,11 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         self._heal_replaced_order_ids: set[str] = set()
         # One maintenance pass at a time per adapter: the connect-time
         # recovery and the daemon loop can overlap, and the dedupe/replaced
-        # sets are not safe to mutate from two interleaved passes.
+        # sets are not safe to mutate from two interleaved passes. A forced
+        # call that lands mid-pass queues one follow-up pass rather than
+        # silently dropping the connect-time guarantee.
         self._protective_maintenance_running = False
+        self._protective_maintenance_rerun = False
 
         if not self.api_key or not self.secret_key:
             raise ValueError(
@@ -6627,9 +6630,11 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             if created < cutoff:
                 continue
             # The audit read is account-agnostic; only THIS account's
-            # intents may mark its orders as our own cancels.
+            # intents may mark its orders as our own cancels. The write
+            # site always records ``detail.account_id``, so anything else
+            # - missing or foreign - is not ours.
             detail = row.get("detail") or {}
-            if detail.get("account_id") not in (None, self.account_id):
+            if detail.get("account_id") != self.account_id:
                 continue
             target_id = str(row.get("target_id") or "").strip()
             if target_id:
@@ -6645,16 +6650,21 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         only the re-verify and the broker writes. The throttle timestamp is
         taken only AFTER the lock is held, so a lock-timeout skip never
         consumes the interval and the next tick retries. A second call while
-        a pass is in flight returns immediately - the running pass covers
-        the same ground.
+        a pass is in flight returns immediately; a forced call also queues
+        one follow-up pass so the connect-time guarantee is not dropped.
         """
         if self._protective_maintenance_running:
+            if force:
+                self._protective_maintenance_rerun = True
             return
         self._protective_maintenance_running = True
         try:
             await self._maintain_protective_stops_pass(force=force)
         finally:
             self._protective_maintenance_running = False
+            if self._protective_maintenance_rerun:
+                self._protective_maintenance_rerun = False
+                await self.maintain_protective_stops(force=True)
 
     async def _maintain_protective_stops_pass(self, *, force: bool) -> None:
         now = time.monotonic()
