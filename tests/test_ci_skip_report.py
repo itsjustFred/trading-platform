@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 from scripts.ci.skip_report import (
@@ -206,3 +207,69 @@ def test_main_exits_zero_when_only_dataset_gated_money_path_skips(
         [("tests.test_trade_engine", "test_x", "set TP_TEST_OHLCV_DIR=/data")],
     )
     assert main([str(path)]) == 0
+
+
+def test_main_fails_loudly_when_a_junit_input_is_missing(tmp_path: Path) -> None:
+    """A missing JUnit file must not pass silently: no report, no verdict."""
+    assert main([str(tmp_path / "absent.xml")]) == 2
+
+
+# ── money-path classification completeness ──────────────────────────────────
+# A new test module that imports the money path (live_runner, risk, the
+# backtest engines) but matches no MUST_NOT_SKIP_PATTERNS entry would let its
+# skips pass unreported. This test forces every such module to be classified:
+# either it matches a pattern, or it is named below with the reason it is not
+# a money-path test. Update the lists together — that is the point.
+
+_MONEY_PATH_IMPORT = re.compile(
+    r"^\s*(?:from|import)\s+(?:live_runner|risk|runner\.engines)\b", re.M
+)
+
+_NON_MONEY_PATH_MODULES = {
+    "tests.test_alerts": (
+        "ops alert sink plumbing; touches live_runner.daemon only for "
+        "control-plane wiring"
+    ),
+    "tests.test_discord_signal_parsing": (
+        "Discord message text parsing; feeds ingestion, not order/risk math"
+    ),
+    "tests.test_packaging": "packaging and wheel surface checks",
+    "tests.test_resample": (
+        "OHLCV resample utility; imports execution_timing for a candle-close edge"
+    ),
+    "tests.test_service_discovery": "service/account discovery, not order math",
+    "tests.test_stats_ruin_consumers": (
+        "stats consumers; live_runner import covers promotion-score plumbing"
+    ),
+    "tests.test_suite_isolation": "suite hermeticity self-guard",
+    "tests.test_symbol_class": "symbol classification / market-data plumbing",
+    "tests.test_venue_calendar": "venue calendar helpers",
+}
+
+# The dataset-gated strategy suite (#289): every skip it emits is the data
+# gate, which the report already counts — classifying each file would add
+# noise, not coverage.
+_NON_MONEY_PATH_PREFIXES = ("tests.strategies.",)
+
+
+def test_every_money_path_importing_module_is_classified() -> None:
+    tests_root = Path(__file__).resolve().parents[1] / "tests"
+    unclassified: list[str] = []
+    for path in sorted(tests_root.rglob("test_*.py")):
+        classname = "tests." + ".".join(
+            path.relative_to(tests_root).with_suffix("").parts
+        )
+        if classname in _NON_MONEY_PATH_MODULES or classname.startswith(
+            _NON_MONEY_PATH_PREFIXES
+        ):
+            continue
+        if not _MONEY_PATH_IMPORT.search(path.read_text(encoding="utf-8")):
+            continue
+        if not is_money_path(classname):
+            unclassified.append(classname)
+    assert not unclassified, (
+        "these test modules import the money path but are neither matched by "
+        "MUST_NOT_SKIP_PATTERNS nor exempted in _NON_MONEY_PATH_MODULES — "
+        "classify them so their skips cannot pass silently: "
+        + ", ".join(unclassified)
+    )

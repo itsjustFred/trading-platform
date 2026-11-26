@@ -98,6 +98,14 @@ MUST_NOT_SKIP_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
         r"^tests\.test_differential_reference",
         r"^tests\.test_optimization",
         r"^tests\.test_optimizer",
+        # Engine parity against the reference library, engine residual
+        # verification, commission math in the live adapters, risk-engine
+        # consumers and the runner CLI surface.
+        r"^tests\.parity\.",
+        r"^tests\.test_verified_residuals",
+        r"^tests\.test_commission",
+        r"^tests\.test_signal_bots_risk",
+        r"^tests\.test_runner",
     )
 )
 
@@ -270,7 +278,9 @@ def main(argv: list[str] | None = None) -> int:
 
     skipped, missing = collect_skips(args.junit_xml)
     for path in missing:
-        print(f"warning: JUnit XML not found, skipping it: {path}", file=sys.stderr)
+        # A missing input means the skip report cannot vouch for the run —
+        # fail loudly rather than let money-path skips pass unreported.
+        print(f"error: JUnit XML not found: {path}", file=sys.stderr)
 
     existing = [str(p) for p in args.junit_xml if p.is_file()]
     report = build_report(skipped, existing)
@@ -281,6 +291,8 @@ def main(argv: list[str] | None = None) -> int:
         with open(summary, "a", encoding="utf-8") as handle:
             handle.write(report + "\n")
 
+    if missing:
+        return 2
     bad = violations(skipped)
     if bad:
         print(
