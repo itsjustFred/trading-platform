@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import re
+import subprocess
+import sys
 from pathlib import Path
 
 from scripts.ci.skip_report import (
@@ -72,6 +74,80 @@ def test_parse_junit_falls_back_to_element_text(tmp_path: Path) -> None:
     assert test.reason == "bare reason"
 
 
+def test_parse_junit_collection_skip_uses_name_as_module(tmp_path: Path) -> None:
+    """A module skipped at collection has empty classname and the module path
+    in ``name``; without the fallback the whole-module skip bypasses the gate.
+    """
+    # Build a real pytest JUnit file: a package tests/live_runner whose module
+    # importorskips at module level, exactly like test_ctrader_live_fix.py.
+    # The project dir is clean so pytest derives the module name
+    # "tests.live_runner.test_ctrader_live_fix" the way the repo does.
+    proj = tmp_path / "proj"
+    pkg = proj / "tests" / "live_runner"
+    pkg.mkdir(parents=True)
+    # An ini file pins rootdir to proj so nodeids — and therefore the JUnit
+    # ``name`` attribute — are "tests.live_runner.test_..." exactly as in the
+    # real repo, whose rootdir is the checkout root.
+    (proj / "pytest.ini").write_text("[pytest]\n", encoding="utf-8")
+    (proj / "tests" / "__init__.py").write_text("", encoding="utf-8")
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    (pkg / "test_ctrader_live_fix.py").write_text(
+        "import pytest\n"
+        "pytest.importorskip('definitely_missing_extra_xyz')\n"
+        "def test_never_runs():\n"
+        "    pass\n",
+        encoding="utf-8",
+    )
+    # A passing sibling keeps pytest's exit code at 0 — an all-skipped run
+    # exits 5 (NO_TESTS_COLLECTED), which is not what CI produces.
+    (proj / "tests" / "test_ok.py").write_text(
+        "def test_ok():\n    pass\n", encoding="utf-8"
+    )
+    junit = proj / "junit.xml"
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            f"--junitxml={junit}",
+            "tests",
+        ],
+        capture_output=True,
+        text=True,
+        cwd=proj,
+        timeout=300,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert junit.is_file()
+
+    (test,) = parse_junit(junit)
+    assert test.module == "tests.live_runner.test_ctrader_live_fix"
+    assert test.label == test.module  # no "::test" suffix for a module skip
+    assert "could not import 'definitely_missing_extra_xyz'" in test.reason
+    assert is_money_path(test.module)
+    assert violations([test]) == [test]
+    assert main([str(junit)]) == 1
+
+
+def test_parse_junit_xfail_is_not_a_violation(tmp_path: Path) -> None:
+    path = tmp_path / "junit.xml"
+    path.write_text(
+        '<testsuite><testcase classname="tests.test_risk_engine" name="t">'
+        '<skipped type="pytest.xfail" message="known engine gap"/>'
+        "</testcase></testsuite>",
+        encoding="utf-8",
+    )
+    (test,) = parse_junit(path)
+    assert test.kind == "pytest.xfail"
+    assert violations([test]) == []
+    report = build_report([test], [str(path)])
+    assert "XFailed tests: 1" in report
+    assert "### XFail by reason" in report
+
+
 def test_collect_skips_warns_on_missing_files(tmp_path: Path) -> None:
     present = _write(tmp_path, "a.xml", [("tests.test_a", "t", "why")])
     skipped, missing = collect_skips([present, tmp_path / "absent.xml"])
@@ -88,41 +164,47 @@ def test_is_money_path_covers_live_runner_and_engine_tests() -> None:
     assert not is_money_path("tests.strategies.test_channel_breakout")
 
 
-def test_is_allowed_skip_only_for_gates_ci_can_never_open() -> None:
-    assert is_allowed_skip(
-        "missing OHLCV dataset for EURUSD/15m covering 2025-01-01..2025-03-31 "
-        "under /tmp/tp-pytest-session-x/data/ohlcv (point TP_TEST_OHLCV_DIR at "
-        "a local dataset root to use one)"
-    )
-    assert is_allowed_skip(
-        "the differential real-data slice is missing at /x "
-        "(DIFFERENTIAL_REAL_SLICE_CSV)"
-    )
+def test_is_allowed_skip_is_scoped_to_the_emitting_module() -> None:
+    trade_engine = "tests.test_trade_engine"
+    diff_ref = "tests.test_differential_reference_strategies"
     # Real messages, verbatim from the tests that emit them.
     assert is_allowed_skip(
-        "intraday_volatility_breakout_eurusd_h1.json not present in this checkout"
-    )
-    assert is_allowed_skip(
-        "intraday_volatility_breakout_sp500_m1.json not present (artifacts are "
-        "generated locally, not committed); run "
-        "scripts/regenerate_mt5_parity_artifacts.py"
-    )
-    assert is_allowed_skip(
-        "set TRADING_PRODUCTION_DB to a production copy to check the corpus"
-    )
-    assert is_allowed_skip(
-        "set TRADING_PRODUCTION_DB to a copy of production to re-verify its defaults"
-    )
-    assert is_allowed_skip(
-        "documented: vectorbt has no protective exits without intrabar data"
-    )
-    assert is_allowed_skip(
+        trade_engine,
         "No local 1h OHLCV parquet data under /tmp/tp-pytest-session-x/data/ohlcv: "
         "set TP_TEST_OHLCV_DIR=/path/to/ohlcv to run this real-data smoke test "
-        "(the suite's DATA_DIR is a throwaway temp directory)"
+        "(the suite's DATA_DIR is a throwaway temp directory)",
     )
-    assert not is_allowed_skip("pynecore is not installed in this environment")
-    assert not is_allowed_skip("needs bash")
+    assert is_allowed_skip(
+        diff_ref,
+        "the differential real-data slice is missing at /x "
+        "(point DIFFERENTIAL_REAL_SLICE_CSV at an existing slice)",
+    )
+    assert is_allowed_skip(
+        diff_ref,
+        "documented: vectorbt has no protective exits without intrabar data",
+    )
+    # The same reasons on any other module — including other money-path
+    # modules — are not allowed.
+    assert not is_allowed_skip(
+        "tests.live_runner.test_x",
+        "set TP_TEST_OHLCV_DIR=/data to run this real-data smoke test",
+    )
+    assert not is_allowed_skip(
+        "tests.test_safe_path",
+        "set TP_TEST_OHLCV_DIR=/data",
+    )
+    # Lookalike messages that no money-path module emits stay disallowed even
+    # on the modules that do have allowances.
+    assert not is_allowed_skip(trade_engine, "pynecore is not installed")
+    assert not is_allowed_skip(diff_ref, "needs bash")
+    assert not is_allowed_skip(
+        "tests.test_mt5_parity_artifacts_fresh",
+        "intraday_volatility_breakout_eurusd_h1.json not present in this checkout",
+    )
+    assert not is_allowed_skip(
+        "tests.test_backfill_sharpe_column",
+        "set TRADING_PRODUCTION_DB to a production copy to check the corpus",
+    )
 
 
 def test_normalize_reason_collapses_session_tmp_dirs() -> None:
@@ -137,12 +219,15 @@ def test_violations_only_flags_money_path_disallowed_skips(tmp_path: Path) -> No
         "junit.xml",
         [
             ("tests.live_runner.test_x", "test_skips", "unexpected env"),
+            # An allowed reason on the wrong module is still a violation.
             ("tests.live_runner.test_x", "test_dataset", "set TP_TEST_OHLCV_DIR=x"),
+            # The same reason on its emitting module is allowed.
+            ("tests.test_trade_engine", "test_smoke", "set TP_TEST_OHLCV_DIR=x"),
             ("tests.test_safe_path", "test_skips", "unexpected env"),
         ],
     )
     bad = violations(parse_junit(path))
-    assert [t.name for t in bad] == ["test_skips"]
+    assert [t.name for t in bad] == ["test_skips", "test_dataset"]
 
 
 def test_build_report_groups_by_reason_and_marks_money_path(tmp_path: Path) -> None:
@@ -248,7 +333,8 @@ _NON_MONEY_PATH_MODULES = {
 
 # The dataset-gated strategy suite (#289): every skip it emits is the data
 # gate, which the report already counts — classifying each file would add
-# noise, not coverage.
+# noise, not coverage. This exemption goes away with #289, when the gate is
+# closed and the suite either runs or is removed.
 _NON_MONEY_PATH_PREFIXES = ("tests.strategies.",)
 
 
