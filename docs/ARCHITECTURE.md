@@ -61,7 +61,10 @@ The folder name is the stable slug; backtests store it in `meta.strategies`.
 LLM-generated strategy code is untrusted until a human approves it: drafts are
 statically screened (`runner/codegen_safety.py`), marked, and only runnable
 after a SHA256-bound approval (`runner/approval_gate.py`,
-`POST /api/strategies/{file}/approve`).
+`POST /api/strategies/{file}/approve`). Any new execution route for generated
+strategy files MUST call `runner.approval_gate.require_generated_strategy_approval`
+(or `runner.auto_agent.run_validated_backtest`) before importing or executing
+the module.
 
 ## Conventions worth knowing
 
@@ -70,3 +73,11 @@ after a SHA256-bound approval (`runner/approval_gate.py`,
 - Money-path decision records: `docs/cleanup-16d1-money-path-semantics.md`.
 - Reference-parity fixtures spec: `docs/reports/parity-reference-libraries.md`.
 - Test sandbox and OHLCV-gated strategy tests: see `AGENTS.md`.
+
+## Metrics and chart semantics
+
+- `runner/stats.py` keeps max drawdown as a decimal fraction;
+  `/api/backtest/<id>/stats` converts it to percentage points for the UI.
+- p-value is a one-sided t-test on daily returns against zero.
+- The backtest equity endpoint normalizes timestamps, sorts points and
+  collapses duplicate timestamps before charting.
