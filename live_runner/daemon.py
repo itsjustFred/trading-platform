@@ -418,7 +418,6 @@ def _recover_failed_services() -> list[Service]:
                 "Not recovering a service whose operator paused it",
                 extra={"data": {"service_id": str(service.id)}},
             )
-            continue
     return list_services()
 
 
@@ -4782,6 +4781,29 @@ def _warn_retired_discord_deployments(
         )
 
 
+def _active_deployment_untradeable_reason(
+    deployment: LiveDeploymentConfig,
+) -> str | None:
+    """Why an ACTIVE deployment can never trade, or ``None`` when it can.
+
+    ``internal`` is not runner-less: the internal strategy runner trades the
+    rows that opted in and resolve a strategy, so the runner's own
+    ``internal_runner_untradeable_reason`` refines the source-level answer —
+    the alert then names the real reason, or stays quiet for a deployment
+    that can trade. Retired-source rows return ``None`` here: the retired
+    warning owns them (it fires for every status, once per process), so an
+    ACTIVE discord row is not double-reported.
+    """
+    if normalize_signal_source(deployment.signal_source) == RETIRED_DISCORD_SIGNAL_SOURCE:
+        return None
+    reason = untradeable_signal_source_reason(deployment.signal_source)
+    if reason is None:
+        return None
+    if normalize_signal_source(deployment.signal_source) == DEFAULT_SIGNAL_SOURCE:
+        return internal_runner_untradeable_reason(deployment)
+    return reason
+
+
 def _warn_untradeable_active_deployments(
     deployments: Sequence[LiveDeploymentConfig],
     already_warned: dict[str, str] | None = None,
@@ -4815,21 +4837,9 @@ def _warn_untradeable_active_deployments(
     for deployment in deployments:
         if _normalize_deployment_status(deployment.status) != "ACTIVE":
             continue
-        if normalize_signal_source(deployment.signal_source) == RETIRED_DISCORD_SIGNAL_SOURCE:
-            # The retired-source warning owns discord rows (it fires for every
-            # status, once per process); do not double-report an ACTIVE one.
-            continue
-        reason = untradeable_signal_source_reason(deployment.signal_source)
+        reason = _active_deployment_untradeable_reason(deployment)
         if reason is None:
             continue
-        if normalize_signal_source(deployment.signal_source) == DEFAULT_SIGNAL_SOURCE:
-            # 'internal' is not runner-less: the internal strategy runner
-            # trades the rows that opted in and resolve a strategy. Ask the
-            # runner's own answer so the alert names the real reason — or
-            # stays quiet for a deployment that can trade.
-            reason = internal_runner_untradeable_reason(deployment)
-            if reason is None:
-                continue
         deployment_id = str(deployment.id)
         # A change of state, never a repeat of one already reported: the reason
         # also encodes the signal source, so repointing a row re-warns it.
@@ -5532,7 +5542,7 @@ async def _shutdown_cleanup(
 
 
 async def _start_daemon_services(
-    scheduler: ServiceScheduler, accounts_env: Path | str | None
+    scheduler: ServiceScheduler,
 ) -> None:
     """The startup work that runs before the daemon's loops exist.
 
@@ -5683,7 +5693,7 @@ async def _run_daemon_locked(
         # interrupted; the second signal's forced exit covers that.)
         stop_waiter = asyncio.create_task(shutdown.wait(), name="shutdown-waiter")
         startup_task = asyncio.create_task(
-            _start_daemon_services(scheduler, accounts_env), name="daemon-startup"
+            _start_daemon_services(scheduler), name="daemon-startup"
         )
         started, _ = await asyncio.wait(
             {startup_task, stop_waiter}, return_when=asyncio.FIRST_COMPLETED

@@ -13702,20 +13702,18 @@ async def create_verification_evidence(
         raise HTTPException(status_code=400, detail=_public_value_error_detail(exc)) from exc
 
 
-async def _resolve_live_deployment_signal_source(
+def _resolve_live_deployment_signal_source(
     *,
-    signal_source_type: str,
     strategy_name: str,
     symbols: list[str],
-    symbol_filter: list[str],
-    signal_source_id: str,
     signal_config_payload: dict[str, Any],
 ) -> tuple[str, list[str], str, list[str], dict[str, Any]]:
     """Validate/normalize the signal-source inputs for a live deployment.
 
     Only ``internal`` remains: Discord signal ingestion was removed
     (maintainer decision 2026-11-26) and the endpoint refuses ``discord``
-    before this runs.
+    before this runs. ``signal_source_id`` and ``symbol_filter`` come back
+    empty: they belonged to the retired Discord routing inputs.
     """
     if not strategy_name:
         raise HTTPException(status_code=400, detail="strategy_name is required for internal signal source")
@@ -14073,7 +14071,12 @@ def _validate_live_deployment_route(
 @app.post(
     LIVE_DEPLOYMENTS_PATH,
     status_code=201,
-    responses={409: {"description": "The deployment is refused by the promotion gate (#165)"}},
+    responses={
+        400: {
+            "description": "The payload is refused (retired source, bad fields or config)"
+        },
+        409: {"description": "The deployment is refused by the promotion gate (#165)"},
+    },
 )
 async def create_live_deployment_endpoint(
     payload: LiveDeploymentCreateRequest,
@@ -14131,12 +14134,9 @@ async def create_live_deployment_endpoint(
         strategy_name,
         symbols,
         signal_config_payload,
-    ) = await _resolve_live_deployment_signal_source(
-        signal_source_type=signal_source_type,
+    ) = _resolve_live_deployment_signal_source(
         strategy_name=strategy_name,
         symbols=symbols,
-        symbol_filter=symbol_filter,
-        signal_source_id=signal_source_id,
         signal_config_payload=signal_config_payload,
     )
 
