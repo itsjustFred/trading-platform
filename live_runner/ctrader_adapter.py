@@ -4609,9 +4609,11 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         """``(name, number)`` pairs for an execution-type enum or test double.
 
         The real ``ProtoOAExecutionType`` is an ``EnumTypeWrapper`` with a
-        ``DESCRIPTOR``; test doubles are plain namespaces, where ``dir``
-        yields the members. Anything unreadable fails closed to an empty
-        list, which makes the caller treat the event as unclassifiable.
+        ``DESCRIPTOR`` (a protobuf-version-dependent shape); test doubles
+        are plain namespaces, where ``dir`` yields the members. Anything
+        unreadable falls through to ``dir`` and ultimately fails closed to
+        an empty list, which makes the caller treat the event as
+        unclassifiable - never a pass.
         """
         try:
             descriptor = getattr(enum, "DESCRIPTOR", None)
@@ -4672,8 +4674,10 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             return None, True
         matched = {name for name, number in members if number == value}
         # Membership in the explicit sets decides: a rejection name wins
-        # over a non-rejection alias on the same number, a member in neither
-        # set fails closed to unclassifiable rather than passing as success.
+        # over a non-rejection alias on the same number. The non-rejection
+        # side is a SUBSET check, not an intersection - every name the value
+        # resolves to must be a known non-rejection, so an alias pair like
+        # {ORDER_FILLED, SOME_FUTURE_TYPE} fails closed instead of passing.
         rejections = matched & _REJECTION_EXECUTION_TYPES
         if rejections:
             return sorted(rejections)[0], False
