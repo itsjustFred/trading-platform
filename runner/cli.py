@@ -30,12 +30,11 @@ from runner.backtest_matrix import MATRIX_OUTPUT_DIR, run_backtest_matrix
 from runner.daily_equity import attach_daily_equity
 from runner.engines.base import (
     BacktestConfig,
-    EngineAdapter,
     native_strategy_parameter_errors,
     resolve_strategy_parameters,
-    warn_if_engine_frozen,
 )
 from runner.engines.contract import default_signal_exit_fill_for_engine
+from runner.engines.registry import get_engine
 from runner.promotion_cli import add_promote_parser
 from runner.slippage import SLIPPAGE_CAPABLE_ENGINES, assert_slippage_supported
 from runner.stats import merge_canonical_stats
@@ -75,29 +74,6 @@ def _emit_progress(
         return
     bounded = max(0.0, min(100.0, float(percent)))
     callback(round(bounded, 2), str(message))
-
-
-def get_engine(name: str) -> EngineAdapter:
-    """Get an engine adapter by name."""
-    warn_if_engine_frozen(name, stacklevel=2)
-    if name == "native":
-        from runner.engines.native_adapter import NativeAdapter
-
-        return NativeAdapter()
-    elif name == "vectorbt":
-        from runner.engines.vectorbt_adapter import VectorbtAdapter
-
-        return VectorbtAdapter()
-    elif name == "lean":
-        from runner.engines.lean_adapter import LeanAdapter
-
-        return LeanAdapter()
-    elif name == "pynecore":
-        from runner.engines.pynecore_adapter import PyneCoreAdapter
-
-        return PyneCoreAdapter()
-    else:
-        raise ValueError(f"Unknown engine: {name}. Available: native, vectorbt, lean, pynecore")
 
 
 def _resolve_strategy_type(strategy_path: str) -> StrategyType:
