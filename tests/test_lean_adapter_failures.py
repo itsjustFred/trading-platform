@@ -100,15 +100,39 @@ def test_lean_config_write_preserves_previous_file_on_failure(tmp_path, monkeypa
     assert config_path.read_text(encoding="utf-8") == "previous"
 
 
-def test_lean_adapter_fails_loudly_when_lean_cli_missing(tmp_path, monkeypatch):
-    import runner.engines.lean_adapter as module
+def test_lean_adapter_default_project_dir_follows_set_data_dir(tmp_path, monkeypatch):
+    import shared.constants as constants
 
+    monkeypatch.delenv("LEAN_PROJECT_DIR", raising=False)
+    data_dir = tmp_path / "data"
+    constants.set_data_dir(data_dir)
+    try:
+        adapter = LeanAdapter()
+    finally:
+        constants.reset_data_dir()
+    assert adapter.project_dir == data_dir / "lean_project"
+
+
+def test_lean_adapter_explicit_dir_and_env_win_over_data_dir(tmp_path, monkeypatch):
+    import shared.constants as constants
+
+    data_dir = tmp_path / "data"
+    constants.set_data_dir(data_dir)
+    try:
+        explicit = LeanAdapter(lean_project_dir=tmp_path / "explicit")
+        assert explicit.project_dir == tmp_path / "explicit"
+        monkeypatch.setenv("LEAN_PROJECT_DIR", str(tmp_path / "env_dir"))
+        from_env = LeanAdapter()
+        assert from_env.project_dir == tmp_path / "env_dir"
+    finally:
+        constants.reset_data_dir()
+
+
+def test_lean_adapter_fails_loudly_when_lean_cli_missing(tmp_path):
     strategy = tmp_path / "strategy.py"
     strategy.write_text("class DemoAlgorithm: pass\n", encoding="utf-8")
     project_dir = tmp_path / "lean_project"
     project_dir.mkdir()
-    monkeypatch.setattr(module, "LEAN_PROJECT_DIR", project_dir)
-
     adapter = LeanAdapter(lean_project_dir=project_dir)
     config = _config(tmp_path)
     with pytest.raises(RuntimeError, match="LEAN"):

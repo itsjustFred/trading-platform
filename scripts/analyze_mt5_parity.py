@@ -25,7 +25,7 @@ import pandas as pd
 
 # --- import-origin guard ---
 # `shared` must resolve to this checkout, not the installed package. The mechanism lives in
-# scripts/_import_origin.py; only the invocation is per script. scripts/ goes on sys.path - never
+# scripts/import_origin.py; only the invocation is per script. scripts/ goes on sys.path - never
 # the repo root, which would repair `import shared` and defeat the guard - so a direct run is
 # refused (exit 2) instead of reading another tree's clock profiles. See
 # tests/test_script_import_origin.py; run as:
@@ -36,7 +36,7 @@ from pathlib import Path as _path
 _scripts_dir = str(_path(__file__).resolve().parent)
 if _scripts_dir not in _sys.path:
     _sys.path.insert(0, _scripts_dir)
-import _import_origin as _guard
+import import_origin as _guard
 
 _guard.ensure_own_checkout("analyze_mt5_parity")
 # --- end import-origin guard ---
@@ -54,8 +54,8 @@ from runner.engines.base import resolve_strategy_parameters
 from scripts.regenerate_mt5_parity_artifacts import (
     COMPARISON_CASES,
     STRATEGY_PATH,
-    _load_ohlcv,
-    _opposite_side_series,
+    load_ohlcv,
+    opposite_side_series,
 )
 from shared.broker_clock import BrokerClock, resolve_broker_clock
 from strategies.intraday_volatility_breakout.intraday_volatility_breakout import generate_signals
@@ -386,7 +386,7 @@ def _local_stop_touch_counts(
     if not bad_matches:
         return 0, 0, 0
 
-    df = _load_ohlcv(
+    df = load_ohlcv(
         data_dir,
         str(case["execution_symbol"]),
         str(case["execution_timeframe"]),
@@ -412,11 +412,11 @@ def _local_stop_touch_counts(
         windows += 1
         side = str(platform_trade.get("direction", "")).upper()
         if side == "LONG":
-            prices = _opposite_side_series(df, side, "low").iloc[start:end]
+            prices = opposite_side_series(df, side, "low").iloc[start:end]
             mt5_touched = bool((prices <= float(mt5_stop)).any())
             platform_touched = bool((prices <= float(platform_stop)).any())
         else:
-            prices = _opposite_side_series(df, side, "high").iloc[start:end]
+            prices = opposite_side_series(df, side, "high").iloc[start:end]
             mt5_touched = bool((prices >= float(mt5_stop)).any())
             platform_touched = bool((prices >= float(platform_stop)).any())
         mt5_stop_touches += int(mt5_touched)
@@ -459,7 +459,7 @@ def stop_atr(args: argparse.Namespace) -> None:
     for label, mt5_path in MT5_REPORTS.items():
         ref = _load_reference(label, mt5_path)
         case = cases[label]
-        df = _load_ohlcv(args.data_dir, case["execution_symbol"], case["execution_timeframe"], case["start"], case["end"])
+        df = load_ohlcv(args.data_dir, case["execution_symbol"], case["execution_timeframe"], case["start"], case["end"])
         _, _, indicators, _ = generate_signals(df, params)
         mt5_rows: list[dict[str, Any]] = []
         our_atr = indicators["daily_atr"]
@@ -510,7 +510,7 @@ def stop_atr(args: argparse.Namespace) -> None:
 def signal_counts(args: argparse.Namespace) -> None:
     cases = _case_by_label()
     for label, case in cases.items():
-        df = _load_ohlcv(args.data_dir, case["execution_symbol"], case["execution_timeframe"], case["start"], case["end"])
+        df = load_ohlcv(args.data_dir, case["execution_symbol"], case["execution_timeframe"], case["start"], case["end"])
         print(f"\n{label}")
         for offset in args.offsets:
             for use_close in (True, False):
@@ -531,7 +531,7 @@ def signal_counts(args: argparse.Namespace) -> None:
 def data_quality(args: argparse.Namespace) -> None:
     cases = _case_by_label()
     for label, case in cases.items():
-        df = _load_ohlcv(args.data_dir, case["execution_symbol"], case["execution_timeframe"], case["start"], case["end"])
+        df = load_ohlcv(args.data_dir, case["execution_symbol"], case["execution_timeframe"], case["start"], case["end"])
         ohlc_cols = ["open", "high", "low", "close"]
         print(f"\n{label} data quality {case['execution_symbol']} {case['execution_timeframe']} rows={len(df)}")
         print("time", df["timestamp"].min(), df["timestamp"].max())

@@ -13,7 +13,7 @@ import sentry_sdk
 from sentry_sdk.integrations.logging import LoggingIntegration
 
 import shared.constants  # noqa: F401
-from shared.logging import _SENSITIVE_MARKERS, get_logger, redact_text, redact_value
+from shared.logging import get_logger, redact_value
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
@@ -203,20 +203,7 @@ def flush_sentry(timeout: float) -> bool:
 
 def _before_send(event: dict[str, Any], hint: dict[str, Any]) -> dict[str, Any] | None:
     del hint
-    return _redact_value(event)
-
-
-def _is_sensitive_key(key: object) -> bool:
-    normalized = str(key).strip().lower().replace("-", "_")
-    return any(marker in normalized for marker in _SENSITIVE_MARKERS)
-
-
-def _redact_value(value: Any) -> Any:
-    return redact_value(value)
-
-
-def _redact_string(value: str) -> str:
-    return redact_text(value)
+    return redact_value(event)
 
 
 def _parse_bool(value: str | None, *, name: str, default: bool | None = None) -> bool:

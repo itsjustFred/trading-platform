@@ -26,7 +26,7 @@ def test_an_unrecognised_live_timeframe_is_refused_rather_than_silently_skipped(
     import pytest
 
     from live_runner.signal_sources.execution_timing import (
-        _timeframe_seconds,
+        timeframe_seconds,
         wait_for_candle_close,
     )
     from risk import TradeSignal
@@ -62,11 +62,11 @@ def test_an_unrecognised_live_timeframe_is_refused_rather_than_silently_skipped(
     # run). The refusal path returns before any sleeping, which is why the
     # unrecognised cases above are safe to call directly.
     for good in ("15m", "1h", "1d", "s1", "H1"):  # H1 canonicalises to 1h
-        assert _timeframe_seconds(good) is not None, (
+        assert timeframe_seconds(good) is not None, (
             f"{good} is a valid timeframe and must still resolve to a budget"
         )
     for bad in ("M15", "D", "5min", "m5", "daily", "", "1x", "15"):
-        assert _timeframe_seconds(bad) is None, (
+        assert timeframe_seconds(bad) is None, (
             f"{bad!r} unexpectedly resolved to a budget, so the refusal above is "
             f"not the only thing distinguishing it from a valid timeframe"
         )
@@ -350,11 +350,11 @@ class TestSignalTimestampParsingAndTimeframeRecognition:
         """
         from live_runner.signal_sources.execution_timing import (
             _require_recognised_timeframe,
-            _timeframe_seconds,
+            timeframe_seconds,
         )
 
         _require_recognised_timeframe("tick", "test")
-        assert _timeframe_seconds("tick") is None
+        assert timeframe_seconds("tick") is None
 
     @pytest.mark.parametrize("timeframe", ["banana", "M15", "D", "", "   ", None, "15"])
     def test_an_unrecognised_timeframe_is_refused_with_a_usable_message(self, timeframe) -> None:
@@ -392,7 +392,7 @@ class TestSignalTimestampParsingAndTimeframeRecognition:
         """
         from live_runner.signal_sources.execution_timing import (
             _require_recognised_timeframe,
-            _timeframe_seconds,
+            timeframe_seconds,
         )
         from shared.constants import TIMEFRAME_ALIASES, normalize_timeframe
 
@@ -402,7 +402,7 @@ class TestSignalTimestampParsingAndTimeframeRecognition:
         )
         assert normalize_timeframe("1M") == "1m"
         _require_recognised_timeframe("1M", "test")
-        assert _timeframe_seconds("1M") == 60, (
+        assert timeframe_seconds("1M") == 60, (
             "the monthly spelling now resolves to something other than a minute; if that was "
             "deliberate, drop the KNOWN annotation from the daemon-side test too"
         )

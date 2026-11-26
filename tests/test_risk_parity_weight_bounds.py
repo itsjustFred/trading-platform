@@ -15,7 +15,7 @@ import pytest
 
 import runner.risk_parity_optimizer as rpo
 from runner.risk_parity_optimizer import (
-    _project_to_capped_simplex,
+    project_to_capped_simplex,
     solve_risk_parity_weights,
 )
 
@@ -131,7 +131,7 @@ def test_projection_returns_a_point_of_the_capped_simplex(seed: int) -> None:
     upper = float(rng.uniform(max(lower, 1.0 / n), 1.0))
     values = rng.normal(0.0, 5.0, size=n)
 
-    projected = _project_to_capped_simplex(values, lower=lower, upper=upper)
+    projected = project_to_capped_simplex(values, lower=lower, upper=upper)
 
     _assert_feasible(projected, n, lower, upper)
 
@@ -189,7 +189,7 @@ def test_projection_refuses_non_finite_weights() -> None:
     # backstop also refuses, but with a different message, so a bare
     # match="finite" would pass on the wrong check.
     with pytest.raises(ValueError, match="finite before projection"):
-        _project_to_capped_simplex(values, lower=0.0, upper=1.0)
+        project_to_capped_simplex(values, lower=0.0, upper=1.0)
 
 
 def test_projection_refuses_a_result_that_does_not_sum_to_one() -> None:
@@ -203,7 +203,7 @@ def test_projection_refuses_a_result_that_does_not_sum_to_one() -> None:
     an overshoot.
     """
     with pytest.raises(ValueError, match="summing to 1"):
-        _project_to_capped_simplex(np.array([0.5, 0.5]), lower=0.5, upper=0.4)
+        project_to_capped_simplex(np.array([0.5, 0.5]), lower=0.5, upper=0.4)
 
 
 def test_projection_refuses_non_finite_bounds() -> None:
@@ -213,7 +213,7 @@ def test_projection_refuses_non_finite_bounds() -> None:
     finiteness half of the backstop stays even though callers validate bounds.
     """
     with pytest.raises(ValueError, match="summing to 1"):
-        _project_to_capped_simplex(np.array([0.5, 0.5]), lower=0.0, upper=float("nan"))
+        project_to_capped_simplex(np.array([0.5, 0.5]), lower=0.0, upper=float("nan"))
 
 
 @pytest.mark.parametrize("variance", [0.0, -1.0], ids=["zero", "negative"])
