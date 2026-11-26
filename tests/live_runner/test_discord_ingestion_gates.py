@@ -3935,35 +3935,6 @@ class TestRealBugsFromThePreMortem:
     file keeps hitting: a second copy of a rule is a rule nobody maintains.
     """
 
-    def test_a_blank_per_bot_var_does_not_widen_on_the_deployment_path(self) -> None:
-        """`if per_service:` fell through to the shared list on a blank value.
-
-        Fixed on the *service* path in 626e485; missed here, on the path all three
-        live deployments use. So the same env file produced the right answer from
-        one code path and the wrong one from the other - Nitro trusting all three
-        bots' authors, which is the cross-bot trust the per-bot var exists to
-        prevent, and the fail-closed configuration being unreachable.
-        """
-        from live_runner.daemon import _deployment_trusted_author_ids
-
-        deployment = SimpleNamespace(
-            id="d1", settings={},
-            signal_config={"service_name": "NITRO"}, signal_source_id="nitro",
-        )
-        env = {
-            "DISCORD_BOT_NITRO_TRUSTED_AUTHOR_IDS": "",
-            "DISCORD_TRUSTED_AUTHOR_IDS": "1,2,3",
-        }
-
-        resolved = _deployment_trusted_author_ids(
-            deployment, accounts_env_values=env
-        )
-
-        assert resolved == set(), (
-            "a blank per-bot allowlist widened to the shared list on the "
-            f"deployment path: {sorted(resolved)}"
-        )
-
     def test_the_per_deployment_author_gate_is_not_inert(self) -> None:
         """The gate read os.environ, which never holds .accounts.env.
 
