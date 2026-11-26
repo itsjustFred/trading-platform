@@ -80,10 +80,10 @@ async def _observe(
     # The scheme belongs to the credential: a bot token sent raw is a 401, and
     # so is an account token sent with a "Bot " prefix. Resolved from the same
     # per-bot scope the daemon uses, not guessed here.
-    from live_runner.daemon import _resolve_discord_auth_scheme
+    from live_runner.daemon import resolve_discord_auth_scheme
 
     try:
-        auth_scheme = _resolve_discord_auth_scheme(name, values)
+        auth_scheme = resolve_discord_auth_scheme(name, values)
         source = DiscordSignalSource(
             bot_name=name,
             token=token,

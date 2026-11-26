@@ -2926,7 +2926,7 @@ def _mint_signal_idempotency_key(
         metadata["legacy_idempotency_key"] = _key(raw_stamp)
 
 
-def _trade_signal_to_live_signal(
+def trade_signal_to_live_signal(
     signal: TradeSignal,
     deployment: LiveDeploymentConfig,
 ) -> LiveSignal:
@@ -3019,7 +3019,7 @@ def _signal_is_exit(
 
     :func:`live_runner.exit_signals.is_exit_order` alone is not the whole answer: a
     plain SELL on a deployment that cannot short is a full exit too, and that is
-    decided per deployment, in :func:`_trade_signal_to_live_signal` (which stamps
+    decided per deployment, in :func:`trade_signal_to_live_signal` (which stamps
     ``exit_only``) - *after* the dispatch gates have already run. Answering it the
     same way here is what keeps "dispatched as an exit" and "gated as an exit" from
     drifting apart, and therefore what lets a pause reject entries while still
@@ -3229,17 +3229,17 @@ def _resolve_account_discord_credentials(
     if override:
         return token, override
     if not token:
-        return "", _resolve_discord_auth_scheme(
+        return "", resolve_discord_auth_scheme(
             _deployment_service_name(deployment), accounts_env_values
         )
     # The scheme is a property of the credential, not of the deployment, so it
     # must be read from the scope the token actually came from. Only the global
     # fallback needs special handling: a per-bot token was found under a key
     # derived from this deployment's service name, which is exactly the scope
-    # `_resolve_discord_auth_scheme` already reads.
+    # `resolve_discord_auth_scheme` already reads.
     if token_source_key == "DISCORD_BOT_TOKEN":
-        return token, _resolve_discord_auth_scheme("", accounts_env_values)
-    return token, _resolve_discord_auth_scheme(
+        return token, resolve_discord_auth_scheme("", accounts_env_values)
+    return token, resolve_discord_auth_scheme(
         _deployment_service_name(deployment), accounts_env_values
     )
 
@@ -3601,7 +3601,7 @@ async def _submit_normalized_discord_signal(
         normalized_signal = prepared
 
         try:
-            live_signal = _trade_signal_to_live_signal(normalized_signal, deployment)
+            live_signal = trade_signal_to_live_signal(normalized_signal, deployment)
         except ValueError as exc:
             # Strict-boolean config errors (e.g. typo'd allow_short) must skip this
             # deployment without dropping the listener loop or sibling deployments.
@@ -3680,7 +3680,7 @@ async def _submit_internal_strategy_signal(
     The signal was produced by ``internal_strategy_runner`` on a closed bar;
     conversion, sizing, the submission claim and adapter persistence are the
     same path Discord signals take. The only internal-specific gate is the
-    short-side check: ``_trade_signal_to_live_signal`` would otherwise turn a
+    short-side check: ``trade_signal_to_live_signal`` would otherwise turn a
     SHORT entry on a long-only deployment into a full exit, which is the
     opposite of what the strategy asked for — skip it instead.
 
@@ -3722,7 +3722,7 @@ async def _submit_internal_strategy_signal(
             )
             return SUBMIT_OUTCOME_REFUSED
     try:
-        live_signal = _trade_signal_to_live_signal(trade_signal, deployment)
+        live_signal = trade_signal_to_live_signal(trade_signal, deployment)
     except ValueError:
         logger.exception(
             "Internal strategy signal failed conversion; skipping",
@@ -4700,7 +4700,7 @@ DEFAULT_DISCORD_AUTH_SCHEME = "raw"
 _DISCORD_AUTH_SCHEME_VOCABULARY = ("raw", "account", "bot")
 
 
-def _resolve_discord_auth_scheme(
+def resolve_discord_auth_scheme(
     bot_name: str,
     accounts_env_values: Mapping[str, str],
 ) -> str:
@@ -4739,7 +4739,7 @@ def _deployment_discord_auth_scheme(deployment: LiveDeploymentConfig) -> str:
     The scheme is fundamentally a property of the *credential*, not of the
     deployment, so an unconfigured deployment returns ``""`` and the caller
     falls through to the credential-scoped resolution in
-    :func:`_resolve_discord_auth_scheme`. Only an operator who pinned
+    :func:`resolve_discord_auth_scheme`. Only an operator who pinned
     ``discord_auth_scheme`` on the deployment or its settings overrides that.
     """
     configured = deployment.signal_config if isinstance(deployment.signal_config, dict) else {}
@@ -5587,7 +5587,7 @@ async def _sync_running_discord_bot(
     service_config = service.config if isinstance(service.config, dict) else {}
     # The scheme belongs to the credential, so it is resolved from the same
     # per-bot scope the token key uses; an explicit per-service override still
-    # wins. `_resolve_discord_auth_scheme` validates the vocabulary and raises on
+    # wins. `resolve_discord_auth_scheme` validates the vocabulary and raises on
     # an unknown value rather than guessing between account and bot tokens.
     try:
         override = str(service_config.get("discord_auth_scheme") or "").strip().lower()
@@ -5599,7 +5599,7 @@ async def _sync_running_discord_bot(
                 f"Unsupported Discord auth_scheme {override!r} for {service.name!r}; "
                 f"expected one of {', '.join(_DISCORD_AUTH_SCHEME_VOCABULARY)}."
             )
-        auth_scheme = override or _resolve_discord_auth_scheme(
+        auth_scheme = override or resolve_discord_auth_scheme(
             service.name, accounts_env_values
         )
     except ValueError as exc:

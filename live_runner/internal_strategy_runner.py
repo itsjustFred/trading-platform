@@ -116,7 +116,7 @@ Risk-policy notes (maintainer decision 2026-11-22):
   delay, not a dropped signal (documented divergence).
 
 Submission: intents are handed to the daemon's ``submit_signal`` callback,
-which routes them through ``_trade_signal_to_live_signal`` and
+which routes them through ``trade_signal_to_live_signal`` and
 ``_prepare_claim_and_submit_signal`` — the same prepare/claim/submit path as
 Discord signals, so sizing, the SL/TP guard, promotion gate, submission lease
 and adapter persistence all apply unchanged.
