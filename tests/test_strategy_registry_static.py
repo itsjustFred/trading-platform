@@ -199,6 +199,201 @@ def test_iter_strategy_entries_skips_dynamic_meta(tmp_path: Path) -> None:
     assert iter_strategy_entries(dynamic_dir) == []
 
 
+def test_vectorbt_only_signal_keys_detects_dict_and_subscript(tmp_path: Path) -> None:
+    """``entry_stop`` counts as a dict-literal key or subscript index only."""
+    from shared.strategy_registry import vectorbt_only_signal_keys
+
+    strategy_dir = tmp_path / "stop_strategy"
+    strategy_dir.mkdir()
+    (strategy_dir / "stop_strategy.py").write_text(
+        "import pandas as pd\n"
+        "def generate_signals(df, params):\n"
+        "    indicators = {'stop_loss': pd.Series([1.0]), 'entry_stop': pd.Series([2.0])}\n"
+        "    indicators['entry_stop'] = indicators['entry_stop'] * 2\n"
+        "    return pd.Series([True]), pd.Series([False]), indicators\n",
+        encoding="utf-8",
+    )
+
+    assert vectorbt_only_signal_keys(strategy_dir / "stop_strategy.py") == frozenset(
+        {"entry_stop"}
+    )
+
+
+def test_vectorbt_only_signal_keys_covers_call_publication_forms(tmp_path: Path) -> None:
+    """``dict(entry_stop=...)`` and ``setdefault("entry_stop", ...)`` also count."""
+    from shared.strategy_registry import vectorbt_only_signal_keys
+
+    strategy_dir = tmp_path / "call_forms"
+    strategy_dir.mkdir()
+    (strategy_dir / "call_forms.py").write_text(
+        "def generate_signals(df, params):\n"
+        "    indicators = dict(entry_stop=1.0, stop_loss=2.0)\n"
+        "    indicators.setdefault('entry_stop', 3.0)\n"
+        "    return None, None, indicators\n",
+        encoding="utf-8",
+    )
+
+    assert vectorbt_only_signal_keys(strategy_dir / "call_forms.py") == frozenset(
+        {"entry_stop"}
+    )
+
+
+def test_vectorbt_only_signal_keys_ignores_mentions_and_other_keys(tmp_path: Path) -> None:
+    """A STRATEGY_META note or variable name mentioning the key must not match."""
+    from shared.strategy_registry import vectorbt_only_signal_keys
+
+    strategy_dir = tmp_path / "mention_strategy"
+    strategy_dir.mkdir()
+    (strategy_dir / "mention_strategy.py").write_text(
+        "STRATEGY_META = {'name': 'Mention', 'notes': 'no entry_stop fills here'}\n"
+        "entry_stop_distance = 1.5\n"
+        "def generate_signals(df, params):\n"
+        "    indicators = {'stop_distance': entry_stop_distance, 'exit_reason': 'x'}\n"
+        "    return None, None, indicators\n",
+        encoding="utf-8",
+    )
+
+    assert vectorbt_only_signal_keys(strategy_dir / "mention_strategy.py") == frozenset()
+
+
+def test_vectorbt_only_signal_keys_real_registry() -> None:
+    """The shipped registry: only us100_scalper emits a vectorbt-only key."""
+    from shared.strategy_registry import (
+        VECTORBT_ONLY_SIGNAL_KEYS,
+        iter_strategy_files,
+        strategy_slug_for_path,
+        vectorbt_only_signal_keys,
+    )
+
+    # exit_reason is a replaceable label, not a fill-semantics input — adding
+    # it would exclude nearly every strategy (pre-mortem finding, PR #447).
+    assert "exit_reason" not in VECTORBT_ONLY_SIGNAL_KEYS
+
+    strategies_dir = Path(__file__).resolve().parents[1] / "strategies"
+    hits = {
+        strategy_slug_for_path(path, strategies_dir)
+        for path in iter_strategy_files(strategies_dir)
+        if vectorbt_only_signal_keys(path)
+    }
+
+    assert hits == {"us100_scalper"}
+
+
+def test_atr_sizing_keys_without_stop_flags_atr_only(tmp_path: Path) -> None:
+    """``atr*`` keys with no stop_loss/sl_price are the vectorbt ATR fallback."""
+    from shared.strategy_registry import atr_sizing_keys_without_stop
+
+    strategy_dir = tmp_path / "atr_only"
+    strategy_dir.mkdir()
+    (strategy_dir / "atr_only.py").write_text(
+        "import pandas as pd\n"
+        "def generate_signals(df, params):\n"
+        "    indicators = {'atr': pd.Series([1.0]), 'atr_value': pd.Series([2.0])}\n"
+        "    return pd.Series([True]), pd.Series([False]), indicators\n",
+        encoding="utf-8",
+    )
+
+    assert atr_sizing_keys_without_stop(strategy_dir / "atr_only.py") == frozenset(
+        {"atr", "atr_value"}
+    )
+
+
+def test_atr_sizing_keys_without_stop_respects_stop_keys(tmp_path: Path) -> None:
+    """A stop_loss/sl_price key keeps vectorbt off the ATR fallback."""
+    from shared.strategy_registry import atr_sizing_keys_without_stop
+
+    strategy_dir = tmp_path / "atr_with_stop"
+    strategy_dir.mkdir()
+    for name, stop_key in (
+        ("with_stop_loss", "stop_loss"),
+        ("with_sl_price", "sl_price"),
+        ("with_sizing_sl_price", "sizing_sl_price"),
+        ("with_sizing_sl", "sizing_sl"),
+    ):
+        (strategy_dir / f"{name}.py").write_text(
+            "def generate_signals(df, params):\n"
+            f"    indicators = {{'atr': 1.0, '{stop_key}': 2.0}}\n"
+            "    return None, None, indicators\n",
+            encoding="utf-8",
+        )
+        assert atr_sizing_keys_without_stop(strategy_dir / f"{name}.py") == frozenset()
+
+
+def test_atr_sizing_keys_without_stop_real_registry() -> None:
+    """No shipped strategy relies on the vectorbt ATR fallback today."""
+    from shared.strategy_registry import (
+        atr_sizing_keys_without_stop,
+        iter_strategy_files,
+    )
+
+    strategies_dir = Path(__file__).resolve().parents[1] / "strategies"
+    hits = {
+        path.name
+        for path in iter_strategy_files(strategies_dir)
+        if atr_sizing_keys_without_stop(path)
+    }
+
+    assert hits == set()
+
+
+def test_stop_level_keys_match_vectorbt_level_aliases() -> None:
+    """``_STOP_LEVEL_SIGNAL_KEYS`` must cover every stop spelling vectorbt honours.
+
+    The adapter resolves sizing distance from ``sizing_stop``/``stop_loss``
+    (``_LEVEL_ALIASES``) before falling back to ``atr*`` — a missing sizing
+    spelling here would wrongly exclude a strategy that has a real stop.
+    """
+    from runner.engines.vectorbt_adapter import _LEVEL_ALIASES
+    from shared.strategy_registry import _STOP_LEVEL_SIGNAL_KEYS
+
+    expected = frozenset(
+        alias
+        for kind in ("stop_loss", "sizing_stop")
+        for alias in _LEVEL_ALIASES[kind]
+    )
+    assert _STOP_LEVEL_SIGNAL_KEYS == expected
+
+
+def test_vectorbt_only_keys_cover_execution_key_diff() -> None:
+    """Every vectorbt execution key native ignores must be registered or excused.
+
+    ``_EXECUTION_SIGNAL_KEYS`` (the adapter's ``require_explicit_roles``
+    allowlist) minus the keys the native engine reads must equal
+    ``VECTORBT_ONLY_SIGNAL_KEYS`` — adding a new vectorbt-only execution key
+    without registering it fails here. ``atr`` and ``exit_reason`` are the two
+    documented exceptions: ``atr*`` is handled conditionally by
+    ``atr_sizing_keys_without_stop`` (it only matters with no stop key), and
+    ``exit_reason`` is a label native replaces with its own reasons.
+    """
+    from runner.engines.vectorbt_adapter import _EXECUTION_SIGNAL_KEYS
+    from shared.strategy_registry import VECTORBT_ONLY_SIGNAL_KEYS
+
+    # Signal keys the native engine reads (pinned literal — the native-read
+    # set is not mechanically derivable): entries/exits frame columns,
+    # _extract_levels stop/tp spellings, _resolve_direction, row.get
+    # stop_distance, row.get exit_price/exit_order_type in trading_engine.py.
+    native_read_keys = frozenset(
+        {
+            "entries",
+            "exits",
+            "stop_loss",
+            "sl_price",
+            "take_profit",
+            "tp_price",
+            "direction",
+            "stop_distance",
+            "exit_price",
+            "exit_order_type",
+        }
+    )
+    conditional_or_label_keys = frozenset({"atr", "exit_reason"})
+
+    unhandled = (
+        _EXECUTION_SIGNAL_KEYS - native_read_keys - conditional_or_label_keys
+    )
+    assert unhandled == VECTORBT_ONLY_SIGNAL_KEYS
+
+
 def test_load_strategy_module_remains_explicit(tmp_path: Path) -> None:
     """The explicit load entry point still exists for real backtest runs."""
     from shared.strategy_registry import load_strategy_module
