@@ -5629,6 +5629,52 @@ def test_ctrader_exit_submit_persists_the_floored_qty_it_sends(monkeypatch) -> N
     assert adapter._resolve_order_volume(saved[0]) == close_volumes[0]
 
 
+def test_ctrader_submit_refuses_a_normalized_qty_above_the_binding_qty(
+    monkeypatch,
+) -> None:
+    """If volume resolution ever produced a qty above the risk-sized binding
+    qty (a future round-up), persisting it would both place an oversized
+    order and hide the excess from reconciliation. The overshoot guard must
+    refuse before the send, marked as provably not submitted."""
+    _module, adapter, saved, volumes = _ctrader_submit_harness(monkeypatch)
+    # EURUSD fallback scale: volume_per_qty 1000, so 2500 units is 2.5 qty -
+    # well above the 2.0007 binding qty and far outside the noise band.
+    monkeypatch.setattr(adapter, "_resolve_order_volume", lambda _signal: 2_500)
+
+    with pytest.raises(ValueError, match="exceeds the binding qty") as excinfo:
+        asyncio.run(adapter.submit_order(_ctrader_entry_signal(), qty=2.0007))
+
+    assert is_order_not_submitted(excinfo.value)
+    assert saved == []
+    assert volumes == []
+
+
+def test_ctrader_submit_refuses_when_qty_normalization_is_not_idempotent(
+    monkeypatch,
+) -> None:
+    """The request builders re-resolve the volume from the normalized signal;
+    if that disagrees with the volume resolved from the binding qty, the wire
+    request and the persisted qty would diverge. Refuse before the send,
+    marked as provably not submitted."""
+    _module, adapter, saved, volumes = _ctrader_submit_harness(monkeypatch)
+    resolutions = {"n": 0}
+
+    def _resolve(_signal):
+        resolutions["n"] += 1
+        # The binding-qty resolution is the real floored volume; every later
+        # resolution disagrees, as a non-idempotent resolution would.
+        return 2_000 if resolutions["n"] == 1 else 2_001
+
+    monkeypatch.setattr(adapter, "_resolve_order_volume", _resolve)
+
+    with pytest.raises(RuntimeError, match="not idempotent") as excinfo:
+        asyncio.run(adapter.submit_order(_ctrader_entry_signal(), qty=2.0007))
+
+    assert is_order_not_submitted(excinfo.value)
+    assert saved == []
+    assert volumes == []
+
+
 def _ctrader_entry_signal() -> LiveSignal:
     return LiveSignal(
         deployment_id="dep-1",

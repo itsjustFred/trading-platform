@@ -70,7 +70,7 @@ from shared.database import (
     set_live_signal_broker_order_id,
 )
 from shared.logging import get_logger
-from shared.lot_grid import _STEP_NOISE, floor_qty_to_step
+from shared.lot_grid import STEP_NOISE, floor_qty_to_step
 from shared.models import (
     PRICE_ABSENT,
     PRICE_OBSERVED,
@@ -3328,7 +3328,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 submitted_qty,
                 qty_value,
                 rel_tol=0.0,
-                abs_tol=2.0 * float(_STEP_NOISE) * step_qty,
+                abs_tol=2.0 * float(STEP_NOISE) * step_qty,
             ):
                 # Volume resolution floors, so this can only happen if a
                 # future change rounds up: persisting an oversized qty would
@@ -3364,13 +3364,14 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             # stays far inside the lot-grid floor's 1e-6-unit noise band for
             # every volume a broker int32 can express (~5e-7 units at
             # INT32_MAX), so an exact int compare cannot false-positive.
-            if self._resolve_order_volume(signal) != order_volume:
+            reresolved_volume = self._resolve_order_volume(signal)
+            if reresolved_volume != order_volume:
                 raise RuntimeError(
                     "cTrader volume resolution is not idempotent under qty "
                     f"normalization for {signal.symbol}: resolved "
                     f"{order_volume} from the binding qty but "
-                    f"{self._resolve_order_volume(signal)} from the "
-                    "normalized qty; refusing to submit."
+                    f"{reresolved_volume} from the normalized qty; "
+                    "refusing to submit."
                 )
             persisted_timestamp = await asyncio.to_thread(
                 get_live_signal_timestamp, signal_id

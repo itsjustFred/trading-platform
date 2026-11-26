@@ -533,7 +533,7 @@ def test_floor_to_lot_grid_never_exceeds_size_by_more_than_the_band():  # Issue 
     # what keeps a cap exact: an on-grid `max_lot` must not floor one whole
     # lot below itself. Pin the documented bound instead of a strict floor:
     # since #278 the shared decimal floor's overshoot is bounded by its noise
-    # band (1e-6 of a step, `shared.lot_grid._STEP_NOISE`), far below any
+    # band (1e-6 of a step, `shared.lot_grid.STEP_NOISE`), far below any
     # broker's quantity resolution, so a capped value is only ever read as
     # the grid multiple it already was. A strict floor would instead cut an
     # on-grid cap by a lot (`25602 * 0.01` -> 256.01, see

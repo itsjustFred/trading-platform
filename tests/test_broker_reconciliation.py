@@ -887,6 +887,105 @@ def test_sub_step_remainder_still_expected_when_adapter_names_no_step(
     assert "missing_working_order" in kinds
 
 
+class _FlakyStepAdapter(_SteppedAdapter):
+    """A stepped adapter whose step lookup raises for named symbols."""
+
+    def __init__(self, step: float, *, raises_for: set[str], **kwargs) -> None:
+        super().__init__(step, **kwargs)
+        self._raises_for = raises_for
+
+    def exit_qty_step(self, symbol: str) -> float:
+        if symbol in self._raises_for:
+            raise RuntimeError(f"no instrument props for {symbol}")
+        return self._step
+
+
+def test_unusable_step_lookup_keeps_that_expectation_and_the_pass_completes(
+    isolated_db, tmp_path
+) -> None:
+    """A symbol whose step lookup raises keeps its expectation (fail closed)
+    without aborting the rest of the account pass: the ETHUSD remainder is
+    still recognized as sub-step dust while NOPE's is still expected."""
+    database, _engine, _data_dir = isolated_db
+    _seed_db(database)
+    _filled_entry_signal(
+        DEPLOYMENT_ID,
+        symbol="NOPE",
+        requested_qty=5.5,
+        filled_qty=5.0,
+        broker_order_id="ord-nope",
+    )
+    _filled_entry_signal(
+        DEPLOYMENT_ID,
+        symbol="ETHUSD",
+        requested_qty=1174.9875223319393,
+        filled_qty=1174.0,
+        broker_order_id="ord-eth",
+    )
+
+    deployment = _deployment()
+    adapter = _FlakyStepAdapter(
+        1.0,
+        raises_for={"NOPE"},
+        positions=[
+            {"symbol": "NOPE", "qty": 5.0},
+            {"symbol": "ETHUSD", "qty": 1174.0},
+        ],
+        stops=[
+            ProtectiveStop(
+                order_id="stop-1", symbol="NOPE", side="sell", stop_price=95.0
+            ),
+            ProtectiveStop(
+                order_id="stop-2", symbol="ETHUSD", side="sell", stop_price=95.0
+            ),
+        ],
+    )
+    manager = _manager(tmp_path, [])
+
+    report = _reconcile(manager, [deployment], {ACCOUNT_ID: adapter})
+
+    missing = [
+        finding
+        for finding in report[ACCOUNT_ID].findings
+        if finding.kind == "missing_working_order"
+    ]
+    assert [finding.detail["symbol"] for finding in missing] == ["NOPE"]
+
+
+@pytest.mark.parametrize("bad_step", [float("nan"), 0.0, -1.0])
+def test_nonpositive_or_nonfinite_step_keeps_the_expectation(
+    isolated_db, tmp_path, bad_step
+) -> None:
+    """A step that is NaN, zero or negative is unusable: the expectation
+    stays (fail closed) instead of flooring against a bogus grid."""
+    database, _engine, _data_dir = isolated_db
+    _seed_db(database)
+    _filled_entry_signal(
+        DEPLOYMENT_ID,
+        symbol="ETHUSD",
+        requested_qty=5.5,
+        filled_qty=5.0,
+        broker_order_id="ord-badstep",
+    )
+
+    deployment = _deployment()
+    adapter = _SteppedAdapter(
+        bad_step,
+        positions=[{"symbol": "ETHUSD", "qty": 5.0}],
+        stops=[
+            ProtectiveStop(
+                order_id="stop-1", symbol="ETHUSD", side="sell", stop_price=95.0
+            )
+        ],
+    )
+    manager = _manager(tmp_path, [])
+
+    report = _reconcile(manager, [deployment], {ACCOUNT_ID: adapter})
+
+    kinds = {finding.kind for finding in report[ACCOUNT_ID].findings}
+    assert "missing_working_order" in kinds
+
+
 def test_order_state_lookups_share_one_phase_deadline(tmp_path, monkeypatch) -> None:
     """Ten slow lookups must not serialize into a ten-minute stall (#303)."""
     import live_runner.broker_reconciliation as recon
