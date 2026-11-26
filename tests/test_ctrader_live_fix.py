@@ -1594,6 +1594,37 @@ def test_an_execution_type_outside_the_enum_is_unclassifiable() -> None:
         _run(sweep)
 
 
+def test_an_unclassifiable_execution_event_is_not_misread_as_an_order_error() -> None:
+    """`errorCode` + `description` + `executionType` is an execution event.
+
+    Even with `_ProtoOAOrderErrorEvent` unloaded, a response exposing
+    `executionType` must reach the execution classifier: an unreadable type
+    is an unknown outcome (RuntimeError), never a definite refusal.
+    """
+    from types import SimpleNamespace
+
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOAOrderType
+
+    adapter = _control_adapter(
+        orders=[_order(891, ProtoOAOrderType.LIMIT)]
+    )
+    adapter._ProtoOAOrderErrorEvent = None
+    adapter._ProtoOAExecutionEvent = None  # partial proto load: attr sniff
+    adapter._ProtoOAExecutionType = SimpleNamespace(
+        ORDER_REJECTED=7, ORDER_CANCEL_REJECTED=8, ORDER_FILLED=3
+    )
+    adapter.exec_event[891] = SimpleNamespace(
+        ctidTraderAccountId=46736452,
+        executionType=99,
+        errorCode="FUTURE_TYPE",
+        description="also carries a description",
+    )
+
+    sweep = adapter.cancel_open_orders()
+    with pytest.raises(RuntimeError, match="could not be classified"):
+        _run(sweep)
+
+
 def test_an_orphaned_protection_cancel_rejected_is_a_failure() -> None:
     """The same refusal check covers every `_cancel_order_id` caller."""
     from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOAOrderType

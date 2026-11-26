@@ -5631,6 +5631,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         elif (
             getattr(response, "errorCode", None) is not None
             and getattr(response, "description", None) is not None
+            and getattr(response, "executionType", None) is None
         ):
             # The error-event class is not loaded, so isinstance cannot
             # prove this is NOT a ProtoOAOrderErrorEvent - and a real one
