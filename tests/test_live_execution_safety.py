@@ -4213,10 +4213,9 @@ def test_ctrader_rejects_malformed_stop_alias(alias: str) -> None:
         metadata={"qty": 1.0, alias: "not-a-price", "take_profit": 1.2},
     )
 
+    volume = _submit_resolved_volume(adapter, signal)
     with pytest.raises(ValueError, match=f"Invalid {alias}"):
-        adapter._build_new_order_request(
-            signal, symbol_id=7, volume=_submit_resolved_volume(adapter, signal)
-        )
+        adapter._build_new_order_request(signal, symbol_id=7, volume=volume)
 
 
 def test_ctrader_relative_sl_tp_direction_and_rejections():
@@ -4274,28 +4273,32 @@ def test_ctrader_new_order_request_fails_closed_without_sl_tp():
         metadata={"qty": 1.0},
     )
 
+    volume = _submit_resolved_volume(adapter, signal)
     request = adapter._build_new_order_request
     with pytest.raises(ValueError, match="without stop_loss"):
-        request(signal, symbol_id=7, volume=_submit_resolved_volume(adapter, signal))
+        request(signal, symbol_id=7, volume=volume)
 
 
 def test_ctrader_build_new_order_request_rejects_unknown_signal_action():
     """The request-builder guard must hold even when submit_order is bypassed."""
     _module, adapter = _make_ctrader_request_builder_adapter()
     bad_signal = _live_signal_with_action("close")
+    volume = _submit_resolved_volume(adapter, bad_signal)
 
     with pytest.raises(ValueError, match=r"[Uu]nsupported .*action: close"):
-        adapter._build_new_order_request(
-            bad_signal, symbol_id=7, volume=_submit_resolved_volume(adapter, bad_signal)
-        )
+        adapter._build_new_order_request(bad_signal, symbol_id=7, volume=volume)
 
 
-@pytest.mark.parametrize("volume", [0, -1, False, float("nan")])
+@pytest.mark.parametrize(
+    "volume", [0, -1, False, float("nan"), 1.5, 1000.5, 0.5]
+)
 def test_ctrader_new_order_request_fails_closed_on_an_unusable_volume(volume) -> None:
     """The volume reaches this seam from the submit path, so it must be
-    validated here like the close request validates its own: a non-positive or
-    non-finite volume is a broker rejection at best and a wrong-size order at
-    worst, never something to put on the wire."""
+    validated here: a non-positive or non-finite volume is a broker rejection
+    at best and a wrong-size order at worst, and a fractional one is a unit
+    confusion (qty or a scaled value handed over as broker units) whose rounding
+    would put a size on the wire that nobody decided on. None of them may be
+    silently rounded into an order."""
     _module, adapter = _make_ctrader_request_builder_adapter()
     signal = LiveSignal(
         deployment_id="dep-1",
@@ -4833,9 +4836,10 @@ def test_ctrader_entry_guard_still_blocks_naked_non_exit_orders():
         metadata={"qty": 2.0},
     )
 
+    volume = _submit_resolved_volume(adapter, signal)
     builder = adapter._build_new_order_request
     with pytest.raises(ValueError, match="without stop_loss"):
-        builder(signal, symbol_id=7, volume=_submit_resolved_volume(adapter, signal))
+        builder(signal, symbol_id=7, volume=volume)
 
 
 def test_submit_order_with_risk_resolves_fallback_sl_tp_into_metadata():

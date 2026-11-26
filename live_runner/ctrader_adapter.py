@@ -3457,9 +3457,12 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                     signal.symbol, requested_position_id
                 )
                 close_position_id = position_id
-                # Records which broker position this close addresses. It
-                # changes nothing the volume resolution reads, so the volume
-                # resolved above stays the one to send.
+                # Records which broker position this close addresses. There is
+                # deliberately no re-resolution here: _resolve_order_volume reads
+                # neither position_id nor any other exit metadata, so this key
+                # cannot change the volume - the volume resolved above stays the
+                # one to send. If the resolver ever starts reading position or
+                # exit metadata, the re-resolution must come back with it.
                 signal = signal.model_copy(
                     update={
                         "metadata": {
@@ -3691,13 +3694,20 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         request.tradeSide = (
             self._ProtoOATradeSide.BUY if signal.action == "buy" else self._ProtoOATradeSide.SELL
         )
-        # The resolved volume is a whole number of broker units; validate it
-        # here like the close request does, so a caller that hands this seam a
-        # non-positive or non-integer volume fails closed instead of putting a
-        # broker-rejected request on the wire.
-        broker_volume = round(
-            coerce_positive_live_qty(volume, field_name="cTrader new-order volume")
+        # The volume no longer arrives validated from the resolver, so validate
+        # it here. A fractional value means the caller handed this seam qty or a
+        # scaled quantity instead of broker units: rounding it would put a size
+        # on the wire that nobody decided on, so refuse it. The protocol field
+        # is an int32 - a whole number of broker units is the only usable input.
+        volume_value = coerce_positive_live_qty(
+            volume, field_name="cTrader new-order volume"
         )
+        if not volume_value.is_integer():
+            raise ValueError(
+                "cTrader new-order volume must be a whole number of broker "
+                f"volume units, got {volume!r}; refusing to round a size."
+            )
+        broker_volume = int(volume_value)
         if broker_volume <= 0:
             raise ValueError("cTrader new-order volume must be a positive integer.")
         request.volume = broker_volume
