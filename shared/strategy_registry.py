@@ -66,8 +66,20 @@ class StrategyEntry:
 VECTORBT_ONLY_SIGNAL_KEYS = frozenset({"entry_stop"})
 
 #: Stop-level spellings that keep vectorbt from falling back to the ``atr*``
-#: implicit stop distance (``_resolve_stop_distance`` checks stop_loss first).
-_STOP_LEVEL_SIGNAL_KEYS = frozenset({"stop_loss", "sl_price"})
+#: implicit stop distance. Mirrors the ``stop_loss`` and ``sizing_stop``
+#: tuples of ``runner.engines.vectorbt_adapter._LEVEL_ALIASES`` — the adapter
+#: resolves sizing distance from ``sizing_stop or stop_loss`` before trying
+#: ``atr*`` (pinned by a test; ``take_profit`` is not a stop distance).
+#: ``stop_distance`` is deliberately absent: vectorbt does not read that key.
+_STOP_LEVEL_SIGNAL_KEYS = frozenset(
+    {
+        "stop_loss",
+        "sl_price",
+        "sizing_stop",
+        "sizing_sl_price",
+        "sizing_sl",
+    }
+)
 
 
 def _published_signal_keys(path: Path) -> frozenset[str]:
@@ -126,9 +138,10 @@ def atr_sizing_keys_without_stop(path: Path) -> frozenset[str]:
 
     Vectorbt uses any ``atr*`` column/indicator as an implicit stop distance —
     sizing risk AND placing a 1xATR stop — only when the strategy publishes no
-    ``stop_loss``/``sl_price``. Native never reads ``atr*`` series, so such a
-    strategy produces different sizing and stops per engine. Returns the
-    ``atr*`` keys found (empty when a stop key is present or none are emitted).
+    stop-level key (``stop_loss``/``sl_price`` or the ``sizing_stop`` family).
+    Native never reads ``atr*`` series, so such a strategy produces different
+    sizing and stops per engine. Returns the ``atr*`` keys found (empty when a
+    stop key is present or none are emitted).
     """
     published = _published_signal_keys(path)
     if published & _STOP_LEVEL_SIGNAL_KEYS:

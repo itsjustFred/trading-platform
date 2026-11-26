@@ -30,7 +30,7 @@ MAX_WORKERS = os.environ.get("MATRIX_MAX_WORKERS", "2")
 TIMEOUT_SECONDS = os.environ.get("MATRIX_TIMEOUT_SECONDS", "3600")
 # #318 / ADR 0001: the native engine is the single strategy engine; the
 # vectorbt adapter is frozen and queued only on explicit MATRIX_ENGINE opt-in.
-ENGINE = os.environ.get("MATRIX_ENGINE", "native")
+ENGINE = os.environ.get("MATRIX_ENGINE", "native").strip().lower()
 
 _LOCK_HANDLE = None
 

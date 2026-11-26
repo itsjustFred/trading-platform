@@ -304,7 +304,12 @@ def test_atr_sizing_keys_without_stop_respects_stop_keys(tmp_path: Path) -> None
 
     strategy_dir = tmp_path / "atr_with_stop"
     strategy_dir.mkdir()
-    for name, stop_key in (("with_stop_loss", "stop_loss"), ("with_sl_price", "sl_price")):
+    for name, stop_key in (
+        ("with_stop_loss", "stop_loss"),
+        ("with_sl_price", "sl_price"),
+        ("with_sizing_sl_price", "sizing_sl_price"),
+        ("with_sizing_sl", "sizing_sl"),
+    ):
         (strategy_dir / f"{name}.py").write_text(
             "def generate_signals(df, params):\n"
             f"    indicators = {{'atr': 1.0, '{stop_key}': 2.0}}\n"
@@ -329,6 +334,64 @@ def test_atr_sizing_keys_without_stop_real_registry() -> None:
     }
 
     assert hits == set()
+
+
+def test_stop_level_keys_match_vectorbt_level_aliases() -> None:
+    """``_STOP_LEVEL_SIGNAL_KEYS`` must cover every stop spelling vectorbt honours.
+
+    The adapter resolves sizing distance from ``sizing_stop``/``stop_loss``
+    (``_LEVEL_ALIASES``) before falling back to ``atr*`` — a missing sizing
+    spelling here would wrongly exclude a strategy that has a real stop.
+    """
+    from runner.engines.vectorbt_adapter import _LEVEL_ALIASES
+    from shared.strategy_registry import _STOP_LEVEL_SIGNAL_KEYS
+
+    expected = frozenset(
+        alias
+        for kind in ("stop_loss", "sizing_stop")
+        for alias in _LEVEL_ALIASES[kind]
+    )
+    assert _STOP_LEVEL_SIGNAL_KEYS == expected
+
+
+def test_vectorbt_only_keys_cover_execution_key_diff() -> None:
+    """Every vectorbt execution key native ignores must be registered or excused.
+
+    ``_EXECUTION_SIGNAL_KEYS`` (the adapter's ``require_explicit_roles``
+    allowlist) minus the keys the native engine reads must equal
+    ``VECTORBT_ONLY_SIGNAL_KEYS`` — adding a new vectorbt-only execution key
+    without registering it fails here. ``atr`` and ``exit_reason`` are the two
+    documented exceptions: ``atr*`` is handled conditionally by
+    ``atr_sizing_keys_without_stop`` (it only matters with no stop key), and
+    ``exit_reason`` is a label native replaces with its own reasons.
+    """
+    from runner.engines.vectorbt_adapter import _EXECUTION_SIGNAL_KEYS
+    from shared.strategy_registry import VECTORBT_ONLY_SIGNAL_KEYS
+
+    # Signal keys the native engine reads (pinned literal — the native-read
+    # set is not mechanically derivable): entries/exits frame columns,
+    # _extract_levels stop/tp spellings, _resolve_direction, row.get
+    # stop_distance, row.get exit_price/exit_order_type in trading_engine.py.
+    native_read_keys = frozenset(
+        {
+            "entries",
+            "exits",
+            "stop_loss",
+            "sl_price",
+            "take_profit",
+            "tp_price",
+            "direction",
+            "stop_distance",
+            "exit_price",
+            "exit_order_type",
+        }
+    )
+    conditional_or_label_keys = frozenset({"atr", "exit_reason"})
+
+    unhandled = (
+        _EXECUTION_SIGNAL_KEYS - native_read_keys - conditional_or_label_keys
+    )
+    assert unhandled == VECTORBT_ONLY_SIGNAL_KEYS
 
 
 def test_load_strategy_module_remains_explicit(tmp_path: Path) -> None:

@@ -47,6 +47,13 @@ def test_matrix_queue_runner_honors_engine_override(monkeypatch, tmp_path: Path)
     assert module.ENGINE == "vectorbt"
 
 
+def test_matrix_queue_runner_normalizes_engine_override(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("MATRIX_ENGINE", " VectorBt ")
+    module = _load_script("matrix_queue_runner.py")
+    monkeypatch.setattr(module, "MATRIX_DIR", tmp_path / "matrix")
+    assert module.ENGINE == "vectorbt"
+
+
 def test_native_engine_excludes_entry_stop_strategies(queue_runner) -> None:
     """us100_scalper emits ``entry_stop``; native cannot honour stop-entry fills."""
     excluded = queue_runner.engine_excluded_strategies()
