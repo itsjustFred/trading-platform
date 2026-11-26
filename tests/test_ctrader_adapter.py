@@ -1506,10 +1506,11 @@ def test_every_session_death_path_clears_rotation_state() -> None:
 
 
 def test_token_invalidation_self_heals_latched_flag_on_dead_session() -> None:
-    """``_own_token_rotation_in_flight`` only means something while a session
-    is connected. If a session-death path ever leaves it latched, the
-    invalidation handler must clear it (via
-    ``_self_heal_rotation_marker_on_dead_session``) instead of letting it
+    """``_own_token_rotation_in_flight`` and ``_session_access_token`` only
+    mean something while a session is connected. If a session-death path
+    ever leaves them behind, the invalidation handler must clear both (via
+    ``_self_heal_rotation_marker_on_dead_session``) instead of letting a
+    latched counter - or a stale session token matching the grace branch -
     suppress every later invalidation event forever. The skip-reason check
     itself stays pure: it reports the latched counter rather than clearing
     it."""
@@ -1522,8 +1523,29 @@ def test_token_invalidation_self_heals_latched_flag_on_dead_session() -> None:
 
     adapter._connected = False
     adapter._own_token_rotation_in_flight = 1
+    adapter._session_access_token = "token"
     adapter._self_heal_rotation_marker_on_dead_session()
     assert adapter._own_token_rotation_in_flight == 0
+    assert adapter._session_access_token == ""
+    assert adapter._token_invalidation_skip_reason() is None
+
+
+def test_token_invalidation_self_heals_stale_session_token_on_dead_session() -> None:
+    """A death path that clears the counter but leaves ``_session_access_token``
+    would still let the grace branch skip a genuine invalidation: the stale
+    token equals ``access_token`` and a recent ``_token_pair_rotated_at``
+    makes the event look like our own rotation echo. The self-heal drops the
+    stale token too, so the dead session is torn down."""
+    adapter = CTraderLiveAdapter(
+        app_id="app", app_secret="secret", access_token="token", account_id="1"
+    )
+    adapter._connected = False
+    adapter._session_access_token = "token"
+    adapter._token_pair_rotated_at = time.monotonic()
+    assert adapter._token_invalidation_skip_reason() is not None
+
+    adapter._self_heal_rotation_marker_on_dead_session()
+    assert adapter._session_access_token == ""
     assert adapter._token_invalidation_skip_reason() is None
 
 
@@ -1539,6 +1561,7 @@ def test_token_invalidation_self_heals_latched_flag_during_handling() -> None:
     adapter, client, ProtoMessage = _lifecycle_event_adapter()
     adapter._connected = False
     adapter._own_token_rotation_in_flight = 1
+    adapter._session_access_token = adapter.access_token
 
     adapter._on_message(
         client,
@@ -1552,6 +1575,7 @@ def test_token_invalidation_self_heals_latched_flag_during_handling() -> None:
 
     _assert_session_dropped_for_reconnect(adapter)
     assert adapter._own_token_rotation_in_flight == 0
+    assert adapter._session_access_token == ""
 
 
 def test_token_invalidation_own_rotation_grace_has_a_sane_floor() -> None:

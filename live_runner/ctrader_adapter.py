@@ -1808,17 +1808,22 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._own_token_rotation_in_flight = 0
 
     def _self_heal_rotation_marker_on_dead_session(self) -> None:
-        """Clear a latched ``_own_token_rotation_in_flight`` on a dead session.
+        """Clear stale session-rotation state on a dead session.
 
-        The counter only means something while a session is connected: no
-        live session can be mid-rotation, so a count still set here was left
-        behind by a session-death path and would make
-        ``_token_invalidation_skip_reason`` treat every later invalidation
-        event as our own rotation echo and never tear the session down.
-        Kept out of the skip-reason check itself so that check stays pure.
+        ``_session_access_token`` and ``_own_token_rotation_in_flight`` only
+        mean something while a session is connected: no live session can be
+        mid-rotation, and the recorded token describes a session that no
+        longer exists. A session-death path that forgets
+        ``_clear_session_rotation_state`` leaves both behind, which would
+        let ``_token_invalidation_skip_reason`` treat a genuine invalidation
+        as our own rotation echo (latched counter, or the grace branch on a
+        stale session token) and never tear the session down. Kept out of
+        the skip-reason check itself so that check stays pure.
         """
-        if self._own_token_rotation_in_flight and not self._connected:
-            self._own_token_rotation_in_flight = 0
+        if not self._connected and (
+            self._own_token_rotation_in_flight or self._session_access_token
+        ):
+            self._clear_session_rotation_state()
 
     def _adopt_persisted_token_pair(self) -> bool:
         """Adopt the token pair persisted in the accounts env file when it differs.
