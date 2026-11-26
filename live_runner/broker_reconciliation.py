@@ -573,10 +573,16 @@ def _instrument_qty_step(adapter: BaseLiveAdapter, symbol: str) -> float | None:
         return None
     try:
         step = float(method(symbol))
-    except Exception:
+    except Exception as exc:
         # One misbehaving adapter/symbol must not abort the whole account
         # pass: an unusable step keeps the expectation (fail closed).
         # (asyncio.CancelledError is BaseException and still propagates.)
+        logger.debug(
+            "broker reconciliation: unusable qty step for %s on %s: %r",
+            symbol,
+            type(adapter).__name__,
+            exc,
+        )
         return None
     return step if math.isfinite(step) and step > 0 else None
 
@@ -584,8 +590,8 @@ def _instrument_qty_step(adapter: BaseLiveAdapter, symbol: str) -> float | None:
 def _order_expectations(
     rows: Iterable[Mapping[str, Any]],
     tolerance_for: Callable[[str], float],
-    step_for: Callable[[str], float | None],
     *,
+    step_for: Callable[[str], float | None],
     expected_deployment_ids: set[str],
     now: datetime,
 ) -> tuple[list[dict[str, Any]], list[str]]:
@@ -705,7 +711,7 @@ def compare_account_state(
     expected_orders, tracked_ids = _order_expectations(
         order_rows,
         tolerance_for,
-        step_for,
+        step_for=step_for,
         expected_deployment_ids={str(deployment.id) for deployment in deployments},
         now=_utcnow(),
     )

@@ -3316,14 +3316,14 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             # Only the lot-grid noise band (<= 1e-6 of a step, see
             # floor_qty_to_step/_qty_to_broker_volume) may push the normalized
             # qty an ulp above the binding qty; anything more means volume
-            # resolution rounded up. Compare in absolute qty units scaled to
-            # the grid step - a relative tolerance would hide a small
-            # overshoot on a large qty.
+            # resolution rounded up. The allowance is absolute qty units
+            # scaled to the grid step - a relative tolerance would hide a
+            # small overshoot on a large qty.
             step_qty = float(max(int(scale.step_volume), 1)) / float(
                 scale.volume_per_qty
             )
             if submitted_qty > qty_value and not math.isclose(
-                submitted_qty, qty_value, rel_tol=0.0, abs_tol=1e-5 * step_qty
+                submitted_qty, qty_value, rel_tol=0.0, abs_tol=2e-6 * step_qty
             ):
                 # Volume resolution floors, so this can only happen if a
                 # future change rounds up: persisting an oversized qty would
@@ -3352,6 +3352,18 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                     }
                 }
             )
+            # The request builders below re-resolve the volume from this
+            # normalized signal; it must reproduce the volume resolved from
+            # the binding qty, or the wire request and the persisted qty
+            # would diverge.
+            if self._resolve_order_volume(signal) != order_volume:
+                raise RuntimeError(
+                    "cTrader volume resolution is not idempotent under qty "
+                    f"normalization for {signal.symbol}: resolved "
+                    f"{order_volume} from the binding qty but "
+                    f"{self._resolve_order_volume(signal)} from the "
+                    "normalized qty; refusing to submit."
+                )
             persisted_timestamp = await asyncio.to_thread(
                 get_live_signal_timestamp, signal_id
             )
