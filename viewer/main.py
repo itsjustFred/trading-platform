@@ -1805,6 +1805,19 @@ def _is_static_asset_request(path: str) -> bool:
     return Path(path).suffix.lower() in _STATIC_ASSET_SUFFIXES
 
 
+def _static_asset_path(rel_path: str) -> Path | None:
+    """The static file ``rel_path`` names, or None when it is missing or escapes.
+
+    Containment is :func:`shared.paths.safe_join`'s decision; ``None`` keeps the
+    middleware's two answers (serve the file, or fall through) in one branch.
+    """
+    try:
+        candidate = safe_join(STATIC_DIR, rel_path)
+    except PathContainmentError:
+        return None
+    return candidate if candidate.is_file() else None
+
+
 @app.middleware("http")
 async def static_spa_middleware(request: Request, call_next):
     path = request.url.path
@@ -1817,11 +1830,8 @@ async def static_spa_middleware(request: Request, call_next):
     ):
         rel_path = path.strip("/")
         if rel_path:
-            try:
-                candidate = safe_join(STATIC_DIR, rel_path)
-            except PathContainmentError:
-                candidate = None
-            if candidate is not None and candidate.is_file():
+            candidate = _static_asset_path(rel_path)
+            if candidate is not None:
                 return FileResponse(candidate)
             if _is_static_asset_request(rel_path):
                 # Missing static asset must not fall back to index.html,

@@ -69,21 +69,12 @@ def _refuse_symlinked_components(base: Path, candidate: Path) -> None:
             )
 
 
-def safe_join(
-    base: str | os.PathLike[str],
-    user_path: str | os.PathLike[str],
-    *,
-    allow_absolute: bool = False,
-    allow_base: bool = False,
-    refuse_symlinks: bool = False,
-) -> Path:
-    """Resolve ``user_path`` beneath ``base``, refusing anything that leaves it.
+def _validated_user_path(user_path: str | os.PathLike[str], *, allow_absolute: bool) -> Path:
+    """Return ``user_path`` as a ``Path`` after the lexical checks.
 
-    ``base`` is resolved once, so a symlinked or relative base compares
-    correctly against the resolved candidate. The returned path is absolute,
-    symlink-free in its final form (``resolve()`` followed it), and the same
-    path the containment check approved -- callers must use it rather than
-    joining again.
+    Everything here is decided from the written form, before the filesystem is
+    consulted: text (not bytes), no NUL byte, not blank, absolute only when the
+    caller asked for it, and no ``..`` segment.
     """
     if user_path is None or isinstance(user_path, bytes):
         raise PathContainmentError(f"path must be text, not {type(user_path).__name__}")
@@ -104,7 +95,41 @@ def safe_join(
         raise PathContainmentError(f"refusing an absolute path: {raw!r}")
     if ".." in candidate.parts:
         raise PathContainmentError(f"refusing a path containing '..': {raw!r}")
+    return candidate
 
+
+def _resolved_candidate(resolved_base: Path, candidate: Path) -> Path:
+    """Resolve ``candidate`` (joined onto ``resolved_base`` when relative).
+
+    A symlink loop or an unreadable component is a refusal, not a crash: the
+    caller asked about a path this process cannot name.
+    """
+    joined = candidate if candidate.is_absolute() else resolved_base / candidate
+    try:
+        return joined.resolve()
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise PathContainmentError(
+            f"refusing a path that cannot be resolved: {candidate!s}"
+        ) from exc
+
+
+def safe_join(
+    base: str | os.PathLike[str],
+    user_path: str | os.PathLike[str],
+    *,
+    allow_absolute: bool = False,
+    allow_base: bool = False,
+    refuse_symlinks: bool = False,
+) -> Path:
+    """Resolve ``user_path`` beneath ``base``, refusing anything that leaves it.
+
+    ``base`` is resolved once, so a symlinked or relative base compares
+    correctly against the resolved candidate. The returned path is absolute,
+    symlink-free in its final form (``resolve()`` followed it), and the same
+    path the containment check approved -- callers must use it rather than
+    joining again.
+    """
+    candidate = _validated_user_path(user_path, allow_absolute=allow_absolute)
     resolved_base = Path(base).resolve()
     if refuse_symlinks:
         # Only components *below* the resolved base are refused. The base
@@ -118,17 +143,12 @@ def safe_join(
         if candidate.is_absolute():
             walk = candidate.relative_to(candidate.anchor)
         _refuse_symlinked_components(resolved_base, walk)
-    joined = candidate if candidate.is_absolute() else resolved_base / candidate
-    try:
-        resolved = joined.resolve()
-    except (OSError, RuntimeError, ValueError) as exc:
-        raise PathContainmentError(f"refusing a path that cannot be resolved: {raw!r}") from exc
 
-    if resolved == resolved_base:
-        if not allow_base:
-            raise PathContainmentError(f"refusing the base directory itself: {raw!r}")
-    elif not resolved.is_relative_to(resolved_base):
+    resolved = _resolved_candidate(resolved_base, candidate)
+    if resolved == resolved_base and not allow_base:
+        raise PathContainmentError(f"refusing the base directory itself: {user_path!r}")
+    if not resolved.is_relative_to(resolved_base):
         raise PathContainmentError(
-            f"refusing a path outside {resolved_base}: {raw!r} resolves to {resolved}"
+            f"refusing a path outside {resolved_base}: {user_path!r} resolves to {resolved}"
         )
     return resolved
