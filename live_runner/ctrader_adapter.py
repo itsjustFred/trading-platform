@@ -3354,15 +3354,20 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 str((signal.metadata or {}).get("risk_sizing_mode") or "")
                 == EXIT_ONLY_RISK_SIZING_MODE
             )
+            # Resolve the broker volume ONCE, here, from the binding qty, and
+            # hand this value to the request builders below. They must not
+            # resolve again: submit_order awaits several times after this
+            # point, and a resolution that reads the scale fresh could size
+            # the wire request off a scale that moved in the meantime - a
+            # volume the persisted qty below no longer describes.
             order_volume = self._resolve_order_volume(signal)
             # Persist the quantity the broker is actually asked for, not the
             # unrounded risk-sized one: the volume grid floor can drop a
             # sub-step remainder the broker can never work, and a persisted
             # requested qty larger than the fill reads as a working-order
-            # expectation forever in broker reconciliation. Recomputing the
-            # volume from the normalized qty is idempotent (the lot-grid
-            # floor's noise band absorbs the float round-trip), so the request
-            # builders below still derive the same volume.
+            # expectation forever in broker reconciliation. Normalizing from
+            # the volume resolved above keeps the persisted qty and the wire
+            # request on one number.
             scale = self._scale_for(signal.symbol)
             submitted_qty = _broker_volume_to_qty(order_volume, scale.volume_per_qty)
             # Only the lot-grid noise band (<= 1e-6 of a step, see
@@ -3409,13 +3414,15 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                     }
                 }
             )
-            # The request builders below re-resolve the volume from this
-            # normalized signal; it must reproduce the volume resolved from
-            # the binding qty, or the wire request and the persisted qty
-            # would diverge. The float round-trip (volume -> qty -> volume)
-            # stays far inside the lot-grid floor's 1e-6-unit noise band for
-            # every volume a broker int32 can express (~5e-7 units at
-            # INT32_MAX), so an exact int compare cannot false-positive.
+            # The ONE deliberate re-resolution: the signal's input CHANGED
+            # since the call above - its qty is now the volume-grid quantity
+            # the broker can work, not the binding qty - so resolving again is
+            # not a duplicate, it is the guard that the persisted quantity
+            # still resolves to the volume we are about to send. The float
+            # round-trip (volume -> qty -> volume) stays far inside the
+            # lot-grid floor's 1e-6-unit noise band for every volume a broker
+            # int32 can express (~5e-7 units at INT32_MAX), so an exact int
+            # compare cannot false-positive.
             reresolved_volume = self._resolve_order_volume(signal)
             if reresolved_volume != order_volume:
                 raise RuntimeError(
@@ -3450,6 +3457,9 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                     signal.symbol, requested_position_id
                 )
                 close_position_id = position_id
+                # Records which broker position this close addresses. It
+                # changes nothing the volume resolution reads, so the volume
+                # resolved above stays the one to send.
                 signal = signal.model_copy(
                     update={
                         "metadata": {
@@ -3458,7 +3468,6 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                         }
                     }
                 )
-                self._resolve_order_volume(signal)
 
             # Build the broker request BEFORE persisting: a refusal here
             # (unknown symbol, missing SL/TP) must not leave a live_signals
@@ -3470,10 +3479,12 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                     raise RuntimeError("cTrader exit-only position id was not resolved.")
                 request = self._build_close_position_request(
                     position_id=position_id,
-                    volume=self._resolve_order_volume(signal),
+                    volume=order_volume,
                 )
             else:
-                request = self._build_new_order_request(signal, symbol_id=symbol_id)
+                request = self._build_new_order_request(
+                    signal, symbol_id=symbol_id, volume=order_volume
+                )
 
             canonical_signal_id, created = await asyncio.to_thread(
                 save_live_signal, signal
@@ -3651,7 +3662,16 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         request.volume = broker_volume
         return request
 
-    def _build_new_order_request(self, signal: LiveSignal, *, symbol_id: int) -> Any:
+    def _build_new_order_request(
+        self, signal: LiveSignal, *, symbol_id: int, volume: int
+    ) -> Any:
+        """Build the entry request for an already-resolved broker *volume*.
+
+        ``submit_order`` resolves the volume exactly once (from the binding
+        qty, then guards the normalized one) and passes it in: the request must
+        carry that volume, not a fresh resolution against a scale that may have
+        moved across the submit's awaits.
+        """
         if signal.action not in {"buy", "sell"}:
             raise ValueError(f"Unsupported signal action: {signal.action}")
         metadata = signal.metadata or {}
@@ -3666,7 +3686,16 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         request.tradeSide = (
             self._ProtoOATradeSide.BUY if signal.action == "buy" else self._ProtoOATradeSide.SELL
         )
-        request.volume = self._resolve_order_volume(signal)
+        # The resolved volume is a whole number of broker units; validate it
+        # here like the close request does, so a caller that hands this seam a
+        # non-positive or non-integer volume fails closed instead of putting a
+        # broker-rejected request on the wire.
+        broker_volume = round(
+            coerce_positive_live_qty(volume, field_name="cTrader new-order volume")
+        )
+        if broker_volume <= 0:
+            raise ValueError("cTrader new-order volume must be a positive integer.")
+        request.volume = broker_volume
         request.timeInForce = self._ProtoOATimeInForce.IMMEDIATE_OR_CANCEL
         request.clientOrderId = str(signal.id)
         stop_loss = _first_metadata_float(

@@ -1716,7 +1716,9 @@ def test_ctrader_direct_persistence_strips_raw_broker_volume_keys(monkeypatch):
     # The request build now runs before persistence; this test is about the
     # persisted metadata, not the wire request.
     monkeypatch.setattr(
-        adapter, "_build_new_order_request", lambda _signal, *, symbol_id: object()
+        adapter,
+        "_build_new_order_request",
+        lambda _signal, *, symbol_id, volume: object(),
     )
 
     with pytest.raises(_PersistenceCaptured):
@@ -3503,7 +3505,9 @@ def test_ctrader_discord_redelivery_uses_canonical_signal_without_resubmitting(m
     # The request build runs before the dedupe save; this test is about the
     # canonical-id recovery, not the wire request.
     monkeypatch.setattr(
-        adapter, "_build_new_order_request", lambda _signal, *, symbol_id: object()
+        adapter,
+        "_build_new_order_request",
+        lambda _signal, *, symbol_id, volume: object(),
     )
 
     async def _unexpected_send(*_args, **_kwargs):
@@ -4079,6 +4083,16 @@ def _make_ctrader_request_builder_adapter():
     return module, adapter
 
 
+def _submit_resolved_volume(adapter, signal: LiveSignal) -> int:
+    """The broker volume ``submit_order`` resolves once and passes down.
+
+    ``_build_new_order_request`` receives that volume instead of resolving it
+    again, so a direct caller hands it the same value the submit path would -
+    which keeps these tests honest about the volume the request carries.
+    """
+    return adapter._resolve_order_volume(signal)
+
+
 def test_alpaca_rejects_unknown_signal_action_instead_of_selling():
     from live_runner import alpaca_adapter as module
 
@@ -4173,7 +4187,9 @@ def test_ctrader_new_order_request_carries_sl_tp_prices():
         metadata={"qty": 1.0, "stop_loss": 1.05, "take_profit": 1.2},
     )
 
-    request = adapter._build_new_order_request(signal, symbol_id=7)
+    request = adapter._build_new_order_request(
+        signal, symbol_id=7, volume=_submit_resolved_volume(adapter, signal)
+    )
 
     assert request.symbolId == 7
     # MARKET orders ignore the absolute stopLoss/takeProfit fields; the
@@ -4198,7 +4214,9 @@ def test_ctrader_rejects_malformed_stop_alias(alias: str) -> None:
     )
 
     with pytest.raises(ValueError, match=f"Invalid {alias}"):
-        adapter._build_new_order_request(signal, symbol_id=7)
+        adapter._build_new_order_request(
+            signal, symbol_id=7, volume=_submit_resolved_volume(adapter, signal)
+        )
 
 
 def test_ctrader_relative_sl_tp_direction_and_rejections():
@@ -4217,27 +4235,31 @@ def test_ctrader_relative_sl_tp_direction_and_rejections():
             metadata={"qty": 1.0, "stop_loss": stop_loss, "take_profit": take_profit},
         )
 
-    buy_request = adapter._build_new_order_request(_signal("buy", 1.05, 1.2), symbol_id=7)
+    buy_request = adapter._build_new_order_request(
+        _signal("buy", 1.05, 1.2), symbol_id=7, volume=1000
+    )
     assert buy_request.relativeStopLoss == round(0.05 * 100_000)
     assert buy_request.relativeTakeProfit == round(0.1 * 100_000)
 
-    sell_request = adapter._build_new_order_request(_signal("sell", 1.2, 1.0), symbol_id=7)
+    sell_request = adapter._build_new_order_request(
+        _signal("sell", 1.2, 1.0), symbol_id=7, volume=1000
+    )
     assert sell_request.relativeStopLoss == round(0.1 * 100_000)
     assert sell_request.relativeTakeProfit == round(0.1 * 100_000)
 
     wrong_side = adapter._build_new_order_request
     wrong_side_signal = _signal("buy", 1.2, 1.05)
     with pytest.raises(ValueError, match="wrong side of the reference price"):
-        wrong_side(wrong_side_signal, symbol_id=7)
+        wrong_side(wrong_side_signal, symbol_id=7, volume=1000)
     nan_signal = _signal("buy", float("nan"), 1.2)
     with pytest.raises(ValueError, match="Invalid SL price"):
-        wrong_side(nan_signal, symbol_id=7)
+        wrong_side(nan_signal, symbol_id=7, volume=1000)
     zero_distance_signal = _signal("buy", 1.1, 1.2)
     with pytest.raises(ValueError, match="wrong side of the reference price"):
-        wrong_side(zero_distance_signal, symbol_id=7)
+        wrong_side(zero_distance_signal, symbol_id=7, volume=1000)
     sub_unit_signal = _signal("buy", 1.099995, 1.2)
     with pytest.raises(ValueError, match="below one 1/100000 price unit"):
-        wrong_side(sub_unit_signal, symbol_id=7)
+        wrong_side(sub_unit_signal, symbol_id=7, volume=1000)
 
 
 def test_ctrader_new_order_request_fails_closed_without_sl_tp():
@@ -4254,7 +4276,7 @@ def test_ctrader_new_order_request_fails_closed_without_sl_tp():
 
     request = adapter._build_new_order_request
     with pytest.raises(ValueError, match="without stop_loss"):
-        request(signal, symbol_id=7)
+        request(signal, symbol_id=7, volume=_submit_resolved_volume(adapter, signal))
 
 
 def test_ctrader_build_new_order_request_rejects_unknown_signal_action():
@@ -4263,7 +4285,9 @@ def test_ctrader_build_new_order_request_rejects_unknown_signal_action():
     bad_signal = _live_signal_with_action("close")
 
     with pytest.raises(ValueError, match=r"[Uu]nsupported .*action: close"):
-        adapter._build_new_order_request(bad_signal, symbol_id=7)
+        adapter._build_new_order_request(
+            bad_signal, symbol_id=7, volume=_submit_resolved_volume(adapter, bad_signal)
+        )
 
 
 def test_alpaca_rejects_non_finite_sl_tp_prices():
@@ -4653,7 +4677,9 @@ def test_ctrader_exit_only_uses_position_addressed_close():
         metadata={"ctrader_volume": 3000, "risk_sizing_mode": "exit_only"},
     )
     with pytest.raises(ValueError, match="position-addressed"):
-        adapter._build_new_order_request(signal, symbol_id=7)
+        # The raw-volume override key makes this signal unresolvable by
+        # design; the exit-only guard must refuse it before any volume is used.
+        adapter._build_new_order_request(signal, symbol_id=7, volume=3000)
 
 
 def test_ctrader_submit_exit_only_uses_broker_position_request(monkeypatch) -> None:
@@ -4789,7 +4815,7 @@ def test_ctrader_entry_guard_still_blocks_naked_non_exit_orders():
 
     builder = adapter._build_new_order_request
     with pytest.raises(ValueError, match="without stop_loss"):
-        builder(signal, symbol_id=7)
+        builder(signal, symbol_id=7, volume=_submit_resolved_volume(adapter, signal))
 
 
 def test_submit_order_with_risk_resolves_fallback_sl_tp_into_metadata():
@@ -5009,7 +5035,9 @@ def test_ctrader_jpy_relative_sl_tp_uses_fixed_protocol_divisor() -> None:
         metadata={"qty": 1.0, "stop_loss": 149.95, "take_profit": 150.10},
     )
     adapter._symbol_name_to_id = {"USDJPY": 9}
-    request = adapter._build_new_order_request(signal, symbol_id=9)
+    request = adapter._build_new_order_request(
+        signal, symbol_id=9, volume=_submit_resolved_volume(adapter, signal)
+    )
     assert request.relativeStopLoss == 5000
     assert request.relativeTakeProfit == 10000
 
@@ -5039,7 +5067,9 @@ def test_ctrader_relative_sl_tp_snaps_to_symbol_price_grid(digits: int, grid: in
         # 9.62751 below / 9.62749 above: both off-grid below 5 digits.
         metadata={"qty": 1.0, "stop_loss": 1925.50 - 9.62751, "take_profit": 1925.50 + 9.62749},
     )
-    request = adapter._build_new_order_request(signal, symbol_id=9)
+    request = adapter._build_new_order_request(
+        signal, symbol_id=9, volume=_submit_resolved_volume(adapter, signal)
+    )
     assert request.relativeStopLoss % grid == 0
     assert request.relativeTakeProfit % grid == 0
     # Snapping floors toward the entry: never beyond the requested distance, and by
@@ -5076,7 +5106,7 @@ def test_ctrader_sub_tick_take_profit_is_sent_as_one_tick_never_zero() -> None:
     module, adapter = _make_ctrader_request_builder_adapter()
     _seed_digits(module, adapter, 2)
     request = adapter._build_new_order_request(
-        _ethusd_signal(1925.50 - 5.0, 1925.504), symbol_id=9
+        _ethusd_signal(1925.50 - 5.0, 1925.504), symbol_id=9, volume=1
     )
     assert request.relativeTakeProfit == 1000
 
@@ -5087,9 +5117,13 @@ def test_ctrader_sub_tick_stop_loss_is_refused_not_widened() -> None:
     module, adapter = _make_ctrader_request_builder_adapter()
     _seed_digits(module, adapter, 2)
     with pytest.raises(ValueError, match=r"SL distance .* below one tick"):
-        adapter._build_new_order_request(_ethusd_signal(1925.496, 1925.50 + 5.0), symbol_id=9)
+        adapter._build_new_order_request(
+            _ethusd_signal(1925.496, 1925.50 + 5.0), symbol_id=9, volume=1
+        )
     # Exactly one tick is accepted.
-    request = adapter._build_new_order_request(_ethusd_signal(1925.49, 1925.60), symbol_id=9)
+    request = adapter._build_new_order_request(
+        _ethusd_signal(1925.49, 1925.60), symbol_id=9, volume=1
+    )
     assert request.relativeStopLoss == 1000
 
 
@@ -5098,15 +5132,19 @@ def test_ctrader_sub_tick_stop_loss_is_refused_for_each_sub_tick_price(stop: flo
     module, adapter = _make_ctrader_request_builder_adapter()
     _seed_digits(module, adapter, 2)
     with pytest.raises(ValueError, match="below one tick"):
-        adapter._build_new_order_request(_ethusd_signal(stop, 1925.50 + 5.0), symbol_id=9)
+        adapter._build_new_order_request(
+            _ethusd_signal(stop, 1925.50 + 5.0), symbol_id=9, volume=1
+        )
 
 
 def test_ctrader_sub_tick_stop_loss_is_refused_on_stop_only_order() -> None:
     module, adapter = _make_ctrader_request_builder_adapter()
     _seed_digits(module, adapter, 2)
     with pytest.raises(ValueError, match=r"SL distance .* below one tick"):
-        adapter._build_new_order_request(_ethusd_signal(1925.50 - 0.004, None), symbol_id=9)
-    request = adapter._build_new_order_request(_ethusd_signal(1925.49, None), symbol_id=9)
+        adapter._build_new_order_request(
+            _ethusd_signal(1925.50 - 0.004, None), symbol_id=9, volume=1
+        )
+    request = adapter._build_new_order_request(_ethusd_signal(1925.49, None), symbol_id=9, volume=1)
     assert request.relativeStopLoss == 1000
     # "No take profit" is an ABSENT field, never a present zero: the broker
     # rejects a present relativeTakeProfit <= 0 ("SL/TP have to be positive").
@@ -5129,7 +5167,9 @@ def test_ctrader_relative_distances_floor_toward_entry(
     module, adapter = _make_ctrader_request_builder_adapter()
     _seed_digits(module, adapter, 2)
     request = adapter._build_new_order_request(
-        _ethusd_signal(1925.50 - 0.01 * stop_ticks, 1925.50 + 0.01 * take_ticks), symbol_id=9
+        _ethusd_signal(1925.50 - 0.01 * stop_ticks, 1925.50 + 0.01 * take_ticks),
+        symbol_id=9,
+        volume=1,
     )
     assert request.relativeStopLoss == expected_stop
     assert request.relativeTakeProfit == expected_take
@@ -5139,7 +5179,9 @@ def test_ctrader_relative_distance_error_names_the_leg() -> None:
     module, adapter = _make_ctrader_request_builder_adapter()
     _seed_digits(module, adapter, 2)
     with pytest.raises(ValueError, match="TP price"):
-        adapter._build_new_order_request(_ethusd_signal(1925.50 - 5.0, float("nan")), symbol_id=9)
+        adapter._build_new_order_request(
+            _ethusd_signal(1925.50 - 5.0, float("nan")), symbol_id=9, volume=1
+        )
 
 
 @pytest.mark.parametrize(("scale", "exp"), [(100_000, 5), (10, 1), (1, 0)])
@@ -5163,7 +5205,7 @@ def test_ctrader_relative_sl_tp_handles_price_digits_above_five(digits: int) -> 
     module, adapter = _make_ctrader_request_builder_adapter()
     _seed_digits(module, adapter, digits)
     request = adapter._build_new_order_request(
-        _ethusd_signal(1925.50 - 9.62751, 1925.50 + 9.62749), symbol_id=9
+        _ethusd_signal(1925.50 - 9.62751, 1925.50 + 9.62749), symbol_id=9, volume=1
     )
     assert isinstance(request.relativeStopLoss, int)
     assert isinstance(request.relativeTakeProfit, int)
@@ -5299,7 +5341,9 @@ def test_unbounded_tp_policy_builds_stop_only_requests() -> None:
             "take_profit_policy": "unbounded_exit_on_opposite_signal",
         },
     )
-    request = cadapter._build_new_order_request(csignal, symbol_id=7)
+    request = cadapter._build_new_order_request(
+        csignal, symbol_id=7, volume=_submit_resolved_volume(cadapter, csignal)
+    )
     assert request.relativeStopLoss == 5000
     # Absent, not zero: a present relativeTakeProfit of 0 is a broker rejection.
     assert not request.HasField("relativeTakeProfit")
@@ -5337,7 +5381,9 @@ def test_ctrader_unbounded_tp_leaves_relative_take_profit_unset_on_the_wire() ->
             "take_profit_policy": "unbounded_exit_on_opposite_signal",
         },
     )
-    request = adapter._build_new_order_request(unbounded, symbol_id=7)
+    request = adapter._build_new_order_request(
+        unbounded, symbol_id=7, volume=_submit_resolved_volume(adapter, unbounded)
+    )
     assert request.HasField("relativeStopLoss")
     assert request.relativeStopLoss == 5000
     assert not request.HasField("relativeTakeProfit")
@@ -5350,7 +5396,9 @@ def test_ctrader_unbounded_tp_leaves_relative_take_profit_unset_on_the_wire() ->
         timestamp=datetime.now(timezone.utc),
         metadata={"qty": 1.0, "stop_loss": 1.05, "take_profit": 1.2},
     )
-    bounded_request = adapter._build_new_order_request(bounded, symbol_id=7)
+    bounded_request = adapter._build_new_order_request(
+        bounded, symbol_id=7, volume=_submit_resolved_volume(adapter, bounded)
+    )
     assert bounded_request.HasField("relativeTakeProfit")
     assert bounded_request.relativeTakeProfit == 10_000
 
@@ -6006,7 +6054,7 @@ def test_ctrader_broker_write_failure_is_not_marked_as_not_submitted(
     monkeypatch.setattr(adapter, "_validate_pre_persistence", lambda _signal: None)
     monkeypatch.setattr(adapter, "_resolve_order_volume", lambda _signal: 1.0)
     monkeypatch.setattr(
-        adapter, "_build_new_order_request", lambda signal, *, symbol_id: object()
+        adapter, "_build_new_order_request", lambda signal, *, symbol_id, volume: object()
     )
 
     async def _resolve_symbol_id(_symbol: str) -> int:
@@ -6187,7 +6235,13 @@ def test_ctrader_new_order_request_volume_is_on_broker_step() -> None:
         metadata={"qty": 1.4, "stop_loss": 1.10304, "take_profit": 1.10904},
     )
 
-    request = adapter._build_new_order_request(signal, symbol_id=1)
+    # The submit path resolves the volume once (1.4 qty floored onto the
+    # 100_000-unit broker grid) and hands that value to the request builder,
+    # which must put exactly it on the wire.
+    resolved_volume = _submit_resolved_volume(adapter, signal)
+    assert resolved_volume == 100_000
+
+    request = adapter._build_new_order_request(signal, symbol_id=1, volume=resolved_volume)
 
     assert request.volume == 100_000
 
