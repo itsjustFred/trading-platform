@@ -594,10 +594,9 @@ def test_without_installed_reactor_clears_every_platform_reactor_module():
 
     Twisted installs `epollreactor` on Linux, `pollreactor` on other POSIX and
     `selectreactor` on Windows and macOS, so hard-coding one name leaves the
-    platform reactor module behind on every other OS (AGENTS.md: portable across
-    Linux, Windows and macOS). Module entries that were already there before the
-    import, and `asyncioreactor` (whose import installs nothing and which the
-    adapter installs itself), must survive.
+    platform reactor module behind on every other OS. Module entries that were
+    already there before the import, and `asyncioreactor` (whose import installs
+    nothing and which the adapter installs itself), must survive.
     """
     result = _run_discovery_subprocess(
         """
