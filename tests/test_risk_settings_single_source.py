@@ -15,15 +15,20 @@ pinned at its call site first.
 
 from __future__ import annotations
 
+from dataclasses import fields
+
 import pandas as pd
 import pytest
 
 from live_runner.daemon import _risk_config_for_deployment
 from risk.config import RiskConfig
 from risk.engine import RiskEngine
-from risk.models import TradeSignal
+from risk.models import SizedOrder, TradeSignal
 from runner.engine_pkg.orders import Order, OrderType
-from runner.engine_pkg.trading_engine import TradeEngine
+from runner.engine_pkg.trading_engine import (
+    BACKTEST_MAX_NOTIONAL_PER_TRADE,
+    TradeEngine,
+)
 from runner.engines.base import BacktestConfig
 from shared.models import LiveDeploymentConfig
 
@@ -109,6 +114,26 @@ def test_from_settings_defaults_are_the_dataclass_fields() -> None:
     assert RiskConfig.from_settings(None) == RiskConfig()
 
 
+def test_from_settings_maps_every_dataclass_field() -> None:
+    """A new RiskConfig field must be wired into the mapping.
+
+    ``from_settings`` spells its keywords out by hand; a field added to the
+    dataclass without a line there would silently ignore a deployment setting
+    for it. Iterate the fields and check each override is honoured.
+    """
+    defaults = RiskConfig()
+    for field_info in fields(RiskConfig):
+        default = getattr(defaults, field_info.name)
+        if isinstance(default, bool):
+            override: object = not default
+        elif isinstance(default, int):
+            override = default + 1
+        else:
+            override = default * 2
+        config = RiskConfig.from_settings({field_info.name: override})
+        assert getattr(config, field_info.name) == override, field_info.name
+
+
 def test_risk_per_trade_pct_is_the_documented_alias() -> None:
     config = _risk_config_for_deployment(_deployment(risk_per_trade_pct=0.005))
     assert config.max_risk_per_trade == pytest.approx(0.005)
@@ -189,8 +214,9 @@ def test_boolean_flags_accept_the_config_spellings() -> None:
 def test_invalid_values_keep_their_exact_error(
     settings: dict[str, object], message: str
 ) -> None:
+    deployment = _deployment(**settings)
     with pytest.raises(ValueError) as excinfo:
-        _risk_config_for_deployment(_deployment(**settings))
+        _risk_config_for_deployment(deployment)
     assert str(excinfo.value) == message
 
 
@@ -342,6 +368,31 @@ def test_native_engine_pending_order_exposure_fallback_stop(
     )
 
 
+def test_native_engine_pending_order_exposure_uses_the_order_trigger() -> None:
+    """The pending-order estimate is |reference - trigger|, not a stop.
+
+    Only a trigger sitting exactly at the reference price falls back to the
+    percent distance (pinned above); a trigger away from it must use its own
+    distance. Improvement-run G03 deliberately keeps this exposure estimate
+    separate from ``RiskEngine.fallback_stop``.
+    """
+    engine = _engine()
+    engine.pending_orders.append(
+        Order(
+            symbol="T",
+            direction="LONG",
+            order_type=OrderType.LIMIT,
+            created_index=0,
+            created_time="2024-01-01T00:00:00Z",
+            quantity=2.0,
+            limit_price=99.0,
+        )
+    )
+
+    # |100 - 99| * 2 units * pip 1.0 / 100_000 sizing equity.
+    assert engine._current_risk_exposure(100.0) == pytest.approx(2.0 / 100_000.0)
+
+
 def _gap_frame(fill_open: float) -> pd.DataFrame:
     """Signal bar closes at 100, the next bar opens at ``fill_open``."""
     return pd.DataFrame(
@@ -451,6 +502,66 @@ def test_sizing_returns_the_resolved_stop_without_hidden_channels() -> None:
     assert "_risk_legacy_signal_id" not in signal.metadata
 
 
+def test_sizing_refuses_a_non_finite_fallback_distance() -> None:
+    """The sizing path still refuses an unusable fallback distance.
+
+    ``default_sl_atr_multiplier`` has no upper bound, so a huge multiplier and
+    a huge finite ATR overflow the distance to ``inf``; sizing must raise
+    rather than produce an invalid stop price.
+    """
+    engine = RiskEngine(RiskConfig(default_sl_atr_multiplier=1e308))
+    signal = TradeSignal(
+        action="buy",
+        symbol="T",
+        entry_price=100.0,
+        stop_loss=None,
+        take_profit=None,
+        timeframe="1h",
+        metadata={"current_positions": 0, "atr": 1e308},
+    )
+
+    with pytest.raises(
+        ValueError, match="Fallback stop distance is not finite and positive"
+    ):
+        engine.calculate_position_size(
+            signal=signal,
+            account_balance=10_000.0,
+            pip_value=1.0,
+            current_exposure=0.0,
+        )
+
+
+@pytest.mark.parametrize(
+    ("value", "message"),
+    [
+        (float("nan"), "resolved_stop_loss must be finite"),
+        (-1.0, "resolved_stop_loss must be > 0"),
+    ],
+)
+def test_sized_order_rejects_an_invalid_resolved_stop(
+    value: float, message: str
+) -> None:
+    """``SizedOrder.resolved_stop_loss`` is validated like every other level."""
+    signal = TradeSignal(
+        action="buy",
+        symbol="T",
+        entry_price=100.0,
+        stop_loss=None,
+        take_profit=None,
+        timeframe="1h",
+    )
+
+    with pytest.raises(ValueError, match=message):
+        SizedOrder(
+            signal=signal,
+            position_size=1.0,
+            risk_amount=1.0,
+            risk_percent=0.01,
+            risk_reward_ratio=None,
+            resolved_stop_loss=value,
+        )
+
+
 def test_sizing_on_an_explicit_stop_leaves_the_stop_alone() -> None:
     engine = RiskEngine(RiskConfig())
     signal = TradeSignal(
@@ -526,7 +637,5 @@ def test_backtest_notional_ceiling_deliberately_differs_from_live() -> None:
     deployments default to 0.20; whether to align them is an open maintainer
     decision, so the divergence is pinned rather than changed.
     """
-    from runner.engine_pkg.trading_engine import BACKTEST_MAX_NOTIONAL_PER_TRADE
-
     assert BACKTEST_MAX_NOTIONAL_PER_TRADE == 1.0
     assert RiskConfig().max_notional_per_trade == 0.20
