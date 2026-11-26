@@ -84,7 +84,7 @@ Judgement calls. Each item says *what it is → how to fix* and names what the n
 ## Axis C: spec and standards
 
 - **Spec** (PR body and linked issue): (a) requirements missing or partial, (b) behaviour changed that the spec does not mention, especially on the live path, (c) requirements implemented wrongly, (d) a PR body that is stale against the diff ("deferred", "no test changed", scope limits) or makes a quantitative or structural claim (memory, complexity, determinism) the code does not keep. Quote the spec line. With no spec, write "no spec provided".
-- **Repo rules** from base-branch `AGENTS.md`: portability across Linux, Windows and macOS (no absolute home paths, no unguarded POSIX-only calls), no weakened tests, test coverage for the change, docs and skills updated with behaviour, lockfile changed with dependency manifests. Commit-style and PR-body conventions are optional NITs: mention them only if there is room.
+- **Repo rules** from base-branch `AGENTS.md`: production and CI are Linux-only (Windows only for MT5 backtests), no weakened tests, test coverage for the change, docs and skills updated with behaviour, lockfile changed with dependency manifests. Commit-style and PR-body conventions are optional NITs: mention them only if there is room.
 - **Committed runtime data** (anything `.gitignore` excludes, such as data stores, logs, env files) is a finding.
 
 ## Severity and confidence

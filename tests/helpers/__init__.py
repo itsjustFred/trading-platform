@@ -1,9 +1,10 @@
-"""Shared deterministic fixtures for the Cleanup 16-D1 engine-behavior tests.
+"""Shared deterministic fixtures for the engine-behavior and strategy tests.
 
 Single source of the trend/consolidation OHLCV series, the bundled SMA
-crossover strategy, and the OHLCV-on-disk helpers used by
-``test_adapter_curve_semantics.py``, ``test_vectorbt_sizing_semantics.py``
-and ``tests/strategies/contract_sma.py``-style conformance tests.
+crossover strategy text, the OHLCV-on-disk parquet helpers, the
+``TP_TEST_OHLCV_DIR`` dataset-gate resolution used by
+``tests/strategies/conftest.py``, and ``with_zero_fees`` for engine contract
+tests.
 """
 
 from __future__ import annotations
