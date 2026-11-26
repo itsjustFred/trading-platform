@@ -232,7 +232,9 @@ UNRESOLVED_EXECUTION_EVENT_LIMIT = 1000
 #: bound, not a guarantee: a submit whose broker outcome stays unknown past
 #: it loses retention, and a later fill on the position books as a
 #: broker-side close - acceptable because an unknown-outcome submit is
-#: already an operator-visible reconciliation case.
+#: already an operator-visible reconciliation case. The TTL must stay well
+#: above the reconciliation cadence so an ordinary in-flight submit cannot
+#: outlive it.
 _PENDING_CLOSE_POSITION_TTL_SECONDS = 3600.0
 #: How often a parked pending-close fill triggers a reconciliation pass while
 #: its submit's mark is still live. Budget-free parking would otherwise never
@@ -5941,7 +5943,10 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             # the attribution. Only an exit signal may claim a position-close
             # fill this way - an entry order's id on a close deal still takes
             # the broker-close path, which resolves the real opener.
-            signal_id = await self._exit_signal_uuid_for_order_id(order_id)
+            signal_id = await self._exit_signal_uuid_for_order_id(
+                order_id,
+                position_id=self._position_id_from_payload(order, deal),
+            )
         if signal_id is None:
             if self._close_position_fill_pending(order=order, deal=deal):
                 raise _PendingCloseFillRetentionError(
@@ -7776,7 +7781,9 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             )
             return None
 
-    async def _exit_signal_uuid_for_order_id(self, order_id: int | None) -> UUID | None:
+    async def _exit_signal_uuid_for_order_id(
+        self, order_id: int | None, *, position_id: int | None = None
+    ) -> UUID | None:
         """The exit signal that owns this broker order id, or ``None``.
 
         ``ProtoOAClosePositionReq`` has no ``clientOrderId`` field (its proto
@@ -7788,6 +7795,8 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         ledger defines it* (``is_exit_only_signal_metadata``): a
         position-close deal carrying an *entry* order's id must still take
         the broker-close path, which resolves the position's real opener.
+        ``position_id`` is the fill's own position: a resolved exit whose
+        recorded position id disagrees cannot be this fill's owner.
         """
         if order_id is None:
             return None
@@ -7826,6 +7835,17 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         # of reducing it.
         if not is_exit_only_signal_metadata(metadata or {}):
             return None
+        if position_id is not None:
+            # A broker order id is not unique, so the resolved exit can still
+            # be the wrong owner: its recorded position id is the last check
+            # that it closed THIS position. A signal with none recorded
+            # cannot disprove the match and keeps the attribution.
+            try:
+                owner_position_id = self._requested_exit_position_id(metadata or {})
+            except ValueError:
+                owner_position_id = None
+            if owner_position_id is not None and owner_position_id != position_id:
+                return None
         try:
             return UUID(str(resolved))
         except (ValueError, AttributeError, TypeError):

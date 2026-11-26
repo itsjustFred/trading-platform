@@ -652,6 +652,30 @@ def test_an_ambiguous_order_id_attributes_to_the_single_exit_owner(database) -> 
     assert _ledger(database) == pytest.approx(0.0)
 
 
+def test_a_close_fill_on_another_position_does_not_attribute_to_the_exit(
+    database,
+) -> None:
+    """Pre-mortem: a broker order id shared across signals can resolve to an
+    exit that closed a DIFFERENT position. The fill's own ``positionId`` is
+    the last check: a recorded position id that disagrees disproves the
+    match, and the fill takes the broker-close path against the real
+    opener."""
+    import shared.database as db
+
+    entry_id = _persist_entry(database, qty=10.0)
+    exit_id = _persist_exit_signal(
+        database,
+        metadata_extra={"position_id": 9999},
+    )
+    adapter = _adapter(database, position_orders={POSITION_ID: [_entry_order(entry_id)]})
+
+    asyncio.run(adapter._persist_execution_event(_event(_sdk_closing_order(), _close_deal())))
+
+    assert _signal_execution_rows(database, exit_id) == []
+    assert len(_signal_execution_rows(database, db.broker_close_signal_id(entry_id))) == 1
+    assert _ledger(database) == pytest.approx(0.0)
+
+
 def test_a_broker_side_close_with_an_sdk_style_client_order_id_still_books(
     database,
 ) -> None:

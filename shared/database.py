@@ -6048,11 +6048,13 @@ def get_live_signal_timestamp(signal_id: str) -> datetime | None:
 def find_live_signal_ids_by_broker_order_id(
     account_id: str, broker_order_id: str
 ) -> list[str]:
-    """Up to two signal ids owning this broker order id on the account.
+    """All signal ids owning this broker order id on the account, newest first.
 
-    ``broker_order_id`` is indexed but not unique, so two rows on one account
-    can share an id (a recovered duplicate, a broker-side id reuse). Callers
-    that must distinguish "one owner" from "ambiguous" need the raw matches;
+    ``broker_order_id`` is indexed but not unique, so several rows on one
+    account can share an id (a recovered duplicate, a broker-side id reuse).
+    Callers that must distinguish "one owner" from "ambiguous" need the raw
+    matches - the list is deliberately uncapped so a three-way share cannot
+    truncate into a false single-owner answer;
     :func:`find_live_signal_id_by_broker_order_id` is the fail-closed
     single-owner projection of this list.
     """
@@ -6071,7 +6073,6 @@ def find_live_signal_ids_by_broker_order_id(
             .where(LiveDeploymentModel.account_id == normalized_account_id)
             .where(LiveSignalModel.broker_order_id == normalized_order_id)
             .order_by(LiveSignalModel.timestamp.desc())
-            .limit(2)
         ).all()
     return [str(row.id) for row in rows]
 
