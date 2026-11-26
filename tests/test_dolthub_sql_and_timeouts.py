@@ -113,7 +113,8 @@ class TestSqlBuilders:
 
         query = captured["cmd"][captured["cmd"].index("-q") + 1]
         assert query == build_ohlcv_select("we`ird", "AAPL")
-        assert "`we``ird`" in query and "'AAPL'" in query
+        assert "`we``ird`" in query
+        assert "'AAPL'" in query
 
 
 class TestDolthubDownloaderSql:
