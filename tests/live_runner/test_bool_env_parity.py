@@ -21,8 +21,10 @@ their own test files - they do not parse env vars.
 
 from __future__ import annotations
 
+import ast
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from types import ModuleType
 
 import pytest
@@ -31,6 +33,8 @@ from live_runner import alpaca_adapter, ctrader_adapter, daemon, loss_breaker, p
 from live_runner.credential_env import parse_bool_env
 from live_runner.ctrader_adapter import CTraderLiveAdapter
 from shared.models import LiveDeploymentConfig
+
+LIVE_RUNNER_DIR = Path(__file__).resolve().parents[2] / "live_runner"
 
 CANONICAL_VALID_LISTING = "0, 1, false, n, no, off, on, true, y, yes"
 # ``loss_breaker._env_bool`` accepts exactly the canonical tokens but names
@@ -312,7 +316,7 @@ def test_loss_breaker_rejects_the_same_typo_with_its_own_message() -> None:
 def test_no_live_runner_module_keeps_a_private_bool_env_parser(
     module: ModuleType,
 ) -> None:
-    """Every former copy is gone and must not come back as a fifth one.
+    """Every former copy is gone and must not come back under its own name.
 
     A private copy is how the daemon's lenient variant appeared in the first
     place: it accepted every unrecognized token as ``False``, so a typo'd
@@ -323,3 +327,111 @@ def test_no_live_runner_module_keeps_a_private_bool_env_parser(
         assert not hasattr(module, name), f"{module.__name__} still defines {name}"
     for name in ("_TRUE_BOOL_TOKENS", "_FALSE_BOOL_TOKENS"):
         assert not hasattr(module, name), f"{module.__name__} still defines {name}"
+
+
+# Every site in ``live_runner`` that still spells out its own boolean token
+# vocabulary. A site that is not on this list fails the scan below, so a fresh
+# copy cannot be added quietly - not under a new name either.
+BOOLEAN_VOCABULARY_SITES: dict[str, str] = {
+    "credential_env.TRUE_BOOL_TOKENS": (
+        "the canonical parser's own vocabulary - this is the single definition"
+    ),
+    "credential_env.FALSE_BOOL_TOKENS": (
+        "the canonical parser's own vocabulary - this is the single definition"
+    ),
+    "loss_breaker._env_bool": (
+        "env tokens, deliberately unmerged: same accepted tokens as the "
+        "canonical parser but its own shorter operator-facing message "
+        "(maintainer decision, PR #457)"
+    ),
+    "broker_reconciliation._SETTING_TRUE": (
+        "deployment SETTINGS, not env vars; fails closed to a safe default"
+    ),
+    "broker_reconciliation._SETTING_FALSE": (
+        "deployment SETTINGS, not env vars; fails closed to a safe default"
+    ),
+    "internal_strategy_runner._internal_runner_opted_in": (
+        "deployment SETTINGS, explicitly lenient by maintainer decision of "
+        "2026-11-22 (anything but an unmistakable truthy value stays inert)"
+    ),
+    "signal_archive._ARCHIVE_DISABLED_VALUES": (
+        "env kill switch with the opposite polarity - enabled unless "
+        "explicitly disabled; not a money-path gate"
+    ),
+}
+
+# A vocabulary of boolean tokens is at least three of them: ``{"0", "1"}`` also
+# describes channel ids, marker sets and flags that have nothing to do with a
+# boolean parser.
+_MIN_VOCABULARY_TOKENS = 3
+
+BOOLEAN_TOKEN_UNIVERSE = frozenset(
+    {"0", "1", "true", "false", "yes", "no", "y", "n", "on", "off"}
+)
+
+
+def _boolean_vocabulary_sites() -> set[str]:
+    """``module.name`` for every live_runner site that spells out boolean tokens.
+
+    Matched on the AST, not on the text: a renamed or reformatted copy still
+    carries its token set, and a comment mentioning the tokens does not.
+    """
+
+    found: set[str] = set()
+    for path in sorted(LIVE_RUNNER_DIR.glob("*.py")):
+        if path.name.startswith("test_"):
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        module = path.stem
+        for node in tree.body:
+            if not isinstance(node, ast.Assign):
+                continue
+            tokens = _boolean_tokens(node.value)
+            if len(tokens) < _MIN_VOCABULARY_TOKENS:
+                continue
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    found.add(f"{module}.{target.id}")
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            tokens = _boolean_tokens(node)
+            if len(tokens) < _MIN_VOCABULARY_TOKENS:
+                continue
+            found.add(f"{module}.{node.name}")
+    return found
+
+
+def _boolean_tokens(node: ast.AST) -> set[str]:
+    """The distinct boolean tokens that appear as string constants under *node*."""
+
+    return {
+        constant.value.strip().lower()
+        for constant in ast.walk(node)
+        if isinstance(constant, ast.Constant)
+        and isinstance(constant.value, str)
+        and constant.value.strip().lower() in BOOLEAN_TOKEN_UNIVERSE
+    }
+
+
+def test_every_boolean_token_vocabulary_in_live_runner_is_declared() -> None:
+    """A fresh copy anywhere in ``live_runner`` lands in this list first.
+
+    Pre-mortem finding on PR #457: the four-module check above cannot see a
+    parser added under a new name in a fifth module. This scan is what fails
+    then - and a stale allowlist fails too, so the list cannot rot silently.
+    """
+
+    observed = _boolean_vocabulary_sites()
+    missing = sorted(observed - BOOLEAN_VOCABULARY_SITES.keys())
+    stale = sorted(BOOLEAN_VOCABULARY_SITES.keys() - observed)
+    assert not missing, (
+        "A boolean token vocabulary exists outside the canonical parser. "
+        f"New sites: {missing}. Route it through "
+        "live_runner.credential_env.parse_bool_env, or add it to "
+        "BOOLEAN_VOCABULARY_SITES with the reason it is a different domain."
+    )
+    assert not stale, (
+        f"Sites removed: {stale}. Drop them from BOOLEAN_VOCABULARY_SITES, or "
+        "restore the parser they guarded."
+    )
