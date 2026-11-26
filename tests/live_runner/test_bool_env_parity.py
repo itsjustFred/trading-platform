@@ -97,7 +97,11 @@ def _loss_breaker_bool(key: str, raw: str | None, default: bool) -> bool:
     return loss_breaker._env_bool(env_values, None, suffix, default=default)  # noqa: SLF001
 
 
-SHARED_PARSERS = [
+# The one parser every live_runner caller now uses. The four copies that used
+# to sit beside it (`ctrader_adapter`, `preflight`, `daemon` and the alpaca
+# passthrough) were byte-identical and are gone; the guard at the end of this
+# module is what keeps them from coming back.
+CANONICAL_PARSERS = [
     BoolParser(
         "credential_env.parse_bool_env",
         "CTRADER_DEMO",
@@ -115,7 +119,7 @@ VARIANT_PARSERS = [
     ),
 ]
 
-ALL_PARSERS = SHARED_PARSERS + VARIANT_PARSERS
+ALL_PARSERS = CANONICAL_PARSERS + VARIANT_PARSERS
 
 _PARSER_IDS = [parser.label for parser in ALL_PARSERS]
 
