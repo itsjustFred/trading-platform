@@ -1368,6 +1368,41 @@ def test_token_invalidation_adopted_pair_reauths_without_refresh(
     assert adapter._session_access_token == "file_access"
 
 
+def test_every_session_death_path_clears_rotation_state() -> None:
+    """``_teardown_client``, ``_on_disconnected`` and ``disconnect()`` must
+    all drop ``_session_access_token`` and ``_own_token_rotation_in_flight``:
+    a stale value left behind would let the invalidation skip-reason treat a
+    genuine event as our own rotation echo and never tear the dead session
+    down."""
+
+    async def _run() -> None:
+        for death in ("teardown", "transport", "disconnect"):
+            adapter = CTraderLiveAdapter(
+                app_id="app",
+                app_secret="secret",
+                access_token="token",
+                account_id="1",
+            )
+            adapter._loop = asyncio.get_running_loop()
+            adapter._client = object()
+            adapter._connected = True
+            adapter._authenticated = True
+            adapter._session_access_token = "session_token"
+            adapter._own_token_rotation_in_flight = 1
+
+            if death == "teardown":
+                adapter._teardown_client()
+            elif death == "transport":
+                adapter._on_disconnected(adapter._client, "lost")
+            else:
+                await adapter.disconnect()
+
+            assert adapter._session_access_token == "", death
+            assert adapter._own_token_rotation_in_flight == 0, death
+
+    asyncio.run(_run())
+
+
 def test_token_invalidation_skip_reason_self_heals_latched_flag_on_dead_session() -> (
     None
 ):
