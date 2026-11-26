@@ -573,7 +573,10 @@ def _instrument_qty_step(adapter: BaseLiveAdapter, symbol: str) -> float | None:
         return None
     try:
         step = float(method(symbol))
-    except (TypeError, ValueError, OverflowError):
+    except Exception:
+        # One misbehaving adapter/symbol must not abort the whole account
+        # pass: an unusable step keeps the expectation (fail closed).
+        # (asyncio.CancelledError is BaseException and still propagates.)
         return None
     return step if math.isfinite(step) and step > 0 else None
 

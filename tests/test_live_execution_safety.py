@@ -5593,6 +5593,9 @@ def test_ctrader_submit_persists_the_normalized_qty_it_sends(monkeypatch) -> Non
     assert volumes == [2000]
     assert saved[0].metadata["qty"] == pytest.approx(2.0)
     assert saved[0].metadata["explicit_qty"] == pytest.approx(2.0)
+    # Idempotent: the request builders re-resolve the volume from the
+    # normalized signal, and it must still be the volume actually sent.
+    assert adapter._resolve_order_volume(saved[0]) == volumes[0]
 
 
 def test_ctrader_exit_submit_persists_the_floored_qty_it_sends(monkeypatch) -> None:
@@ -5622,6 +5625,8 @@ def test_ctrader_exit_submit_persists_the_floored_qty_it_sends(monkeypatch) -> N
     assert close_volumes == [1333]
     assert saved[0].metadata["qty"] == pytest.approx(1.333)
     assert saved[0].metadata["explicit_qty"] == pytest.approx(1.333)
+    # Same idempotency invariant on the exit path.
+    assert adapter._resolve_order_volume(saved[0]) == close_volumes[0]
 
 
 def _ctrader_entry_signal() -> LiveSignal:
