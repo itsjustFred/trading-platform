@@ -90,8 +90,6 @@ def _log_safe(value: object) -> str:
 
 
 BACKTESTS_DIR = DATA_DIR / "backtests"
-REACT_DIST = Path(__file__).parent.parent / "frontend" / "dist"
-STATIC_DIR = REACT_DIST if REACT_DIST.exists() else Path(__file__).parent / "static"
 
 STRATEGIES_DIR = DEFAULT_STRATEGIES_DIR
 PORTFOLIOS_DIR = DATA_DIR / "portfolios"
