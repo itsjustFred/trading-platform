@@ -133,6 +133,8 @@ from pathlib import Path
 import pytest
 import yaml
 
+from tests.conftest import sandboxed_env
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 WORKFLOWS = REPO_ROOT / ".github" / "workflows"
 SKILLS = REPO_ROOT / ".agents" / "skills"
@@ -300,7 +302,7 @@ def probe_repo(tmp_path):
         done = subprocess.run(
             ["git", *args],
             cwd=repo,
-            env={**os.environ, **env},
+            env=sandboxed_env(**env),
             check=True,
             capture_output=True,
             text=True,
@@ -343,7 +345,7 @@ def _run_selection(probe: dict, tmp_path, *, base: str, skill_path: str | None) 
     github_env = tmp_path / "github-env"
     github_env.write_text("", encoding="utf-8")
     # A set-but-empty SKILL_PATH, which is what a workflow expression resolving to nothing leaves.
-    environment = {**os.environ, "SKILL_PATH": skill_path or ""}
+    environment = sandboxed_env(SKILL_PATH=skill_path or "")
     environment.update(
         {
             "RUNNER_TEMP": str(runner_temp),
@@ -498,11 +500,11 @@ def _run_reporter(job_name, step_name, tmp_path, pages, env_override=None):
         (pagedir / f"page-{index}.json").write_text(page, encoding="utf-8")
     log = tmp_path / "calls.log"
     log.unlink(missing_ok=True)
-    env = {
-        "PATH": os.pathsep.join([str(bindir), os.environ["PATH"]]),
-        "STUB_LOG": str(log),
-        "STUB_PAGES": str(pagedir),
-    }
+    env = sandboxed_env(
+        PATH=os.pathsep.join([str(bindir), os.environ["PATH"]]),
+        STUB_LOG=str(log),
+        STUB_PAGES=str(pagedir),
+    )
     for key in _step_variables(step):
         assert key in REPORTER_ENV, f"{job_name}/{step_name}: the harness sets no {key}"
         env[key] = REPORTER_ENV[key]
@@ -1955,14 +1957,13 @@ def _run_probe_step(tmp_path, mode: str):
     runner_temp.mkdir(exist_ok=True)
     output = tmp_path / "github-output"
     output.write_text("", encoding="utf-8")
-    env = {
-        **os.environ,
-        "PATH": os.pathsep.join([str(bindir), os.environ["PATH"]]),
-        "STUB_OPENCODE_MODE": mode,
-        "RUNNER_TEMP": str(runner_temp),
-        "GITHUB_OUTPUT": str(output),
-        "OPENCODE_DISABLE_PROJECT_CONFIG": "1",
-    }
+    env = sandboxed_env(
+        PATH=os.pathsep.join([str(bindir), os.environ["PATH"]]),
+        STUB_OPENCODE_MODE=mode,
+        RUNNER_TEMP=str(runner_temp),
+        GITHUB_OUTPUT=str(output),
+        OPENCODE_DISABLE_PROJECT_CONFIG="1",
+    )
     script = tmp_path / "probe.sh"
     script.write_text(_run(step), encoding="utf-8")
     result = subprocess.run(
@@ -2135,8 +2136,12 @@ def test_an_nvidia_model_without_the_key_fails_with_its_reason(name, tmp_path) -
         case.mkdir()
         script = case / "step.sh"
         script.write_text(_run(step), encoding="utf-8")
-        env = {**os.environ, "MODEL": "nvidia/stepfun-ai/step-5-preview", "NVIDIA_API_KEY": "",
-               "RUNNER_TEMP": str(case), "GITHUB_OUTPUT": str(case / "out")}
+        env = sandboxed_env(
+            MODEL="nvidia/stepfun-ai/step-5-preview",
+            NVIDIA_API_KEY="",
+            RUNNER_TEMP=str(case),
+            GITHUB_OUTPUT=str(case / "out"),
+        )
         result = subprocess.run(
             [shutil.which("bash") or "bash", str(script)], env=env, capture_output=True,
             text=True, cwd=case,
@@ -2167,7 +2172,7 @@ def test_a_kilo_model_enables_the_kilo_provider_and_nothing_else_changes(name, t
     ):
         home = tmp_path / model.replace("/", "_").replace(":", "_")
         home.mkdir()
-        env = {**os.environ, "HOME": str(home), "MODEL": model, "VARIANT": "high"}
+        env = sandboxed_env(HOME=str(home), MODEL=model, VARIANT="high")
         script = home / "configure.sh"
         script.write_text(_run(step), encoding="utf-8")
         result = subprocess.run(
@@ -2207,8 +2212,12 @@ def test_a_model_without_a_provider_or_an_id_stops_with_its_name(name, tmp_path)
             home.mkdir()
             script = home / "configure.sh"
             script.write_text(_run(step), encoding="utf-8")
-            env = {**os.environ, "HOME": str(home), "MODEL": model, "VARIANT": "high",
-                   "RUNNER_TEMP": str(home)}
+            env = sandboxed_env(
+                HOME=str(home),
+                MODEL=model,
+                VARIANT="high",
+                RUNNER_TEMP=str(home),
+            )
             result = subprocess.run(
                 [shutil.which("bash") or "bash", str(script)], env=env, capture_output=True,
                 text=True, cwd=home,
@@ -2322,13 +2331,12 @@ def _agent_step_env(tmp_path, head: str) -> dict:
 
 
 def _git(repo: Path, *args: str) -> str:
-    env = {
-        **os.environ,
-        "GIT_AUTHOR_NAME": "probe",
-        "GIT_AUTHOR_EMAIL": "probe@example.invalid",
-        "GIT_COMMITTER_NAME": "probe",
-        "GIT_COMMITTER_EMAIL": "probe@example.invalid",
-    }
+    env = sandboxed_env(
+        GIT_AUTHOR_NAME="probe",
+        GIT_AUTHOR_EMAIL="probe@example.invalid",
+        GIT_COMMITTER_NAME="probe",
+        GIT_COMMITTER_EMAIL="probe@example.invalid",
+    )
     done = subprocess.run(
         ["git", *args], cwd=repo, env=env, check=True, capture_output=True, text=True
     )
@@ -2378,9 +2386,11 @@ def test_the_mid_run_quota_skip_reports_instead_of_failing(tmp_path) -> None:
     ):
         case = tmp_path / mode
         case.mkdir()
-        env = {**os.environ, **_agent_step_env(case, head)}
-        env["PATH"] = os.pathsep.join([str(bindir), os.environ["PATH"]])
-        env["STUB_OPENCODE_MODE"] = mode
+        env = sandboxed_env(
+            **_agent_step_env(case, head),
+            PATH=os.pathsep.join([str(bindir), os.environ["PATH"]]),
+            STUB_OPENCODE_MODE=mode,
+        )
         script = case / "step.sh"
         script.write_text(body, encoding="utf-8")
         result = subprocess.run(
@@ -2479,18 +2489,18 @@ def _run_comment_post(tmp_path, *, quota_skip: bool, prior_body: str | None):
     body.write_text(prior_body or "", encoding="utf-8")
     log = tmp_path / "calls.log"
     log.unlink(missing_ok=True)
-    env = {
-        "PATH": os.pathsep.join([str(bindir), os.environ["PATH"]]),
-        "STUB_LOG": str(log),
-        "STUB_HEAD_SHA": REPORTER_ENV["HEAD_SHA"],
-        "STUB_COMMENT_IDS": str(ids),
-        "STUB_COMMENT_BODY": str(body),
-        "GITHUB_REPOSITORY": REPORTER_ENV["GITHUB_REPOSITORY"],
-        "PR_NUMBER": REPORTER_ENV["PR_NUMBER"],
-        "HEAD_SHA": REPORTER_ENV["HEAD_SHA"],
-        "BASE_SHA": REPORTER_ENV["BASE_SHA"],
-        "QUOTA_SKIP": "true" if quota_skip else "false",
-    }
+    env = sandboxed_env(
+        PATH=os.pathsep.join([str(bindir), os.environ["PATH"]]),
+        STUB_LOG=str(log),
+        STUB_HEAD_SHA=REPORTER_ENV["HEAD_SHA"],
+        STUB_COMMENT_IDS=str(ids),
+        STUB_COMMENT_BODY=str(body),
+        GITHUB_REPOSITORY=REPORTER_ENV["GITHUB_REPOSITORY"],
+        PR_NUMBER=REPORTER_ENV["PR_NUMBER"],
+        HEAD_SHA=REPORTER_ENV["HEAD_SHA"],
+        BASE_SHA=REPORTER_ENV["BASE_SHA"],
+        QUOTA_SKIP="true" if quota_skip else "false",
+    )
     script = tmp_path / "post.sh"
     script.write_text(_run(step), encoding="utf-8")
     result = subprocess.run(
