@@ -586,8 +586,13 @@ def _present_proto_field(
                 return None
         except Exception:  # except-kind: money-decision
             # Presence is unanswerable: fail_closed callers get the sentinel,
-            # everyone else reads the field as absent - never as proof. Logged
-            # because a swallowed HasField failure is otherwise invisible.
+            # everyone else reads the field as absent - never as proof. The
+            # catch is deliberately wider than (TypeError, ValueError):
+            # HasField is protobuf-version-dependent and test doubles raise
+            # arbitrary errors, and EVERY exception here means the same thing -
+            # presence could not be proven - so the fail-closed policy applies
+            # uniformly. Logged because a swallowed HasField failure is
+            # otherwise invisible.
             logger.warning(
                 "cTrader HasField(%s) failed; treating field presence as "
                 "unanswerable",
@@ -3619,7 +3624,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         return response
 
     @staticmethod
-    def _raise_submit_refusal(
+    def _classify_and_raise_refusal(
         message: str, *, error_code: str, definitive: bool
     ) -> None:
         """A refusal is ``BrokerOrderRejectedError`` only when definitive."""
@@ -3655,7 +3660,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 f"Order rejected ({getattr(response, 'errorCode', '') or ''}): "
                 f"{getattr(response, 'description', '') or 'no description'}"
             )
-            self._raise_submit_refusal(
+            self._classify_and_raise_refusal(
                 message,
                 error_code=str(getattr(response, "errorCode", "") or ""),
                 definitive=definitive_refusal,
@@ -3668,6 +3673,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             isinstance(response, self._ProtoOAExecutionEvent)
             if self._ProtoOAExecutionEvent is not None
             else getattr(response, "executionType", None) is not None
+            and getattr(response, "ctidTraderAccountId", None) is not None
         )
         if is_execution_event:
             rejected = self._is_order_rejected_execution(response)
@@ -3693,7 +3699,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                     f"Order rejected ({error_code or 'ORDER_REJECTED'}): "
                     f"{getattr(response, 'description', '') or 'no description'}"
                 )
-                self._raise_submit_refusal(
+                self._classify_and_raise_refusal(
                     message,
                     error_code=error_code,
                     definitive=self._execution_rejection_is_definitive(

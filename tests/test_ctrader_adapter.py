@@ -4284,3 +4284,34 @@ def test_order_rejected_execution_without_loaded_event_class_is_classified() -> 
     with pytest.raises(BrokerOrderRejectedError, match="Order rejected") as excinfo:
         asyncio.run(submission)
     assert excinfo.value.error_code == "TRADING_BAD_VOLUME"
+
+
+def test_order_rejected_execution_unanswerable_order_presence_stays_unknown() -> None:
+    """HasField failing only on ``order`` must read as present-but-unknown."""
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import (
+        ProtoOAExecutionType,
+        ProtoOAOrderStatus,
+    )
+
+    from live_runner.base_adapter import BrokerOrderRejectedError
+
+    class _OrderPresenceUnknownEvent:
+        executionType = ProtoOAExecutionType.ORDER_REJECTED
+        errorCode = "TRADING_BAD_VOLUME"
+        # A valid-looking rejected order is readable via getattr; only its
+        # presence is unanswerable. Without fail_closed this would classify
+        # as definitive and release the lease.
+        order = SimpleNamespace(orderStatus=ProtoOAOrderStatus.ORDER_STATUS_REJECTED)
+
+        def HasField(self, name: str) -> bool:
+            if name == "order":
+                raise ValueError("order presence unavailable")
+            return False
+
+    adapter = _execution_event_response_adapter(_OrderPresenceUnknownEvent())
+    adapter._ProtoOAExecutionEvent = _OrderPresenceUnknownEvent
+    submission = adapter._submit_new_order_request(object())
+
+    with pytest.raises(RuntimeError, match="Order rejected") as excinfo:
+        asyncio.run(submission)
+    assert not isinstance(excinfo.value, BrokerOrderRejectedError)
