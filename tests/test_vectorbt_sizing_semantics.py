@@ -20,7 +20,7 @@ import pandas as pd
 import pytest
 
 from runner.engines.base import BacktestConfig
-from runner.engines.vectorbt_adapter import VectorbtAdapter, _resolve_max_leverage
+from runner.engines.vectorbt_adapter import VectorbtAdapter
 from tests.helpers import deterministic_ohlcv_frame, sma_crossover_strategy_text, with_zero_fees
 from tests.helpers import write_ohlcv as _write_shared_ohlcv
 

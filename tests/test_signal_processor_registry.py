@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import pandas as pd
 import pytest
 
 from signal_bots.registry import get_signal_processor, list_signal_processor_options

@@ -11,7 +11,6 @@ Seams under test:
 
 from __future__ import annotations
 
-import inspect
 import json
 import subprocess
 

@@ -18,8 +18,6 @@ add a timeframe is forced to make a decision instead of inheriting a stale copy.
 
 from __future__ import annotations
 
-from pathlib import Path
-
 import pytest
 
 from data_tools import download_grid_market_data as grid

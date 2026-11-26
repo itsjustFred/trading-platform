@@ -927,6 +927,8 @@ def test_run_optimization_forwards_the_configured_embargo(monkeypatch, tmp_path:
     """
     from tests.test_optimizer_three_way import (
         _config as _three_way_config,
+    )
+    from tests.test_optimizer_three_way import (
         _patch_environment as _patch_three_way_environment,
     )
 
