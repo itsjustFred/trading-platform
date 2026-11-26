@@ -44,13 +44,20 @@ from pathlib import Path, PurePosixPath
 _MAIN_OK_MARKER = "TP_MAIN_CHECKOUT_OK=1"
 _MAX_DEPTH = 6
 _MAX_SEGMENTS = 400
+_TOO_COMPLEX = (
+    "blocked: command too complex to verify safely (over "
+    f"{_MAX_SEGMENTS} segments or nesting deeper than {_MAX_DEPTH}); "
+    "split it into smaller commands."
+)
 
-_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+_ASSIGN_RE = re.compile(r"^[A-Za-z_]\w*=", re.ASCII)
 _GLOB_CHARS = frozenset("*?[]")
 _CTRL_CHARS = frozenset("()&|;")
 _REDIRECT_CHARS = frozenset("<>&")
 
-_HEREDOC_RE = re.compile(r"(?<!<)<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
+_HEREDOC_RE = re.compile(
+    r"(?<!<)<<-?\s*(['\"]?)([A-Za-z_]\w*)\1", re.ASCII
+)
 
 
 def _basename(token: str) -> str:
@@ -81,14 +88,16 @@ def _strip_heredocs(command: str) -> str:
 
 
 def _tokenize(command: str) -> list[str]:
-    lexer = shlex.shlex(_strip_heredocs(command), posix=True, punctuation_chars="();<>|&")
+    # ``command`` must already be heredoc-stripped (see _eval_command_string);
+    # _strip_heredocs is not idempotent.
+    lexer = shlex.shlex(command, posix=True, punctuation_chars="();<>|&")
     lexer.whitespace_split = True
     try:
         return list(lexer)
     except ValueError:
         # Unbalanced quotes: fall back to a naive split so obvious matches
         # are still caught.
-        return _strip_heredocs(command).split()
+        return command.split()
 
 
 def _op_kind(tok: str) -> str | None:
@@ -134,7 +143,7 @@ def _resolve(base: Path, arg: str) -> Path:
 
 
 def _skip_value(
-    tokens: list[str], i: int, tok: str, value_opts: set[str], value_longs: set[str]
+    i: int, tok: str, value_opts: set[str], value_longs: set[str]
 ) -> int:
     """Index after ``tok`` at ``i``, consuming a separate value token when needed."""
     if tok.startswith("--"):
@@ -161,7 +170,7 @@ def _skip_options(
         if tok == "--":
             return i + 1
         if tok.startswith("-") and tok != "-":
-            i = _skip_value(argv, i, tok, value_opts, value_longs)
+            i = _skip_value(i, tok, value_opts, value_longs)
             continue
         return i
     return i
@@ -181,7 +190,7 @@ def _positional_args(
             i += 1
             continue
         if not end_opts and tok.startswith("-") and tok != "-":
-            i = _skip_value(argv, i, tok, value_opts, value_longs)
+            i = _skip_value(i, tok, value_opts, value_longs)
             continue
         out.append(tok)
         i += 1
@@ -266,7 +275,7 @@ def _check_git_checkout(rest: list[str], cwd: Path) -> str | None:
         if _looks_like_path_restore(spec, cwd):
             return (
                 "blocked: `git checkout` with a pathspec discards uncommitted "
-                "work. Save it first with `git diff > /tmp/fix.patch` (or "
+                "work. Save it first with `git diff > \"$TMPDIR/fix.patch\"` (or "
                 "commit it on your branch), then restore explicitly if you "
                 "really mean it."
             )
@@ -336,7 +345,7 @@ def _check_git_restore(rest: list[str], cwd: Path) -> str | None:
     return (
         "blocked: `git restore` can discard uncommitted work. Only "
         "`git restore --staged <explicit files>` is allowed; for worktree "
-        "changes save `git diff > /tmp/fix.patch` first."
+        "changes save `git diff > \"$TMPDIR/fix.patch\"` first."
     )
 
 
@@ -384,7 +393,7 @@ def _check_git_reset(rest: list[str]) -> str | None:
     if "--hard" in rest:
         return (
             "blocked: `git reset --hard` discards uncommitted work. Commit "
-            "or `git diff > /tmp/fix.patch` first; `git reset --soft/--mixed` "
+            "or `git diff > \"$TMPDIR/fix.patch\"` first; `git reset --soft/--mixed` "
             "is fine."
         )
     return None
@@ -445,7 +454,7 @@ def _check_git_push(rest: list[str], cwd: Path) -> str | None:
             cluster = tok[1:]
             if "f" in cluster:
                 force = True
-            i = _skip_value(rest, i, tok, _PUSH_VALUE_OPTS, _PUSH_VALUE_LONGS)
+            i = _skip_value(i, tok, _PUSH_VALUE_OPTS, _PUSH_VALUE_LONGS)
             continue
         positionals.append(tok)
         i += 1
@@ -844,8 +853,10 @@ def _strip_assignments(argv: list[str]) -> tuple[list[str], bool]:
 def _eval_argv(
     argv: list[str], cwd: Path, depth: int, main_ok: bool
 ) -> str | None:
-    if depth > _MAX_DEPTH or not argv:
+    if not argv:
         return None
+    if depth > _MAX_DEPTH:
+        return _TOO_COMPLEX
     argv, seg_override = _strip_assignments(argv)
     main_ok = main_ok or seg_override
     if not argv:
@@ -903,20 +914,20 @@ def _eval_argv(
                 break
             if tok == "-c" or (not tok.startswith("-") and tok != "-"):
                 break  # `-c` code or a script path ends option parsing
-            i = _skip_value(args, i, tok, _PY_VALUE_OPTS, _PY_VALUE_LONGS)
+            i = _skip_value(i, tok, _PY_VALUE_OPTS, _PY_VALUE_LONGS)
         if m_idx is not None:
             module = args[m_idx + 1]
             if module == "pip":
-                return _check_simple(["pip", *args[m_idx + 2 :]], cwd, depth, main_ok)
+                return _check_simple(["pip", *args[m_idx + 2 :]], cwd, main_ok)
             if module == "ruff":
-                return _check_simple(["ruff", *args[m_idx + 2 :]], cwd, depth, main_ok)
+                return _check_simple(["ruff", *args[m_idx + 2 :]], cwd, main_ok)
         return None
 
     inner = _uv_inner_argv(argv)
     if inner is not None and name in ("uv", "uvx"):
         # `uv run`/`uvx` get their own main-checkout verdict first (uv run
         # auto-syncs the env), then the wrapped command is checked too.
-        verdict = _check_simple(argv, cwd, depth, main_ok)
+        verdict = _check_simple(argv, cwd, main_ok)
         if verdict:
             return verdict
         return _eval_argv(inner, cwd, depth + 1, main_ok)
@@ -944,7 +955,7 @@ def _eval_argv(
             return _eval_argv([rest[0], *rest[1:]], cwd, depth + 1, main_ok)
         return None
 
-    return _check_simple(argv, cwd, depth, main_ok)
+    return _check_simple(argv, cwd, main_ok)
 
 
 def _cd_target(argv: list[str], cwd: Path) -> Path | None:
@@ -963,7 +974,7 @@ def _cd_target(argv: list[str], cwd: Path) -> Path | None:
         return None
 
 
-def _check_simple(argv: list[str], cwd: Path, depth: int, main_ok: bool) -> str | None:
+def _check_simple(argv: list[str], cwd: Path, main_ok: bool) -> str | None:
     verdict = _check_pkill(argv)
     if verdict:
         return verdict
@@ -994,7 +1005,7 @@ def _eval_tokens(
         seg, current = current, []
         segments += 1
         if segments > _MAX_SEGMENTS:
-            return None
+            return _TOO_COMPLEX
         bare = _strip_assignments(seg)[0]
         if bare and _basename(bare[0]).strip("`") in _CD_BUILTINS:
             target = _cd_target(bare, cwd)
@@ -1028,7 +1039,50 @@ def _eval_tokens(
     return flush()
 
 
+def _backtick_spans(command: str) -> list[str]:
+    """Inner command strings of `` `...` `` substitutions.
+
+    shlex treats backticks as word characters, so ``echo `git stash` `` would
+    otherwise stay inside the ``echo`` segment even though the shell runs the
+    substitution. Single-quoted and escaped backticks are literal and skipped;
+    backticks inside double quotes still substitute.
+    """
+    spans: list[str] = []
+    i = 0
+    in_squote = False
+    in_dquote = False
+    while i < len(command):
+        ch = command[i]
+        if ch == "\\":
+            i += 2
+            continue
+        if in_squote:
+            if ch == "'":
+                in_squote = False
+            i += 1
+            continue
+        if ch == "'":
+            if not in_dquote:
+                in_squote = True
+        elif ch == '"':
+            in_dquote = not in_dquote
+        elif ch == "`":
+            end = command.find("`", i + 1)
+            if end == -1:
+                break
+            spans.append(command[i + 1 : end])
+            i = end + 1
+            continue
+        i += 1
+    return spans
+
+
 def _eval_command_string(command: str, cwd: Path, depth: int, main_ok: bool) -> str | None:
+    command = _strip_heredocs(command)
+    for span in _backtick_spans(command):
+        verdict = _eval_command_string(span, cwd, depth + 1, main_ok)
+        if verdict:
+            return verdict
     return _eval_tokens(_tokenize(command), cwd, depth, main_ok)
 
 
@@ -1036,14 +1090,17 @@ def check_command(command: str, cwd: Path) -> str | None:
     """Return the block message for ``command`` run in ``cwd``, or None."""
     if not command.strip():
         return None
-    # The human/operator override is a property of the whole command line.
-    return _eval_tokens(_tokenize(command), cwd, 0, main_ok=_MAIN_OK_MARKER in command)
+    # The override is per segment: only a leading `TP_MAIN_CHECKOUT_OK=1`
+    # assignment (or `env TP_MAIN_CHECKOUT_OK=1 ...`) disables the
+    # main-checkout rules for that command - mentioning the marker in an
+    # argument, string or comment does not.
+    return _eval_command_string(command, cwd, 0, main_ok=False)
 
 
 def main() -> int:
     try:
         payload = json.load(sys.stdin)
-    except (json.JSONDecodeError, ValueError):
+    except ValueError:
         return 0
     if payload.get("tool_name") != "Bash":
         return 0

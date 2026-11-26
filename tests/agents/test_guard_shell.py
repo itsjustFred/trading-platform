@@ -169,6 +169,14 @@ CASES: list[tuple[str, str, bool]] = [
     ("git stash > /tmp/fix.patch", "wt", True),
     ("git stash 2>&1 | tee log", "wt", True),
     ("git -C src stash", "wt", True),
+    # command substitution runs the inner command too
+    ("echo result: $(git stash)", "wt", True),
+    ("x=$(git stash)", "wt", True),
+    ("echo `git stash`", "wt", True),
+    ("echo `git add -A`", "wt", True),
+    ('echo "`git stash`"', "wt", True),  # backticks substitute inside "..."
+    ("echo '`git stash`'", "wt", False),  # single-quoted: literal text
+    ("cat > /tmp/doc.md <<'EOF'\nuse `git stash` carefully\nEOF", "wt", False),
     ("uv run ruff format", "wt", True),
     ("uvx ruff format .", "wt", True),
     ("python -m pip --version", "wt", False),
@@ -201,6 +209,8 @@ CASES: list[tuple[str, str, bool]] = [
     ("uv pip uninstall foo", "main", True),
     ("uv run pytest", "main", True),
     ("uv run --no-sync pytest", "main", False),
+    ("uv run --no-sync --with pytest pytest", "main", False),
+    ("uv run --no-project pytest", "main", False),
     ("uv pip list", "main", False),
     ("pip install foo", "main", True),
     ("pip3 install foo", "main", True),
@@ -243,6 +253,11 @@ CASES: list[tuple[str, str, bool]] = [
     # ...but global rules still apply under the override
     ("TP_MAIN_CHECKOUT_OK=1 git stash", "main", True),
     ("TP_MAIN_CHECKOUT_OK=1 git add -A", "main", True),
+    # the marker only counts as a leading assignment, not as text
+    ("echo TP_MAIN_CHECKOUT_OK=1 && git commit -m x", "main", True),
+    ("git commit -m 'TP_MAIN_CHECKOUT_OK=1'", "main", True),
+    ("git commit -m x # TP_MAIN_CHECKOUT_OK=1", "main", True),
+    ("echo TP_MAIN_CHECKOUT_OK=1", "main", False),
     # --- cwd tracking -------------------------------------------------------------------
     ("cd {main} && git commit -m x", "wt", True),  # placeholder, resolved below
     ("cd src && git commit -m x", "wt", False),
@@ -294,6 +309,21 @@ def test_subshell_cd_does_not_leak(checkouts: dict[str, Path]) -> None:
     """A `cd` inside `( )` must not change the cwd of later commands."""
     cmd = f"(cd {checkouts['main']}); git status"
     assert guard_shell.check_command(cmd, checkouts["wt"]) is None
+
+
+def test_segment_cap_fails_closed(checkouts: dict[str, Path]) -> None:
+    """A blocked command past _MAX_SEGMENTS must not slip through unevaluated."""
+    filler = "true;" * (guard_shell._MAX_SEGMENTS + 2)
+    cmd = f"{filler}git commit -m x"
+    verdict = guard_shell.check_command(cmd, checkouts["main"])
+    assert verdict is not None and "too complex" in verdict
+
+
+def test_depth_cap_fails_closed(checkouts: dict[str, Path]) -> None:
+    """Nesting deeper than _MAX_DEPTH must not bypass the rules."""
+    cmd = "eval " * (guard_shell._MAX_DEPTH + 3) + "git stash"
+    verdict = guard_shell.check_command(cmd, checkouts["wt"])
+    assert verdict is not None and "too complex" in verdict
 
 
 # --- hook contract: stdin JSON -> exit code ------------------------------------
