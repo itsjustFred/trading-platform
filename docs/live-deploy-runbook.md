@@ -563,6 +563,14 @@ snapshot. For every account with an ACTIVE or PAUSED deployment it compares:
   stop/target orders are marked as protection, not untracked entries/exits);
 - protective stops with open broker positions when the adapter can list them.
 
+Note the Alpaca aged-order policy: any GTC order - including the protective
+legs and restored stops the adapter submits `GTC` - is cancelled by Alpaca
+~90 days after creation, and nothing re-places a protective order lost that
+way yet. A position left without a working protective stop surfaces as the
+reconciler's `position_without_protective_stop` finding (entry halt after
+the consecutive-mismatch threshold), which is the safety net until aged-order
+re-placement is implemented.
+
 Unreadable broker state is a mismatch (fail closed), but it must not flap: a
 deployment's entries are halted only after
 `broker_reconciliation_consecutive_mismatches` consecutive bad passes
@@ -586,7 +594,13 @@ permanent, leave the flag - or `PAUSED`/`STOPPED` the deployment.
 
 Only signals younger than 7 days and belonging to ACTIVE/PAUSED deployments
 count as orders the ledger still expects to be working: both live order paths
-expire fast (Alpaca `DAY`, cTrader `IMMEDIATE_OR_CANCEL`), so an older
+expire fast (cTrader `IMMEDIATE_OR_CANCEL`, and Alpaca entries are market
+orders - they fill at the open or are rejected, never rest unfilled; the
+adapter submits them `GTC` since 2026-11-25 only so the bracket/OTO SL/TP
+legs survive the session close; Alpaca's aged-order policy cancels any GTC
+order ~90 days after creation and nothing re-places a protective order lost
+that way yet - the reconciler's `position_without_protective_stop` finding
+is what catches it), so an older
 unfilled row is a cancelled/expired/rejected historical order, not a working
 one. A younger order missing from the broker's working list is not trusted on
 the age bound alone: the reconciler asks the adapter for that order's state

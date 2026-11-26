@@ -477,7 +477,7 @@ def test_alpaca_extended_hours_entries_fail_closed():
     base_kwargs = dict(
         qty=1.0,
         order_side=SimpleNamespace(BUY="buy", SELL="sell"),
-        time_in_force=SimpleNamespace(DAY="day"),
+        time_in_force=SimpleNamespace(DAY="day", GTC="gtc"),
         market_request_cls=_fail_request_cls,
         client_order_id="cid-eh",
     )
@@ -508,7 +508,7 @@ def test_alpaca_regular_market_orders_carry_bracket_legs(monkeypatch):
 
     adapter = module.AlpacaLiveAdapter(api_key="k", secret_key="s", paper=True)
     order_side = SimpleNamespace(BUY="buy", SELL="sell")
-    time_in_force = SimpleNamespace(DAY="day")
+    time_in_force = SimpleNamespace(DAY="day", GTC="gtc")
 
     def _market_request_cls(**kwargs):
         return ("market", kwargs)
@@ -536,7 +536,7 @@ def test_alpaca_regular_market_orders_carry_bracket_legs(monkeypatch):
     assert market_kwargs["symbol"] == "MSFT"
     assert market_kwargs["qty"] == 2.0
     assert market_kwargs["side"] == "sell"
-    assert market_kwargs["time_in_force"] == "day"
+    assert market_kwargs["time_in_force"] == "gtc"
     assert market_kwargs["extended_hours"] is False
     assert market_kwargs["client_order_id"] == "cid-regular"
     assert market_kwargs["order_class"] is module.OrderClass.BRACKET
@@ -4072,7 +4072,7 @@ def test_alpaca_build_order_request_rejects_unknown_signal_action():
     kwargs = dict(
         qty=1.0,
         order_side=SimpleNamespace(BUY="buy", SELL="sell"),
-        time_in_force=SimpleNamespace(DAY="day"),
+        time_in_force=SimpleNamespace(DAY="day", GTC="gtc"),
         market_request_cls=lambda **kw: ("market", kw),
         client_order_id="cid-unknown-action",
     )
@@ -4308,7 +4308,7 @@ def test_alpaca_build_order_request_carries_bracket_legs():
         signal,
         qty=2.0,
         order_side=SimpleNamespace(BUY="buy", SELL="sell"),
-        time_in_force=SimpleNamespace(DAY="day"),
+        time_in_force=SimpleNamespace(DAY="day", GTC="gtc"),
         market_request_cls=lambda **kwargs: ("market", kwargs),
         client_order_id="cid-bracket",
     )
@@ -4522,7 +4522,7 @@ def test_alpaca_exit_only_orders_bypass_entry_sl_tp_guard():
         signal,
         qty=3.0,
         order_side=SimpleNamespace(BUY="buy", SELL="sell"),
-        time_in_force=SimpleNamespace(DAY="day"),
+        time_in_force=SimpleNamespace(DAY="day", GTC="gtc"),
         market_request_cls=lambda **kwargs: ("market", kwargs),
         client_order_id="cid-exit",
     )
@@ -5239,7 +5239,7 @@ def test_unbounded_tp_policy_builds_stop_only_requests() -> None:
         signal,
         qty=1.0,
         order_side=SimpleNamespace(BUY="buy", SELL="sell"),
-        time_in_force=SimpleNamespace(DAY="day"),
+        time_in_force=SimpleNamespace(DAY="day", GTC="gtc"),
         market_request_cls=_market_request_cls,
         client_order_id="cid-unbounded",
     )
