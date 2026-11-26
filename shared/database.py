@@ -7714,7 +7714,6 @@ def reanchor_live_loss_breaker_deployment(
     scope: str,
     *,
     equity_anchor: float,
-    scope_equity: float,
     reanchored_at: datetime,
     account_id: str,
 ) -> LiveLossBreakerRecord | None:
@@ -7722,10 +7721,14 @@ def reanchor_live_loss_breaker_deployment(
 
     Sets ``equity_anchor`` to ``equity_anchor`` (the CURRENT residual -
     account equity minus the sum of all deployment P&L on the account) and
-    moves ``last_equity`` to ``scope_equity`` (``equity_anchor + own
-    P&L``), shifting ``day_start_equity`` and ``peak_equity`` by the same
-    delta so no breaker fraction jumps. Existing breach latches are kept:
-    re-anchoring fixes the measurement basis (after e.g. a large
+    moves ``last_equity`` to ``equity_anchor + own P&L``, where own P&L is
+    ``last_equity - old equity_anchor`` read from the SAME row inside the
+    write transaction when the row is already on ``account_id`` (a re-pointed
+    row that has not been observed on the new account contributes 0 - its
+    stored P&L belongs to the old account's residual basis), shifting
+    ``day_start_equity`` and ``peak_equity`` by the same delta so no breaker
+    fraction jumps. Existing breach latches are kept: re-anchoring fixes the
+    measurement basis (after e.g. a large
     deposit/withdrawal or an account repoint); it does not clear a trip.
     ``account_id`` is the deployment's CURRENT account: the row's
     ``account_id`` is rewritten to it, so a re-pointed deployment's scope
@@ -7755,11 +7758,6 @@ def reanchor_live_loss_breaker_deployment(
         raise ValueError(
             f"loss breaker equity anchor must be finite, got {equity_anchor!r}"
         )
-    equity_value = float(scope_equity)
-    if not math.isfinite(equity_value):
-        raise ValueError(
-            f"loss breaker scope equity must be finite, got {scope_equity!r}"
-        )
     reanchored_naive = _naive_utc(reanchored_at)
 
     init_db()
@@ -7773,6 +7771,20 @@ def reanchor_live_loss_breaker_deployment(
                 raise ValueError(
                     f"loss breaker scope {normalized_scope!r} has no last "
                     "observed equity; there is no series to re-anchor"
+                )
+            own_pnl = (
+                float(row.last_equity) - float(row.equity_anchor)
+                if (
+                    row.account_id == normalized_account
+                    and row.equity_anchor is not None
+                )
+                else 0.0
+            )
+            equity_value = anchor_value + own_pnl
+            if not math.isfinite(equity_value):
+                raise ValueError(
+                    "loss breaker scope equity must be finite, got "
+                    f"{equity_value!r}"
                 )
             delta = equity_value - float(row.last_equity)
             row.equity_anchor = anchor_value

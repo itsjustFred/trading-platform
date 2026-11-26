@@ -55,6 +55,19 @@ def _run(argv: list[str], data_dir: Path) -> subprocess.CompletedProcess[str]:
     )
 
 
+def _run_code(code: str, data_dir: Path) -> None:
+    """Run setup Python in the same sandboxed environment as the CLI."""
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        cwd=str(REPO_ROOT),
+        env=_child_env(data_dir),
+        timeout=300,
+    )
+    assert result.returncode == 0, result.stderr
+
+
 def _seed_state(data_dir: Path, *, stale: bool = False) -> None:
     """Create breaker state in the sandbox: account scope tripped on drawdown.
 
@@ -86,6 +99,36 @@ def _seed_state(data_dir: Path, *, stale: bool = False) -> None:
         timeout=300,
     )
     assert result.returncode == 0, result.stderr
+
+
+def _seed_cli_account(data_dir: Path, account_id: str) -> None:
+    _run_code(
+        f"""
+from shared.database import LiveAccountModel, get_session, init_db
+init_db()
+with get_session() as session:
+    session.add(LiveAccountModel(id='{account_id}', broker='test', name='{account_id}'))
+    session.commit()
+""",
+        data_dir,
+    )
+
+
+def _seed_cli_deployment(data_dir: Path, dep_id: str, account_id: str) -> None:
+    _run_code(
+        f"""
+from shared.database import (
+    LiveAccountModel, LiveDeploymentModel, get_session, init_db)
+init_db()
+with get_session() as session:
+    session.add(LiveAccountModel(id='{account_id}', broker='test', name='{account_id}'))
+    session.add(LiveDeploymentModel(
+        id='{dep_id}', strategy_name='t', account_id='{account_id}',
+        symbols_json=['AAPL'], timeframe='1h', status='PAUSED'))
+    session.commit()
+""",
+        data_dir,
+    )
 
 
 @pytest.mark.parametrize(
@@ -735,6 +778,151 @@ def test_reanchor_refuses_scope_with_no_state(tmp_path: Path) -> None:
 
     assert result.returncode == 1
     assert "no loss breaker state" in result.stderr
+
+
+def test_reanchor_uses_current_account_after_repoint_without_observe(
+    tmp_path: Path,
+) -> None:
+    """B1 pin through the CLI's default equity source: after a re-point with
+    no intervening deployment observe, ``re-anchor`` must measure the NEW
+    account's scope equity and move the breaker row to that account."""
+    data_dir = tmp_path / "data"
+    old_account = "acc-repoint-cli-old"
+    new_account = "acc-repoint-cli-new"
+    _seed_cli_deployment(data_dir, DEP_ID, old_account)
+    _seed_cli_account(data_dir, new_account)
+    _run_code(
+        f"""
+from datetime import datetime, timedelta, timezone
+from live_runner.loss_breaker import observe_account_loss_breaker_equity
+from shared.database import update_live_deployment_account
+from shared.models import LiveDeploymentConfig
+now = datetime.now(timezone.utc)
+dep = LiveDeploymentConfig(
+    id='{DEP_ID}', strategy_name='t', account_id='{old_account}',
+    symbols=['AAPL'], timeframe='1h', status='PAUSED',
+    signal_source='internal', signal_config={{}}, settings={{}})
+observe_account_loss_breaker_equity(
+    '{old_account}', 100000.0, now=now, deployments=[dep],
+    deployment_pnls={{'{DEP_ID}': -10000.0}}, env_values={{}})
+update_live_deployment_account('{DEP_ID}', '{new_account}')
+observe_account_loss_breaker_equity(
+    '{new_account}', 70000.0, now=now + timedelta(seconds=1),
+    deployments=[], deployment_pnls={{}}, env_values={{}})
+""",
+        data_dir,
+    )
+
+    result = _run(["re-anchor", "--deployment", DEP_ID], data_dir)
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["equity_source"] == "last_observed_equity"
+    assert payload["account_equity"] == pytest.approx(70_000.0)
+    assert payload["equity_anchor_after"] == pytest.approx(70_000.0)
+    assert payload["last_equity_after"] == pytest.approx(70_000.0)
+
+    status = _run(["status", "--account", new_account], data_dir)
+    assert status.returncode == 0, status.stderr
+    scopes = json.loads(status.stdout)["scopes"]
+    dep_state = next(s for s in scopes if s["scope"] == f"deployment:{DEP_ID}")
+    assert dep_state["account_id"] == new_account
+    assert dep_state["equity_anchor"] == pytest.approx(70_000.0)
+
+
+def test_reanchor_refuses_future_account_equity_observation(
+    tmp_path: Path,
+) -> None:
+    """The CLI's default equity source refuses an account observation dated
+    in the future instead of re-anchoring on it."""
+    data_dir = tmp_path / "data"
+    account_id = "acc-future-equity"
+    _seed_cli_deployment(data_dir, DEP_ID, account_id)
+    _run_code(
+        f"""
+from datetime import datetime, timedelta, timezone
+from shared.database import observe_live_loss_breaker
+future = datetime.now(timezone.utc) + timedelta(days=1)
+observe_live_loss_breaker('account:{account_id}', '{account_id}', 70000.0, future)
+observe_live_loss_breaker(
+    'deployment:{DEP_ID}', '{account_id}', 100000.0, future)
+""",
+        data_dir,
+    )
+
+    result = _run(["re-anchor", "--deployment", DEP_ID], data_dir)
+
+    assert result.returncode == 1
+    assert "in the future" in result.stderr
+
+
+def test_reset_drawdown_refuses_future_breaker_observation(
+    tmp_path: Path,
+) -> None:
+    """``reset-drawdown`` refuses a stored observation dated in the future."""
+    data_dir = tmp_path / "data"
+    account_id = "acc-future-reset"
+    _run_code(
+        f"""
+from datetime import datetime, timedelta, timezone
+from shared.database import observe_live_loss_breaker
+future = datetime.now(timezone.utc) + timedelta(days=1)
+observe_live_loss_breaker('account:{account_id}', '{account_id}', 80000.0, future)
+""",
+        data_dir,
+    )
+
+    result = _run(["reset-drawdown", "--account", account_id], data_dir)
+
+    assert result.returncode == 1
+    assert "in the future" in result.stderr
+
+
+def test_reanchor_bounds_deployment_rows_by_account_equity_time(
+    tmp_path: Path,
+) -> None:
+    """The deployment-row age check must use the ACCOUNT EQUITY observation
+    time, not the re-anchor's wall clock: a fills row observed after that
+    equity snapshot is refused even though it is fresh right now."""
+    data_dir = tmp_path / "data"
+    account_id = "acc-cli"
+    _seed_cli_deployment(data_dir, DEP_ID, account_id)
+    _run_code(
+        f"""
+from datetime import datetime, timedelta, timezone
+from uuid import uuid4
+from live_runner.loss_breaker import observe_account_loss_breaker_equity
+from shared.database import (
+    observe_live_loss_breaker, save_live_execution, save_live_signal)
+from shared.models import LiveDeploymentConfig, LiveExecution, LiveSignal
+now = datetime.now(timezone.utc)
+row_time = now - timedelta(seconds=100)
+equity_time = now - timedelta(seconds=500)
+dep = LiveDeploymentConfig(
+    id='{DEP_ID}', strategy_name='t', account_id='{account_id}',
+    symbols=['AAPL'], timeframe='1h', status='PAUSED',
+    signal_source='internal', signal_config={{}}, settings={{}})
+observe_account_loss_breaker_equity(
+    '{account_id}', 100000.0, now=row_time, deployments=[dep],
+    deployment_pnls={{'{DEP_ID}': 0.0}}, env_values={{}})
+observe_live_loss_breaker(
+    'account:{account_id}', '{account_id}', 70000.0, equity_time)
+signal = LiveSignal(
+    id=uuid4(), deployment_id='{DEP_ID}', symbol='AAPL', action='buy',
+    theoretical_price=100.0, timestamp=row_time, metadata={{}})
+save_live_signal(signal)
+save_live_execution(LiveExecution(
+    signal_id=signal.id, actual_price=100.0, filled_qty=10.0,
+    commission=0.0, timestamp=row_time, broker_order_id='bo-cli-age',
+    actual_price_observed='observed'))
+""",
+        data_dir,
+    )
+
+    result = _run(["re-anchor", "--deployment", DEP_ID], data_dir)
+
+    assert result.returncode == 1
+    assert "AFTER the equity observation" in result.stderr
 
 
 def test_resolve_ledger_flag_reports_when_nothing_was_flagged(tmp_path: Path) -> None:

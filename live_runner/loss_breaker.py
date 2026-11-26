@@ -428,7 +428,7 @@ def _deployment_scope_series(
 ) -> tuple[float, float | None]:
     """``(scope_equity, anchor_to_persist)`` from ONE breaker ``record``.
 
-    The pure half of :func:`deployment_scope_equity`: ``record`` is the
+    The pure half of :func:`_deployment_scope_equity`: ``record`` is the
     scope's stored state (``None`` when it has no row yet). Callers that
     observe pass the row read INSIDE the write transaction
     (:func:`observe_live_loss_breaker_series`), so the anchor they compute
@@ -456,7 +456,7 @@ def _deployment_scope_series(
     return residual + own_pnl, residual
 
 
-def deployment_scope_equity(
+def _deployment_scope_equity(
     *,
     scope: str,
     account_equity: float,
@@ -958,7 +958,7 @@ def refuse_entry_if_loss_breaker_tripped(
     poison the persisted equity series. ``deployment_pnls`` maps deployment id
     to its trading P&L on the account
     (:func:`account_deployment_trading_pnls`); the deployment scope's equity
-    is computed from it by :func:`deployment_scope_equity` - the same anchored
+    is computed from it by :func:`_deployment_scope_equity` - the same anchored
     formula the balance poll uses. ``None`` means the P&L could not be
     measured, which fails closed when the deployment breaker is enabled and
     skips the scope when it is disabled.
@@ -1072,7 +1072,7 @@ def observe_account_loss_breaker_equity(
 
     ``deployment_pnls`` maps deployment id to its trading P&L
     (:func:`account_deployment_trading_pnls`); each deployment scope observes
-    the anchored equity :func:`deployment_scope_equity` computes - the
+    the anchored equity :func:`_deployment_scope_equity` computes - the
     persisted ``equity_anchor`` plus its own P&L - so the scope moves only
     with its own deployment's P&L and is immune to unattributed equity
     changes, deposits and other deployments' P&L. ``None`` means the P&L
@@ -1354,12 +1354,10 @@ def reanchor_deployment_loss_breaker_scope(
     own_pnl = anchored_pnls.get(deployment_id, 0.0)
     total_pnl = sum(anchored_pnls.values())
     residual = equity_value - total_pnl
-    scope_equity = residual + own_pnl
 
     updated = reanchor_live_loss_breaker_deployment(
         normalized_scope,
         equity_anchor=residual,
-        scope_equity=scope_equity,
         reanchored_at=observed_at,
         account_id=account_id,
     )
