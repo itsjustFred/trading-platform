@@ -1496,6 +1496,49 @@ def test_fail_in_flight_requests_tolerates_errback_failures(caplog) -> None:
     asyncio.run(_run())
 
 
+def test_fail_in_flight_requests_tolerates_unexpected_response_deferreds(
+    caplog,
+) -> None:
+    """A ctrader-open-api bump that reshapes ``_responseDeferreds`` (here a
+    non-iterable) must not abort teardown: adapter-tracked deferreds are
+    still errbacked and the enumeration miss is warned, not silent."""
+    import logging
+
+    from live_runner.ctrader_adapter import CTraderConnectionLostError
+
+    async def _run() -> None:
+        adapter = CTraderLiveAdapter(
+            app_id="app", app_secret="secret", access_token="token", account_id="1"
+        )
+        adapter._loop = asyncio.get_running_loop()
+
+        class _Deferred:
+            called = False
+            errbacks: list[BaseException] = []
+
+            def errback(self, exc: BaseException) -> None:
+                self.errbacks.append(exc)
+
+        deferred = _Deferred()
+        adapter._in_flight_request_deferreds.add(deferred)
+
+        class _Client:
+            # Not a mapping and not iterable: enumerating it raises.
+            _responseDeferreds = 42
+
+        with caplog.at_level(logging.WARNING, logger="trading.live-runner"):
+            adapter._fail_in_flight_requests(client=_Client())
+
+        assert len(deferred.errbacks) == 1
+        assert isinstance(deferred.errbacks[0], CTraderConnectionLostError)
+        assert any(
+            "Could not enumerate in-flight" in record.getMessage()
+            for record in caplog.records
+        )
+
+    asyncio.run(_run())
+
+
 def test_submit_awaiting_when_disconnect_event_arrives_ends_unknown(
     tmp_path, monkeypatch
 ) -> None:

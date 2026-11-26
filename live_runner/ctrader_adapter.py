@@ -1992,6 +1992,14 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._authenticated = False
         self._already_logged_in_notified = False
         self._connected_event.clear()
+        # The session is dead with the transport: drop the recorded session
+        # token and any in-flight rotation marker so a stale value cannot
+        # make a later invalidation event look like our own rotation echo.
+        # (An in-flight rotation cannot survive this anyway - its pending
+        # send is errbacked by ``_fail_in_flight_requests`` below and the
+        # helper's ``finally`` clears the flag on the way out.)
+        self._session_access_token = ""
+        self._own_token_rotation_in_flight = False
         self._last_session_teardown_at = time.monotonic()
         # Upstream ``Client._disconnected`` clears ``_responseDeferreds``
         # BEFORE invoking this callback, so the dict enumeration in
@@ -2452,48 +2460,47 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         or re-auth raised propagates.
 
         ``_own_token_rotation_in_flight`` spans the whole refresh+re-auth
-        window - set here, cleared by ``_note_session_access_token`` on
-        success or explicitly on every failure exit - so a
+        window - set here and cleared unconditionally by the ``finally``
+        (``_note_session_access_token`` also clears it on success, which the
+        ``finally`` then re-affirms) - so a
         ``ProtoOAAccountsTokenInvalidatedEvent`` landing anywhere inside it
         (including between refresh completion and the AccountAuthRes) is
-        recognised as our own rotation echo, not a fresh invalidation.
+        recognised as our own rotation echo, not a fresh invalidation. The
+        ``finally`` is deliberate: a flag left set makes
+        ``_token_invalidation_skip_reason`` ignore every later invalidation
+        event, so a dead session would never be torn down.
         """
         self._own_token_rotation_in_flight = True
         try:
             refreshed = await self._refresh_access_token(
                 failed_access_token=failed_access_token
             )
-        except BaseException:  # except-kind: money-decision
-            self._own_token_rotation_in_flight = False
-            raise
-        if not refreshed:
-            self._own_token_rotation_in_flight = False
-            return False
-        if (
-            self._ProtoOAAccountAuthReq is None
-            or self._ProtoOAAccountAuthRes is None
-        ):
-            # No re-auth will run, so nothing will note the new session
-            # token; the flag must not outlive this rotation attempt.
-            self._own_token_rotation_in_flight = False
-            return True
-        # The token the AccountAuthReq carries is fixed at send time; a
-        # sibling-pair adoption during the flight must not make the session
-        # record describe a token the session never authenticated with.
-        auth_token = self.access_token
-        try:
-            account_auth_res = await self._send_account_auth_request(timeout_seconds=15)
-        except BaseException:  # except-kind: money-decision
-            self._own_token_rotation_in_flight = False
-            raise
-        if not isinstance(account_auth_res, self._ProtoOAAccountAuthRes):
-            self._own_token_rotation_in_flight = False
-            raise RuntimeError(
-                "Unexpected account auth response after refresh: "
-                f"{type(account_auth_res).__name__}"
+            if not refreshed:
+                return False
+            if (
+                self._ProtoOAAccountAuthReq is None
+                or self._ProtoOAAccountAuthRes is None
+            ):
+                # No re-auth will run, so nothing will note the new session
+                # token; the flag must not outlive this rotation attempt.
+                return True
+            # The token the AccountAuthReq carries is fixed at send time; a
+            # sibling-pair adoption during the flight must not make the
+            # session record describe a token the session never
+            # authenticated with.
+            auth_token = self.access_token
+            account_auth_res = await self._send_account_auth_request(
+                timeout_seconds=15
             )
-        self._note_session_access_token(auth_token)
-        return True
+            if not isinstance(account_auth_res, self._ProtoOAAccountAuthRes):
+                raise RuntimeError(
+                    "Unexpected account auth response after refresh: "
+                    f"{type(account_auth_res).__name__}"
+                )
+            self._note_session_access_token(auth_token)
+            return True
+        finally:
+            self._own_token_rotation_in_flight = False
 
     async def _send_account_auth_request(self, *, timeout_seconds: int = 15) -> Any:
         account_auth_req = self._ProtoOAAccountAuthReq()
