@@ -1527,6 +1527,33 @@ def test_token_invalidation_self_heals_latched_flag_on_dead_session() -> None:
     assert adapter._token_invalidation_skip_reason() is None
 
 
+def test_token_invalidation_self_heals_latched_flag_during_handling() -> None:
+    """End-to-end: a latched ``_own_token_rotation_in_flight`` on a dead
+    session must not let the invalidation handler skip a genuine event.
+    The handler self-heals the marker before the skip check, so the dead
+    session is still torn down."""
+    from ctrader_open_api.messages.OpenApiMessages_pb2 import (
+        ProtoOAAccountsTokenInvalidatedEvent,
+    )
+
+    adapter, client, ProtoMessage = _lifecycle_event_adapter()
+    adapter._connected = False
+    adapter._own_token_rotation_in_flight = 1
+
+    adapter._on_message(
+        client,
+        _wire_payload(
+            ProtoMessage,
+            ProtoOAAccountsTokenInvalidatedEvent(
+                ctidTraderAccountIds=[46736452], reason="token revoked"
+            ),
+        ),
+    )
+
+    _assert_session_dropped_for_reconnect(adapter)
+    assert adapter._own_token_rotation_in_flight == 0
+
+
 def test_token_invalidation_own_rotation_grace_has_a_sane_floor() -> None:
     """The grace window must stay larger than cTrader's invalidation-event
     delivery latency: a late echo for the OLD token arriving after our
@@ -1732,6 +1759,27 @@ def test_listener_reconnect_delay_after_teardown_is_bounded() -> None:
         time.monotonic() - module._LISTENER_RECONNECT_MIN_INTERVAL_SECONDS - 1.0
     )
     assert adapter._listener_reconnect_delay_seconds() == 0.0
+
+
+def test_on_disconnected_sets_listener_reconnect_floor() -> None:
+    """A plain transport loss (``_on_disconnected``, not a session
+    teardown) must also record the teardown time, or the listener's
+    minimum reconnect interval would not apply after transport drops and
+    a broker that keeps dropping right after auth could spin
+    connect/auth/disconnect unbounded."""
+    from live_runner import ctrader_adapter as module
+
+    adapter = CTraderLiveAdapter(
+        app_id="app", app_secret="secret", access_token="token", account_id="1"
+    )
+    client = object()
+    adapter._client = client
+    adapter._connected = True
+
+    adapter._on_disconnected(client, "connection lost")
+
+    delay = adapter._listener_reconnect_delay_seconds()
+    assert 0.0 < delay <= module._LISTENER_RECONNECT_MIN_INTERVAL_SECONDS
 
 
 def test_listener_sleeps_reconnect_floor_before_connecting(monkeypatch) -> None:
