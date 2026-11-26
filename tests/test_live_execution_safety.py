@@ -5018,6 +5018,42 @@ def test_alpaca_listen_clean_return_backs_off_instead_of_spinning(monkeypatch):
 
 # ── #80: per-symbol cTrader volume + SL/TP scales ─────────────────────────────
 
+@pytest.mark.parametrize(
+    "volume",
+    [
+        1,
+        999,
+        1_000,
+        2_001,
+        123_457,
+        999_999,
+        1_000_000,
+        2_147_483_000,
+        2_147_483_647,
+    ],
+)
+def test_ctrader_volume_qty_round_trip_is_exact_at_broker_volumes(volume: int) -> None:
+    """The submit path's exact-int idempotency guard rests on this round trip.
+
+    ``submit_order`` normalizes the signal qty from the resolved volume and
+    fails closed when resolving that qty again does not reproduce the volume,
+    so ``volume -> qty -> volume`` must be exact for every volume the cTrader
+    protocol can express (int32). It is the decimal lot-grid floor that makes
+    it exact - a change to ``_broker_volume_to_qty``, ``_qty_to_broker_volume``
+    or the floor's noise band would otherwise make the guard false-positive
+    (refusing valid submits) or false-negative (wire volume and persisted qty
+    diverging silently). Pinning the bound directly, not only through one
+    resolution point, is what makes such a change visible.
+    """
+    from live_runner import ctrader_adapter as module
+
+    volume_per_qty = module._fallback_symbol_scale("EURUSD").volume_per_qty
+
+    qty = module._broker_volume_to_qty(volume, volume_per_qty)
+
+    assert module._qty_to_broker_volume(qty, volume_per_qty) == volume
+
+
 def _ctrader_signal(symbol: str, metadata: dict) -> "LiveSignal":
     return LiveSignal(
         deployment_id="dep-1",

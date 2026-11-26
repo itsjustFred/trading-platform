@@ -858,12 +858,14 @@ def _qty_to_broker_volume(qty: float, volume_per_qty: float = QTY_VOLUME_SCALE) 
 def _coerce_broker_volume(volume: Any, *, field_name: str) -> int:
     """Coerce the broker volume a request builder was handed, failing closed.
 
-    Both builders receive the volume ``submit_order`` resolved once, in whole
-    broker volume units (the protocol fields are int32). A fractional, boolean
-    or textual value means the caller handed this seam something else - qty, or
-    a scaled quantity - and rounding it would put a size on the wire that
-    nobody decided on. The two builders must agree on this contract, so the
-    check lives here rather than in each of them.
+    Both builders receive the volume ``submit_order`` resolved once, as a
+    Python ``int`` count of whole broker volume units - the protocol fields are
+    int32, and a whole-valued ``float`` is refused rather than accepted: this
+    seam is a typed contract, not a coercion point. A fractional, boolean or
+    textual value means the caller handed this seam something else - qty, or a
+    scaled quantity - and rounding it would put a size on the wire that nobody
+    decided on. The two builders must agree on this contract, so the check
+    lives here rather than in each of them.
     """
     if isinstance(volume, bool) or not isinstance(volume, int):
         raise ValueError(
