@@ -8,7 +8,7 @@ Map of the top-level packages. Detail lives in the linked docs; decisions in
 - `runner/` — backtesting. `runner/engine.py` + `runner/engine_pkg/` is the
   native event-based engine (`TradeEngine`); `runner/engines/` holds the
   engine adapters (`native_adapter.py` is the single strategy engine going
-  forward per ADR 0001 / #318; `vectorbt`, `pynecore`, `lean` and
+  forward per the native-single-strategy-engine ADR / #318; `vectorbt`, `pynecore`, `lean` and
   `signal_replay` adapters are frozen). Also the CLI (`cli.py`), grid/matrix
   runners, optimizer, walk-forward and `stats.py`. Contracts:
   `docs/cross-engine-backtest-contract.md`, `docs/sizing-semantics.md`,
@@ -58,13 +58,25 @@ strategies/<slug>/<slug>.py   (+ optional README.md, helper context files)
 ```
 
 The folder name is the stable slug; backtests store it in `meta.strategies`.
+Helper context files beside the main module may only import a fixed whitelist
+(`pandas`, `numpy`, `math`, `statistics`, `decimal`, `datetime`, `typing`,
+`collections`, `itertools`, `functools`, `dataclasses`, `__future__`) and
+define `build_trade_context` / `build_drawings` — they are compiled inside the
+runner process, so the whitelist in
+`runner/engines/pynecore_adapter.py` (`HELPER_ALLOWED_IMPORT_ROOTS`) is a
+security gate, not a style rule.
 LLM-generated strategy code is untrusted until a human approves it: drafts are
 statically screened (`runner/codegen_safety.py`), marked, and only runnable
 after a SHA256-bound approval (`runner/approval_gate.py`,
 `POST /api/strategies/{file}/approve`). Any new execution route for generated
 strategy files MUST call `runner.approval_gate.require_generated_strategy_approval`
 (or `runner.auto_agent.run_validated_backtest`) before importing or executing
-the module.
+the module. Engine adapters and grid entry points re-check the approval as a
+second layer (`require_generated_strategy_approval` in each adapter and
+`runner/backtest_grid.py`); the auto-agent validation route runs the approved
+backtest in a subprocess with an allowlisted environment
+(`runner/agent_process.build_backtest_child_env` — no API keys) and a
+wall-clock timeout.
 
 ## Conventions worth knowing
 
@@ -72,7 +84,24 @@ the module.
   `max_total_exposure`): `docs/sizing-semantics.md`.
 - Money-path decision records: `docs/cleanup-16d1-money-path-semantics.md`.
 - Reference-parity fixtures spec: `docs/reports/parity-reference-libraries.md`.
+- Grid/matrix backtest docs: `docs/backtest_grid.md`, `docs/backtest_matrix.md`.
+- Frontend↔backend contract: `frontend/src/api/client.ts` and `types.ts` mirror
+  `viewer/main.py`/`viewer/core.py` — keep them in sync when fields change.
 - Test sandbox and OHLCV-gated strategy tests: see `AGENTS.md`.
+
+## Optimization and walk-forward invariants
+
+- Portfolio optimization normalizes each equity curve to its first observation
+  before correlation, weighting and OOS metrics (`_normalize_equity_matrix` in
+  `runner/portfolio_optimizer.py`); persisted portfolio artifacts carry a UUID
+  suffix so same-second runs cannot collide.
+- Walk-forward steps default to the test-window length; custom step, purge or
+  embargo windows require explicit `start`/`end` boundaries so OOS folds
+  cannot overlap silently (`runner/walkforward.py` raises otherwise).
+- The optimizer's three-way split, embargo and result-payload contract:
+  `docs/walk_forward.md`. Its `diagnostics` block (plateau, selection-bias,
+  survivorship) never changes which trial wins — it reports how much the
+  selection should be trusted.
 
 ## Metrics and chart semantics
 

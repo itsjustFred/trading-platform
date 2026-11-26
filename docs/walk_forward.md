@@ -174,3 +174,53 @@ min_deflated_sharpe: 0.90
 ```
 
 Defaults are shown above; only `train_split_pct` is required for backward compatibility (the remainder is split equally).
+## Result diagnostics
+
+Every parameter-mode optimization emits a `diagnostics` block
+(`runner/optimizer.py::_build_diagnostics_payload`, statistics in
+`runner/optimization_diagnostics.py`). It never changes which parameter is
+selected; it reports how much the selection should be trusted.
+
+```json
+"diagnostics": {
+  "split":      { "train": {}, "validation": {}, "test": {},
+                  "embargo_train_val": {}, "embargo_val_test": {},
+                  "embargo_bars_equivalent": 12.0 },
+  "walk_forward_folds": [ { "fold": 0, "train": {}, "test": {} } ],
+  "walk_forward_note": "Fold boundaries only ...",
+  "plateau":    { "parameter": "...", "direction": "maximize",
+                  "is_plateau": false, "sensitivity": 0.011 },
+  "multiple_testing": { "n_trials": 8, "bonferroni_threshold": 0.00625,
+                        "expected_max_under_null": 1.397,
+                        "survives_selection_bias": false },
+  "survivorship": {}, "subperiod_stability": {}, "target_metric": "..."
+}
+```
+
+- `split` reports the windows that actually ran, including both embargo gaps
+  (`embargo_train_val`, `embargo_val_test`) and the train→validation gap in
+  bars (`embargo_bars_equivalent`). `embargo_pct` (default `0.0`, max `0.4`)
+  plus `embargo_days` (default `1`) size those gaps; they are taken out of the
+  train segment so validation and test keep their configured length.
+- `walk_forward_folds` is **report-only**: fold boundaries inside the range
+  before the test holdout and its embargo (`walk_forward_splits`, default 3,
+  max 20). No per-fold performance is computed and no parameter is re-fitted —
+  `walk_forward_note` says so; it is not walk-forward evidence.
+- `plateau` is centred on the trial the study selects (highest metric for a
+  maximize target, lowest for `p_value`), along the most broadly varied
+  parameter; `direction` is published. `is_plateau` is false when only the
+  winning parameter scores within `tolerance` of the best — a lone spike, the
+  classic overfitting signature. No-trade penalty trials and internal params
+  are excluded from the statistics (`n_no_trade_trials_excluded` reports how
+  many).
+- `multiple_testing.survives_selection_bias` compares the observed metric with
+  the expected maximum of N trials under the null (Bonferroni threshold
+  `alpha / n_trials`). A best-of-N result below that expectation is consistent
+  with pure selection noise. It is `null` for single-trial studies.
+- `survivorship` reports what the stored data says about a universe that may
+  not be point-in-time; `subperiod_stability` asks whether the winning value
+  also wins in each sub-period (realized PnL, never a guess when no trial
+  carries sub-period results).
+
+Reading a result: `is_plateau: false` **and** `survives_selection_bias: false`
+together mean the selected parameter should not be promoted to live trading.
