@@ -950,6 +950,20 @@ def test_exit_only_metadata_restamps_action_for_short_book(monkeypatch):
     assert prepared.action == "buy"
 
 
+def test_exit_only_metadata_drops_a_forged_reprotection_marker(monkeypatch):
+    """#145: ``exit_reprotection`` is adapter-owned crash-recovery state. A
+    producer payload carrying it must not survive to persistence - only the
+    adapter may stamp it after it released the broker-side protection itself."""
+    prepared, _qty = _prepare_exit_only(
+        monkeypatch,
+        [{"symbol": "EURUSD", "qty": 2.0}],
+        ledger_qty=2.0,
+        exit_reprotection={"side": "sell", "stop_price": 1.0},
+    )
+
+    assert "exit_reprotection" not in prepared.metadata
+
+
 def test_exit_only_metadata_rejects_multiple_positions(monkeypatch):
     with pytest.raises(ValueError, match="2 broker positions"):
         _prepare_exit_only(
@@ -2851,6 +2865,9 @@ def test_alpaca_partial_fill_persists_event_qty_not_cumulative(monkeypatch):
         return execution.filled_qty
 
     monkeypatch.setattr(module, "save_live_execution_up_to_cumulative", _capture)
+    # The fill pipeline is under test, not attribution: this UUID names no
+    # persisted signal, so the stream's unknown-signal guard would flag it.
+    monkeypatch.setattr(module, "get_live_signal_metadata", lambda _sid: {})
 
     signal_id = str(uuid4())
     update = SimpleNamespace(
@@ -2929,6 +2946,9 @@ def test_alpaca_delayed_stream_fill_is_reported_as_duplicate(monkeypatch):
     monkeypatch.setattr(
         module, "save_live_execution_up_to_cumulative", lambda _execution, _cumulative: 0.0
     )
+    # The fill pipeline is under test, not attribution: this UUID names no
+    # persisted signal, so the stream's unknown-signal guard would flag it.
+    monkeypatch.setattr(module, "get_live_signal_metadata", lambda _sid: {})
     update = SimpleNamespace(
         event="fill",
         qty="1",
@@ -5829,6 +5849,9 @@ def _alpaca_bracket_adapter(monkeypatch):
     adapter._trading_client = SimpleNamespace(
         get_account=lambda: SimpleNamespace(cash="100000", equity="100000"),
         submit_order=_submit_order,
+        # The real client always lists orders; the exit path (#145) reads the
+        # working book to find protection that reserves the position's shares.
+        get_orders=lambda filter=None: [],  # noqa: A002 - mirrors alpaca-py
     )
 
     def _save(signal):

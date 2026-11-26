@@ -1597,10 +1597,15 @@ def test_balance_polling_fans_out_across_accounts(monkeypatch) -> None:
 # ── ACTIVE deployments nothing can trade (#242) ──────────────────────────────
 
 
-def _internal_deployment(status: str = "ACTIVE") -> LiveDeploymentConfig:
+def _internal_deployment(
+    status: str = "ACTIVE",
+    *,
+    strategy_name: str = "internal::ramjet",
+    settings: dict | None = None,
+) -> LiveDeploymentConfig:
     return LiveDeploymentConfig(
         id="22222222-2222-2222-2222-222222222222",
-        strategy_name="internal::ramjet",
+        strategy_name=strategy_name,
         account_id="acc-1",
         symbols=["AAPL"],
         timeframe="1h",
@@ -1608,6 +1613,7 @@ def _internal_deployment(status: str = "ACTIVE") -> LiveDeploymentConfig:
         signal_source="internal",
         signal_source_type="internal",
         signal_config={},
+        settings=settings or {},
     )
 
 
@@ -1629,7 +1635,75 @@ def test_active_internal_deployment_logs_error_naming_it(monkeypatch) -> None:
     data = kwargs["extra"]["data"]
     assert data["deployment_id"] == "22222222-2222-2222-2222-222222222222"
     assert data["signal_source"] == "internal"
-    assert "no live strategy runner" in data["untradeable_reason"]
+    # No opt-in flag: the reason names that, not a missing runner (#348).
+    assert "internal_runner_enabled" in data["untradeable_reason"]
+
+
+def test_active_internal_deployment_opted_in_with_resolvable_strategy_is_not_warned(
+    monkeypatch,
+) -> None:
+    """#348: an opted-in internal deployment whose strategy resolves trades."""
+    errors: list[tuple] = []
+    monkeypatch.setattr(
+        daemon,
+        "logger",
+        SimpleNamespace(error=lambda msg, *args, **kwargs: errors.append((msg, args, kwargs))),
+    )
+    deployment = _internal_deployment(
+        strategy_name="example_sma",
+        settings={"internal_runner_enabled": True},
+    )
+
+    daemon._warn_untradeable_active_deployments([deployment])
+
+    assert errors == []
+
+
+def test_active_internal_deployment_opted_in_with_unresolvable_strategy_warns(
+    monkeypatch,
+) -> None:
+    """Opted in but the strategy name resolves to nothing: still untradeable."""
+    errors: list[tuple] = []
+    monkeypatch.setattr(
+        daemon,
+        "logger",
+        SimpleNamespace(error=lambda msg, *args, **kwargs: errors.append((msg, args, kwargs))),
+    )
+    deployment = _internal_deployment(
+        strategy_name="risk_parity/risk_parity.py",
+        settings={"internal_runner_enabled": True},
+    )
+
+    daemon._warn_untradeable_active_deployments([deployment])
+
+    assert len(errors) == 1
+    data = errors[0][2]["extra"]["data"]
+    assert data["alert"] == "untradeable_active_deployment"
+    assert "risk_parity/risk_parity.py" in data["untradeable_reason"]
+    assert "cannot be resolved" in data["untradeable_reason"]
+
+
+def test_active_internal_source_with_non_internal_source_type_warns(
+    monkeypatch,
+) -> None:
+    """signal_source 'internal' + signal_source_type 'discord' is inert: neither
+    the Discord listener nor the internal runner evaluates it."""
+    errors: list[tuple] = []
+    monkeypatch.setattr(
+        daemon,
+        "logger",
+        SimpleNamespace(error=lambda msg, *args, **kwargs: errors.append((msg, args, kwargs))),
+    )
+    deployment = _internal_deployment(
+        strategy_name="example_sma",
+        settings={"internal_runner_enabled": True},
+    )
+    deployment.signal_source_type = "discord"
+
+    daemon._warn_untradeable_active_deployments([deployment])
+
+    assert len(errors) == 1
+    assert "signal_source_type" in errors[0][2]["extra"]["data"]["untradeable_reason"]
 
 
 def test_active_discord_and_non_active_deployments_are_not_warned(monkeypatch) -> None:
@@ -1815,7 +1889,7 @@ def test_sync_loop_alerts_an_untradeable_active_deployment() -> None:
     assert data["deployment_id"] == str(deployment.id)
     assert data["account_id"] == "acc-1"
     assert data["signal_source"] == "internal"
-    assert "no live strategy runner" in data["untradeable_reason"]
+    assert "internal_runner_enabled" in data["untradeable_reason"]
 
 
 def test_the_same_untradeable_row_is_not_alerted_on_every_tick() -> None:
@@ -1830,6 +1904,15 @@ def test_a_stopped_or_paused_row_is_not_alerted() -> None:
 
 def test_a_tradeable_row_is_not_alerted() -> None:
     assert _untradeable_alerts(_run_ticks([_discord_deployment()], ticks=2)) == []
+
+
+def test_an_opted_in_internal_deployment_with_a_resolvable_strategy_is_not_alerted() -> None:
+    """#348: the internal strategy runner trades this row, so it is not untradeable."""
+    deployment = _internal_deployment(
+        strategy_name="example_sma",
+        settings={"internal_runner_enabled": True},
+    )
+    assert _untradeable_alerts(_run_ticks([deployment], ticks=2)) == []
 
 
 def test_activating_a_row_alerts_it_once() -> None:

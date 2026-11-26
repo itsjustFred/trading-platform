@@ -44,6 +44,7 @@ from live_runner.account_routing import (
 from live_runner.alpaca_adapter import AlpacaLiveAdapter, resolve_alpaca_credentials
 from live_runner.base_adapter import (
     EXIT_ONLY_RISK_SIZING_MODE,
+    EXIT_REPROTECTION_METADATA_KEY,
     LIVE_QUOTE_FUTURE_SKEW_SECONDS,
     QUOTE_TIME_RULE_IN_FUTURE,
     QUOTE_TIME_RULE_INVALID,
@@ -73,7 +74,9 @@ from live_runner.credential_env import (
 )
 from live_runner.ctrader_adapter import CTraderAuthTerminalError, CTraderLiveAdapter
 from live_runner.deployment_policy import (
+    DEFAULT_SIGNAL_SOURCE,
     normalize_deployment_status,
+    normalize_signal_source,
     signal_source_can_trade,
     untradeable_signal_source_reason,
 )
@@ -100,6 +103,7 @@ from live_runner.internal_strategy_runner import (
     SUBMIT_OUTCOME_REFUSED,
     SUBMIT_OUTCOME_SUBMITTED,
     SUBMIT_OUTCOME_UNKNOWN,
+    internal_runner_untradeable_reason,
     run_internal_strategy_loop,
 )
 from live_runner.kill_switch import (
@@ -2186,6 +2190,9 @@ async def prepare_exit_intent_order(
         "tp_price",
         "stop_price",
         "resolved_stop_loss",
+        # Adapter-owned crash-recovery state (#145): only the adapter may
+        # stamp it, after it has released the broker-side protection itself.
+        EXIT_REPROTECTION_METADATA_KEY,
     ):
         metadata.pop(key, None)
     # Stamp the instruction actually executed, so the persisted signal records
@@ -2786,6 +2793,13 @@ async def prepare_order_with_risk(
     # under one of these keys can neither shadow nor survive them.
     final_metadata.update(quote_metadata)
     final_metadata.update(pip_metadata)
+    # ``exit_reprotection`` is adapter-owned crash-recovery state stamped only
+    # on exits (#145): a payload value on an entry must never reach
+    # persistence, or the recovery sweep would replay protection for a signal
+    # that never exited (#350 review). Both merge sources are stripped here -
+    # the incoming metadata (via ``preserved_metadata``) and the sized
+    # metadata, which the sizing engine rebuilds from the original signal.
+    final_metadata.pop(EXIT_REPROTECTION_METADATA_KEY, None)
     # theoretical_price carries the resolved entry so an adapter that places
     # SL/TP as distances from it (cTrader) uses the distance that was sized.
     sized_signal = sized_signal.model_copy(
@@ -6838,14 +6852,23 @@ def _warn_untradeable_active_deployments(
 ) -> None:
     """Alert (ERROR, which Sentry turns into an event) per untradeable ACTIVE deployment (#242).
 
-    An ``internal`` deployment (or any signal source other than ``discord``)
-    has no live strategy runner behind it: it can be ACTIVE, hold an adapter and
-    an execution listener, and still never place an order. The daemon does not
-    block on this -- the operator stops or repoints the row -- but silence makes
-    an untradeable ACTIVE deployment look live.
+    A ``discord`` deployment is traded by the listener fan-out. An ``internal``
+    deployment is traded by the internal strategy runner (#348) — but only when
+    the deployment opted in (``settings["internal_runner_enabled"]``) and its
+    strategy name resolves through ``live_runner.promotion.strategy_target``;
+    anything else, and any signal source the daemon has no runner for, can be
+    ACTIVE, hold an adapter and an execution listener, and still never place an
+    order. The daemon does not block on this -- the operator stops, opts in, or
+    repoints the row -- but silence makes an untradeable ACTIVE deployment look
+    live.
 
-    The definition of "untradeable" is ``live_runner.deployment_policy``'s,
-    so the daemon log and both preflights cannot drift apart.
+    "Untradeable" starts as ``live_runner.deployment_policy``'s source-level
+    answer; for ``internal`` rows the runner's own
+    ``internal_runner_untradeable_reason`` refines it, so this log cannot drift
+    from what the runner will actually evaluate. The read-only preflights keep
+    the source-level answer: they warn on every ACTIVE ``internal`` row because
+    they cannot see the per-deployment opt-in, which is a warning, not the
+    alert this loop owns.
 
     ``already_warned`` is the operator's memory of what this process already
     reported, keyed by deployment id: the same reason for the same row is not
@@ -6860,6 +6883,14 @@ def _warn_untradeable_active_deployments(
         reason = untradeable_signal_source_reason(deployment.signal_source)
         if reason is None:
             continue
+        if normalize_signal_source(deployment.signal_source) == DEFAULT_SIGNAL_SOURCE:
+            # 'internal' is not runner-less: the internal strategy runner
+            # trades the rows that opted in and resolve a strategy. Ask the
+            # runner's own answer so the alert names the real reason — or
+            # stays quiet for a deployment that can trade.
+            reason = internal_runner_untradeable_reason(deployment)
+            if reason is None:
+                continue
         deployment_id = str(deployment.id)
         # A change of state, never a repeat of one already reported: the reason
         # also encodes the signal source, so repointing a row re-warns it.

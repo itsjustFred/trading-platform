@@ -1180,6 +1180,486 @@ def test_broker_close_rows_carry_their_own_source_and_fill_price(
     assert by_id[parent]["source"] == "internal"
 
 
+# ─── the re-placed exit protection of a partial exit (#350 on #277) ─────────
+#
+# A partial exit releases the bracket protection, submits the exit and re-places
+# the remainder's SL/TP as a standalone OCO (or a lone stop/take-profit) whose
+# ``client_order_id`` is ``{entry_signal_id}-reprotect-{exit_signal_id}`` -
+# deliberately not a signal UUID. Its fills are broker-side closes of the
+# remainder: they must reduce the entry's deployment ledger exactly like a
+# bracket leg fill, or every later exit re-reads a stale ledger (#144 again,
+# for every partially exited position).
+
+REPROTECT_EXIT_ID = "33333333-3333-4333-8333-cccccccccccc"
+REPROTECT_PARENT_ID = "44444444-5555-4444-8444-444444444444"
+REPROTECT_TP_LEG_ID = "55555555-5555-4555-8555-555555555555"
+REPROTECT_SL_LEG_ID = "66666666-6666-4666-8666-666666666666"
+REPROTECT_LONE_ID = "77777777-7777-4777-8777-777777777777"
+
+
+def _persist_exit_signal(database, *, deployment_id: str = DEP_ENTRY) -> str:
+    """One persisted exit-only signal (the ``{exit}`` half of a reprotect id)."""
+    signal = LiveSignal(
+        deployment_id=deployment_id,
+        symbol="AAPL",
+        action="sell",
+        theoretical_price=95.0,
+        timestamp=T1,
+        metadata={
+            "exit_only": True,
+            "risk_sizing_mode": "exit_only",
+        },
+    )
+    signal_id, created = database.save_live_signal(signal)
+    assert created
+    return signal_id
+
+
+def _reprotect_leg(
+    *,
+    order_id: str,
+    order_type: str = "stop",
+    side: str = "sell",
+    filled_qty: float = 0.0,
+    status: str = "new",
+    stop_price: float = 190.0,
+    limit_price: float | None = None,
+    client_order_id: str | None = None,
+) -> SimpleNamespace:
+    """The stop leg of a re-placed OCO, as Alpaca nests it.
+
+    Alpaca gives each leg its own UUID-shaped ``client_order_id`` - it does
+    NOT inherit the parent's ``-reprotect`` id, which is why leg fills rely
+    on the broker-order-id map.
+    """
+    return SimpleNamespace(
+        id=order_id,
+        client_order_id=client_order_id or str(uuid4()),
+        symbol="AAPL",
+        side=side,
+        order_type=order_type,
+        qty=6.0,
+        status=status,
+        stop_price=stop_price,
+        limit_price=limit_price,
+        filled_qty=filled_qty,
+        filled_avg_price=95.0 if filled_qty else None,
+        filled_at=T1 if filled_qty else None,
+        updated_at=T1,
+    )
+
+
+def _reprotect_order(
+    *,
+    client_order_id: str,
+    legs: list[SimpleNamespace] | None = None,
+    order_id: str = REPROTECT_PARENT_ID,
+    status: str = "new",
+    filled_qty: float = 0.0,
+    order_class: str | None = None,
+) -> SimpleNamespace:
+    """A re-placed protection order in Alpaca's real shape.
+
+    An ``oco`` parent IS the take-profit: a ``limit`` order carrying
+    ``limit_price`` whose only leg is the stop. A lone order (``legs=None``)
+    is a plain stop or take-profit with ``order_class="simple"``.
+    """
+    is_oco = legs is not None
+    return SimpleNamespace(
+        id=order_id,
+        client_order_id=client_order_id,
+        symbol="AAPL",
+        side="sell",
+        order_type="limit",
+        order_class=(
+            order_class if order_class is not None else ("oco" if is_oco else "simple")
+        ),
+        qty=6.0,
+        status=status,
+        limit_price=210.0 if is_oco else None,
+        legs=list(legs or []),
+        filled_qty=filled_qty,
+        filled_avg_price=95.0 if filled_qty else None,
+        filled_at=T1 if filled_qty else None,
+        updated_at=T1,
+    )
+
+
+def _reprotect_fill_update(
+    *,
+    order_id: str,
+    client_order_id: str,
+    qty: float = 6.0,
+    order_type: str = "stop",
+    side: str = "sell",
+) -> SimpleNamespace:
+    """A trade update for a fill of re-placed exit protection."""
+    return SimpleNamespace(
+        event="fill",
+        qty=qty,
+        price=95.0,
+        fill_price=95.0,
+        timestamp=T1,
+        execution_id="exec-reprotect-1",
+        order=SimpleNamespace(
+            id=order_id,
+            client_order_id=client_order_id,
+            symbol="AAPL",
+            side=side,
+            order_type=order_type,
+            qty=qty,
+            status="filled",
+            filled_qty=qty,
+            filled_avg_price=95.0,
+            filled_at=T1,
+            updated_at=T1,
+            commission=None,
+        ),
+    )
+
+
+class _ReprotectOrdersClient:
+    """``get_orders`` returning a fixed order page; order lookups raise."""
+
+    def __init__(self, orders: list[Any]) -> None:
+        self._orders = list(orders)
+        self.get_orders_calls: list[Any] = []
+
+    def get_orders(self, *, filter: Any = None) -> list[Any]:
+        self.get_orders_calls.append(filter)
+        return list(self._orders)
+
+    def get_order_by_id(self, *_a: Any, **_k: Any) -> Any:
+        raise KeyError("not found")
+
+    def get_order_by_client_id(self, *_a: Any, **_k: Any) -> Any:
+        raise KeyError("not found")
+
+
+def _reconciliation_flags(database) -> list[dict[str, Any]]:
+    return [
+        row
+        for row in database.list_live_control_audit(limit=200)
+        if row["action"] == database.LEDGER_RECONCILIATION_AUDIT_ACTION
+    ]
+
+
+def test_a_reprotect_leg_fill_on_the_stream_reduces_the_entry_ledger(database) -> None:
+    """The OCO leg's fill arrives before any registration reached it.
+
+    Its ``client_order_id`` is ``{entry}-reprotect-{exit}``: not a signal UUID,
+    so the fill must be attributed through the embedded entry id and booked
+    against that signal's deployment - once.
+    """
+    parent = _persist_entry(database)
+    exit_id = _persist_exit_signal(database)
+    adapter = _alpaca_adapter()
+
+    coid = f"{parent}-reprotect-{exit_id}"
+    update = _reprotect_fill_update(
+        order_id=REPROTECT_SL_LEG_ID, client_order_id=coid
+    )
+    asyncio.run(adapter._on_trade_update(update))
+    asyncio.run(adapter._on_trade_update(update))  # redelivery
+
+    assert _ledger(database, DEP_ENTRY) == pytest.approx(4.0)
+    close_rows = [
+        row for row in _executions(database) if row[0] == database.broker_close_signal_id(parent)
+    ]
+    assert [row[2] for row in close_rows] == [6.0]
+
+
+def test_a_reconciled_reprotect_leg_fill_reduces_the_entry_ledger_once(database) -> None:
+    """After a restart the in-memory leg map is empty; the connect pass must
+    find the re-placed OCO by its ``-reprotect`` client order id, learn its
+    legs and backfill the filled one - and a second pass must add nothing."""
+    parent = _persist_entry(database)
+    exit_id = _persist_exit_signal(database)
+    coid = f"{parent}-reprotect-{exit_id}"
+    oco = _reprotect_order(
+        client_order_id=coid,
+        legs=[
+            _reprotect_leg(
+                order_id=REPROTECT_SL_LEG_ID,
+                status="canceled",
+            ),
+        ],
+        # The OCO parent IS the take-profit: it filled while the stream was
+        # down, and its fill is a separate fill from the (cancelled) stop's.
+        status="filled",
+        filled_qty=6.0,
+    )
+    client = _ReprotectOrdersClient([oco])
+    adapter = _alpaca_adapter(client=client)
+
+    asyncio.run(adapter.reconcile_executions())
+
+    assert _ledger(database, DEP_ENTRY) == pytest.approx(4.0)
+    assert adapter._bracket_leg_order_id_to_signal_id[REPROTECT_PARENT_ID] == parent
+    assert adapter._bracket_leg_order_id_to_signal_id[REPROTECT_SL_LEG_ID] == parent
+
+    asyncio.run(adapter.reconcile_executions())
+
+    assert _ledger(database, DEP_ENTRY) == pytest.approx(4.0)
+    close_rows = [
+        row for row in _executions(database) if row[0] == database.broker_close_signal_id(parent)
+    ]
+    assert [row[2] for row in close_rows] == [6.0]
+
+
+def test_a_reconciled_reprotect_stop_leg_fill_reduces_the_entry_ledger_once(database) -> None:
+    """The other half of the real OCO shape: the stop leg filled while the
+    take-profit parent was cancelled - booked once over two passes."""
+    parent = _persist_entry(database)
+    exit_id = _persist_exit_signal(database)
+    coid = f"{parent}-reprotect-{exit_id}"
+    oco = _reprotect_order(
+        client_order_id=coid,
+        status="canceled",
+        legs=[
+            _reprotect_leg(
+                order_id=REPROTECT_SL_LEG_ID,
+                filled_qty=6.0,
+                status="filled",
+            ),
+        ],
+    )
+    client = _ReprotectOrdersClient([oco])
+    adapter = _alpaca_adapter(client=client)
+
+    asyncio.run(adapter.reconcile_executions())
+
+    assert _ledger(database, DEP_ENTRY) == pytest.approx(4.0)
+    assert adapter._bracket_leg_order_id_to_signal_id[REPROTECT_SL_LEG_ID] == parent
+
+    asyncio.run(adapter.reconcile_executions())
+
+    assert _ledger(database, DEP_ENTRY) == pytest.approx(4.0)
+    close_rows = [
+        row for row in _executions(database) if row[0] == database.broker_close_signal_id(parent)
+    ]
+    assert [row[2] for row in close_rows] == [6.0]
+
+
+def test_a_lone_reprotect_order_fill_is_booked_and_reconciled(database) -> None:
+    """A re-placed lone stop/take-profit has no legs: the order id itself is
+    the fill's identity, on the stream and in the reconcile scan."""
+    parent = _persist_entry(database)
+    exit_id = _persist_exit_signal(database)
+    coid = f"{parent}-reprotect-{exit_id}"
+    lone = _reprotect_order(
+        client_order_id=coid, order_id=REPROTECT_LONE_ID, legs=None
+    )
+    # The order itself filled: mark it filled for the reconcile leg.
+    lone.status = "filled"
+    lone.filled_qty = 6.0
+    lone.filled_avg_price = 95.0
+    lone.filled_at = T1
+    adapter = _alpaca_adapter(client=_ReprotectOrdersClient([lone]))
+
+    asyncio.run(adapter.reconcile_executions())
+
+    assert _ledger(database, DEP_ENTRY) == pytest.approx(4.0)
+    assert adapter._bracket_leg_order_id_to_signal_id[REPROTECT_LONE_ID] == parent
+
+    asyncio.run(adapter.reconcile_executions())
+    assert _ledger(database, DEP_ENTRY) == pytest.approx(4.0)
+
+
+def test_placing_reprotect_protection_registers_its_legs(database) -> None:
+    """``_place_exit_protection`` must teach the leg map at submit time, so a
+    leg fill arriving before the next connect is attributed immediately.
+
+    The OCO parent's own id is registered too: it IS the take-profit, and
+    its fill is a separate fill from the stop leg's.
+    """
+    parent = _persist_entry(database)
+    exit_id = _persist_exit_signal(database)
+    adapter = _alpaca_adapter()
+    oco = _reprotect_order(
+        client_order_id=f"{parent}-reprotect-{exit_id}",
+        legs=[
+            _reprotect_leg(order_id=REPROTECT_SL_LEG_ID),
+        ],
+    )
+    client = SimpleNamespace(submit_order=lambda order_data: oco)
+    plan = {
+        "symbol": "AAPL",
+        "side": "sell",
+        "stop_price": 190.0,
+        "take_profit_price": 210.0,
+        "stop_limit_price": None,
+        "entry_signal_id": parent,
+    }
+
+    placed = asyncio.run(
+        adapter._place_exit_protection(
+            client, plan, qty=6.0, signal_id=exit_id, reason="test"
+        )
+    )
+
+    assert placed is True
+    assert adapter._bracket_leg_order_id_to_signal_id == {
+        REPROTECT_PARENT_ID: parent,
+        REPROTECT_SL_LEG_ID: parent,
+    }
+
+
+def test_placing_a_lone_reprotect_stop_registers_the_order_id(database) -> None:
+    """A lone re-placed stop has no legs: its own order id is registered so
+    its fill routes to the entry's ledger."""
+    parent = _persist_entry(database)
+    exit_id = _persist_exit_signal(database)
+    adapter = _alpaca_adapter()
+    lone = _reprotect_order(
+        client_order_id=f"{parent}-reprotect-{exit_id}",
+        order_id=REPROTECT_LONE_ID,
+        legs=None,
+    )
+    lone.order_class = "simple"
+    client = SimpleNamespace(submit_order=lambda order_data: lone)
+    plan = {
+        "symbol": "AAPL",
+        "side": "sell",
+        "stop_price": 190.0,
+        "take_profit_price": None,
+        "stop_limit_price": None,
+        "entry_signal_id": parent,
+    }
+
+    asyncio.run(
+        adapter._place_exit_protection(
+            client, plan, qty=6.0, signal_id=exit_id, reason="test"
+        )
+    )
+
+    assert adapter._bracket_leg_order_id_to_signal_id == {
+        REPROTECT_LONE_ID: parent
+    }
+
+
+def test_a_reprotect_fill_without_an_entry_id_is_flagged_not_dropped(database) -> None:
+    """``{exit}-reprotect`` names no entry: the fill must surface as
+    ``ledger_reconciliation_required`` instead of vanishing."""
+    _persist_entry(database)
+    exit_id = _persist_exit_signal(database)
+    adapter = _alpaca_adapter()
+
+    update = _reprotect_fill_update(
+        order_id=REPROTECT_SL_LEG_ID,
+        client_order_id=f"{exit_id}-reprotect",
+    )
+    asyncio.run(adapter._on_trade_update(update))
+
+    assert _ledger(database, DEP_ENTRY) == pytest.approx(10.0)
+    flags = _reconciliation_flags(database)
+    assert len(flags) == 1
+    assert flags[0]["target_id"] == f"{ACCOUNT}:AAPL"
+    assert flags[0]["detail"]["cause"] == "alpaca_reprotect_fill_unattributed"
+
+
+def test_a_reprotect_fill_with_an_unknown_entry_id_is_flagged(database) -> None:
+    """A ``-reprotect`` id whose leading UUID is no known entry signal is
+    unattributable too - flagged, never guessed into a ledger."""
+    _persist_entry(database)
+    adapter = _alpaca_adapter()
+
+    update = _reprotect_fill_update(
+        order_id=REPROTECT_SL_LEG_ID,
+        client_order_id=f"{str(uuid4())}-reprotect-{REPROTECT_EXIT_ID}",
+    )
+    asyncio.run(adapter._on_trade_update(update))
+
+    assert _ledger(database, DEP_ENTRY) == pytest.approx(10.0)
+    flags = _reconciliation_flags(database)
+    assert len(flags) == 1
+    assert flags[0]["detail"]["cause"] == "alpaca_reprotect_fill_unattributed"
+
+
+def test_a_reprotect_take_profit_fill_on_the_parent_is_booked_once(database) -> None:
+    """The OCO parent IS the take-profit: its fill arrives on the stream with
+    the ``-reprotect`` client order id and must reduce the ledger exactly
+    once across a redelivery."""
+    parent = _persist_entry(database)
+    exit_id = _persist_exit_signal(database)
+    adapter = _alpaca_adapter()
+
+    update = _reprotect_fill_update(
+        order_id=REPROTECT_PARENT_ID,
+        client_order_id=f"{parent}-reprotect-{exit_id}",
+        order_type="limit",
+    )
+    asyncio.run(adapter._on_trade_update(update))
+    asyncio.run(adapter._on_trade_update(update))  # redelivery
+
+    assert _ledger(database, DEP_ENTRY) == pytest.approx(4.0)
+    close_rows = [
+        row for row in _executions(database) if row[0] == database.broker_close_signal_id(parent)
+    ]
+    assert [row[2] for row in close_rows] == [6.0]
+
+
+def test_a_registered_reprotect_leg_fill_with_a_uuid_client_order_id_is_booked(
+    database,
+) -> None:
+    """Alpaca gives the OCO stop leg its own UUID-shaped client order id: the
+    fill is attributed through the learned broker-order-id map, not the
+    client order id."""
+    parent = _persist_entry(database)
+    exit_id = _persist_exit_signal(database)
+    adapter = _alpaca_adapter()
+    asyncio.run(
+        adapter._register_reprotect_attribution(
+            SimpleNamespace(),
+            {"entry_signal_id": parent},
+            _reprotect_order(
+                client_order_id=f"{parent}-reprotect-{exit_id}",
+                legs=[_reprotect_leg(order_id=REPROTECT_SL_LEG_ID)],
+            ),
+            nested_lookup=False,
+        )
+    )
+
+    update = _reprotect_fill_update(
+        order_id=REPROTECT_SL_LEG_ID,
+        client_order_id=str(uuid4()),  # the leg's own broker-assigned id
+        order_type="stop",
+    )
+    asyncio.run(adapter._on_trade_update(update))
+
+    assert _ledger(database, DEP_ENTRY) == pytest.approx(4.0)
+
+
+def test_an_unregistered_reprotect_leg_fill_with_a_uuid_client_order_id_is_flagged(
+    database,
+) -> None:
+    """When the nested re-read at placement failed, the stop leg's fill
+    arrives with a UUID client order id that names no signal: it must be
+    flagged for reconciliation, never booked against a phantom signal."""
+    _persist_entry(database)
+    adapter = _alpaca_adapter()
+
+    update = _reprotect_fill_update(
+        order_id=REPROTECT_SL_LEG_ID,
+        client_order_id=str(uuid4()),
+        order_type="stop",
+    )
+    asyncio.run(adapter._on_trade_update(update))
+
+    assert _ledger(database, DEP_ENTRY) == pytest.approx(10.0)
+    flags = _reconciliation_flags(database)
+    assert len(flags) == 1
+    assert flags[0]["detail"]["cause"] == "alpaca_unattributed_order_fill"
+
+
+def test_the_reprotect_client_order_id_fits_alpacas_limit() -> None:
+    """``{entry}-reprotect-{exit}`` with two real UUIDs is 83 chars; Alpaca's
+    ``client_order_id`` schema allows 128."""
+    coid = f"{uuid4()}-reprotect-{uuid4()}"
+    assert len(coid) == 83
+    assert len(coid) <= 128
+
+
 # ─── unreadable money fields fail closed (#280) ────────────────────────────────────────────────
 
 ORDER_B_ID = "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff"

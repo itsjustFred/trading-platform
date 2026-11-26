@@ -22,6 +22,9 @@ Handlers in files owned by open PRs #192, #271, #272, #274, #277, #313, #316, an
 | `live_runner/alpaca_adapter.py` | 859 | `_reconcile_signal_fill` | money decision (must fail closed) | no — after PR #277 |
 | `live_runner/alpaca_adapter.py` | 1058 | `backfill_commissions` | money decision (must fail closed) | yes — stays unknown, retried next pass |
 | `live_runner/alpaca_adapter.py` | 1140 | `disconnect` | loop survival (log and continue) | yes — stream stop cleanup |
+| `live_runner/alpaca_adapter.py` | 1454 | `connect` (recovery schedule) | money decision (must fail closed) | yes — warning, markers stay pending |
+| `live_runner/alpaca_adapter.py` | 1496 | `_run_exit_reprotection_recovery` | money decision (must fail closed) | yes — error log, markers stay pending |
+| `live_runner/alpaca_adapter.py` | 1514 | `_cancel_exit_reprotection_recovery` | money decision (must fail closed) | yes — warning, task cancelled |
 | `live_runner/alpaca_adapter.py` | 1179 | `_recover_existing_signal_order` | money decision (must fail closed) | yes — raises, refuses duplicate |
 | `live_runner/alpaca_adapter.py` | 2003 | `_cancel_open_orders_locked` | money decision (must fail closed) | yes — failure recorded, sweep incomplete |
 | `live_runner/alpaca_adapter.py` | 2027 | `_cancel_open_orders_locked` | money decision (must fail closed) | yes — verify failure reported |
