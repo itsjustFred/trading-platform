@@ -6612,6 +6612,11 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 created = created.replace(tzinfo=timezone.utc)
             if created < cutoff:
                 continue
+            # The audit read is account-agnostic; only THIS account's
+            # intents may mark its orders as our own cancels.
+            detail = row.get("detail") or {}
+            if detail.get("account_id") not in (None, self.account_id):
+                continue
             target_id = str(row.get("target_id") or "").strip()
             if target_id:
                 ids.add(target_id)
@@ -6671,6 +6676,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             self._expired_stop_heal_last_run = time.monotonic()
             return
         lock_timed_out = False
+        heal_failed = False
         for symbol in sorted(work):
             parts = work[symbol]
             try:
@@ -6702,13 +6708,14 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # except-kind: money-decision
+                heal_failed = True
                 self._expired_stop_heal_alert(
                     symbol, "heal_error", {"error": repr(exc)}
                 )
         # Stamp once per pass, after every symbol was attempted - and not at
-        # all when a symbol was skipped on a busy lock, so that symbol's
-        # retry is not held back by the interval.
-        if not lock_timed_out:
+        # all when a symbol was skipped on a busy lock or raised, so that
+        # symbol's retry is not held back by the interval.
+        if not lock_timed_out and not heal_failed:
             self._expired_stop_heal_last_run = time.monotonic()
 
     async def _act_on_maintenance_symbol(
