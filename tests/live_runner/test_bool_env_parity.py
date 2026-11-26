@@ -97,14 +97,6 @@ SHARED_PARSERS = [
         lambda name, raw, default: parse_bool_env(name, raw, default=default),
         _canonical_error,
     ),
-    BoolParser(
-        "alpaca_adapter._parse_bool_env",
-        "ALPACA_PAPER",
-        lambda name, raw, default: alpaca_adapter._parse_bool_env(  # noqa: SLF001
-            name, raw, default=default
-        ),
-        _canonical_error,
-    ),
 ]
 
 VARIANT_PARSERS = [

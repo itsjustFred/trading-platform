@@ -940,14 +940,6 @@ def _alpaca_market_data_start(
     )
 
 
-def _parse_bool_env(name: str, value: str | None, *, default: bool = True) -> bool:
-    """Strict boolean parsing shared with live_runner.credential_env.
-
-    A typo'd value raises instead of silently selecting live/paper mode.
-    """
-    return parse_bool_env(name, value, default=default)
-
-
 def _display_float(value: Any) -> float:
     """Best-effort float for display-only payload fields.
 
@@ -1247,7 +1239,7 @@ def _default_alpaca_credentials(values: Mapping[str, str]) -> tuple[str, str, bo
     secret_key = str(values.get("ALPACA_SECRET_KEY", "")).strip()
     if api_key and secret_key:
         raw_paper = values.get("ALPACA_PAPER")
-        paper = _parse_bool_env(
+        paper = parse_bool_env(
             "ALPACA_PAPER",
             str(raw_paper).strip() if raw_paper is not None else None,
             default=True,
@@ -1285,7 +1277,7 @@ def _alpaca_credential_block(
         paper = "paper" in endpoint
     else:
         raw_paper = values.get(f"ALPACA_PAPER_ACC{idx}")
-        paper = _parse_bool_env(
+        paper = parse_bool_env(
             f"ALPACA_PAPER_ACC{idx}",
             str(raw_paper).strip() if raw_paper is not None else None,
             default=True,
@@ -1465,7 +1457,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 extra={"data": {"account_id": account_id}},
             )
         self.paper = (
-            _parse_bool_env(
+            parse_bool_env(
                 "ALPACA_PAPER",
                 resolve_env_value(env_values, "ALPACA_PAPER") or None,
                 default=True,
