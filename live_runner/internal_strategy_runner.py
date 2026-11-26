@@ -146,7 +146,7 @@ from live_runner.promotion import (
     deployment_signal_processor_name,
     strategy_target,
 )
-from live_runner.signal_sources.execution_timing import _timeframe_seconds
+from live_runner.signal_sources.execution_timing import timeframe_seconds
 from live_runner.symbol_class import classify_symbol
 from risk.models import TradeSignal
 from runner.engine_pkg.trading_engine import TRADE_ENGINE_MAX_POSITIONS, TradeEngine
@@ -1660,7 +1660,7 @@ class InternalStrategyRunner:
                 timeframe = normalize_timeframe(deployment.timeframe)
                 if timeframe not in VALID_TIMEFRAMES:
                     raise ValueError(f"unsupported timeframe {deployment.timeframe!r}")
-                bar_seconds = _timeframe_seconds(timeframe)
+                bar_seconds = timeframe_seconds(timeframe)
                 if not bar_seconds:
                     raise ValueError(f"timeframe {timeframe!r} has no bar length")
                 symbols = _deployment_symbols(deployment)
