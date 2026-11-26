@@ -172,7 +172,12 @@ def dump_reference(
     csv_path: Path,
     json_path: Path,
 ) -> tuple[Path, Path]:
-    """Write the CSV and JSON dump atomically and return their paths."""
+    """Write the CSV and JSON dump atomically and return their paths.
+
+    Each file is written atomically, but the pair is not transactional: a
+    crash can leave one output updated and the other missing or stale. Treat a
+    partial pair as incomplete and rerun the command.
+    """
     safe_csv = reject_traversal(csv_path, field="--csv")
     safe_json = reject_traversal(json_path, field="--json")
     write_text_atomically(safe_csv, render_trade_csv(reference))
