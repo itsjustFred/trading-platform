@@ -33,18 +33,11 @@ from runner.engines.base import (
     ProgressCallback,
     warn_if_engine_frozen,
 )
+from shared import constants
 from shared.atomic_io import write_text_atomically
-from shared.constants import DATA_DIR
 from shared.models import BacktestResult
 
 logger = logging.getLogger(__name__)
-
-LEAN_PROJECT_DIR = Path(
-    os.environ.get(
-        "LEAN_PROJECT_DIR",
-        DATA_DIR / "lean_project",
-    )
-)
 
 
 def _frozen_signal_exit_fill(config: BacktestConfig) -> BacktestConfig:
@@ -79,7 +72,14 @@ class LeanAdapter(EngineAdapter):
         return "lean"
 
     def __init__(self, lean_project_dir: str | Path | None = None):
-        self.project_dir = Path(lean_project_dir) if lean_project_dir else LEAN_PROJECT_DIR
+        # Resolved at call time, not import: DATA_DIR can be overridden per
+        # process via shared.constants.set_data_dir (test isolation).
+        env_dir = os.environ.get("LEAN_PROJECT_DIR")
+        self.project_dir = (
+            Path(lean_project_dir)
+            if lean_project_dir
+            else Path(env_dir) if env_dir else constants.DATA_DIR / "lean_project"
+        )
 
     def run(
         self,
