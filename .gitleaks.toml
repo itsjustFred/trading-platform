@@ -1,0 +1,33 @@
+title = "trading-platform"
+
+# Default ruleset plus the fixture allowlist below.
+[extend]
+useDefault = true
+
+# Known dummy credentials in tests. Each entry suppresses a finding only when
+# BOTH the file path and the secret pattern match (condition = "AND"), so a real
+# secret in the same file - or the same dummy string elsewhere - is still
+# reported.
+[allowlist]
+description = "Dummy credentials used by tests"
+condition = "AND"
+# Match against the finding text, not only the extracted secret: in `git` scans
+# the secret capture can be a substring that loses the fixture's distinguishing
+# prefix.
+regexTarget = "match"
+paths = [
+  '''tests/test_agent_sibling_hardening\.py''',
+  '''tests/test_live_api\.py''',
+  '''tests/test_live_preflight\.py''',
+  '''tests/test_preflight_db\.py''',
+]
+regexes = [
+  # Fake NVIDIA API keys seeded for workflow-file scans.
+  '''nvapi-test-[0-9]+''',
+  # Synthetic claim tokens for the live-deployment lease tests.
+  '''token-(first|second|expired)''',
+  # Deliberately malformed secret used to test redaction of boolean errors.
+  '''sk-live-[0-9a-f]+''',
+  # Numeric Discord snowflake-shaped channel id, not a credential.
+  '''123456789012345678''',
+]
