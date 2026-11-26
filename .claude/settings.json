@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"$CLAUDE_PROJECT_DIR/scripts/agents/guard_shell.py\""
+            "command": "test -f \"$CLAUDE_PROJECT_DIR/scripts/agents/guard_shell.py\" || exit 0; python3 \"$CLAUDE_PROJECT_DIR/scripts/agents/guard_shell.py\""
           }
         ]
       }

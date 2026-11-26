@@ -12,7 +12,7 @@ Before starting work, run `python scripts/agents/worktree_preflight.py` in your 
 
 Do NOT weaken, remove, bypass or rewrite a test just to achieve a passing result, instead fix the underlying problem. Change tests only when the task changes or you can independently identify that the test is wrong.
 Bug fixes start with a test that fails on the unfixed code; say in the PR that it failed before the fix. New behaviour on the money path (`live_runner`, `risk`, the backtest engines, sizing) is written test-first: the test lands in the same PR and fails without the change.
-Install the dev tooling with `uv sync --frozen --extra dev` and run `uv run ruff check <changed files>` and `uv run mypy` (no arguments) before a PR.
+Install the dev tooling with `uv sync --frozen --extra dev` and run `uv run ruff check <changed files>` and `uv run mypy` (no arguments) before a PR. In the main checkout the guard hook blocks plain `uv run` (it can mutate the daemon's venv) - use `uv run --no-sync ...` there.
 The test sandbox (see `tests/conftest.py`) guards only the pytest process: a test that starts a Python subprocess must give it a sandboxed environment explicitly, or a child importing `shared.constants` loads the checkout's real `.env`.
 
 ## Issues

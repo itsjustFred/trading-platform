@@ -16,6 +16,8 @@ from pathlib import Path
 
 import pytest
 
+from scripts.agents import worktree_preflight
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PREFLIGHT = REPO_ROOT / "scripts" / "agents" / "worktree_preflight.py"
 
@@ -140,3 +142,84 @@ def test_venv_check_degrades_without_pyproject(repo: dict[str, Path]) -> None:
     assert result.returncode == 0, result.stderr
     out = result.stdout + result.stderr
     assert "uv export" in out or "skipping venv check" in out
+
+
+# --- _check_venv unit tests (subprocess mocked) ---------------------------------
+
+
+def _fake_python(tmp_path: Path) -> Path:
+    python = tmp_path / "venv" / "bin" / "python"
+    python.parent.mkdir(parents=True)
+    python.write_text("", encoding="utf-8")
+    return python
+
+
+def _patch_venv_env(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    export_rc: int = 0,
+    dry_output: str = "Would make no changes\n",
+) -> tuple[Path, Path]:
+    """Point _check_venv at a fake venv python and canned uv output."""
+    root = tmp_path / "repo"
+    root.mkdir(exist_ok=True)
+    (root / "uv.lock").write_text("", encoding="utf-8")
+    python = _fake_python(tmp_path)
+    monkeypatch.setattr(worktree_preflight.shutil, "which", lambda _name: "/usr/bin/uv")
+    monkeypatch.setattr(worktree_preflight, "_venv_candidates", lambda _root: [python])
+
+    def fake_run(cmd: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        if "export" in cmd:
+            return subprocess.CompletedProcess(cmd, export_rc, "pkg==1.0\n", "")
+        return subprocess.CompletedProcess(cmd, 0, "", dry_output)
+
+    monkeypatch.setattr(worktree_preflight.subprocess, "run", fake_run)
+    return root, python
+
+
+def test_check_venv_in_sync(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root, python = _patch_venv_env(monkeypatch, tmp_path)
+    assert worktree_preflight._check_venv(root) == str(python)
+
+
+def test_check_venv_out_of_sync_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root, _python = _patch_venv_env(
+        monkeypatch, tmp_path, dry_output="Would install foo==1.0\n"
+    )
+    with pytest.raises(SystemExit) as exc:
+        worktree_preflight._check_venv(root)
+    assert exc.value.code == 1
+
+
+def test_check_venv_unrecognized_output_warns(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root, _python = _patch_venv_env(
+        monkeypatch, tmp_path, dry_output="some future uv wording\n"
+    )
+    assert worktree_preflight._check_venv(root) is None
+    assert "could not verify" in capsys.readouterr().out
+
+
+def test_check_venv_export_failure_warns(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root, _python = _patch_venv_env(monkeypatch, tmp_path, export_rc=2)
+    assert worktree_preflight._check_venv(root) is None
+    assert "uv export" in capsys.readouterr().out
+
+
+def test_check_venv_skips_without_uv(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "uv.lock").write_text("", encoding="utf-8")
+    monkeypatch.setattr(worktree_preflight.shutil, "which", lambda _name: None)
+    assert worktree_preflight._check_venv(root) is None
+    assert "uv" in capsys.readouterr().out
