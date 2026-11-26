@@ -517,7 +517,7 @@ def test_regenerate_case_threads_the_case_broker_clock_into_the_strategy(monkeyp
         }
     )
 
-    def fakeload_ohlcv(data_dir, symbol, timeframe, start, end):
+    def fake_load_ohlcv(data_dir, symbol, timeframe, start, end):
         return frame.copy()
 
     def fake_generate_signals(df, params):
@@ -525,7 +525,7 @@ def test_regenerate_case_threads_the_case_broker_clock_into_the_strategy(monkeyp
         no_signal = pd.Series(False, index=df.index)
         return no_signal, no_signal.copy(), {}, []
 
-    monkeypatch.setattr(regen, "load_ohlcv", fakeload_ohlcv)
+    monkeypatch.setattr(regen, "load_ohlcv", fake_load_ohlcv)
     monkeypatch.setattr(regen, "generate_signals", fake_generate_signals)
     monkeypatch.setattr(regen, "attach_daily_equity", lambda result, **kwargs: None)
 

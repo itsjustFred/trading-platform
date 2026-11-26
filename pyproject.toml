@@ -104,13 +104,6 @@ packages = [
 [tool.ruff]
 line-length = 100
 target-version = "py312"
-# PLC2701 (import-private-name) is still a preview rule in ruff 0.16.x, so it
-# cannot be enabled by `select` alone. `preview = true` would normally enable
-# EVERY preview rule in the selected families; `explicit-preview-rules` narrows
-# that to rules named by their exact code, so only PLC2701 - selected
-# explicitly below - is turned on. Verified: no other selected family gains a
-# preview rule this way.
-preview = true
 # Not Python, or deliberately broken. These are inputs to other tools, not
 # source we own:
 #   tests/fixtures/sample_strategy.py is Pine Script (//@version=5, strategy()),
@@ -126,6 +119,14 @@ extend-exclude = [
 ]
 
 [tool.ruff.lint]
+# PLC2701 (import-private-name) is still a preview rule in ruff 0.16.x, so it
+# cannot be enabled by `select` alone. `preview = true` lives here (lint
+# scope only - a top-level setting would also flip preview FORMATTER style)
+# and would normally enable EVERY preview rule in the selected families;
+# `explicit-preview-rules` narrows that to rules named by their exact code,
+# so only PLC2701 - selected explicitly below - is turned on. Verified: no
+# other selected family gains a preview rule this way.
+preview = true
 select = [
     "E", "F", "I", "W",
     # Bug-class rules only (no style families, no mass reformat). Each family
