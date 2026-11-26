@@ -8,6 +8,7 @@ the escape rows pin the cases that used to need a hand-written check each.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from urllib.parse import unquote
 
@@ -58,18 +59,28 @@ def test_relative_paths_inside_the_base_are_accepted(base: Path, raw: str, expec
         "/etc/passwd",
         "//etc/passwd",
         "x\x00y",
-        # Windows-style separators are refused on every platform: on POSIX a
-        # backslash is an ordinary filename character, so "..\\x" would reach
-        # the filesystem as a single file name here but climb on Windows.
-        "..\\x",
-        "sub\\file.csv",
-        "C:\\temp\\x",
         unquote("%2e%2e/x"),
     ],
 )
 def test_escape_patterns_are_refused(base: Path, raw: str) -> None:
     with pytest.raises(PathContainmentError):
         safe_join(base, raw)
+
+
+def test_windows_style_dotdot_is_a_filename_on_posix(base: Path) -> None:
+    """A backslash is an ordinary character on POSIX, a separator on Windows.
+
+    On POSIX ``..\\x`` is one file name that cannot leave ``base``, so it is
+    accepted as such; on Windows the same string is ``..`` plus ``x`` and the
+    ``..`` rule refuses it. Either way the parts decide, not the string.
+    """
+    if os.name == "nt":
+        with pytest.raises(PathContainmentError):
+            safe_join(base, "..\\x")
+    else:
+        assert safe_join(base, "..\\x") == (base / "..\\x").resolve()
+        # A backslash-separated subdirectory is a single file name on POSIX.
+        assert safe_join(base, "sub\\file.csv") == (base / "sub\\file.csv").resolve()
 
 
 def test_non_text_inputs_are_refused(base: Path) -> None:

@@ -21,12 +21,17 @@ What it refuses, and why:
   guessing which parts were meant.
 * **NUL bytes**, empty/blank paths, and ``.``: they either raise inside the
   filesystem layer or name the base itself, which is a directory, not a file.
-* **backslash separators**, on every platform. On POSIX a backslash is an
-  ordinary filename character, so ``..\\x`` is a plain file name here but a
-  traversal on Windows; refusing it everywhere keeps the same input rejected
-  the same way on Linux, Windows and macOS.
 * a result **equal to ``base``**, unless the caller passes ``allow_base=True``
   because it really does mean the directory.
+
+Backslashes are *not* special here. On POSIX a backslash is an ordinary
+filename character, so ``..\\x`` is a plain file name that cannot escape the
+base; on Windows the same string is two parts, ``..`` and ``x``, and the ``..``
+rule refuses it. The parts are what decide, which is why the check is written
+in terms of :class:`pathlib.PurePath.parts` rather than string prefixes. Callers
+that need the *same* input rejected identically on every platform (the matrix
+and asset-id routes refuse separators outright) keep that as their own naming
+rule before calling here.
 
 Symlinks: the candidate is resolved, so a symlink inside ``base`` that points
 outside it resolves outside and is refused. A symlink that stays inside is
@@ -87,10 +92,6 @@ def safe_join(
         raise PathContainmentError(f"refusing a path containing a NUL byte: {raw!r}")
     if not raw.strip():
         raise PathContainmentError("refusing an empty path")
-    if "\\" in raw:
-        raise PathContainmentError(
-            f"refusing a path containing a backslash separator: {raw!r}"
-        )
 
     try:
         candidate = Path(raw)
