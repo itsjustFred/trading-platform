@@ -5783,6 +5783,167 @@ def test_ctrader_exit_submit_refuses_when_qty_normalization_is_not_idempotent(
     assert saved == []
 
 
+def _ctrader_volume_resolution_spy(adapter, monkeypatch, seen_qty: list[float]):
+    """Count and record every ``_resolve_order_volume`` call of one submit.
+
+    Wraps the real resolver so the recorded volumes and the qty each call read
+    are the genuine ones: the call COUNT is what the single-resolution
+    invariant pins, and the recorded qty is what shows which signal state each
+    call resolved from.
+    """
+    resolver = adapter._resolve_order_volume
+
+    def _spy(signal):
+        seen_qty.append(float((signal.metadata or {}).get("qty")))
+        return resolver(signal)
+
+    monkeypatch.setattr(adapter, "_resolve_order_volume", _spy)
+
+
+def test_ctrader_submit_resolves_order_volume_once_and_sends_that_volume(
+    monkeypatch,
+) -> None:
+    """The entry path resolves the broker volume ONCE and hands that value to
+    the request builder.
+
+    Resolution is deliberate exactly twice: the binding qty (what the risk
+    engine sized upstream), then the volume-grid quantity the submit persists -
+    the qty CHANGED between the two, so the second call is the idempotency
+    guard, not a duplicate. Anything else (a third resolution for the wire
+    request) would let a symbol scale that moved during an intervening await
+    put a different size on the wire than the persisted qty describes.
+    """
+    _module, adapter, saved, volumes = _ctrader_submit_harness(monkeypatch)
+    seen_qty: list[float] = []
+    _ctrader_volume_resolution_spy(adapter, monkeypatch, seen_qty)
+
+    assert asyncio.run(adapter.submit_order(_ctrader_entry_signal(), qty=2.0007)) == "777"
+
+    assert len(seen_qty) == 2
+    # First from the binding qty, second from the normalized one the submit
+    # persists - the state the guard re-resolves.
+    assert seen_qty[0] == pytest.approx(2.0007)
+    assert seen_qty[1] == pytest.approx(2.0)
+    # The wire volume is the once-resolved volume (2000.7 floored to 2000) and
+    # the persisted qty is exactly the quantity that volume represents.
+    assert volumes == [2000]
+    assert saved[0].metadata["qty"] == pytest.approx(2.0)
+    assert saved[0].metadata["explicit_qty"] == pytest.approx(2.0)
+
+
+def test_ctrader_exit_submit_resolves_order_volume_once_and_sends_that_volume(
+    monkeypatch,
+) -> None:
+    """Same invariant on the exit path: one resolution, one idempotency guard,
+    and the close request carries the resolved volume. A second resolution for
+    the close is a duplicate - nothing the close needs changes in between.
+    """
+    _module, adapter, saved, _volumes = _ctrader_submit_harness(monkeypatch)
+    adapter._position_ids_by_symbol = {"EURUSD": (7,)}
+    close_volumes: list[int] = []
+
+    def _close_request(*, position_id: int, volume: int):
+        close_volumes.append(volume)
+        return SimpleNamespace(volume=volume)
+
+    monkeypatch.setattr(adapter, "_build_close_position_request", _close_request)
+    seen_qty: list[float] = []
+    _ctrader_volume_resolution_spy(adapter, monkeypatch, seen_qty)
+    signal = LiveSignal(
+        deployment_id="dep-1",
+        symbol="EURUSD",
+        action="sell",
+        theoretical_price=1.1,
+        timestamp=datetime.now(timezone.utc),
+        metadata={"exit_only": True, "risk_sizing_mode": "exit_only"},
+    )
+
+    assert asyncio.run(adapter.submit_order(signal, qty=1.3336)) == "777"
+
+    assert len(seen_qty) == 2
+    assert seen_qty[0] == pytest.approx(1.3336)
+    assert seen_qty[1] == pytest.approx(1.333)
+    assert close_volumes == [1333]
+    assert saved[0].metadata["qty"] == pytest.approx(1.333)
+
+
+def test_ctrader_submit_refuses_a_volume_input_that_changes_after_normalization(
+    monkeypatch,
+) -> None:
+    """The one re-resolution is the guard for a state change between the two
+    calls: the symbol scale moves (a props refresh landing between the binding
+    resolution and the normalized one), so the volume the normalized qty
+    resolves to no longer reproduces the volume the submit normalized to. The
+    submit must refuse instead of persisting a qty that describes a different
+    order than the one sent.
+    """
+    from live_runner import ctrader_adapter as module
+
+    _module, adapter, saved, volumes = _ctrader_submit_harness(monkeypatch)
+    resolutions = {"n": 0}
+    resolver = adapter._resolve_order_volume
+
+    def _move_scale_then_resolve(signal):
+        resolutions["n"] += 1
+        if resolutions["n"] == 2:
+            # A reconnect's props fetch replaces the cached scale mid-submit.
+            adapter._symbol_props["EURUSD"] = module.SymbolScale(
+                volume_per_qty=100.0,
+                price_digits=5,
+                min_volume=1,
+                lot_size=10_000.0,
+                source="broker",
+            )
+        return resolver(signal)
+
+    monkeypatch.setattr(adapter, "_resolve_order_volume", _move_scale_then_resolve)
+    submit = adapter.submit_order(_ctrader_entry_signal(), qty=2.0007)
+
+    with pytest.raises(RuntimeError, match="not idempotent") as excinfo:
+        asyncio.run(submit)
+
+    assert is_order_not_submitted(excinfo.value)
+    assert saved == []
+    assert volumes == []
+
+
+def test_ctrader_submit_keeps_the_resolved_volume_when_the_scale_moves_mid_submit(
+    monkeypatch,
+) -> None:
+    """A scale change AFTER the normalization guard must not reach the wire.
+
+    The persisted qty has already been normalized to the volume resolved once;
+    resolving again for the request build would read the moved scale and send a
+    different size than the signal records. The submit therefore hands the
+    request builder the volume it resolved and validated, so wire volume and
+    persisted qty cannot diverge.
+    """
+    from live_runner import ctrader_adapter as module
+
+    _module, adapter, saved, volumes = _ctrader_submit_harness(monkeypatch)
+
+    async def _refresh_then_resolve(symbol: str) -> int:
+        # A concurrent reconnect/props refresh lands during the submit's await:
+        # the cached scale moves from 1000 to 100 units per qty.
+        adapter._symbol_props["EURUSD"] = module.SymbolScale(
+            volume_per_qty=100.0,
+            price_digits=5,
+            min_volume=1,
+            lot_size=10_000.0,
+            source="broker",
+        )
+        return 1
+
+    monkeypatch.setattr(adapter, "_resolve_symbol_id", _refresh_then_resolve)
+
+    assert asyncio.run(adapter.submit_order(_ctrader_entry_signal(), qty=2.0007)) == "777"
+
+    # 2000 units (the volume resolved once from the binding qty), NOT the 200 a
+    # re-resolution against the moved scale would have produced.
+    assert volumes == [2000]
+    assert saved[0].metadata["qty"] == pytest.approx(2.0)
+
+
 def test_ctrader_volume_resolution_is_idempotent_at_the_int32_bound(
     monkeypatch,
 ) -> None:
