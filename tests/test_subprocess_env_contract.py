@@ -100,53 +100,99 @@ def _is_spawn_call(node: ast.Call) -> bool:
     return parts[-1] in _ASYNCIO_SPAWN_TAILS
 
 
-def _names_defined_in_file(tree: ast.AST) -> dict[str, ast.AST]:
-    """Every name the module binds at top level or inside a function body.
+def _scope_of(node: ast.AST, tree: ast.Module) -> ast.AST:
+    """The innermost function, class or module whose body *node* is part of."""
+    scope = tree
+    for parent in ast.walk(tree):
+        if isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            if parent is not node and any(child is node for child in ast.walk(parent)):
+                if parent.lineno >= getattr(scope, "lineno", 0) or scope is tree:
+                    if parent.lineno >= getattr(scope, "lineno", 0):
+                        scope = parent
+    return scope
 
-    A local ``_child_env`` helper is how most call sites build the child's
-    environment, so the scan has to see a name's definition to decide whether an
-    ``env=_child_env(...)`` is the sandboxed one or a hand-rolled copy.
+
+def _names_defined_in_scope(scope: ast.AST) -> dict[str, ast.AST]:
+    """Every name *scope* binds, mapped to the value it binds.
+
+    A local ``_child_env`` helper, or an ``env`` built inside one function, is how
+    most call sites name the child's environment, so the scan has to see a name's
+    definition to decide whether an ``env=_child_env(...)`` is the sandboxed one or
+    a hand-rolled copy. The whole scope is walked, loops and ``if`` arms included,
+    but nested functions and classes are not descended into: they are scopes of
+    their own, and the same name is bound differently in different functions - the
+    binding a call site resolves against is the one in its own scope (or an
+    enclosing one, outward).
     """
     definitions: dict[str, ast.AST] = {}
-    for node in ast.walk(tree):
+    body = [scope]
+    while body:
+        node = body.pop()
         if isinstance(node, ast.Assign):
             for target in node.targets:
                 if isinstance(target, ast.Name):
                     definitions.setdefault(target.id, node.value)
         elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
-            definitions.setdefault(node.target.id, node.value)
+            if node.value is not None:
+                definitions.setdefault(node.target.id, node.value)
         elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            definitions.setdefault(node.name, node)
+            if node is not scope:
+                definitions.setdefault(node.name, node)
+                continue  # a nested scope: its own bindings stay its own
+        body.extend(ast.iter_child_nodes(node))
     return definitions
 
 
-def _expr_uses_sandboxed_env(expression: ast.AST, definitions: dict[str, ast.AST]) -> bool:
+def _resolve_name(name: str, node: ast.AST, tree: ast.Module) -> ast.AST | None:
+    """The value *name* binds where *node* reads it, or ``None`` when unbound.
+
+    The lookup walks outward from the scope the name is read in: a function-local
+    ``env`` wins over the module-level one, and an unbound name answers ``None``
+    rather than borrowing an unrelated binding from elsewhere in the file.
+    """
+    scope: ast.AST = _scope_of(node, tree)
+    while True:
+        definitions = _names_defined_in_scope(scope)
+        if name in definitions:
+            return definitions[name]
+        if scope is tree:
+            return None
+        scope = _scope_of(scope, tree)
+
+
+def _expr_uses_sandboxed_env(expression: ast.AST, tree: ast.Module) -> bool:
     """Whether *expression* is ``sandboxed_env(...)`` or a name that resolves to it.
 
     Follows same-file variables and helper functions transitively: a ``_child_env``
     that calls ``sandboxed_env`` (directly or through another local helper) is the
-    contract, while ``dict(os.environ)`` is not.
+    contract, while ``dict(os.environ)`` is not. Each name is resolved in the scope
+    that reads it, so two functions binding the same name differently do not
+    confuse the scan.
     """
-    seen: set[str] = set()
-    pending: list[ast.AST] = [expression]
+    seen: set[tuple[str, int, int]] = set()
+    pending: list[tuple[ast.AST, ast.AST]] = [(expression, tree)]
     while pending:
-        node = pending.pop()
+        node, scope = pending.pop()
         if isinstance(node, ast.Call):
             if _dotted_call_name(node).endswith("sandboxed_env"):
                 return True
-            pending.append(node.func)
+            pending.append((node.func, scope))
             continue
-        if isinstance(node, ast.Name) and node.id not in seen:
-            seen.add(node.id)
-            definition = definitions.get(node.id)
+        if isinstance(node, ast.Name):
+            key = (node.id, node.lineno, node.col_offset)
+            if key in seen:
+                continue
+            seen.add(key)
+            definition = _resolve_name(node.id, node, tree)
             if definition is None:
                 continue
             if isinstance(definition, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 # The helper's whole body: it may reach the sandboxed environment
                 # through another local name, which this loop then follows.
-                pending.extend(ast.walk(definition))
+                pending.extend((child, definition) for child in ast.walk(definition))
                 continue
-            pending.append(definition)
+            pending.append((definition, _scope_of(definition, tree)))
+            continue
     return False
 
 
@@ -157,9 +203,7 @@ def _env_keyword(node: ast.Call) -> ast.AST | None:
     return None
 
 
-def _spawn_call_is_sandboxed(
-    node: ast.Call, definitions: dict[str, ast.AST], source_lines: list[str]
-) -> bool:
+def _spawn_call_is_sandboxed(node: ast.Call, tree: ast.Module, source_lines: list[str]) -> bool:
     """Whether the ``env=`` of one spawn call is the sandboxed environment.
 
     Three shapes are the contract: ``env=sandboxed_env(...)``, an ``env=`` bound to
@@ -169,7 +213,7 @@ def _spawn_call_is_sandboxed(
     env_expression = _env_keyword(node)
     if env_expression is None:
         return False
-    if _expr_uses_sandboxed_env(env_expression, definitions):
+    if _expr_uses_sandboxed_env(env_expression, tree):
         return True
     # The call may span several lines; the marker is looked for on the whole call.
     start = node.lineno - 1
@@ -198,14 +242,13 @@ def _unsandboxed_spawn_calls(path: Path) -> list[str]:
         tree = ast.parse(source)
     except SyntaxError as exc:  # pragma: no cover - a broken test file fails on its own
         return [f"{path}: {exc}"]
-    definitions = _names_defined_in_file(tree)
     source_lines = source.splitlines()
     return [
         f"{_display_path(path)}:{node.lineno}: {_dotted_call_name(node)}"
         for node in ast.walk(tree)
         if isinstance(node, ast.Call)
         and _is_spawn_call(node)
-        and not _spawn_call_is_sandboxed(node, definitions, source_lines)
+        and not _spawn_call_is_sandboxed(node, tree, source_lines)
     ]
 
 
@@ -231,9 +274,8 @@ def test_the_scan_reports_a_plain_subprocess_call(tmp_path: Path) -> None:
     )
     tree = ast.parse(sample.read_text(encoding="utf-8"))
     (call,) = [node for node in ast.walk(tree) if isinstance(node, ast.Call)]
-    definitions = _names_defined_in_file(tree)
     source_lines = sample.read_text(encoding="utf-8").splitlines()
-    assert _spawn_call_is_sandboxed(call, definitions, source_lines) is False
+    assert _spawn_call_is_sandboxed(call, tree, source_lines) is False
     assert len(_unsandboxed_spawn_calls(sample)) == 1
 
 

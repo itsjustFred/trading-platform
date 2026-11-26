@@ -154,7 +154,7 @@ def test_env_loaded_for_fresh_interpreter_imports(tmp_path: Path) -> None:
     proc = subprocess.run(
         [sys.executable, "-c", code],
         cwd=str(sandbox),
-        env=env,
+        env=env,  # sandbox-env: deliberately bare; see the comment above the mapping
         capture_output=True,
         text=True,
         timeout=120,

@@ -11,6 +11,8 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
+from tests.conftest import sandboxed_env
+
 from scripts import signal_archive_market_features as saf
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -385,18 +387,19 @@ def test_main_since_until_filters_days(tmp_path: Path) -> None:
 
 
 def _child_env(data_dir: Path) -> dict[str, str]:
-    """Sandboxed environment for a script subprocess.
+    """The sandboxed environment for a script subprocess, pointed at ``data_dir``.
 
-    ``tests/conftest.py``: a child that imports ``shared.constants`` loads the checkout's
-    real ``.env`` unless the data paths are redirected, so the inherited
-    environment is not enough - point every data root at the test sandbox.
+    ``sandboxed_env()`` is the whole child sandbox (a child that imports
+    ``shared.constants`` would otherwise load the checkout's real ``.env`` and
+    resolve the real accounts-env path); the data roots below are the naming
+    test's own.
     """
-    env = dict(os.environ)
     data_dir.mkdir(parents=True, exist_ok=True)
-    env["DATA_DIR"] = str(data_dir)
-    env["TRADING_DATA_DIR"] = str(data_dir)
-    env["LOG_DIR"] = str(data_dir / "logs")
-    return env
+    return sandboxed_env(
+        DATA_DIR=str(data_dir),
+        TRADING_DATA_DIR=str(data_dir),
+        LOG_DIR=str(data_dir / "logs"),
+    )
 
 
 def test_module_help_exits_without_touching_data(tmp_path: Path) -> None:

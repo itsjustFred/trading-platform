@@ -1129,7 +1129,11 @@ def _run_throwaway_suite(
     # copy - the run must exercise the copy exactly as a real run loads it. The inherited
     # environment is already the swept one, and the copy sweeps it again.
     # sandbox-env: throwaway suite loads its own copied conftest
-    env = {**os.environ, "PYTHONPATH": str(_PROJECT_ROOT), **(env_extra or {})}
+    env = {
+        **os.environ,
+        "PYTHONPATH": str(_PROJECT_ROOT),
+        **(env_extra or {}),
+    }
     return subprocess.run(
         [
             sys.executable,
@@ -1142,7 +1146,7 @@ def _run_throwaway_suite(
             "tests/test_throwaway.py",
         ],
         cwd=project,
-        env=env,
+        env=env,  # sandbox-env: the throwaway suite loads its own copied conftest
         capture_output=True,
         text=True,
         timeout=300,

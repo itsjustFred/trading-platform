@@ -2690,6 +2690,7 @@ def test_a_truncated_report_is_diagnosable_from_the_run_log(tmp_path) -> None:
         capture_output=True,
         text=True,
         check=True,
+        env=sandboxed_env(),
     )
     notice = [line for line in result.stdout.splitlines() if "pre-mortem report is" in line]
     assert notice, (
@@ -2883,6 +2884,7 @@ def _premortem_verdict(output: str, tmp_path) -> str:
         capture_output=True,
         text=True,
         check=True,
+        env=sandboxed_env(),
     )
     return result.stdout
 

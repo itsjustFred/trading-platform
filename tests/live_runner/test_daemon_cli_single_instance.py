@@ -28,6 +28,8 @@ from typing import Any
 
 import pytest
 
+from tests.conftest import sandboxed_env
+
 from live_runner import daemon_cli
 from shared.single_instance import (
     SingleInstanceError,
@@ -762,16 +764,15 @@ class TestLockPath:
 
 
 def _daemon_child_env(data_dir: Path) -> dict[str, str]:
-    env = {key: value for key, value in os.environ.items() if key != "DATABASE_URL"}
-    env["DATA_DIR"] = str(data_dir)
-    # Pointed at the child's scratch dir so the test can tell whether the heavy daemon module was
-    # imported at all: it creates the log directory from the logger factory on the way through.
-    env["LOG_DIR"] = str(data_dir / "logs")
-    existing = env.get("PYTHONPATH")
-    env["PYTHONPATH"] = (
-        str(REPO_ROOT) if not existing else os.pathsep.join([str(REPO_ROOT), existing])
-    )
-    return env
+    """The sandboxed environment for a daemon child, pointed at ``data_dir``.
+
+    ``DATABASE_URL`` is not merely dropped: ``sandboxed_env()`` clears the
+    environment down to the allowlist the suite itself runs under, and the child
+    then resolves its data roots here. Pointed at the child's scratch dir so the
+    test can tell whether the heavy daemon module was imported at all: it creates
+    the log directory from the logger factory on the way through.
+    """
+    return sandboxed_env(DATA_DIR=str(data_dir), LOG_DIR=str(data_dir / "logs"))
 
 
 def _run_daemon_process(args: list[str], data_dir: Path, timeout: float = 120.0) -> Any:
