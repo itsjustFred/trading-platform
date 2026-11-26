@@ -7586,7 +7586,7 @@ def list_live_control_audit(
             statement = statement.where(
                 LiveControlAuditModel.target_id == str(target_id).strip()
             )
-        if action:
+        if action is not None:
             statement = statement.where(
                 LiveControlAuditModel.action == str(action).strip()
             )

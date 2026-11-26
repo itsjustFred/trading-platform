@@ -6632,6 +6632,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         if not work:
             self._expired_stop_heal_last_run = time.monotonic()
             return
+        lock_timed_out = False
         for symbol in sorted(work):
             parts = work[symbol]
             try:
@@ -6639,7 +6640,6 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                     self.order_placement_account_id,
                     timeout=_EXPIRED_STOP_HEAL_LOCK_TIMEOUT_SECONDS,
                 ), self._order_book_lock():
-                    self._expired_stop_heal_last_run = time.monotonic()
                     qty = await self._symbol_position_qty(symbol)
                     if qty is None or _is_flat(qty):
                         continue
@@ -6648,6 +6648,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                         client, symbol, position, parts
                     )
             except AccountOrderLockTimeoutError as exc:
+                lock_timed_out = True
                 logger.warning(
                     "Alpaca protective-stop maintenance skipped %s: the "
                     "account order-placement lock stayed busy",
@@ -6666,6 +6667,11 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 self._expired_stop_heal_alert(
                     symbol, "heal_error", {"error": repr(exc)}
                 )
+        # Stamp once per pass, after every symbol was attempted - and not at
+        # all when a symbol was skipped on a busy lock, so that symbol's
+        # retry is not held back by the interval.
+        if not lock_timed_out:
+            self._expired_stop_heal_last_run = time.monotonic()
 
     async def _act_on_maintenance_symbol(
         self,
