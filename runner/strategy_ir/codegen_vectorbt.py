@@ -115,10 +115,10 @@ def _select_signal_roles(
     return primary, secondary
 
 
-def _untranslatable(text: str, *, source: str) -> NoReturn:
+def _untranslatable(text: str, *, source: str, engine: str) -> NoReturn:
     """F4: unmatched condition text must fail loudly, never fabricate rules."""
     raise ValueError(
-        "Cannot deterministically translate condition text into vectorbt logic: "
+        f"Cannot deterministically translate condition text into {engine} logic: "
         f"{source}. Extend the StrategyIR with an explicit expression instead of "
         "relying on keyword guessing."
     )
@@ -130,12 +130,13 @@ def _rule_from_text(
     primary_signal: str,
     secondary_signal: str,
     source: str = "",
+    engine: str,
 ) -> str:
     normalized = (text or "").strip().lower()
     # An empty condition is just as untranslatable as prose: falling back to a
     # directional rule here would fabricate trading logic (same rule as F4).
     if not normalized:
-        _untranslatable(text, source=source or repr(text))
+        _untranslatable(text, source=source or repr(text), engine=engine)
 
     if "crossunder" in normalized:
         return f"_cross_under({primary_signal}, {secondary_signal})"
@@ -152,7 +153,7 @@ def _rule_from_text(
     if any(token in normalized for token in ("<", "below", "under", "less", "lower")):
         return f"({primary_signal} < {secondary_signal})"
 
-    _untranslatable(text, source=source or text)
+    _untranslatable(text, source=source or text, engine=engine)
 
 
 def _entry_rule_expressions(
@@ -160,6 +161,7 @@ def _entry_rule_expressions(
     *,
     primary_signal: str,
     secondary_signal: str,
+    engine: str,
 ) -> list[str]:
     expressions: list[str] = []
     for condition in conditions:
@@ -168,6 +170,7 @@ def _entry_rule_expressions(
             primary_signal=primary_signal,
             secondary_signal=secondary_signal,
             source=f"entry condition {condition.expression!r}",
+            engine=engine,
         )
         expressions.append(expression)
     return expressions
@@ -178,6 +181,7 @@ def _exit_rule_expressions(
     *,
     primary_signal: str,
     secondary_signal: str,
+    engine: str,
 ) -> list[str]:
     expressions: list[str] = []
     for signal in exit_signals:
@@ -186,13 +190,19 @@ def _exit_rule_expressions(
             primary_signal=primary_signal,
             secondary_signal=secondary_signal,
             source=f"exit signal {signal.condition!r}",
+            engine=engine,
         )
         expressions.append(expression)
     return expressions
 
 
-def generate_vectorbt_strategy_code(strategy_ir: StrategyIR) -> str:
-    """Generate deterministic vectorbt-compatible strategy code from StrategyIR."""
+def _generate_strategy_module(strategy_ir: StrategyIR, *, engine: str) -> str:
+    """Emit the shared ``generate_signals`` strategy module for ``engine``.
+
+    Both the native and vectorbt adapters consume the same
+    ``generate_signals(df, params)`` module convention, so the emitted code is
+    identical apart from the header label and error text.
+    """
     meta = _strategy_meta_from_ir(strategy_ir)
     indicators = sorted(strategy_ir.indicators, key=lambda item: item.name.lower())
 
@@ -245,15 +255,17 @@ def generate_vectorbt_strategy_code(strategy_ir: StrategyIR) -> str:
         strategy_ir.entry_conditions,
         primary_signal=primary_signal,
         secondary_signal=secondary_signal,
+        engine=engine,
     )
     exit_expressions = _exit_rule_expressions(
         strategy_ir.exit_signals,
         primary_signal=primary_signal,
         secondary_signal=secondary_signal,
+        engine=engine,
     )
 
     lines: list[str] = [
-        '"""Auto-generated deterministic vectorbt strategy from StrategyIR."""',
+        f'"""Auto-generated deterministic {engine} strategy from StrategyIR."""',
         "",
         "from __future__ import annotations",
         "",
@@ -404,3 +416,8 @@ def generate_vectorbt_strategy_code(strategy_ir: StrategyIR) -> str:
     )
 
     return "\n".join(lines).rstrip() + "\n"
+
+
+def generate_vectorbt_strategy_code(strategy_ir: StrategyIR) -> str:
+    """Generate deterministic vectorbt-compatible strategy code from StrategyIR."""
+    return _generate_strategy_module(strategy_ir, engine="vectorbt")

@@ -97,6 +97,7 @@ class RawExpressionLanguage(str, Enum):
 class EngineHint(str, Enum):
     """Preferred target engine for deterministic codegen."""
 
+    NATIVE = "native"
     VECTORBT = "vectorbt"
     PYNECORE = "pynecore"
     LEAN = "lean"
