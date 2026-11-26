@@ -5018,36 +5018,50 @@ def test_alpaca_listen_clean_return_backs_off_instead_of_spinning(monkeypatch):
 
 # ── #80: per-symbol cTrader volume + SL/TP scales ─────────────────────────────
 
-@pytest.mark.parametrize(
-    "volume",
-    [
-        1,
-        999,
-        1_000,
-        2_001,
-        123_457,
-        999_999,
-        1_000_000,
-        2_147_483_000,
-        2_147_483_647,
-    ],
-)
-def test_ctrader_volume_qty_round_trip_is_exact_at_broker_volumes(volume: int) -> None:
+#: Volumes spanning the low range, a mid range and the whole int32 upper
+#: bound the protocol can express.
+_ROUND_TRIP_VOLUMES = [1, 999, 2_001, 123_457, 999_999, 2_147_483_000, 2_147_483_647]
+
+
+@pytest.mark.parametrize("symbol", ["EURUSD", "USDJPY", "XAUUSD", "XAGUSD", "US500"])
+@pytest.mark.parametrize("volume", _ROUND_TRIP_VOLUMES)
+def test_ctrader_volume_qty_round_trip_is_exact_for_every_fallback_scale(
+    symbol: str, volume: int
+) -> None:
     """The submit path's exact-int idempotency guard rests on this round trip.
 
     ``submit_order`` normalizes the signal qty from the resolved volume and
     fails closed when resolving that qty again does not reproduce the volume,
     so ``volume -> qty -> volume`` must be exact for every volume the cTrader
-    protocol can express (int32). It is the decimal lot-grid floor that makes
-    it exact - a change to ``_broker_volume_to_qty``, ``_qty_to_broker_volume``
-    or the floor's noise band would otherwise make the guard false-positive
-    (refusing valid submits) or false-negative (wire volume and persisted qty
-    diverging silently). Pinning the bound directly, not only through one
-    resolution point, is what makes such a change visible.
+    protocol can express (int32) *and every scale a submit can resolve
+    against*. A scale whose conversion did not round-trip would make the guard
+    refuse every valid submit for that symbol - a silent failure that only a
+    pin across the scales can surface. It is the decimal lot-grid floor that
+    makes the round trip exact; a change to ``_broker_volume_to_qty``,
+    ``_qty_to_broker_volume`` or the floor's noise band would otherwise make
+    the guard false-positive (refusing valid submits) or false-negative (wire
+    volume and persisted qty diverging silently).
     """
     from live_runner import ctrader_adapter as module
 
-    volume_per_qty = module._fallback_symbol_scale("EURUSD").volume_per_qty
+    volume_per_qty = module._fallback_symbol_scale(symbol).volume_per_qty
+
+    qty = module._broker_volume_to_qty(volume, volume_per_qty)
+
+    assert module._qty_to_broker_volume(qty, volume_per_qty) == volume
+
+
+@pytest.mark.parametrize(
+    "volume_per_qty", [100_000.0, 10.0, 1.0]
+)
+@pytest.mark.parametrize("volume", _ROUND_TRIP_VOLUMES)
+def test_ctrader_volume_qty_round_trip_is_exact_for_broker_scales(
+    volume_per_qty: float, volume: int
+) -> None:
+    """Same bound on broker scales: entries are only sized from a broker-sent
+    lotSize, and the demo's EURUSD scale (``lotSize`` 10_000_000 -> 100_000
+    units per qty) is the one every real submit resolves against."""
+    from live_runner import ctrader_adapter as module
 
     qty = module._broker_volume_to_qty(volume, volume_per_qty)
 

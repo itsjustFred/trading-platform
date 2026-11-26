@@ -2515,7 +2515,16 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         return round(floored_qty * float(scale.volume_per_qty))
 
     def _resolve_order_volume(self, signal: LiveSignal) -> int:
-        """Resolve broker volume from the binding risk-engine ``qty``."""
+        """Resolve broker volume from the binding risk-engine ``qty``.
+
+        Reads only the sizing metadata (``qty``, the pip value and
+        ``risk_sizing_mode``). In particular it reads no position or exit
+        metadata, which is why ``submit_order`` does not re-resolve the exit
+        path after it records the broker position id: a resolver that starts
+        reading that metadata must restore the re-resolution (and its
+        idempotency compare) with it - see
+        ``test_ctrader_resolved_volume_ignores_exit_position_metadata``.
+        """
         scale = self._scale_for(signal.symbol)
         metadata = signal.metadata or {}
         raw_keys = [key for key in ("ctrader_volume", "volume") if key in metadata]
