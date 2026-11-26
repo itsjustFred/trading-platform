@@ -22,7 +22,7 @@ from decimal import Decimal, InvalidOperation
 #: Float noise allowance when flooring to a step, as a fraction of one step. A
 #: ledger sum of 2.9999999999999996 is a whole 3, not 2 plus dust; anything this
 #: close to the next step is below every broker's quantity resolution.
-_STEP_NOISE = Decimal("1e-6")
+STEP_NOISE = Decimal("1e-6")
 
 
 def floor_qty_to_step(qty: float, step: float) -> float:
@@ -45,5 +45,5 @@ def floor_qty_to_step(qty: float, step: float) -> float:
         raise ValueError(f"Order quantity step must be finite and positive, got {step!r}")
     if not qty_value.is_finite() or qty_value < 0:
         raise ValueError(f"Order quantity must be finite and non-negative, got {qty!r}")
-    steps = math.floor(qty_value / step_value + _STEP_NOISE)
+    steps = math.floor(qty_value / step_value + STEP_NOISE)
     return float(Decimal(steps) * step_value)

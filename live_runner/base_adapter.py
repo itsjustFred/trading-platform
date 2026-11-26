@@ -71,6 +71,28 @@ def is_order_not_submitted(exc: BaseException) -> bool:
     return bool(getattr(exc, _ORDER_NOT_SUBMITTED_ATTR, False))
 
 
+class BrokerOrderRejectedError(RuntimeError):
+    """The broker received the order request and definitively refused it.
+
+    Distinct from a pre-request failure marked by :func:`order_not_submitted`:
+    the request DID reach the broker, but the broker's correlated answer was
+    a refusal (cTrader ``ProtoOAOrderErrorEvent`` as the response payload),
+    not an acceptance - so nothing was opened (entry) or closed (exit) and
+    the outcome is as certain as a pre-request refusal. A caller may release
+    its submission lease and record the signal as rejected instead of holding
+    it for reconciliation.
+
+    Adapters raise this ONLY when the refusal is provably tied to the request
+    that was sent: a timeout, a transport failure, or an error event that
+    cannot be correlated to this order stays an ordinary exception (unknown
+    outcome), never this type.
+    """
+
+    def __init__(self, message: str, *, error_code: str = "") -> None:
+        self.error_code = str(error_code or "").strip()
+        super().__init__(message)
+
+
 def is_unbounded_tp(metadata: object) -> bool:
     """Whether metadata declares the explicit unbounded-TP policy."""
     if not isinstance(metadata, dict):
@@ -548,17 +570,6 @@ class BaseLiveAdapter(ABC):
             f"{type(self).__name__} cannot report used margin"
         )
 
-    # ── Operator safety controls ──────────────────────────────────────────────────────────────
-    #
-    # Status semantics built on top of these:
-    #   PAUSED  -> stop opening new positions; orders and positions are left untouched, and the
-    #              deployment can be resumed.
-    #   STOPPED -> stop opening new positions, cancel every open order, then flatten every open
-    #              position. Deliberately not implicit in PAUSED, so pausing never liquidates.
-    #
-    # Adapters that cannot honour a control leave it unsupported so the caller fails loudly
-    # instead of reading a silent no-op as "nothing was open".
-
     # ── Stop amendment (live trailing stops, issue #167) ──────────────────────────────────────
     #
     # A trailing stop is executed live by moving the broker-side protective stop. An adapter
@@ -646,6 +657,17 @@ class BaseLiveAdapter(ABC):
             f"{type(self).__name__} cannot amend position take profits"
         )
 
+    # ── Operator safety controls ──────────────────────────────────────────────────────────────
+    #
+    # Status semantics built on top of these:
+    #   PAUSED  -> stop opening new positions; orders and positions are left untouched, and the
+    #              deployment can be resumed.
+    #   STOPPED -> stop opening new positions, cancel every open order, then flatten every open
+    #              position. Deliberately not implicit in PAUSED, so pausing never liquidates.
+    #
+    # Adapters that cannot honour a control leave it unsupported so the caller fails loudly
+    # instead of reading a silent no-op as "nothing was open".
+
     @property
     def supports_cancel_orders(self) -> bool:
         """Whether :meth:`cancel_open_orders` is implemented for this broker."""
@@ -725,6 +747,7 @@ class BaseLiveAdapter(ABC):
         """Fill in commissions the broker reports only after the fill. Returns the rows updated.
 
         A no-op by default: a broker that states its fee on the fill has nothing to backfill.
-        Alpaca posts crypto fees end of day and overrides this (#124).
+        Alpaca reports crypto fees only as ``CFEE`` activities posted in batches after the
+        fill, and overrides this (#124).
         """
         return 0

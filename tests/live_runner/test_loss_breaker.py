@@ -28,6 +28,7 @@ from live_runner.loss_breaker import (
     deployment_loss_breaker_limits,
     deployment_loss_breaker_scope,
     observe_account_loss_breaker_equity,
+    reanchor_deployment_loss_breaker_scope,
     refuse_entry_if_loss_breaker_tripped,
 )
 from shared.database import (
@@ -35,9 +36,12 @@ from shared.database import (
     get_live_loss_breaker_state,
     list_live_loss_breaker_states,
     observe_live_loss_breaker,
+    reanchor_live_loss_breaker_deployment,
+    reset_live_loss_breaker_drawdown,
     save_live_balance,
     save_live_execution,
     save_live_signal,
+    update_live_deployment_account,
 )
 from shared.models import LiveBalanceRecord, LiveDeploymentConfig, LiveSignal
 
@@ -77,19 +81,20 @@ def _gate(
     now: datetime,
     env_values: dict | None = None,
     symbol: str | None = None,
-    deployment_equity: float | None = None,
+    deployment_pnls: dict | None = None,
 ) -> None:
-    """The entry gate with ``deployment_equity`` defaulting to ``equity``.
+    """The entry gate with ``deployment_pnls`` defaulting to ``{}``.
 
-    These tests have no other deployments' P&L, so the deployment scope's
-    synthetic equity equals the account equity; tests that exercise the
-    P&L-adjusted scope pass ``deployment_equity`` or call
+    These tests have no fill-ledger P&L, so the measurable map is empty -
+    the deployment scope's anchored equity then stays flat (its own P&L is
+    zero) while the account scope tracks raw equity. Tests that exercise a
+    deployment P&L pass ``deployment_pnls`` or call
     ``refuse_entry_if_loss_breaker_tripped`` directly.
     """
     return refuse_entry_if_loss_breaker_tripped(
         deployment,
         equity=equity,
-        deployment_equity=equity if deployment_equity is None else deployment_equity,
+        deployment_pnls={} if deployment_pnls is None else deployment_pnls,
         now=now,
         env_values=NO_ENV if env_values is None else env_values,
         symbol=symbol,
@@ -383,20 +388,25 @@ def test_deployment_breach_blocks_only_that_deployment():
     loose = _deployment(account_id="acc-mix")
     _observe("acc-mix", 100_000.0, DAY1)
     # The deployment scope seeds its baseline from its OWN first observation
-    # (flat P&L -> V == account equity), then measures the drop against it.
+    # (flat P&L -> anchored equity == account equity), then measures the
+    # drop against it.
     _gate(tight, equity=100_000.0, now=DAY1, env_values=NO_ENV)
-    # 2 % down: over the tight deployment's 1 % daily limit, under the
-    # account's 5 %.
+    # tight's own P&L is -2 000 while account equity is 98k: residual stays
+    # 100k, so tight's anchored equity is 98k (-2%) - over its 1% daily
+    # limit, under the account's 5%.
+    pnls = {str(tight.id): -2_000.0, str(loose.id): 0.0}
     with pytest.raises(LossBreakerBreachError) as excinfo:
         _gate(
-            tight, equity=98_000.0, now=DAY1 + timedelta(minutes=1), env_values=NO_ENV
+            tight, equity=98_000.0, now=DAY1 + timedelta(minutes=1),
+            env_values=NO_ENV, deployment_pnls=pnls,
         )
     assert excinfo.value.scope == deployment_loss_breaker_scope(str(tight.id))
-    # The sibling deployment on the same account still trades: its scope
-    # seeds at the current 98k (its own first observation) and the account
-    # scope is only -2 %.
+    # The sibling deployment on the same account still trades: its own P&L
+    # is flat so its anchored equity stays at its 100k baseline, and the
+    # account scope is only -2 %.
     _gate(
-        loose, equity=98_000.0, now=DAY1 + timedelta(minutes=1), env_values=NO_ENV
+        loose, equity=98_000.0, now=DAY1 + timedelta(minutes=1),
+        env_values=NO_ENV, deployment_pnls=pnls,
     )
 
 
@@ -528,29 +538,34 @@ def test_breach_alerts_once_per_episode(caplog):
 def test_poll_observation_trips_breaker_without_any_entry():
     dep_a = _deployment(account_id="acc-poll")
     dep_b = _deployment(account_id="acc-poll")
+    a_id, b_id = str(dep_a.id), str(dep_b.id)
+    pnls_flat = {a_id: 0.0, b_id: 0.0}
     observe_account_loss_breaker_equity(
         "acc-poll",
         100_000.0,
         now=DAY1,
         deployments=[dep_a, dep_b],
-        deployment_pnls={},
+        deployment_pnls=pnls_flat,
         env_values=NO_ENV,
     )
-    # Second poll: equity down 6 % - both scopes latch on the poll itself.
+    # Second poll: each deployment's OWN P&L is -6k (account equity -12k,
+    # residual unchanged at 100k) - both deployment scopes latch on the poll
+    # itself, and so does the account scope.
     observe_account_loss_breaker_equity(
         "acc-poll",
-        94_000.0,
+        88_000.0,
         now=DAY1 + timedelta(minutes=1),
         deployments=[dep_a, dep_b],
-        deployment_pnls={},
+        deployment_pnls={a_id: -6_000.0, b_id: -6_000.0},
         env_values=NO_ENV,
     )
     for dep in (dep_a, dep_b):
         with pytest.raises(LossBreakerBreachError):
             _gate(
-                dep, equity=94_000.0, now=DAY1, env_values=NO_ENV
+                dep, equity=88_000.0, now=DAY1, env_values=NO_ENV,
+                deployment_pnls={a_id: -6_000.0, b_id: -6_000.0},
             )
-    state = get_live_loss_breaker_state(deployment_loss_breaker_scope(str(dep_a.id)))
+    state = get_live_loss_breaker_state(deployment_loss_breaker_scope(a_id))
     assert state.daily_breached is True
 
 
@@ -699,18 +714,19 @@ def test_deployment_scope_trips_on_own_pnl_while_account_stays_under():
     assert state_b.drawdown_breached is False
 
 
-def test_gate_uses_deployment_equity_not_account_equity():
+def test_gate_uses_deployment_pnl_not_account_equity():
     dep = _deployment(account_id="acc-v")
     _observe("acc-v", 100_000.0, DAY1)
     # The deployment scope seeds its baseline from its OWN first observation:
-    # flat synthetic equity first, then the -6% drop is measured against it.
-    _gate(dep, equity=100_000.0, now=DAY1, deployment_equity=100_000.0)
-    # Account equity flat at 100k but this deployment's synthetic equity is
-    # 94k (-6%): only the deployment scope trips.
+    # flat P&L anchors it at 100k, then a -6k own-P&L move is measured
+    # against it while account equity stays flat.
+    _gate(dep, equity=100_000.0, now=DAY1, deployment_pnls={})
+    # Account equity flat at 100k but this deployment's own P&L is -6k:
+    # anchored equity 94k (-6%): only the deployment scope trips.
     with pytest.raises(LossBreakerBreachError) as excinfo:
         _gate(
             dep, equity=100_000.0, now=DAY1 + timedelta(minutes=1),
-            deployment_equity=94_000.0,
+            deployment_pnls={str(dep.id): -6_000.0},
         )
     assert excinfo.value.scope == deployment_loss_breaker_scope(str(dep.id))
 
@@ -720,7 +736,7 @@ def test_gate_refuses_when_deployment_pnl_unmeasurable():
     _observe("acc-nopnl", 100_000.0, DAY1)
     with pytest.raises(LossBreakerBreachError) as excinfo:
         refuse_entry_if_loss_breaker_tripped(
-            dep, equity=100_000.0, deployment_equity=None,
+            dep, equity=100_000.0, deployment_pnls=None,
             now=DAY1, env_values=NO_ENV,
         )
     assert excinfo.value.state_unreadable is True
@@ -734,26 +750,70 @@ def test_gate_skips_unmeasurable_deployment_scope_when_disabled():
     _observe("acc-nopnl2", 100_000.0, DAY1)
     # Deployment breaker disabled: no P&L needed, account scope still passes.
     refuse_entry_if_loss_breaker_tripped(
-        dep, equity=100_000.0, deployment_equity=None,
+        dep, equity=100_000.0, deployment_pnls=None,
         now=DAY1, env_values=NO_ENV,
     )
 
 
-def test_poll_skips_deployment_scopes_when_pnl_unmeasurable():
+def test_poll_skips_deployment_scopes_when_pnl_unmeasurable(caplog):
     dep = _deployment(account_id="acc-pnp")
-    observe_account_loss_breaker_equity(
-        "acc-pnp", 100_000.0, now=DAY1,
-        deployments=[dep], deployment_pnls=None, env_values=NO_ENV,
-    )
-    # Account scope observed; the deployment scope was skipped entirely.
+    with caplog.at_level(logging.WARNING, logger="live-runner"):
+        observe_account_loss_breaker_equity(
+            "acc-pnp", 100_000.0, now=DAY1,
+            deployments=[dep], deployment_pnls=None, env_values=NO_ENV,
+        )
+    # Account scope observed; the deployment scope was skipped entirely -
+    # gracefully, with the skip warning and WITHOUT the generic
+    # "observation failed" error a crash inside the loop would log.
     assert get_live_loss_breaker_state(account_loss_breaker_scope("acc-pnp")) is not None
     assert (
         get_live_loss_breaker_state(deployment_loss_breaker_scope(str(dep.id)))
         is None
     )
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("scopes skipped this poll" in m for m in messages)
+    assert not any("observation failed" in m for m in messages)
 
 
 # ─── Deployment P&L reconstruction from the fill ledger ────────────────────────
+
+
+def _ensure_live_account(account_id: str) -> None:
+    """Persist the ``live_accounts`` row deployment/breaker FKs need."""
+    import shared.database as database
+
+    database.init_db()
+    with database.get_session() as session:
+        if session.get(database.LiveAccountModel, account_id) is None:
+            session.add(
+                database.LiveAccountModel(
+                    id=account_id, broker="test", name=account_id
+                )
+            )
+        session.commit()
+
+
+def _persist_deployment(
+    account_id: str, deployment_id: str, *, status: str = "PAUSED"
+) -> None:
+    """Persist the ``live_deployments`` row ``get_live_deployment`` resolves."""
+    import shared.database as database
+
+    _ensure_live_account(account_id)
+    database.init_db()
+    with database.get_session() as session:
+        if session.get(database.LiveDeploymentModel, deployment_id) is None:
+            session.add(
+                database.LiveDeploymentModel(
+                    id=deployment_id,
+                    strategy_name="t",
+                    account_id=account_id,
+                    symbols_json=["AAPL"],
+                    timeframe="1h",
+                    status=status,
+                )
+            )
+        session.commit()
 
 
 def _persist_fill(
@@ -908,13 +968,22 @@ class _PollAdapter:
         )
 
 
-def test_poll_adapter_balance_latches_account_and_deployment_scopes():
+def test_poll_adapter_balance_latches_account_and_deployment_scopes(monkeypatch):
     """Drives the real ``_poll_adapter_balance``: a 6% equity drop latches
     BOTH the account scope and the deployment scope on the poll itself, and
     the deployment row seeds its baseline from its OWN first observation
-    (created mid-stream, never inheriting the account baseline)."""
+    (created mid-stream, never inheriting the account baseline). The
+    deployment scope only moves with its OWN P&L, so the drop is attributed
+    to it via the ledger-P&L lookup."""
     dep = _deployment(account_id="acc-pollwire")
     adapter = _PollAdapter([100_000.0, 94_000.0])
+
+    pnls_script = [{str(dep.id): 0.0}, {str(dep.id): -6_000.0}]
+
+    async def _pnls(_adapter, _account_id):
+        return pnls_script.pop(0) if len(pnls_script) > 1 else pnls_script[0]
+
+    monkeypatch.setattr(daemon, "account_deployment_trading_pnls", _pnls)
     for equity_time in (DAY1, DAY1 + timedelta(minutes=1)):
         asyncio.run(
             daemon._poll_adapter_balance(
@@ -1798,3 +1867,1072 @@ def test_run_daemon_points_loss_breaker_env_at_accounts_env(monkeypatch, tmp_pat
     env_file = tmp_path / "custom.accounts.env"
     asyncio.run(daemon.run_daemon(accounts_env=env_file))
     assert captured["path"] == env_file
+
+
+# ─── Anchored deployment scope: unattributed equity is not the deployment's ────
+#
+# Sentry TRADING-PLATFORM-2F: an unattributed broker-side close moved account
+# equity and, through ``equity - total_pnl + own_pnl``, moved EVERY deployment
+# scope - all seven ACTIVE deployments on the account tripped at once. A
+# deployment scope now observes ``equity_anchor + own P&L``: the anchor is the
+# residual ``account_equity - total deployment P&L`` fixed at first
+# observation, so only the deployment's own trading P&L moves its scope.
+
+
+def test_unattributed_equity_drop_does_not_trip_deployment_scopes():
+    """Poll path: a 33% unattributed drop trips the ACCOUNT scope only."""
+    dep_a = _deployment(account_id="acc-foreign")
+    dep_b = _deployment(account_id="acc-foreign")
+    a_id, b_id = str(dep_a.id), str(dep_b.id)
+    deployments = [dep_a, dep_b]
+    pnls_flat = {a_id: 0.0, b_id: 0.0}
+    # Baseline: account equity 134, no deployment P&L -> residual 134 anchors.
+    observe_account_loss_breaker_equity(
+        "acc-foreign", 134.0, now=DAY1,
+        deployments=deployments, deployment_pnls=pnls_flat, env_values=NO_ENV,
+    )
+    # The unattributed close: equity 134 -> 90 (-33%), P&L map unchanged.
+    observe_account_loss_breaker_equity(
+        "acc-foreign", 90.0, now=DAY1 + timedelta(minutes=1),
+        deployments=deployments, deployment_pnls=pnls_flat, env_values=NO_ENV,
+    )
+    account_state = get_live_loss_breaker_state(
+        account_loss_breaker_scope("acc-foreign")
+    )
+    assert account_state.daily_breached is True
+    assert account_state.drawdown_breached is True
+    for dep in (dep_a, dep_b):
+        state = get_live_loss_breaker_state(
+            deployment_loss_breaker_scope(str(dep.id))
+        )
+        assert state.daily_breached is False
+        assert state.drawdown_breached is False
+        # The scope equity never moved: anchor 134 + own P&L 0.
+        assert state.last_equity == pytest.approx(134.0)
+        assert state.equity_anchor == pytest.approx(134.0)
+
+
+def test_unattributed_equity_drop_does_not_trip_deployment_scopes_at_gate():
+    """Entry-gate path: same drop, thresholds raised so the account scope
+    stays under - the deployment scope must still pass."""
+    dep = _deployment(account_id="acc-foreign-gate")
+    dep_id = str(dep.id)
+    pnls_flat = {dep_id: 0.0}
+    # Raised thresholds on BOTH poll and gate so the account scope observes
+    # the -33% drop without latching: only the deployment scope's verdict is
+    # under test here (the poll-path test covers the account latch).
+    env = {
+        "LOSS_BREAKER_DAILY_LOSS_FRACTION": "0.5",
+        "LOSS_BREAKER_MAX_DRAWDOWN_FRACTION": "0.5",
+    }
+    observe_account_loss_breaker_equity(
+        "acc-foreign-gate", 134.0, now=DAY1,
+        deployments=[dep], deployment_pnls=pnls_flat, env_values=env,
+    )
+    observe_account_loss_breaker_equity(
+        "acc-foreign-gate", 90.0, now=DAY1 + timedelta(minutes=1),
+        deployments=[dep], deployment_pnls=pnls_flat, env_values=env,
+    )
+    # Account -33% is under the raised 50% limits; the deployment scope's
+    # anchored equity is flat at 134 -> the entry is allowed.
+    _gate(
+        dep, equity=90.0, now=DAY1 + timedelta(minutes=2),
+        env_values=env, deployment_pnls=pnls_flat,
+    )
+    state = get_live_loss_breaker_state(deployment_loss_breaker_scope(dep_id))
+    assert state.last_equity == pytest.approx(134.0)
+    assert state.daily_breached is False
+    assert state.drawdown_breached is False
+
+
+def test_own_pnl_loss_still_trips_only_that_deployment_scope():
+    """The fix must not blunt the breaker: one deployment's own P&L dropping
+    past the threshold trips ITS scope on poll and gate, not the sibling's.
+    dep_b's gain offsets dep_a's loss so the ACCOUNT scope stays under."""
+    dep_a = _deployment(account_id="acc-ownloss")
+    dep_b = _deployment(account_id="acc-ownloss")
+    a_id, b_id = str(dep_a.id), str(dep_b.id)
+    deployments = [dep_a, dep_b]
+    observe_account_loss_breaker_equity(
+        "acc-ownloss", 100_000.0, now=DAY1,
+        deployments=deployments,
+        deployment_pnls={a_id: 0.0, b_id: 0.0},
+        env_values=NO_ENV,
+    )
+    # dep_a -6k, dep_b +4k: account equity -2k (residual stays 100k), so only
+    # dep_a's anchored equity moves: 100k -> 94k (-6% > 5% daily).
+    pnls = {a_id: -6_000.0, b_id: 4_000.0}
+    loss_time = DAY1 + timedelta(minutes=1)
+    observe_account_loss_breaker_equity(
+        "acc-ownloss", 98_000.0, now=loss_time,
+        deployments=deployments, deployment_pnls=pnls, env_values=NO_ENV,
+    )
+    account_state = get_live_loss_breaker_state(
+        account_loss_breaker_scope("acc-ownloss")
+    )
+    assert account_state.daily_breached is False
+    state_a = get_live_loss_breaker_state(deployment_loss_breaker_scope(a_id))
+    assert state_a.daily_breached is True
+    assert state_a.last_equity == pytest.approx(94_000.0)
+    state_b = get_live_loss_breaker_state(deployment_loss_breaker_scope(b_id))
+    assert state_b.daily_breached is False
+    assert state_b.last_equity == pytest.approx(104_000.0)
+    # Gate agrees: dep_a refused on its own scope, dep_b allowed.
+    with pytest.raises(LossBreakerBreachError) as excinfo:
+        _gate(
+            dep_a, equity=98_000.0, now=loss_time,
+            deployment_pnls=pnls,
+        )
+    assert excinfo.value.scope == deployment_loss_breaker_scope(a_id)
+    _gate(
+        dep_b, equity=98_000.0, now=loss_time,
+        deployment_pnls=pnls,
+    )
+
+
+def test_deposit_does_not_move_deployment_scopes():
+    """A deposit raises account equity with zero P&L: the deployment scope's
+    anchored equity must stay exactly flat."""
+    dep = _deployment(account_id="acc-deposit")
+    dep_id = str(dep.id)
+    observe_account_loss_breaker_equity(
+        "acc-deposit", 100_000.0, now=DAY1,
+        deployments=[dep], deployment_pnls={dep_id: 0.0}, env_values=NO_ENV,
+    )
+    # +20k deposit: account equity 120k, deployment P&L still flat.
+    observe_account_loss_breaker_equity(
+        "acc-deposit", 120_000.0, now=DAY1 + timedelta(minutes=1),
+        deployments=[dep], deployment_pnls={dep_id: 0.0}, env_values=NO_ENV,
+    )
+    state = get_live_loss_breaker_state(deployment_loss_breaker_scope(dep_id))
+    assert state.last_equity == pytest.approx(100_000.0)
+    assert state.equity_anchor == pytest.approx(100_000.0)
+    assert state.daily_breached is False
+    assert state.drawdown_breached is False
+    # The account scope saw the deposit, as it must.
+    account_state = get_live_loss_breaker_state(
+        account_loss_breaker_scope("acc-deposit")
+    )
+    assert account_state.last_equity == pytest.approx(120_000.0)
+
+
+def test_reset_drawdown_reanchors_deployment_scope():
+    """``reset-drawdown`` keeps the anchored series consistent: the anchor
+    shifts by the re-base delta so scope equity continues from the reset
+    equity and keeps measuring only own P&L."""
+    from live_runner.loss_breaker import reset_drawdown_breaker
+
+    dep = _deployment(account_id="acc-reset")
+    dep_id = str(dep.id)
+    scope = deployment_loss_breaker_scope(dep_id)
+    observe_account_loss_breaker_equity(
+        "acc-reset", 100_000.0, now=DAY1,
+        deployments=[dep], deployment_pnls={dep_id: 0.0}, env_values=NO_ENV,
+    )
+    # Unattributed -30k drop: the deployment scope stays at 100k.
+    observe_account_loss_breaker_equity(
+        "acc-reset", 70_000.0, now=DAY1 + timedelta(minutes=1),
+        deployments=[dep], deployment_pnls={dep_id: 0.0}, env_values=NO_ENV,
+    )
+    state = get_live_loss_breaker_state(scope)
+    assert state.last_equity == pytest.approx(100_000.0)
+    assert state.equity_anchor == pytest.approx(100_000.0)
+    # Operator reset at the scope's own last equity: the delta is zero, the
+    # anchor is unchanged and the peak re-bases.
+    updated = reset_drawdown_breaker(scope, equity=100_000.0, now=DAY1)
+    assert updated.peak_equity == pytest.approx(100_000.0)
+    assert updated.equity_anchor == pytest.approx(100_000.0)
+    # A reset to a DIFFERENT equity shifts the anchor by the same delta.
+    updated = reset_drawdown_breaker(scope, equity=120_000.0, now=DAY1)
+    assert updated.equity_anchor == pytest.approx(120_000.0)
+    # Next observation: equity = anchor + own P&L = 120k - 10k = 110k.
+    observe_account_loss_breaker_equity(
+        "acc-reset", 70_000.0, now=DAY1 + timedelta(minutes=2),
+        deployments=[dep], deployment_pnls={dep_id: -10_000.0},
+        env_values=NO_ENV,
+    )
+    state = get_live_loss_breaker_state(scope)
+    assert state.last_equity == pytest.approx(110_000.0)
+
+
+def test_legacy_deployment_scope_anchors_on_next_observation_without_tripping():
+    """A deployment row written before ``equity_anchor`` existed (NULL)
+    anchors on its next observation CONTINUING from its last observed
+    equity - the anchoring observation itself cannot trip the breaker, and
+    unattributed drift afterwards still cannot move the scope."""
+    dep = _deployment(account_id="acc-legacy")
+    dep_id = str(dep.id)
+    scope = deployment_loss_breaker_scope(dep_id)
+    # Simulate the pre-anchor row: written through the raw DB helper, which
+    # never sets equity_anchor (NULL after the column migration).
+    observe_live_loss_breaker(scope, "acc-legacy", 100_000.0, DAY1)
+    observe_live_loss_breaker(
+        scope, "acc-legacy", 98_000.0, DAY1 + timedelta(minutes=1)
+    )
+    state = get_live_loss_breaker_state(scope)
+    assert state.equity_anchor is None
+    # A -31% unattributed account drop with flat deployment P&L: the legacy
+    # row's first anchored observation continues from 98k (last_equity), it
+    # does NOT re-measure the whole residual drop.
+    observe_account_loss_breaker_equity(
+        "acc-legacy", 69_000.0, now=DAY1 + timedelta(minutes=2),
+        deployments=[dep], deployment_pnls={dep_id: 0.0}, env_values=NO_ENV,
+    )
+    state = get_live_loss_breaker_state(scope)
+    assert state.equity_anchor == pytest.approx(98_000.0)
+    assert state.last_equity == pytest.approx(98_000.0)
+    assert state.daily_breached is False
+    assert state.drawdown_breached is False
+    # And a further unattributed drop still cannot move the now-anchored scope.
+    observe_account_loss_breaker_equity(
+        "acc-legacy", 50_000.0, now=DAY1 + timedelta(minutes=3),
+        deployments=[dep], deployment_pnls={dep_id: 0.0}, env_values=NO_ENV,
+    )
+    state = get_live_loss_breaker_state(scope)
+    assert state.last_equity == pytest.approx(98_000.0)
+    assert state.daily_breached is False
+    assert state.drawdown_breached is False
+
+
+# ─── Anchor arithmetic with NON-ZERO own P&L ──────────────────────────────────
+#
+# The migration path (legacy NULL-anchor row) and the first-observation path
+# (no row) are where every live deployment lands; the arithmetic there must
+# be pinned with a non-zero own P&L or mutants that drop ``- own_pnl`` from
+# the persisted anchor survive silently.
+
+
+def _legacy_unanchored_row(account_id: str, dep: LiveDeploymentConfig, last_equity: float):
+    """A pre-anchor deployment row: ``equity_anchor`` stays NULL."""
+    scope = deployment_loss_breaker_scope(str(dep.id))
+    observe_live_loss_breaker(scope, account_id, last_equity, DAY1)
+    observe_live_loss_breaker(
+        scope, account_id, last_equity, DAY1 + timedelta(minutes=1)
+    )
+    state = get_live_loss_breaker_state(scope)
+    assert state.equity_anchor is None
+    assert state.last_equity == pytest.approx(last_equity)
+    return scope
+
+
+def test_legacy_row_anchor_subtracts_own_pnl_poll():
+    """Poll path: a legacy row with ``last_equity = L`` and own P&L 300 keeps
+    ``last_equity == L`` and persists ``equity_anchor == L - 300``; the next
+    observation with own P&L 250 lands at ``L - 50`` - it moves by exactly
+    the change in own P&L."""
+    account_id = "acc-anchor-legacy-poll"
+    dep = _deployment(account_id=account_id)
+    dep_id = str(dep.id)
+    last = 100_000.0
+    scope = _legacy_unanchored_row(account_id, dep, last)
+
+    observe_account_loss_breaker_equity(
+        account_id, 100_000.0, now=DAY1 + timedelta(minutes=2),
+        deployments=[dep], deployment_pnls={dep_id: 300.0}, env_values=NO_ENV,
+    )
+    state = get_live_loss_breaker_state(scope)
+    assert state.last_equity == pytest.approx(last)
+    assert state.equity_anchor == pytest.approx(last - 300.0)
+
+    observe_account_loss_breaker_equity(
+        account_id, 100_000.0, now=DAY1 + timedelta(minutes=3),
+        deployments=[dep], deployment_pnls={dep_id: 250.0}, env_values=NO_ENV,
+    )
+    state = get_live_loss_breaker_state(scope)
+    assert state.equity_anchor == pytest.approx(last - 300.0)
+    assert state.last_equity == pytest.approx(last - 50.0)
+
+
+def test_legacy_row_anchor_subtracts_own_pnl_gate():
+    """Entry-gate path: the same legacy-row arithmetic through
+    ``refuse_entry_if_loss_breaker_tripped``."""
+    account_id = "acc-anchor-legacy-gate"
+    dep = _deployment(account_id=account_id)
+    dep_id = str(dep.id)
+    last = 100_000.0
+    scope = _legacy_unanchored_row(account_id, dep, last)
+
+    _gate(
+        dep, equity=100_000.0, now=DAY1 + timedelta(minutes=2),
+        deployment_pnls={dep_id: 300.0},
+    )
+    state = get_live_loss_breaker_state(scope)
+    assert state.last_equity == pytest.approx(last)
+    assert state.equity_anchor == pytest.approx(last - 300.0)
+
+    _gate(
+        dep, equity=100_000.0, now=DAY1 + timedelta(minutes=3),
+        deployment_pnls={dep_id: 250.0},
+    )
+    state = get_live_loss_breaker_state(scope)
+    assert state.equity_anchor == pytest.approx(last - 300.0)
+    assert state.last_equity == pytest.approx(last - 50.0)
+
+
+def test_first_observation_anchor_is_residual_poll():
+    """Poll path: a deployment whose FIRST breaker observation already has
+    fills anchors at the residual ``account_equity - total P&L``; the second
+    observation moves by exactly the change in own P&L."""
+    account_id = "acc-anchor-first-poll"
+    dep = _deployment(account_id=account_id)
+    dep_id = str(dep.id)
+    scope = deployment_loss_breaker_scope(dep_id)
+    account_equity = 100_000.0
+
+    observe_account_loss_breaker_equity(
+        account_id, account_equity, now=DAY1,
+        deployments=[dep], deployment_pnls={dep_id: 300.0}, env_values=NO_ENV,
+    )
+    residual = account_equity - 300.0
+    state = get_live_loss_breaker_state(scope)
+    assert state.equity_anchor == pytest.approx(residual)
+    assert state.last_equity == pytest.approx(residual + 300.0)
+
+    observe_account_loss_breaker_equity(
+        account_id, account_equity, now=DAY1 + timedelta(minutes=1),
+        deployments=[dep], deployment_pnls={dep_id: 250.0}, env_values=NO_ENV,
+    )
+    state = get_live_loss_breaker_state(scope)
+    # own P&L fell by 50: the scope equity falls by exactly 50.
+    assert state.last_equity == pytest.approx(account_equity - 50.0)
+    assert state.equity_anchor == pytest.approx(residual)
+
+
+def test_first_observation_anchor_is_residual_gate():
+    """Entry-gate path: same first-observation residual arithmetic."""
+    account_id = "acc-anchor-first-gate"
+    dep = _deployment(account_id=account_id)
+    dep_id = str(dep.id)
+    scope = deployment_loss_breaker_scope(dep_id)
+    account_equity = 100_000.0
+
+    _gate(
+        dep, equity=account_equity, now=DAY1,
+        deployment_pnls={dep_id: 300.0},
+    )
+    residual = account_equity - 300.0
+    state = get_live_loss_breaker_state(scope)
+    assert state.equity_anchor == pytest.approx(residual)
+    assert state.last_equity == pytest.approx(residual + 300.0)
+
+    _gate(
+        dep, equity=account_equity, now=DAY1 + timedelta(minutes=1),
+        deployment_pnls={dep_id: 250.0},
+    )
+    state = get_live_loss_breaker_state(scope)
+    assert state.last_equity == pytest.approx(account_equity - 50.0)
+    assert state.equity_anchor == pytest.approx(residual)
+
+
+def test_equity_anchor_is_write_once_at_db_level():
+    """``observe_live_loss_breaker`` fills ``equity_anchor`` only while the
+    row's anchor is NULL; a later observation must never rewrite it."""
+    scope = deployment_loss_breaker_scope("dep-writeonce")
+    observe_live_loss_breaker(
+        scope, "acc-writeonce", 100.0, DAY1, equity_anchor=50.0
+    )
+    observe_live_loss_breaker(
+        scope, "acc-writeonce", 90.0,
+        DAY1 + timedelta(minutes=1), equity_anchor=10.0,
+    )
+    state = get_live_loss_breaker_state(scope)
+    assert state.equity_anchor == pytest.approx(50.0)
+
+
+def test_observe_rejects_non_finite_equity_anchor():
+    """A NaN/inf anchor must never reach the row: ``observe`` refuses it."""
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(ValueError, match="anchor"):
+            observe_live_loss_breaker(
+                deployment_loss_breaker_scope("dep-nan-anchor"),
+                "acc-nan-anchor",
+                100.0,
+                DAY1,
+                equity_anchor=bad,
+            )
+
+
+def test__deployment_scope_equity_rejects_non_finite_inputs():
+    """Every input to the anchored-equity formula must be finite: a NaN
+    account equity or a NaN sibling P&L is refused, never propagated into a
+    scope equity a caller could act on."""
+    from live_runner.loss_breaker import _deployment_scope_equity
+
+    with pytest.raises(ValueError, match="account equity"):
+        _deployment_scope_equity(
+            scope="deployment:x", account_equity=float("nan"),
+            own_pnl=0.0, deployment_pnls={"x": 0.0},
+        )
+    with pytest.raises(ValueError, match="own P&L"):
+        _deployment_scope_equity(
+            scope="deployment:x", account_equity=100.0,
+            own_pnl=float("nan"), deployment_pnls={"x": float("nan")},
+        )
+    with pytest.raises(ValueError, match="dep-b"):
+        _deployment_scope_equity(
+            scope="deployment:x", account_equity=100.0,
+            own_pnl=0.0, deployment_pnls={"x": 0.0, "dep-b": float("inf")},
+        )
+
+
+def test_observe_rejects_anchor_on_account_scope():
+    """Account scopes never carry an equity anchor; ``observe`` refuses one
+    rather than storing an invariant violation."""
+    with pytest.raises(ValueError, match="account scopes never carry"):
+        observe_live_loss_breaker(
+            account_loss_breaker_scope("acc-anchor-forbidden"),
+            "acc-anchor-forbidden",
+            100.0,
+            DAY1,
+            equity_anchor=50.0,
+        )
+
+
+def test_gate_fails_closed_when_deployment_state_read_raises(monkeypatch):
+    """The gate's fail-closed wrapper: a breaker-state read that raises for
+    the deployment scope must surface as ``state_unreadable``, never as a
+    raw exception and never as 'all clear'. The deployment scope's equity is
+    computed inside the observe write transaction, so the seam that can
+    raise is ``observe_live_loss_breaker_series``."""
+    account_id = "acc-state-unreadable"
+    dep = _deployment(account_id=account_id)
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("breaker state is gone")
+
+    monkeypatch.setattr(loss_breaker, "observe_live_loss_breaker_series", _boom)
+    with pytest.raises(LossBreakerBreachError) as excinfo:
+        _gate(
+            dep, equity=100_000.0, now=DAY1,
+            deployment_pnls={str(dep.id): 0.0},
+        )
+    assert excinfo.value.state_unreadable is True
+    assert excinfo.value.scope == deployment_loss_breaker_scope(str(dep.id))
+
+
+# ─── Operator re-anchor ───────────────────────────────────────────────────────
+
+
+def test_reanchor_shifts_series_and_keeps_latch():
+    """``re-anchor`` sets the anchor to the CURRENT residual, moves the whole
+    equity series by the same delta, keeps BOTH latches, leaves
+    ``last_observed_at`` alone and writes an audit row."""
+    from shared.database import latch_live_loss_breaker_breach, list_live_control_audit
+
+    account_id = "acc-reanchor"
+    dep_a = _deployment(account_id=account_id)
+    dep_b = _deployment(account_id=account_id)
+    a_id, b_id = str(dep_a.id), str(dep_b.id)
+    _persist_deployment(account_id, a_id)
+    _persist_deployment(account_id, b_id)
+    deployments = [dep_a, dep_b]
+    # equity 100k, pnls a=-6k b=+4k -> total -2k, residual 102k.
+    observe_account_loss_breaker_equity(
+        account_id, 100_000.0, now=DAY1,
+        deployments=deployments,
+        deployment_pnls={a_id: -6_000.0, b_id: 4_000.0},
+        env_values=NO_ENV,
+    )
+    scope_a = deployment_loss_breaker_scope(a_id)
+    before = get_live_loss_breaker_state(scope_a)
+    assert before.equity_anchor == pytest.approx(102_000.0)
+    assert before.last_equity == pytest.approx(96_000.0)
+    latch_live_loss_breaker_breach(
+        scope_a, "drawdown", {"kind": "drawdown"}, DAY1
+    )
+    latch_live_loss_breaker_breach(
+        scope_a, "daily", {"kind": "daily"}, DAY1
+    )
+
+    # 80k withdrawn; deployment P&L unchanged (implied by the rows).
+    updated = reanchor_deployment_loss_breaker_scope(
+        scope_a, account_equity=20_000.0, actor="test",
+        now=DAY1 + timedelta(minutes=5),
+    )
+    # residual = 20_000 - (-2_000) = 22_000; own_a = -6_000 -> 16_000.
+    assert updated.equity_anchor == pytest.approx(22_000.0)
+    assert updated.last_equity == pytest.approx(16_000.0)
+    # delta = 16_000 - 96_000 = -80_000 moved the whole series.
+    assert updated.day_start_equity == pytest.approx(16_000.0)
+    assert updated.peak_equity == pytest.approx(16_000.0)
+    assert updated.drawdown_breached is True
+    assert updated.daily_breached is True
+    # A re-anchor is not a market observation: the observation timestamp
+    # the freshness rules measure against must not move.
+    assert updated.last_observed_at == before.last_observed_at
+
+    audits = [
+        a for a in list_live_control_audit(target_id=scope_a)
+        if a["action"] == "loss_breaker.reanchor"
+    ]
+    assert len(audits) == 1
+    assert audits[0]["actor"] == "test"
+    assert audits[0]["succeeded"] is True
+    assert audits[0]["detail"]["equity_anchor_after"] == pytest.approx(22_000.0)
+
+    # The sibling scope is untouched.
+    state_b = get_live_loss_breaker_state(deployment_loss_breaker_scope(b_id))
+    assert state_b.equity_anchor == pytest.approx(102_000.0)
+    assert state_b.last_equity == pytest.approx(106_000.0)
+
+
+def test_reanchor_refuses_account_scope_and_bad_inputs():
+    account_id = "acc-reanchor-refuse"
+    dep = _deployment(account_id=account_id)
+    dep_id = str(dep.id)
+    _persist_deployment(account_id, dep_id)
+    observe_account_loss_breaker_equity(
+        account_id, 100_000.0, now=DAY1,
+        deployments=[dep], deployment_pnls={dep_id: 0.0}, env_values=NO_ENV,
+    )
+    scope = deployment_loss_breaker_scope(dep_id)
+
+    with pytest.raises(ValueError, match="deployment scopes only"):
+        reanchor_deployment_loss_breaker_scope(
+            account_loss_breaker_scope(account_id), account_equity=50_000.0
+        )
+    with pytest.raises(ValueError, match="no loss breaker state"):
+        reanchor_deployment_loss_breaker_scope(
+            deployment_loss_breaker_scope("dep-missing"), account_equity=50_000.0
+        )
+    for bad in (0.0, -1.0, float("nan"), float("inf")):
+        with pytest.raises(ValueError, match="positive finite"):
+            reanchor_deployment_loss_breaker_scope(
+                scope, account_equity=bad
+            )
+    # Nothing was written by the refused attempts.
+    state = get_live_loss_breaker_state(scope)
+    assert state.equity_anchor == pytest.approx(100_000.0)
+
+
+def test_reanchor_refuses_when_deployment_pnl_is_unmeasurable():
+    """A deployment with fills but no ANCHORED scope row makes the residual
+    unknowable: the re-anchor must refuse rather than guess."""
+    account_id = "acc-reanchor-unmeasurable"
+    dep = _deployment(account_id=account_id)
+    dep_id = str(dep.id)
+    _persist_deployment(account_id, dep_id)
+    observe_account_loss_breaker_equity(
+        account_id, 100_000.0, now=DAY1,
+        deployments=[dep], deployment_pnls={dep_id: 0.0}, env_values=NO_ENV,
+    )
+    scope = deployment_loss_breaker_scope(dep_id)
+
+    # A second deployment on the account has fills but was never observed:
+    # no scope row at all.
+    other = _deployment(account_id=account_id)
+    _persist_fill(account_id, str(other.id), "AAPL", "buy", 10.0, 100.0)
+    with pytest.raises(ValueError, match="no anchored breaker scope"):
+        reanchor_deployment_loss_breaker_scope(
+            scope, account_equity=50_000.0
+        )
+
+    # And a scope row that exists but has not anchored yet, WITH fills,
+    # refuses the same way on a fresh account.
+    account_id2 = "acc-reanchor-unanchored"
+    dep2 = _deployment(account_id=account_id2)
+    dep2_id = str(dep2.id)
+    scope2 = deployment_loss_breaker_scope(dep2_id)
+    observe_live_loss_breaker(scope2, account_id2, 90_000.0, DAY1)
+    _persist_fill(account_id2, dep2_id, "AAPL", "buy", 10.0, 100.0)
+    with pytest.raises(ValueError, match="has not anchored yet"):
+        reanchor_deployment_loss_breaker_scope(
+            scope2, account_equity=50_000.0
+        )
+
+    # An unanchored row WITHOUT fills contributes exactly 0 and is fine.
+    account_id3 = "acc-reanchor-clean"
+    dep3 = _deployment(account_id=account_id3)
+    dep3_id = str(dep3.id)
+    _persist_deployment(account_id3, dep3_id)
+    scope3 = deployment_loss_breaker_scope(dep3_id)
+    observe_live_loss_breaker(scope3, account_id3, 90_000.0, DAY1)
+    updated = reanchor_deployment_loss_breaker_scope(
+        scope3, account_equity=50_000.0, now=DAY1 + timedelta(minutes=1)
+    )
+    assert updated.equity_anchor == pytest.approx(50_000.0)
+    assert updated.last_equity == pytest.approx(50_000.0)
+
+
+def test_reanchor_after_account_repoint_uses_new_account_residual():
+    """B1: after ``update_live_deployment_account`` the re-anchor must
+    measure the deployment's CURRENT account - its equity source, its
+    scope list and its P&L total - not the account the breaker row was
+    created on. The anchor must equal the NEW account's residual."""
+    old_account = "acc-repoint-old"
+    new_account = "acc-repoint-new"
+    dep_x = _deployment(account_id=old_account)
+    dep_y = _deployment(account_id=old_account)
+    x_id, y_id = str(dep_x.id), str(dep_y.id)
+    _persist_deployment(old_account, x_id)
+    _persist_deployment(old_account, y_id)
+    _ensure_live_account(new_account)
+    # equity 100k, pnls x=-6k y=+2k -> total -4k, residual 104k.
+    observe_account_loss_breaker_equity(
+        old_account, 100_000.0, now=DAY1,
+        deployments=[dep_x, dep_y],
+        deployment_pnls={x_id: -6_000.0, y_id: 2_000.0},
+        env_values=NO_ENV,
+    )
+    scope_x = deployment_loss_breaker_scope(x_id)
+    assert get_live_loss_breaker_state(scope_x).account_id == old_account
+
+    # Re-point X at the new account and observe it there at 10k equity.
+    # The poll loads deployments fresh, so it sees X on the new account.
+    update_live_deployment_account(x_id, new_account)
+    dep_x_moved = _deployment(account_id=new_account, deployment_id=x_id)
+    observe_account_loss_breaker_equity(
+        new_account, 10_000.0, now=DAY1 + timedelta(minutes=1),
+        deployments=[dep_x_moved],
+        deployment_pnls={x_id: -6_000.0},
+        env_values=NO_ENV,
+    )
+    # The observe moved the row to the new account: the old account's scope
+    # list (and its re-anchor total) no longer counts the moved deployment.
+    moved = get_live_loss_breaker_state(scope_x)
+    assert moved.account_id == new_account
+    old_scopes = {row.scope for row in list_live_loss_breaker_states(old_account)}
+    assert scope_x not in old_scopes
+    new_scopes = {row.scope for row in list_live_loss_breaker_states(new_account)}
+    assert scope_x in new_scopes
+
+    updated = reanchor_deployment_loss_breaker_scope(
+        scope_x, account_equity=10_000.0, actor="test",
+        now=DAY1 + timedelta(minutes=2),
+    )
+    # NEW account residual = 10_000 - (-6_000) = 16_000. On the OLD account
+    # the total would wrongly include Y's +2_000 (residual 14_000).
+    assert updated.equity_anchor == pytest.approx(16_000.0)
+    assert updated.account_id == new_account
+    assert updated.last_equity == pytest.approx(10_000.0)
+    # The sibling scope on the old account is untouched.
+    state_y = get_live_loss_breaker_state(deployment_loss_breaker_scope(y_id))
+    assert state_y.account_id == old_account
+    assert state_y.equity_anchor == pytest.approx(104_000.0)
+
+
+def test_reanchor_after_repoint_without_observe_uses_new_account():
+    """B1 pin with the daemon stopped: no observe moves the breaker row after
+    the re-point, so the re-anchor's own account resolution is all there is.
+    The anchor must be the NEW account's residual and the row must follow the
+    deployment to the new account."""
+    old_account = "acc-repoint-noobserve-old"
+    new_account = "acc-repoint-noobserve-new"
+    dep = _deployment(account_id=old_account)
+    dep_id = str(dep.id)
+    _persist_deployment(old_account, dep_id)
+    _ensure_live_account(new_account)
+    # Old account: own P&L -10k -> anchor 110k, scope equity 100k. On the old
+    # account a re-anchor would wrongly keep that -10k in the residual.
+    observe_account_loss_breaker_equity(
+        old_account,
+        100_000.0,
+        now=DAY1,
+        deployments=[dep],
+        deployment_pnls={dep_id: -10_000.0},
+        env_values=NO_ENV,
+    )
+    scope = deployment_loss_breaker_scope(dep_id)
+    assert get_live_loss_breaker_state(scope).account_id == old_account
+
+    update_live_deployment_account(dep_id, new_account)
+    # Account-scope observation only: the deployment row is NOT observed on
+    # the new account, so its stored account_id is still the old one.
+    observe_account_loss_breaker_equity(
+        new_account,
+        70_000.0,
+        now=DAY1 + timedelta(minutes=1),
+        deployments=[],
+        deployment_pnls={},
+        env_values=NO_ENV,
+    )
+    assert get_live_loss_breaker_state(scope).account_id == old_account
+
+    updated = reanchor_deployment_loss_breaker_scope(
+        scope,
+        account_equity=70_000.0,
+        actor="test",
+        now=DAY1 + timedelta(minutes=2),
+    )
+    # The new account has no other deployment P&L: residual == equity.
+    assert updated.equity_anchor == pytest.approx(70_000.0)
+    assert updated.account_id == new_account
+    assert updated.last_equity == pytest.approx(70_000.0)
+    old_scopes = {row.scope for row in list_live_loss_breaker_states(old_account)}
+    new_scopes = {row.scope for row in list_live_loss_breaker_states(new_account)}
+    assert scope not in old_scopes
+    assert scope in new_scopes
+
+
+def test_reanchor_after_repoint_with_fills_refuses_until_observed():
+    """A re-pointed deployment WITH fills cannot be re-anchored before its
+    breaker row has been observed on the new account: the fill ledger follows
+    the deployment's current account, but the stale row still sits on the old
+    account's scope list, so the residual is unknowable."""
+    old_account = "acc-repoint-fills-old"
+    new_account = "acc-repoint-fills-new"
+    dep = _deployment(account_id=old_account)
+    dep_id = str(dep.id)
+    _persist_deployment(old_account, dep_id)
+    _ensure_live_account(new_account)
+    observe_account_loss_breaker_equity(
+        old_account,
+        100_000.0,
+        now=DAY1,
+        deployments=[dep],
+        deployment_pnls={dep_id: 0.0},
+        env_values=NO_ENV,
+    )
+    scope = deployment_loss_breaker_scope(dep_id)
+    _persist_fill(old_account, dep_id, "AAPL", "buy", 10.0, 100.0)
+
+    update_live_deployment_account(dep_id, new_account)
+    reanchor_now = DAY1 + timedelta(minutes=1)
+    with pytest.raises(ValueError, match="no anchored breaker scope"):
+        reanchor_deployment_loss_breaker_scope(
+            scope,
+            account_equity=50_000.0,
+            now=reanchor_now,
+        )
+    state = get_live_loss_breaker_state(scope)
+    assert state.account_id == old_account
+    assert state.equity_anchor == pytest.approx(100_000.0)
+
+
+def test_reanchor_refuses_missing_deployment_row():
+    """The scope's account is resolved from the deployment row; a breaker
+    scope with no live deployment behind it cannot be re-anchored."""
+    account_id = "acc-reanchor-nodep"
+    dep = _deployment(account_id=account_id)
+    dep_id = str(dep.id)
+    observe_account_loss_breaker_equity(
+        account_id, 100_000.0, now=DAY1,
+        deployments=[dep], deployment_pnls={dep_id: 0.0}, env_values=NO_ENV,
+    )
+    # Breaker state exists but no live_deployments row was persisted.
+    scope = deployment_loss_breaker_scope(dep_id)
+    reanchor_now = DAY1 + timedelta(minutes=1)
+    with pytest.raises(ValueError, match="no live deployment"):
+        reanchor_deployment_loss_breaker_scope(
+            scope, account_equity=50_000.0, now=reanchor_now
+        )
+
+
+def test_reanchor_refuses_unresolved_ledger_flag():
+    """An unresolved ``ledger_reconciliation_required`` flag makes the
+    fill-ledger P&L untrustworthy - the same condition the live path fails
+    closed on - so the re-anchor refuses."""
+    from shared.database import record_live_control_audit
+
+    account_id = "acc-reanchor-flag"
+    dep = _deployment(account_id=account_id)
+    dep_id = str(dep.id)
+    _persist_deployment(account_id, dep_id)
+    observe_account_loss_breaker_equity(
+        account_id, 100_000.0, now=DAY1,
+        deployments=[dep], deployment_pnls={dep_id: 0.0}, env_values=NO_ENV,
+    )
+    record_live_control_audit(
+        action="ledger_reconciliation_required",
+        target_type="account_symbol",
+        target_id=f"{account_id}:AAPL",
+        actor="test",
+        detail={"cause": "unattributed close"},
+    )
+    scope = deployment_loss_breaker_scope(dep_id)
+    reanchor_now = DAY1 + timedelta(minutes=1)
+    with pytest.raises(ValueError, match="ledger_reconciliation_required"):
+        reanchor_deployment_loss_breaker_scope(
+            scope,
+            account_equity=50_000.0,
+            now=reanchor_now,
+        )
+
+
+def test_reanchor_refuses_untrusted_fill():
+    """A fill whose price cannot be trusted makes the deployment P&L
+    unmeasurable; the re-anchor refuses rather than anchor on it."""
+    account_id = "acc-reanchor-untrusted"
+    dep = _deployment(account_id=account_id)
+    dep_id = str(dep.id)
+    _persist_deployment(account_id, dep_id)
+    observe_account_loss_breaker_equity(
+        account_id, 100_000.0, now=DAY1,
+        deployments=[dep], deployment_pnls={dep_id: 0.0}, env_values=NO_ENV,
+    )
+    _persist_fill(account_id, dep_id, "AAPL", "buy", 10.0, 100.0, observed="absent")
+    scope = deployment_loss_breaker_scope(dep_id)
+    reanchor_now = DAY1 + timedelta(minutes=1)
+    with pytest.raises(ValueError, match="trusted price"):
+        reanchor_deployment_loss_breaker_scope(
+            scope,
+            account_equity=50_000.0,
+            now=reanchor_now,
+        )
+
+
+def test_reanchor_refuses_stale_deployment_row():
+    """A deployment row with fills whose last observation is older than
+    ``STALE_SNAPSHOT_SECONDS`` before the equity time carries a stale P&L;
+    the re-anchor refuses rather than skew the residual."""
+    account_id = "acc-reanchor-stale"
+    dep = _deployment(account_id=account_id)
+    dep_id = str(dep.id)
+    _persist_deployment(account_id, dep_id)
+    stale_day = datetime(2020, 1, 1, 12, 0, tzinfo=timezone.utc)
+    observe_account_loss_breaker_equity(
+        account_id, 100_000.0, now=stale_day,
+        deployments=[dep], deployment_pnls={dep_id: 0.0}, env_values=NO_ENV,
+    )
+    _persist_fill(account_id, dep_id, "AAPL", "buy", 10.0, 100.0)
+    scope = deployment_loss_breaker_scope(dep_id)
+    reanchor_now = datetime.now(timezone.utc)
+    with pytest.raises(ValueError, match="last observed"):
+        reanchor_deployment_loss_breaker_scope(
+            scope,
+            account_equity=50_000.0,
+            now=reanchor_now,
+        )
+
+
+def test_reanchor_refuses_deployment_row_after_equity_observation():
+    """A fills-bearing deployment row observed AFTER the equity snapshot is
+    just as unusable as a stale one: its P&L postdates the equity it would be
+    subtracted from."""
+    account_id = "acc-reanchor-future-row"
+    dep = _deployment(account_id=account_id)
+    dep_id = str(dep.id)
+    _persist_deployment(account_id, dep_id)
+    row_time = DAY1 + timedelta(minutes=10)
+    observe_account_loss_breaker_equity(
+        account_id,
+        100_000.0,
+        now=row_time,
+        deployments=[dep],
+        deployment_pnls={dep_id: 0.0},
+        env_values=NO_ENV,
+    )
+    _persist_fill(account_id, dep_id, "AAPL", "buy", 10.0, 100.0)
+    scope = deployment_loss_breaker_scope(dep_id)
+    with pytest.raises(ValueError, match="AFTER the equity observation"):
+        reanchor_deployment_loss_breaker_scope(
+            scope,
+            account_equity=50_000.0,
+            now=row_time,
+            equity_observed_at=DAY1,
+        )
+
+
+def test_cross_connection_reanchor_cannot_interleave_with_observe(monkeypatch):
+    """S1 pin: the process-local observe lock is not the serialisation.
+
+    The CLI runs in another process, so this bypasses
+    ``_loss_breaker_observe_lock`` and lets the re-anchor thread race the
+    observe's ``BEGIN IMMEDIATE`` window for real. A stale series write must
+    not land on the re-anchored row and false-latch the scope.
+    """
+    import contextlib
+    import threading
+
+    import shared.database as database
+
+    monkeypatch.setattr(
+        database,
+        "_loss_breaker_observe_lock",
+        lambda _scope: contextlib.nullcontext(),
+    )
+    account_id = "acc-xconn"
+    dep = _deployment(account_id=account_id)
+    dep_id = str(dep.id)
+    _persist_deployment(account_id, dep_id)
+    scope = deployment_loss_breaker_scope(dep_id)
+    pnls = {dep_id: -1_000.0}
+    observe_account_loss_breaker_equity(
+        account_id,
+        100_000.0,
+        now=DAY1,
+        deployments=[dep],
+        deployment_pnls=pnls,
+        env_values=NO_ENV,
+    )
+
+    real_series = loss_breaker._deployment_scope_series
+    reanchor_thread: threading.Thread | None = None
+    reanchor_errors: list[BaseException] = []
+
+    def _reanchor() -> None:
+        try:
+            reanchor_deployment_loss_breaker_scope(
+                scope,
+                account_equity=200_000.0,
+                actor="test",
+                now=DAY1 + timedelta(minutes=2),
+            )
+        except BaseException as exc:  # noqa: BLE001 - surfaced by the test
+            reanchor_errors.append(exc)
+
+    def hooked(record, **kwargs):
+        nonlocal reanchor_thread
+        out = real_series(record, **kwargs)
+        if reanchor_thread is None:
+            reanchor_thread = threading.Thread(target=_reanchor, daemon=True)
+            reanchor_thread.start()
+            # With BEGIN IMMEDIATE this join times out: the re-anchor waits
+            # for the observe's commit. Without it the re-anchor can commit
+            # inside the resolver window and the stale write below lands on
+            # the shifted series.
+            reanchor_thread.join(timeout=2.0)
+        return out
+
+    monkeypatch.setattr(loss_breaker, "_deployment_scope_series", hooked)
+    pnls2 = {dep_id: -1_500.0}
+    observe_account_loss_breaker_equity(
+        account_id,
+        99_500.0,
+        now=DAY1 + timedelta(minutes=2),
+        deployments=[dep],
+        deployment_pnls=pnls2,
+        env_values=NO_ENV,
+    )
+    assert reanchor_thread is not None
+    reanchor_thread.join(timeout=40)
+    monkeypatch.setattr(loss_breaker, "_deployment_scope_series", real_series)
+    assert reanchor_errors == []
+
+    observe_account_loss_breaker_equity(
+        account_id,
+        200_000.0,
+        now=DAY1 + timedelta(minutes=4),
+        deployments=[dep],
+        deployment_pnls=pnls2,
+        env_values=NO_ENV,
+    )
+    state = get_live_loss_breaker_state(scope)
+    assert state.equity_anchor == pytest.approx(201_000.0)
+    assert state.last_equity == pytest.approx(199_500.0)
+    assert state.daily_breached is False
+    assert state.drawdown_breached is False
+
+
+def test_observe_and_reanchor_serialize_without_false_latch(monkeypatch):
+    """S1: a ``re-anchor`` attempted while a deployment observe holds its
+    write transaction must not leave the series on the stale anchor. The
+    observe computes equity from the stored row inside ``BEGIN IMMEDIATE``,
+    so whichever commits second sees a consistent series - and the next
+    observation cannot false-latch."""
+    import threading
+    import time
+
+    import shared.database as database
+
+    account_id = "acc-interleave"
+    dep = _deployment(account_id=account_id)
+    dep_id = str(dep.id)
+    _persist_deployment(account_id, dep_id)
+    scope = deployment_loss_breaker_scope(dep_id)
+    pnls = {dep_id: -1_000.0}
+    # Seed: anchor 101k, last 100k.
+    observe_account_loss_breaker_equity(
+        account_id, 100_000.0, now=DAY1,
+        deployments=[dep], deployment_pnls=pnls, env_values=NO_ENV,
+    )
+
+    inside_txn = threading.Event()
+    reanchor_go = threading.Event()
+    reanchor_done = threading.Event()
+    fired: list[bool] = []
+    real_apply = database._apply_loss_breaker_observation
+
+    def hooked_apply(row, **kwargs):
+        # Runs inside the observe write transaction, after the row read and
+        # before the series write - the exact window the race lived in.
+        if row.scope == scope and not fired:
+            fired.append(True)
+            inside_txn.set()
+            assert reanchor_go.wait(timeout=10)
+            # Give the concurrent re-anchor room to commit IF it can: with
+            # BEGIN IMMEDIATE it cannot (it waits for our commit); without
+            # it, it lands here and the stale write below corrupts the series.
+            time.sleep(1.0)
+        return real_apply(row, **kwargs)
+
+    monkeypatch.setattr(database, "_apply_loss_breaker_observation", hooked_apply)
+
+    def _reanchor() -> None:
+        assert inside_txn.wait(timeout=10)
+        reanchor_go.set()
+        reanchor_deployment_loss_breaker_scope(
+            scope, account_equity=50_000.0, actor="test",
+            now=DAY1 + timedelta(minutes=3),
+        )
+        reanchor_done.set()
+
+    thread = threading.Thread(target=_reanchor, daemon=True)
+    thread.start()
+    try:
+        observe_account_loss_breaker_equity(
+            account_id, 100_000.0, now=DAY1 + timedelta(minutes=2),
+            deployments=[dep], deployment_pnls=pnls, env_values=NO_ENV,
+        )
+    finally:
+        thread.join(timeout=30)
+    assert reanchor_done.is_set()
+    monkeypatch.undo()
+
+    # The re-anchor ran after the observe committed: residual 51k, own -1k.
+    state = get_live_loss_breaker_state(scope)
+    assert state.equity_anchor == pytest.approx(51_000.0)
+    assert state.last_equity == pytest.approx(50_000.0)
+    assert state.day_start_equity == pytest.approx(50_000.0)
+    assert state.peak_equity == pytest.approx(50_000.0)
+
+    # The follow-up observation sees anchor + own = 50k - nothing moved, so
+    # no breaker fraction can trip: no false latch from a stale write.
+    observe_account_loss_breaker_equity(
+        account_id, 50_000.0, now=DAY1 + timedelta(minutes=4),
+        deployments=[dep], deployment_pnls=pnls, env_values=NO_ENV,
+    )
+    state = get_live_loss_breaker_state(scope)
+    assert state.last_equity == pytest.approx(50_000.0)
+    assert state.daily_breached is False
+    assert state.drawdown_breached is False
+
+
+def test_observe_rejects_non_finite_equity_at_db_level():
+    """``observe_live_loss_breaker`` itself refuses NaN/inf equity - the
+    poll's own validation is not the only layer."""
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(ValueError, match="must be finite"):
+            observe_live_loss_breaker(
+                account_loss_breaker_scope("acc-nan-equity"),
+                "acc-nan-equity",
+                bad,
+                DAY1,
+            )
+
+
+def test_reset_rejects_non_finite_equity_at_db_level():
+    """``reset_live_loss_breaker_drawdown`` refuses NaN/inf equity itself."""
+    observe_live_loss_breaker(
+        account_loss_breaker_scope("acc-nan-reset"),
+        "acc-nan-reset",
+        100_000.0,
+        DAY1,
+    )
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(ValueError, match="must be finite"):
+            reset_live_loss_breaker_drawdown(
+                account_loss_breaker_scope("acc-nan-reset"), bad, DAY1
+            )
+
+
+def test_reanchor_db_rejects_account_scope():
+    """The storage-layer re-anchor refuses account scopes on its own - the
+    CLI and library checks are not the only layer."""
+    with pytest.raises(ValueError, match="deployment scopes only"):
+        reanchor_live_loss_breaker_deployment(
+            account_loss_breaker_scope("acc-db-scope"),
+            equity_anchor=1.0,
+            reanchored_at=DAY1,
+            account_id="acc-db-scope",
+        )

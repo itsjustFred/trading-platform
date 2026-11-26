@@ -747,6 +747,326 @@ def test_non_terminal_or_unknown_expected_order_still_finds(
     }
 
 
+class _SteppedAdapter(FakeAdapter):
+    """A FakeAdapter that names the instrument's broker volume step."""
+
+    def __init__(self, step: float, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._step = step
+
+    def exit_qty_step(self, symbol: str) -> float:
+        return self._step
+
+
+def _filled_entry_signal(
+    deployment_id: str,
+    *,
+    symbol: str,
+    requested_qty: float,
+    filled_qty: float,
+    broker_order_id: str,
+) -> str:
+    signal_id, _ = save_live_signal(
+        LiveSignal(
+            id=uuid4(),
+            deployment_id=deployment_id,
+            symbol=symbol,
+            action="buy",
+            theoretical_price=100.0,
+            timestamp=datetime.now(timezone.utc),
+            # Rows persisted before the adapters stamped the normalized
+            # submitted qty carry the unrounded risk-sized qty here - exactly
+            # the rows the live cTrader soak produced.
+            metadata={
+                "broker_order_id": broker_order_id,
+                "qty": requested_qty,
+                "explicit_qty": requested_qty,
+            },
+        )
+    )
+    _fill(signal_id, broker_order_id=broker_order_id, qty=filled_qty)
+    return signal_id
+
+
+def test_sub_step_remainder_of_a_filled_entry_is_not_expected(isolated_db, tmp_path) -> None:
+    """Live repro (cTrader demo 49714635, 2026-11-26): a market entry sized
+    1174.9875 was submitted on the broker volume grid and filled 1174. The
+    persisted requested qty kept the unrounded size, so the reconciler
+    expected a working order for the 0.9875 remainder forever - a remainder
+    below one volume step can never be a working order."""
+    database, _engine, _data_dir = isolated_db
+    _seed_db(database)
+    _filled_entry_signal(
+        DEPLOYMENT_ID,
+        symbol="ETHUSD",
+        requested_qty=1174.9875223319393,
+        filled_qty=1174.0,
+        broker_order_id="330977245",
+    )
+
+    deployment = _deployment()
+    adapter = _SteppedAdapter(
+        1.0,
+        positions=[{"symbol": "ETHUSD", "qty": 1174.0}],
+        stops=[
+            ProtectiveStop(
+                order_id="stop-1", symbol="ETHUSD", side="sell", stop_price=95.0
+            )
+        ],
+    )
+    manager = _manager(tmp_path, [])
+
+    report = _reconcile(manager, [deployment], {ACCOUNT_ID: adapter})
+
+    assert report[ACCOUNT_ID].ok is True
+    assert report[ACCOUNT_ID].findings == ()
+
+
+def test_partial_fill_with_a_step_sized_remainder_is_still_expected(
+    isolated_db, tmp_path
+) -> None:
+    """A remainder of one broker volume step or more can still be working:
+    it must keep producing the missing-order finding (fail closed)."""
+    database, _engine, _data_dir = isolated_db
+    _seed_db(database)
+    _filled_entry_signal(
+        DEPLOYMENT_ID,
+        symbol="ETHUSD",
+        requested_qty=11.0,
+        filled_qty=10.0,
+        broker_order_id="ord-partial",
+    )
+
+    deployment = _deployment()
+    adapter = _SteppedAdapter(
+        1.0,
+        positions=[{"symbol": "ETHUSD", "qty": 10.0}],
+        stops=[
+            ProtectiveStop(
+                order_id="stop-1", symbol="ETHUSD", side="sell", stop_price=95.0
+            )
+        ],
+    )
+    manager = _manager(tmp_path, [])
+
+    report = _reconcile(manager, [deployment], {ACCOUNT_ID: adapter})
+
+    kinds = {finding.kind for finding in report[ACCOUNT_ID].findings}
+    assert "missing_working_order" in kinds
+
+
+def test_sub_step_remainder_still_expected_when_adapter_names_no_step(
+    isolated_db, tmp_path
+) -> None:
+    """An adapter that cannot state the instrument's volume step keeps the
+    expectation: an unknown grid must never hide a real remainder."""
+    database, _engine, _data_dir = isolated_db
+    _seed_db(database)
+    _filled_entry_signal(
+        DEPLOYMENT_ID,
+        symbol="ETHUSD",
+        requested_qty=5.5,
+        filled_qty=5.0,
+        broker_order_id="ord-nostep",
+    )
+
+    deployment = _deployment()
+    adapter = FakeAdapter(
+        positions=[{"symbol": "ETHUSD", "qty": 5.0}],
+        stops=[
+            ProtectiveStop(
+                order_id="stop-1", symbol="ETHUSD", side="sell", stop_price=95.0
+            )
+        ],
+    )
+    manager = _manager(tmp_path, [])
+
+    report = _reconcile(manager, [deployment], {ACCOUNT_ID: adapter})
+
+    kinds = {finding.kind for finding in report[ACCOUNT_ID].findings}
+    assert "missing_working_order" in kinds
+
+
+class _FlakyStepAdapter(_SteppedAdapter):
+    """A stepped adapter whose step lookup raises for named symbols."""
+
+    def __init__(self, step: float, *, raises_for: set[str], **kwargs) -> None:
+        super().__init__(step, **kwargs)
+        self._raises_for = raises_for
+
+    def exit_qty_step(self, symbol: str) -> float:
+        if symbol in self._raises_for:
+            raise RuntimeError(f"no instrument props for {symbol}")
+        return self._step
+
+
+def test_unusable_step_lookup_keeps_that_expectation_and_the_pass_completes(
+    isolated_db, tmp_path
+) -> None:
+    """A symbol whose step lookup raises keeps its expectation (fail closed)
+    without aborting the rest of the account pass: the ETHUSD remainder is
+    still recognized as sub-step dust while NOPE's is still expected."""
+    database, _engine, _data_dir = isolated_db
+    _seed_db(database)
+    _filled_entry_signal(
+        DEPLOYMENT_ID,
+        symbol="NOPE",
+        requested_qty=5.5,
+        filled_qty=5.0,
+        broker_order_id="ord-nope",
+    )
+    _filled_entry_signal(
+        DEPLOYMENT_ID,
+        symbol="ETHUSD",
+        requested_qty=1174.9875223319393,
+        filled_qty=1174.0,
+        broker_order_id="ord-eth",
+    )
+
+    deployment = _deployment()
+    adapter = _FlakyStepAdapter(
+        1.0,
+        raises_for={"NOPE"},
+        positions=[
+            {"symbol": "NOPE", "qty": 5.0},
+            {"symbol": "ETHUSD", "qty": 1174.0},
+        ],
+        stops=[
+            ProtectiveStop(
+                order_id="stop-1", symbol="NOPE", side="sell", stop_price=95.0
+            ),
+            ProtectiveStop(
+                order_id="stop-2", symbol="ETHUSD", side="sell", stop_price=95.0
+            ),
+        ],
+    )
+    manager = _manager(tmp_path, [])
+
+    report = _reconcile(manager, [deployment], {ACCOUNT_ID: adapter})
+
+    missing = [
+        finding
+        for finding in report[ACCOUNT_ID].findings
+        if finding.kind == "missing_working_order"
+    ]
+    assert [finding.detail["symbol"] for finding in missing] == ["NOPE"]
+
+
+@pytest.mark.parametrize("bad_step", [float("nan"), 0.0, -1.0])
+def test_nonpositive_or_nonfinite_step_keeps_the_expectation(
+    isolated_db, tmp_path, bad_step
+) -> None:
+    """A step that is NaN, zero or negative is unusable: the expectation
+    stays (fail closed) instead of flooring against a bogus grid."""
+    database, _engine, _data_dir = isolated_db
+    _seed_db(database)
+    _filled_entry_signal(
+        DEPLOYMENT_ID,
+        symbol="ETHUSD",
+        requested_qty=5.5,
+        filled_qty=5.0,
+        broker_order_id="ord-badstep",
+    )
+
+    deployment = _deployment()
+    adapter = _SteppedAdapter(
+        bad_step,
+        positions=[{"symbol": "ETHUSD", "qty": 5.0}],
+        stops=[
+            ProtectiveStop(
+                order_id="stop-1", symbol="ETHUSD", side="sell", stop_price=95.0
+            )
+        ],
+    )
+    manager = _manager(tmp_path, [])
+
+    report = _reconcile(manager, [deployment], {ACCOUNT_ID: adapter})
+
+    kinds = {finding.kind for finding in report[ACCOUNT_ID].findings}
+    assert "missing_working_order" in kinds
+
+
+@pytest.mark.parametrize("explicit_qty", [5.5, 5.0 + 1e-12])
+def test_disagreeing_qty_keys_keep_the_expectation(
+    isolated_db, tmp_path, caplog, explicit_qty
+) -> None:
+    """``qty`` and ``explicit_qty`` disagreeing is adapter corruption: the
+    reconciler must not silently pick one - it logs and keeps the
+    working-order expectation (fail closed), even when the two values differ
+    by less than any plausible tolerance (they are written as the same
+    float). Here either key alone would have produced no expectation (5.0 is
+    fully filled; the explicit remainder is sub-step or inside tolerance),
+    so only the fail-closed path yields the finding."""
+    database, _engine, _data_dir = isolated_db
+    _seed_db(database)
+    signal_id, _ = save_live_signal(
+        LiveSignal(
+            id=uuid4(),
+            deployment_id=DEPLOYMENT_ID,
+            symbol="ETHUSD",
+            action="buy",
+            theoretical_price=100.0,
+            timestamp=datetime.now(timezone.utc),
+            metadata={
+                "broker_order_id": "ord-split",
+                "qty": 5.0,
+                "explicit_qty": explicit_qty,
+            },
+        )
+    )
+    _fill(signal_id, broker_order_id="ord-split", qty=5.0)
+
+    deployment = _deployment()
+    adapter = _SteppedAdapter(
+        1.0,
+        positions=[{"symbol": "ETHUSD", "qty": 5.0}],
+        stops=[
+            ProtectiveStop(
+                order_id="stop-1", symbol="ETHUSD", side="sell", stop_price=95.0
+            )
+        ],
+    )
+    manager = _manager(tmp_path, [])
+
+    with caplog.at_level("WARNING"):
+        report = _reconcile(manager, [deployment], {ACCOUNT_ID: adapter})
+
+    kinds = {finding.kind for finding in report[ACCOUNT_ID].findings}
+    assert "missing_working_order" in kinds
+    assert "qty keys disagree" in caplog.text
+
+
+def test_order_expectations_survives_a_raising_step_lookup() -> None:
+    """``step_for`` is the fail-closed seam inside ``_order_expectations``:
+    even a callable that raises keeps the working-order expectation instead
+    of aborting the account pass."""
+    import live_runner.broker_reconciliation as recon
+
+    row = {
+        "signal_id": "sig-1",
+        "broker_order_id": "ord-1",
+        "deployment_id": DEPLOYMENT_ID,
+        "symbol": "ETHUSD",
+        "action": "buy",
+        "timestamp": datetime.now(timezone.utc),
+        "metadata": {"qty": 5.5, "explicit_qty": 5.5},
+        "filled_qty": 5.0,
+    }
+
+    def _raise(_symbol: str) -> float:
+        raise RuntimeError("no instrument props")
+
+    expected, _tracked = recon._order_expectations(
+        [row],
+        lambda _symbol: 1e-9,
+        step_for=_raise,
+        expected_deployment_ids={DEPLOYMENT_ID},
+        now=datetime.now(timezone.utc),
+    )
+
+    assert [item["signal_id"] for item in expected] == ["sig-1"]
+
+
 def test_order_state_lookups_share_one_phase_deadline(tmp_path, monkeypatch) -> None:
     """Ten slow lookups must not serialize into a ten-minute stall (#303)."""
     import live_runner.broker_reconciliation as recon

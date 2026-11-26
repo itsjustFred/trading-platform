@@ -627,6 +627,38 @@ async def _clear_exit_reprotection_marker(
         )
 
 
+async def _reread_exit_order_until_terminal(
+    get_order: Any, order_id: str, *, sleep: Any
+) -> tuple[Any, bool]:
+    """Re-read ``order_id`` until it reads terminal, bounded.
+
+    Up to ``_EXIT_MARKER_REREAD_ATTEMPTS`` reads
+    ``_EXIT_MARKER_REREAD_INTERVAL_SECONDS`` apart, only while the status is
+    non-terminal; a terminal status or a failed read ends the loop early.
+    Returns ``(fresh, terminal)`` - ``terminal`` is True only when the last
+    read proved a terminal status, so a still-working order, an exhausted
+    retry budget and an unknown outcome are all indistinguishable to the
+    caller: the marker stays.
+    """
+    fresh: Any = None
+    for attempt in range(_EXIT_MARKER_REREAD_ATTEMPTS):
+        try:
+            fresh = await asyncio.to_thread(get_order, order_id)
+        except Exception as exc:  # except-kind: money-decision
+            logger.debug(
+                "Alpaca exit order %s could not be re-read after "
+                "re-protect; the marker stays pending: %r",
+                order_id,
+                exc,
+            )
+            return fresh, False
+        if _order_status(fresh) in _TERMINAL_ORDER_STATUSES:
+            return fresh, True
+        if attempt + 1 < _EXIT_MARKER_REREAD_ATTEMPTS:
+            await sleep(_EXIT_MARKER_REREAD_INTERVAL_SECONDS)
+    return fresh, False
+
+
 def _is_definite_broker_rejection(exc: BaseException) -> bool:
     """Whether ``exc`` proves the broker answered and refused the order.
 
@@ -1023,9 +1055,10 @@ def _resolve_fill_price(
 def _known_commission(order: Any) -> float | None:
     """``0.0`` for an equity order (commission-free on Alpaca), ``None`` (unknown) otherwise.
 
-    Alpaca reports no commission on the order or the trade update. Crypto fees are posted end of day
-    as ``CFEE`` activities and priced later by `AlpacaLiveAdapter.backfill_commissions`; options and
-    an unreadable asset class are unknown too. Maintainer decision on #124: ``0.0`` only for a known
+    Alpaca reports no commission on the order or the trade update. Crypto fees appear only as
+    ``CFEE`` account activities, posted in batches well after the fill (a ~51 h posting delay was
+    observed), and are priced later by `AlpacaLiveAdapter.backfill_commissions`; options and an
+    unreadable asset class are unknown too. Maintainer decision on #124: ``0.0`` only for a known
     zero, NULL for everything else.
     """
     raw = _order_attr(order, "asset_class", None)
@@ -2883,8 +2916,21 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             take_profit_leg = (
                 None if exit_only else TakeProfitRequest(limit_price=take_profit_price)
             )
+        # Entries ride GTC so the SL/TP legs survive the session close: a DAY
+        # bracket/OTO's stop leg expires at 4pm ET and leaves the filled
+        # position naked overnight (paper soak 2026-11-25). Alpaca accepts
+        # ``gtc`` on bracket/OTO parents, market parent included (its order
+        # docs restrict advanced-order TIF to day/gtc and allow gtc on market
+        # orders); ``extended_hours`` stays False. A bare exit-only market
+        # order keeps DAY: it carries no resting leg to protect, it is meant
+        # to fill in the session it was submitted, and a DAY expiry surfaces
+        # an unfilled exit through the terminal-order reconciliation rather
+        # than silently carrying a stale exit into a later session.
+        entry_time_in_force = (
+            time_in_force.DAY if exit_only else time_in_force.GTC
+        )
         return market_request_cls(
-            time_in_force=time_in_force.DAY,
+            time_in_force=entry_time_in_force,
             extended_hours=False,
             order_class=order_class,
             take_profit=take_profit_leg,
@@ -4020,11 +4066,15 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         terminal and its ``filled_qty`` must cover the requested exit
         quantity. The re-read is a short bounded retry - a market exit is
         usually still ``new`` on the first read right after the re-place, so
-        a single read would strand the marker until the next connect. Up to
-        ``_EXIT_MARKER_REREAD_ATTEMPTS`` reads ``_EXIT_MARKER_REREAD_INTERVAL_SECONDS``
-        apart, only while the status is non-terminal; a terminal status or a
-        failed read ends the loop. The caller holds the account order lock,
-        so the sleeps total well under the ~1.5 s budget. A still-working
+        a single read would strand the marker until the next connect. The
+        retry loop lives in ``_reread_exit_order_until_terminal``: up to
+        ``_EXIT_MARKER_REREAD_ATTEMPTS`` reads
+        ``_EXIT_MARKER_REREAD_INTERVAL_SECONDS`` apart, only while the
+        status is non-terminal; a terminal status or a failed read ends it.
+        The caller holds the account order lock AND ``_order_book_lock``
+        (inside ``_submit_exit_releasing_protection``), so the ~1 s of
+        sleeps also blocks flatten sweeps and trailing replaces on this
+        adapter - the budget stays well under ~1.5 s. A still-working
         order, a short fill, an unknown status or a failed re-read all keep
         the marker - the connect replay is the backstop; the stream only
         alerts (#350 review).
@@ -4033,24 +4083,9 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         get_order = getattr(client, "get_order_by_id", None)
         if order_id is None or not callable(get_order):
             return
-        fresh: Any = None
-        terminal = False
-        for attempt in range(_EXIT_MARKER_REREAD_ATTEMPTS):
-            try:
-                fresh = await asyncio.to_thread(get_order, order_id)
-            except Exception as exc:  # except-kind: money-decision
-                logger.debug(
-                    "Alpaca exit order %s could not be re-read after "
-                    "re-protect; the marker stays pending: %r",
-                    order_id,
-                    exc,
-                )
-                return
-            if _order_status(fresh) in _TERMINAL_ORDER_STATUSES:
-                terminal = True
-                break
-            if attempt + 1 < _EXIT_MARKER_REREAD_ATTEMPTS:
-                await sleep(_EXIT_MARKER_REREAD_INTERVAL_SECONDS)
+        fresh, terminal = await _reread_exit_order_until_terminal(
+            get_order, order_id, sleep=sleep
+        )
         if not terminal or fresh is None:
             return
         exit_qty = plan.get("exit_qty")
@@ -4128,6 +4163,26 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             # otherwise leave the uncovered shares naked forever (#350 review).
             return "pending"
         candidates = await self._exit_protection_candidates(client, symbol, side)
+        if any(candidate.get("qty") is None for candidate in candidates):
+            # An unreadable quantity can be neither counted as covered nor
+            # safely excluded from the top-up: treating it as 0 inflates
+            # ``uncovered`` and over-protects shares already covered. Fail
+            # closed - alert and keep the marker pending (#350 review).
+            logger.error(
+                "ALERT: Alpaca exit re-protection for %s found working "
+                "protection whose quantity is unreadable; coverage can be "
+                "neither verified nor safely topped up - the marker stays "
+                "pending. Reconcile manually",
+                symbol,
+                extra={
+                    "data": {
+                        "signal_id": signal_id,
+                        "symbol": symbol,
+                        "marker": dict(marker),
+                    }
+                },
+            )
+            return "pending"
         kinds = {_exit_protection_kind(c) for c in candidates}
         uncovered = abs(position_qty) - _covered_exit_protection_qty(candidates)
         if candidates and uncovered > self.position_qty_tolerance(symbol):
@@ -5751,7 +5806,9 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 side=order_side.SELL
                 if live.stop_side == "sell"
                 else order_side.BUY,
-                time_in_force=time_in_force.DAY,
+                # GTC: a DAY stop expires at the close and the refused close
+                # would leave the position naked overnight (2026-11-25 soak).
+                time_in_force=time_in_force.GTC,
                 stop_price=stop_price,
             )
             await asyncio.to_thread(client.submit_order, order_data=request)
@@ -7102,8 +7159,9 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
 
             event_filled_qty = parse_optional(filled_qty_value)
             filled_qty = 0.0 if event_filled_qty is None else event_filled_qty
-            # alpaca-py has no commission field on TradeUpdate or Order; a crypto fee is posted end
-            # of day and backfilled, so here it is unknown unless it is a known zero (#124).
+            # alpaca-py has no commission field on TradeUpdate or Order; a crypto fee is only
+            # known once its ``CFEE`` activity posts (in delayed batches) and is backfilled,
+            # so here it is unknown unless it is a known zero (#124).
             commission = _known_commission(order)
             raw_fill_ts = getattr(data, "timestamp", None)
             fill_ts = _broker_fill_timestamp(

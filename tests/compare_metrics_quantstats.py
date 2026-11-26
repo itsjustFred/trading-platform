@@ -105,7 +105,9 @@ def compare_scenario(name: str, equities: list[float]) -> dict:
     total_return = (equities[-1] / equities[0]) - 1 if equities[0] > 0 else 0
     n_points = len(equities)
     our_annualized_return = (1 + total_return) ** (252 / max(n_points, 1)) - 1
-    # BUG CANDIDATE: divides by max_drawdown_pct/100
+    # Hypothetical variant for comparison only: divides the drawdown fraction
+    # by 100 as if it were a percent. compute_stats does not do this — it calls
+    # _safe_calmar_ratio(cagr, max_drawdown_pct) on the fraction directly.
     our_calmar_bugged = (
         our_annualized_return / abs(our_mdd / 100) if our_mdd != 0 else 0
     )

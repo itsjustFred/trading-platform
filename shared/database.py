@@ -8,7 +8,7 @@ import os
 import re
 import subprocess
 import threading
-from collections.abc import Collection, Iterable, Mapping
+from collections.abc import Callable, Collection, Iterable, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -1106,6 +1106,11 @@ class LiveLossBreakerStateModel(SQLModel, table=True):
     drawdown_breached: bool = Field(default=False)
     last_equity: float | None = Field(default=None)
     last_observed_at: datetime | None = Field(default=None)
+    # Deployment scopes only: the anchored base the synthetic equity is
+    # measured from (``equity = equity_anchor + own trading P&L``). NULL on
+    # account scopes and on deployment rows not yet anchored; the first
+    # anchored observation fills it and it is never rewritten by ``observe``.
+    equity_anchor: float | None = Field(default=None)
     breach_detail_json: dict[str, Any] | None = Field(
         default=None, sa_column=Column(JSON, nullable=True)
     )
@@ -1123,6 +1128,7 @@ class LiveLossBreakerStateModel(SQLModel, table=True):
             drawdown_breached=record.drawdown_breached,
             last_equity=record.last_equity,
             last_observed_at=record.last_observed_at,
+            equity_anchor=record.equity_anchor,
             breach_detail_json=record.breach_detail,
         )
 
@@ -1137,6 +1143,7 @@ class LiveLossBreakerStateModel(SQLModel, table=True):
             drawdown_breached=bool(self.drawdown_breached),
             last_equity=self.last_equity,
             last_observed_at=self.last_observed_at,
+            equity_anchor=self.equity_anchor,
             breach_detail=self.breach_detail_json,
         )
 
@@ -2268,6 +2275,25 @@ def _add_background_task_columns(connection: Connection) -> None:
         )
 
 
+def _add_live_loss_breaker_state_columns(connection: Connection) -> None:
+    """Add ``live_loss_breaker_state.equity_anchor`` to legacy tables.
+
+    Deployment scopes anchor their synthetic equity to a persisted base
+    (``equity = equity_anchor + own trading P&L``) so P&L no deployment owns,
+    deposits/withdrawals and other deployments' P&L cannot move them. Existing
+    rows get NULL: they anchor on their next observation, continuing from
+    their last observed equity so the migration itself cannot trip a breaker.
+    """
+    column_names = _table_column_names(connection, "live_loss_breaker_state")
+    if column_names and "equity_anchor" not in column_names:
+        connection.execute(
+            text(
+                "ALTER TABLE live_loss_breaker_state "
+                "ADD COLUMN equity_anchor FLOAT"
+            )
+        )
+
+
 def _add_trade_columns(connection: Connection) -> None:
     """Add risk and exit columns to legacy trades tables."""
     column_names = _table_column_names(connection, "trades")
@@ -3030,6 +3056,7 @@ def _migrate_schema() -> None:
         _add_service_columns(connection)
         _add_background_task_columns(connection)
         _add_trade_columns(connection)
+        _add_live_loss_breaker_state_columns(connection)
 
         # Parent the smoke-sourced orphans before the FK is added, so the rebuild never copies a
         # row that violates the constraint it is introducing. On a database whose only orphans are
@@ -4689,7 +4716,7 @@ def list_live_deployment_unfilled_entry_order_refs(
             continue
         metadata_dict = metadata if isinstance(metadata, dict) else {}
         is_close = (
-            _is_exit_only_signal_metadata(metadata_dict)
+            is_exit_only_signal_metadata(metadata_dict)
             or str(source or "") == BROKER_CLOSE_SIGNAL_SOURCE
         )
         if is_close:
@@ -4864,7 +4891,7 @@ def _position_lot_entries(
     for signal_id, sig_symbol, timestamp, action, broker_order_id, source, metadata in signal_rows:
         metadata_dict = metadata if isinstance(metadata, dict) else {}
         is_close = (
-            _is_exit_only_signal_metadata(metadata_dict)
+            is_exit_only_signal_metadata(metadata_dict)
             or str(source or "") == BROKER_CLOSE_SIGNAL_SOURCE
         )
         if is_close:
@@ -5778,8 +5805,23 @@ def get_live_signal_metadata(signal_id: str) -> dict[str, Any] | None:
 _ENTRY_SIGNAL_SCAN_PAGE_SIZE = 25
 
 
-def _is_exit_only_signal_metadata(metadata: Mapping[str, Any]) -> bool:
-    return bool(metadata.get("exit_only")) or (
+def is_exit_only_signal_metadata(metadata: Mapping[str, Any]) -> bool:
+    """Whether signal metadata marks a ledger-reducing (exit-only) signal.
+
+    This is THE exit predicate: ``_position_lot_entries`` and the open-entry
+    counts treat exactly these signals as closes, so any other consumer that
+    needs "would the ledger count this fill as reducing" - the cTrader
+    close-fill attribution and the close-attribution repair script - must use
+    this same test or the two sides can disagree about which side of the
+    ledger a fill lands on.
+    """
+    exit_only = metadata.get("exit_only")
+    if isinstance(exit_only, str):
+        # JSON metadata can carry "false" as a string, which bool() would
+        # count as an exit; normalise against the same truthy tokens the
+        # rest of the codebase accepts for boolean config.
+        exit_only = exit_only.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return bool(exit_only) or (
         str(metadata.get("risk_sizing_mode") or "").strip().lower() == "exit_only"
     )
 
@@ -5853,7 +5895,7 @@ def _newest_filled_entry_signal(
         rows = session.exec(statement.offset(offset).limit(_ENTRY_SIGNAL_SCAN_PAGE_SIZE)).all()
         for row in rows:
             metadata = dict(row.metadata_json or {})
-            if _is_exit_only_signal_metadata(metadata):
+            if is_exit_only_signal_metadata(metadata):
                 continue
             timestamp = row.timestamp
             if timestamp.tzinfo is None:
@@ -6009,16 +6051,26 @@ def get_live_signal_timestamp(signal_id: str) -> datetime | None:
     return timestamp.astimezone(timezone.utc)
 
 
-def find_live_signal_id_by_broker_order_id(
+def find_live_signal_ids_by_broker_order_id(
     account_id: str, broker_order_id: str
-) -> str | None:
+) -> list[str]:
+    """All signal ids owning this broker order id on the account, newest first.
+
+    ``broker_order_id`` is indexed but not unique, so several rows on one
+    account can share an id (a recovered duplicate, a broker-side id reuse).
+    Callers that must distinguish "one owner" from "ambiguous" need the raw
+    matches - the list is deliberately uncapped so a three-way share cannot
+    truncate into a false single-owner answer;
+    :func:`find_live_signal_id_by_broker_order_id` is the fail-closed
+    single-owner projection of this list.
+    """
     normalized_account_id = str(account_id or "").strip()
     normalized_order_id = str(broker_order_id or "").strip()
     if not normalized_account_id or not normalized_order_id:
-        return None
+        return []
     init_db()
     with get_session() as session:
-        row = session.exec(
+        rows = session.exec(
             select(LiveSignalModel)
             .join(
                 LiveDeploymentModel,
@@ -6027,9 +6079,22 @@ def find_live_signal_id_by_broker_order_id(
             .where(LiveDeploymentModel.account_id == normalized_account_id)
             .where(LiveSignalModel.broker_order_id == normalized_order_id)
             .order_by(LiveSignalModel.timestamp.desc())
-            .limit(1)
-        ).first()
-    return str(row.id) if row is not None else None
+        ).all()
+    return [str(row.id) for row in rows]
+
+
+def find_live_signal_id_by_broker_order_id(
+    account_id: str, broker_order_id: str
+) -> str | None:
+    """The signal owning this broker order id, or ``None`` when unknown.
+
+    Picking the newest of several matches would attribute a fill to a
+    possibly-wrong signal, so an ambiguous match fails closed to ``None`` -
+    callers then take their unresolved/flagged path instead of mis-booking
+    the fill.
+    """
+    owner_ids = find_live_signal_ids_by_broker_order_id(account_id, broker_order_id)
+    return owner_ids[0] if len(owner_ids) == 1 else None
 
 
 def get_live_signal_reconciliation_cursor(signal_id: str) -> tuple[datetime, str] | None:
@@ -7742,11 +7807,176 @@ def list_live_loss_breaker_states(
     return [row.to_record() for row in rows]
 
 
+def _apply_loss_breaker_observation(
+    row: LiveLossBreakerStateModel,
+    *,
+    equity_value: float,
+    utc_day: str,
+    observed_naive: datetime,
+    anchor_value: float | None,
+) -> None:
+    """Apply one equity observation to an existing breaker ``row``.
+
+    UTC day boundary: the daily breaker resets automatically. The new day's
+    baseline is the equity last seen before the boundary, not this
+    observation - a gap across midnight is a loss of the new day, not its
+    starting capital. ``equity_anchor`` is write-once: it is filled only
+    while the row's anchor is NULL, so the scope's equity series moves only
+    with the deployment's own P&L afterwards.
+    """
+    if row.utc_day != utc_day:
+        row.utc_day = utc_day
+        row.day_start_equity = (
+            float(row.last_equity) if row.last_equity is not None else equity_value
+        )
+        row.daily_breached = False
+    if row.equity_anchor is None and anchor_value is not None:
+        row.equity_anchor = anchor_value
+    row.peak_equity = max(float(row.peak_equity), equity_value)
+    row.last_equity = equity_value
+    row.last_observed_at = observed_naive
+    row.updated_at = observed_naive
+
+
+def _validate_loss_breaker_series(
+    normalized_scope: str,
+    equity_value: float,
+    anchor_value: float | None,
+    *,
+    equity_raw: object,
+    anchor_raw: object,
+) -> None:
+    """Refuse a non-finite equity/anchor or an anchor on an account scope."""
+    if not math.isfinite(equity_value):
+        raise ValueError(f"loss breaker equity must be finite, got {equity_raw!r}")
+    if anchor_value is not None and not math.isfinite(anchor_value):
+        raise ValueError(
+            f"loss breaker equity anchor must be finite, got {anchor_raw!r}"
+        )
+    if anchor_value is not None and normalized_scope.startswith("account:"):
+        raise ValueError(
+            "account scopes never carry an equity anchor; "
+            f"got one for {normalized_scope!r}"
+        )
+
+
+def _observe_live_loss_breaker_row(
+    normalized_scope: str,
+    normalized_account: str,
+    observed_at: datetime,
+    resolve_series: Callable[
+        [LiveLossBreakerRecord | None], tuple[float, float | None]
+    ],
+) -> LiveLossBreakerRecord:
+    """One atomic equity-series write for ``normalized_scope``.
+
+    ``resolve_series`` is invoked INSIDE the write transaction with the
+    scope's current record (``None`` when it has no row yet) and returns
+    ``(equity, equity_anchor_to_persist)``. Because the row read, the series
+    computation and the write share one ``BEGIN IMMEDIATE`` transaction, a
+    concurrent writer (the ``re-anchor`` CLI in another process) cannot land
+    between the anchor read and the series write - the deployment scope's
+    equity is always computed from the anchor that is actually stored.
+    """
+    observed_naive = _naive_utc(observed_at)
+    utc_day = _loss_breaker_utc_day(observed_at)
+
+    init_db()
+    with _loss_breaker_observe_lock(normalized_scope), get_session() as session:
+        session.connection().exec_driver_sql(_SQLITE_BEGIN_IMMEDIATE)
+        try:
+            row = session.get(LiveLossBreakerStateModel, normalized_scope)
+            prior = row.to_record() if row is not None else None
+            equity_raw, anchor_raw = resolve_series(prior)
+            equity_value = float(equity_raw)
+            anchor_value = (
+                float(anchor_raw) if anchor_raw is not None else None
+            )
+            _validate_loss_breaker_series(
+                normalized_scope,
+                equity_value,
+                anchor_value,
+                equity_raw=equity_raw,
+                anchor_raw=anchor_raw,
+            )
+            if row is None:
+                row = LiveLossBreakerStateModel(
+                    scope=normalized_scope,
+                    account_id=normalized_account,
+                    utc_day=utc_day,
+                    day_start_equity=equity_value,
+                    peak_equity=equity_value,
+                    daily_breached=False,
+                    drawdown_breached=False,
+                    last_equity=equity_value,
+                    last_observed_at=observed_naive,
+                    equity_anchor=anchor_value,
+                    breach_detail_json=None,
+                    updated_at=observed_naive,
+                )
+                session.add(row)
+            else:
+                if (
+                    normalized_scope.startswith("deployment:")
+                    and row.account_id != normalized_account
+                ):
+                    # The deployment was re-pointed at another account: the
+                    # row follows it, so the old account's scope list (and
+                    # its re-anchor P&L total) stops counting a deployment
+                    # that no longer trades there.
+                    row.account_id = normalized_account
+                _apply_loss_breaker_observation(
+                    row,
+                    equity_value=equity_value,
+                    utc_day=utc_day,
+                    observed_naive=observed_naive,
+                    anchor_value=anchor_value,
+                )
+            session.add(row)
+            session.commit()
+            session.refresh(row)
+            return row.to_record()
+        except Exception:
+            session.rollback()
+            raise
+
+
+def observe_live_loss_breaker_series(
+    scope: str,
+    account_id: str,
+    observed_at: datetime,
+    resolve_series: Callable[
+        [LiveLossBreakerRecord | None], tuple[float, float | None]
+    ],
+) -> LiveLossBreakerRecord:
+    """Observe ``scope`` with its equity computed inside the write transaction.
+
+    ``resolve_series`` receives the scope's current record (``None`` when it
+    has no row yet) and returns ``(equity, equity_anchor_to_persist)``; it
+    runs after ``BEGIN IMMEDIATE``, so the anchor it reads and the series it
+    writes are one atomic step. Deployment scopes use this: their equity is
+    ``equity_anchor + own P&L``, and computing it from a separately-read
+    anchor would let a concurrent ``re-anchor`` overwrite the series with a
+    stale-anchor value.
+    """
+    normalized_scope = str(scope or "").strip()
+    normalized_account = str(account_id or "").strip()
+    if not normalized_scope or not normalized_account:
+        raise ValueError(
+            "observe_live_loss_breaker_series requires a scope and an account_id"
+        )
+    return _observe_live_loss_breaker_row(
+        normalized_scope, normalized_account, observed_at, resolve_series
+    )
+
+
 def observe_live_loss_breaker(
     scope: str,
     account_id: str,
     equity: float,
     observed_at: datetime,
+    *,
+    equity_anchor: float | None = None,
 ) -> LiveLossBreakerRecord:
     """Record one equity observation for ``scope`` and return the new state.
 
@@ -7760,10 +7990,22 @@ def observe_live_loss_breaker(
 
     A scope's first-ever observation always seeds ``day_start_equity`` and
     ``peak_equity`` from THAT observation - never from another scope's
-    baseline. A deployment scope observes a synthetic equity
-    (``account_equity - other deployments' P&L``) on a different basis than
-    the account scope, so inheriting the account row's baseline would trip a
-    brand-new deployment instantly (or hide its first-day losses).
+    baseline. A deployment scope observes a synthetic equity on a different
+    basis than the account scope, so inheriting the account row's baseline
+    would trip a brand-new deployment instantly (or hide its first-day
+    losses).
+
+    ``equity_anchor`` is the deployment scope's anchored base (the scope's
+    equity with its own P&L removed; see ``LiveLossBreakerRecord``). It is
+    written only while the row's anchor is NULL - the first anchored
+    observation fixes it and ``observe`` never rewrites it, so the scope's
+    equity series moves only with the deployment's own P&L afterwards.
+    ``reset_live_loss_breaker_drawdown`` is the only other writer.
+
+    Scopes whose equity must be computed from the stored row (deployment
+    scopes: ``anchor + own P&L``) must use
+    :func:`observe_live_loss_breaker_series` instead, so the anchor read and
+    the series write stay inside one transaction.
     """
     normalized_scope = str(scope or "").strip()
     normalized_account = str(account_id or "").strip()
@@ -7772,49 +8014,24 @@ def observe_live_loss_breaker(
     equity_value = float(equity)
     if not math.isfinite(equity_value):
         raise ValueError(f"loss breaker equity must be finite, got {equity!r}")
-    observed_naive = _naive_utc(observed_at)
-    utc_day = _loss_breaker_utc_day(observed_at)
-
-    init_db()
-    with _loss_breaker_observe_lock(normalized_scope):
-        with get_session() as session:
-            row = session.get(LiveLossBreakerStateModel, normalized_scope)
-            if row is None:
-                row = LiveLossBreakerStateModel(
-                    scope=normalized_scope,
-                    account_id=normalized_account,
-                    utc_day=utc_day,
-                    day_start_equity=equity_value,
-                    peak_equity=equity_value,
-                    daily_breached=False,
-                    drawdown_breached=False,
-                    last_equity=equity_value,
-                    last_observed_at=observed_naive,
-                    breach_detail_json=None,
-                    updated_at=observed_naive,
-                )
-                session.add(row)
-            else:
-                if row.utc_day != utc_day:
-                    # UTC day boundary: the daily breaker resets automatically.
-                    # The new day's baseline is the equity last seen before the
-                    # boundary, not this observation - a gap across midnight is a
-                    # loss of the new day, not its starting capital.
-                    row.utc_day = utc_day
-                    row.day_start_equity = (
-                        float(row.last_equity)
-                        if row.last_equity is not None
-                        else equity_value
-                    )
-                    row.daily_breached = False
-                row.peak_equity = max(float(row.peak_equity), equity_value)
-                row.last_equity = equity_value
-                row.last_observed_at = observed_naive
-                row.updated_at = observed_naive
-            session.add(row)
-            session.commit()
-            session.refresh(row)
-            return row.to_record()
+    anchor_value = (
+        float(equity_anchor) if equity_anchor is not None else None
+    )
+    if anchor_value is not None and not math.isfinite(anchor_value):
+        raise ValueError(
+            f"loss breaker equity anchor must be finite, got {equity_anchor!r}"
+        )
+    if anchor_value is not None and normalized_scope.startswith("account:"):
+        raise ValueError(
+            "account scopes never carry an equity anchor; "
+            f"got one for {normalized_scope!r}"
+        )
+    return _observe_live_loss_breaker_row(
+        normalized_scope,
+        normalized_account,
+        observed_at,
+        lambda _record: (equity_value, anchor_value),
+    )
 
 
 def latch_live_loss_breaker_breach(
@@ -7862,6 +8079,11 @@ def reset_live_loss_breaker_drawdown(
     breaker measures from the peak, so a reset that kept the old high-water
     mark would re-trip on the very next observation. Returns ``None`` when the
     scope has no state row.
+
+    A deployment scope's ``equity_anchor`` shifts by the same delta so the
+    synthetic equity series (``equity_anchor + own P&L``) continues from the
+    re-based equity instead of jumping back to the pre-reset anchor. Account
+    scopes never carry an anchor, so this is a no-op for them.
     """
     normalized_scope = str(scope or "").strip()
     if not normalized_scope:
@@ -7876,15 +8098,114 @@ def reset_live_loss_breaker_drawdown(
         row = session.get(LiveLossBreakerStateModel, normalized_scope)
         if row is None:
             return None
+        previous_equity = (
+            float(row.last_equity) if row.last_equity is not None else None
+        )
         row.drawdown_breached = False
         row.peak_equity = equity_value
         row.last_equity = equity_value
+        if row.equity_anchor is not None and previous_equity is not None:
+            row.equity_anchor = float(row.equity_anchor) + (
+                equity_value - previous_equity
+            )
         row.last_observed_at = reset_naive
         row.updated_at = reset_naive
         session.add(row)
         session.commit()
         session.refresh(row)
         return row.to_record()
+
+
+def reanchor_live_loss_breaker_deployment(
+    scope: str,
+    *,
+    equity_anchor: float,
+    reanchored_at: datetime,
+    account_id: str,
+) -> LiveLossBreakerRecord | None:
+    """Operator re-anchor of a deployment scope's ``equity_anchor``.
+
+    Sets ``equity_anchor`` to ``equity_anchor`` (the CURRENT residual -
+    account equity minus the sum of all deployment P&L on the account) and
+    moves ``last_equity`` to ``equity_anchor + own P&L``, where own P&L is
+    ``last_equity - old equity_anchor`` read from the SAME row inside the
+    write transaction when the row is already on ``account_id`` (a re-pointed
+    row that has not been observed on the new account contributes 0 - its
+    stored P&L belongs to the old account's residual basis), shifting
+    ``day_start_equity`` and ``peak_equity`` by the same delta so no breaker
+    fraction jumps. Existing breach latches are kept: re-anchoring fixes the
+    measurement basis (after e.g. a large
+    deposit/withdrawal or an account repoint); it does not clear a trip.
+    ``account_id`` is the deployment's CURRENT account: the row's
+    ``account_id`` is rewritten to it, so a re-pointed deployment's scope
+    list and re-anchor P&L total follow the account it actually trades on.
+
+    Deployment scopes only - account scopes never carry an anchor, so they
+    are refused. ``last_observed_at`` is left alone: a re-anchor is not a
+    market observation. Returns ``None`` when the scope has no state row.
+    """
+    normalized_scope = str(scope or "").strip()
+    if not normalized_scope:
+        raise ValueError("reanchor_live_loss_breaker_deployment requires a scope")
+    kind, _, _ = normalized_scope.partition(":")
+    if kind != "deployment":
+        raise ValueError(
+            "re-anchor applies to deployment scopes only, got "
+            f"{normalized_scope!r}"
+        )
+    normalized_account = str(account_id or "").strip()
+    if not normalized_account:
+        raise ValueError(
+            "reanchor_live_loss_breaker_deployment requires the deployment's "
+            "current account_id"
+        )
+    anchor_value = float(equity_anchor)
+    if not math.isfinite(anchor_value):
+        raise ValueError(
+            f"loss breaker equity anchor must be finite, got {equity_anchor!r}"
+        )
+    reanchored_naive = _naive_utc(reanchored_at)
+
+    init_db()
+    with _loss_breaker_observe_lock(normalized_scope), get_session() as session:
+        session.connection().exec_driver_sql(_SQLITE_BEGIN_IMMEDIATE)
+        try:
+            row = session.get(LiveLossBreakerStateModel, normalized_scope)
+            if row is None:
+                return None
+            if row.last_equity is None:
+                raise ValueError(
+                    f"loss breaker scope {normalized_scope!r} has no last "
+                    "observed equity; there is no series to re-anchor"
+                )
+            own_pnl = (
+                float(row.last_equity) - float(row.equity_anchor)
+                if (
+                    row.account_id == normalized_account
+                    and row.equity_anchor is not None
+                )
+                else 0.0
+            )
+            equity_value = anchor_value + own_pnl
+            if not math.isfinite(equity_value):
+                raise ValueError(
+                    "loss breaker scope equity must be finite, got "
+                    f"{equity_value!r}"
+                )
+            delta = equity_value - float(row.last_equity)
+            row.equity_anchor = anchor_value
+            row.account_id = normalized_account
+            row.day_start_equity = float(row.day_start_equity) + delta
+            row.peak_equity = float(row.peak_equity) + delta
+            row.last_equity = equity_value
+            row.updated_at = reanchored_naive
+            session.add(row)
+            session.commit()
+            session.refresh(row)
+            return row.to_record()
+        except Exception:
+            session.rollback()
+            raise
 
 
 # ─── Deployment trading flows (loss breaker, #301) ────────────────────────────
@@ -8576,7 +8897,7 @@ def _live_slippage_decomposition(
     quote_price = _usable_quote_price(signal.entry_quote_price)
     has_snapshot = bid is not None and ask is not None and quote_price is not None
     metadata = signal.metadata_json or {}
-    is_exit = _is_exit_only_signal_metadata(metadata) or str(
+    is_exit = is_exit_only_signal_metadata(metadata) or str(
         metadata.get("signal_intent") or ""
     ) == "exit"
     result: dict[str, Any] = {

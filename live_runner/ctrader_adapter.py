@@ -25,6 +25,7 @@ from live_runner.base_adapter import (
     ORDER_STATE_TERMINAL,
     ORDER_STATE_WORKING,
     BaseLiveAdapter,
+    BrokerOrderRejectedError,
     BrokerOrderView,
     ControlOutcome,
     LivePipValue,
@@ -38,7 +39,11 @@ from live_runner.base_adapter import (
     order_not_submitted,
     validate_live_quote_prices,
 )
-from live_runner.credential_env import resolve_accounts_env_path, resolve_env_value
+from live_runner.credential_env import (
+    read_accounts_env_file,
+    resolve_accounts_env_path,
+    resolve_env_value,
+)
 from live_runner.exit_signals import ExitBelowStepError
 from shared import venue_calendar
 from shared.constants import DATA_DIR
@@ -46,6 +51,7 @@ from shared.database import (
     BROKER_CLOSE_REASON_CTRADER_POSITION_CLOSE,
     broker_close_signal_id,
     find_live_signal_id_by_broker_order_id,
+    find_live_signal_ids_by_broker_order_id,
     flag_live_ledger_reconciliation,
     get_live_adapter_state,
     get_live_signal_account_id,
@@ -53,6 +59,7 @@ from shared.database import (
     get_live_signal_metadata,
     get_live_signal_reconciliation_cursor,
     get_live_signal_timestamp,
+    is_exit_only_signal_metadata,
     list_live_account_open_position_lots,
     list_live_ledger_reconciliation_deal_ids,
     list_live_ledger_reconciliation_flag_entries,
@@ -69,7 +76,7 @@ from shared.database import (
     set_live_signal_broker_order_id,
 )
 from shared.logging import get_logger
-from shared.lot_grid import floor_qty_to_step
+from shared.lot_grid import STEP_NOISE, floor_qty_to_step
 from shared.models import (
     PRICE_ABSENT,
     PRICE_OBSERVED,
@@ -98,6 +105,32 @@ class CTraderAuthTerminalError(RuntimeError):
     def __init__(self, message: str, *, error_code: str = "") -> None:
         self.error_code = str(error_code or "").strip()
         super().__init__(message)
+
+
+class CTraderConnectionLostError(ConnectionError):
+    """An in-flight cTrader request was abandoned by a session teardown.
+
+    Upstream ``Client._disconnected`` clears pending response Deferreds
+    without errbacking them, which would leave every in-flight
+    ``_send_request`` waiting out its own response timeout after the socket
+    is already gone. Teardown fails them with this instead. It is
+    deliberately a plain connection error: the request may already have been
+    written, so callers must treat the outcome as unknown - never as
+    provably-not-submitted and never as a broker refusal.
+    """
+
+
+class _PendingCloseFillRetentionError(ValueError):
+    """A position-close fill retained while its own close submit is unresolved.
+
+    Subclasses ``ValueError`` so every existing retain-for-reconciliation
+    handler still applies, but ``listen_executions`` recognises it and parks
+    the event in ``_unresolved_execution_events`` WITHOUT spending the retry
+    budget: a pending mark can live up to ``_PENDING_CLOSE_POSITION_TTL_SECONDS``
+    (an unknown-outcome submit), and a budgeted requeue would crash-loop the
+    listener - delaying every other fill on the account - for that whole
+    window.
+    """
 
 
 _TRUE_BOOL_TOKENS = {"1", "true", "yes", "y", "on"}
@@ -206,6 +239,24 @@ MAX_CONVERSION_HOPS = 3
 CTRADER_RELATIVE_PRICE_UNIT_DIVISOR = 100_000
 EXECUTION_RETRY_LIMIT = 3
 UNRESOLVED_EXECUTION_EVENT_LIMIT = 1000
+#: How long a ``ClosePositionReq`` submit keeps its position marked pending
+#: (position_id -> (signal_id, monotonic timestamp)). ``ProtoOAClosePositionReq``
+#: carries no ``clientOrderId`` of ours, so while the submit is in flight - or
+#: after an unknown-outcome submit until reconciliation persists the broker
+#: order id - a fill on the position can only be retained, not attributed.
+#: The mark expires so a failed submit cannot hold a genuine broker-side
+#: close on the position out of the stream path indefinitely. The TTL is a
+#: bound, not a guarantee: a submit whose broker outcome stays unknown past
+#: it loses retention, and a later fill on the position books as a
+#: broker-side close - acceptable because an unknown-outcome submit is
+#: already an operator-visible reconciliation case. The TTL must stay well
+#: above the reconciliation cadence so an ordinary in-flight submit cannot
+#: outlive it.
+_PENDING_CLOSE_POSITION_TTL_SECONDS = 3600.0
+#: How often a parked pending-close fill triggers a reconciliation pass while
+#: its submit's mark is still live. Budget-free parking would otherwise never
+#: re-arm the pass that can recover the close's broker order id.
+_PENDING_CLOSE_FILL_RECONCILE_SECONDS = 30.0
 #: Bounded broker-state confirmation for ProtoOAAmendPositionSLTPReq (#168):
 #: the request has no dedicated response, so the amended stop is confirmed by
 #: re-reading the position. The broker applies the amend asynchronously, so a
@@ -216,6 +267,56 @@ _AMEND_CONFIRM_INTERVAL_SECONDS = 0.4
 #: pending broker reconciliation instead of letting it sleep out the 30 s
 #: ``queue.get`` timeout. Never a real execution payload.
 _EXECUTION_RECONCILE_WAKE = object()
+
+#: How long after our own token rotation (refresh or adoption of a sibling's
+#: persisted pair) a ``ProtoOAAccountsTokenInvalidatedEvent`` is treated as
+#: the echo of THAT rotation rather than a fresh invalidation of the current
+#: token. cTrader emits the event when a token is refreshed, so the echo can
+#: arrive after our re-auth and even after the resent request; tearing the
+#: session down then would turn a recoverable submit into an unknown outcome.
+#: A genuinely invalidated current token still surfaces through the next
+#: request's auth error, which drives the refresh path - so a bounded window
+#: errs toward keeping a healthy session. The window must stay larger than
+#: cTrader's invalidation-event delivery latency or a late echo for the OLD
+#: token would tear down the re-authenticated session. The grace applies ONLY
+#: when the session already re-authenticated on the current token
+#: (``_session_access_token == access_token``): while a rotation+re-auth is
+#: still in flight the explicit ``_own_token_rotation_in_flight`` flag is the
+#: skip signal instead, and a stale session token means the session is dead.
+_TOKEN_INVALIDATION_OWN_ROTATION_GRACE_SECONDS = 60.0
+
+#: Minimum interval between ``listen_executions`` reconnect attempts after a
+#: session teardown. The teardown wakes the listener immediately (it used to
+#: wait out the 30 s queue timeout); without a floor, a broker that keeps
+#: dropping the session right after auth would produce an unbounded
+#: connect/auth/disconnect loop bounded only by connect latency.
+_LISTENER_RECONNECT_MIN_INTERVAL_SECONDS = 2.0
+
+#: One refresh lock per (event loop, accounts env file). Every cTrader
+#: adapter in the process shares the same persisted token pair, and a cTrader
+#: refresh token is single-use: without serialization two adapters could
+#: spend the same refresh token concurrently and the loser would latch
+#: terminal. Keyed by loop because ``asyncio.Lock`` binds to the loop that
+#: first contends it; the daemon runs a single loop, so this is exact there.
+#: Adapters refreshing from more than one event loop in the same process are
+#: NOT serialized by this dict - that configuration is unsupported.
+_SHARED_TOKEN_REFRESH_LOCKS: dict[tuple[asyncio.AbstractEventLoop, str], asyncio.Lock] = {}
+
+
+def _shared_token_refresh_lock(accounts_env_path: Path) -> asyncio.Lock:
+    # Canonicalize so adapters constructed with differently-formed paths to
+    # the same env file (relative vs absolute, symlink variants) share one
+    # lock - otherwise their refreshes are not serialized.
+    key = (
+        asyncio.get_running_loop(),
+        str(accounts_env_path.expanduser().resolve()),
+    )
+    lock = _SHARED_TOKEN_REFRESH_LOCKS.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _SHARED_TOKEN_REFRESH_LOCKS[key] = lock
+    return lock
+
 
 # ── Trendbar market data (#168) ────────────────────────────────────────────────
 #
@@ -512,7 +613,7 @@ def _relative_distance(
 
     Floors toward the entry so a stop never widens beyond the risk the position was
     sized for. A stop under one tick is refused; a take-profit under one tick is
-    sent as one tick (0 would mean "no TP").
+    sent as one tick.
     """
     leg = "SL" if is_stop else "TP"
     if math.isnan(price) or math.isinf(price) or price <= 0:
@@ -561,21 +662,57 @@ class _SpotWaiter:
     received_at: datetime | None = None
 
 
-def _present_proto_field(payload: Any, name: str) -> Any | None:
+# Sentinel returned by ``_present_proto_field`` when field presence cannot be
+# proven. For refusal classification "absent" would release the order lease,
+# so an unanswerable ``HasField`` must read as "present / unknown" instead.
+_PRESENT_BUT_UNKNOWN = object()
+
+
+def _present_proto_field(
+    payload: Any, name: str, *, fail_closed: bool = False
+) -> Any | None:
     """The field's value when it was sent, else ``None``.
 
     Spot ``bid``/``ask`` are ``optional uint64``: ``HasField`` tells an omitted
     side from a sent one. A payload without ``HasField`` (a test double) falls
-    back to attribute presence.
+    back to attribute presence. With ``fail_closed`` a ``HasField`` failure
+    reports the field as present but unknown (the sentinel) rather than
+    absent, for callers where "absent" is the unsafe direction.
     """
     has_field = getattr(payload, "HasField", None)
     if has_field is not None:
         try:
             if not bool(has_field(name)):
                 return None
-        except (TypeError, ValueError):
+        except Exception:  # except-kind: money-decision
+            # Presence is unanswerable: fail_closed callers get the sentinel,
+            # everyone else reads the field as absent - never as proof. The
+            # catch is deliberately wider than (TypeError, ValueError):
+            # HasField is protobuf-version-dependent and test doubles raise
+            # arbitrary errors, and EVERY exception here means the same thing -
+            # presence could not be proven - so the fail-closed policy applies
+            # uniformly. Logged because a swallowed HasField failure is
+            # otherwise invisible.
+            logger.warning(
+                "cTrader HasField(%s) failed; treating field presence as "
+                "unanswerable",
+                name,
+                exc_info=True,
+            )
+            if fail_closed:
+                return _PRESENT_BUT_UNKNOWN
             return None
     return getattr(payload, name, None)
+
+
+def _present_proto_field_fail_closed(payload: Any, name: str) -> Any | None:
+    """``_present_proto_field`` for refusal classification.
+
+    Every field check on the order-refusal path MUST go through this wrapper:
+    an unanswerable ``HasField`` reads as present-but-unknown, never absent,
+    because "absent" is the direction that would release the submission lease.
+    """
+    return _present_proto_field(payload, name, fail_closed=True)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -976,11 +1113,39 @@ def _payload_ctid_trader_account_id(payload: Any) -> int:
     ``ProtoOAErrorRes.ctidTraderAccountId`` is proto3-optional: unset reads back
     as ``0``, which is never a real cTrader account id, so ``0`` doubles as
     "not set" and the caller only compares when the result is non-zero.
+    Non-positive values are clamped to ``0`` for the same reason
+    ``_payload_ctid_trader_account_ids`` drops them: a negative id cannot be
+    proven foreign, and treating it as a foreign account would silently drop
+    (e.g.) a disconnect event that should tear the session down.
     """
     try:
-        return int(getattr(payload, "ctidTraderAccountId", 0) or 0)
+        account_id = int(getattr(payload, "ctidTraderAccountId", 0) or 0)
     except (TypeError, ValueError):
         return 0
+    return account_id if account_id > 0 else 0
+
+
+def _payload_ctid_trader_account_ids(payload: Any) -> tuple[int, ...]:
+    """``ctidTraderAccountIds`` on an inbound payload, ``()`` when unset.
+
+    ``ProtoOAAccountsTokenInvalidatedEvent`` carries a *repeated* account-id
+    field, so the singular ``_payload_ctid_trader_account_id`` helper cannot
+    read it. Non-positive entries are dropped for the same reason the
+    singular helper treats ``0`` as unset: ``0`` is never a real cTrader
+    account id. An empty tuple means the event names no account: it cannot be
+    proven foreign, so callers treat it like an own-account event.
+    """
+    try:
+        return tuple(
+            account_id
+            for account_id in (
+                int(raw_id)
+                for raw_id in (getattr(payload, "ctidTraderAccountIds", None) or ())
+            )
+            if account_id > 0
+        )
+    except (TypeError, ValueError):
+        return ()
 
 
 _CTRADER_AUTH_FAILURE_FALLBACK = "cTrader account authorization failed"
@@ -1306,6 +1471,43 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._authenticated = False
         self._connect_lock = asyncio.Lock()
         self._refresh_lock = asyncio.Lock()
+        # The access token the CURRENT session authenticated with ("" when no
+        # session is authenticated). ``ProtoOAAccountsTokenInvalidatedEvent``
+        # names accounts, not tokens, so the invalidation handler compares
+        # this against ``self.access_token`` to tell "our own refresh already
+        # replaced the dead token" apart from "the session's token died".
+        self._session_access_token = ""
+        # ``time.monotonic()`` of the last token-pair rotation this adapter
+        # knows about (own refresh or adoption of a sibling's persisted pair);
+        # 0.0 when none happened this process.
+        self._token_pair_rotated_at = 0.0
+        # Depth counter: ``> 0`` from the moment an own token rotation
+        # starts until its re-auth completes. A counter, not a bool, so two
+        # concurrent auth-error rotations cannot clear each other's
+        # in-flight marker. ``ProtoOAAccountsTokenInvalidatedEvent`` names
+        # accounts, not tokens, so this explicit in-flight signal - not the
+        # token comparison - is what protects the window between refresh
+        # completion and the AccountAuthRes from a teardown.
+        self._own_token_rotation_in_flight = 0
+        # ``time.monotonic()`` of the last session teardown or transport
+        # loss; ``listen_executions`` waits out
+        # ``_LISTENER_RECONNECT_MIN_INTERVAL_SECONDS`` from it before
+        # reconnecting so a flapping broker cannot spin the loop. This is
+        # monotonic history for the process lifetime - never reset on
+        # (re)connect, or the floor silently disappears.
+        self._last_session_teardown_at = 0.0
+        # Deferreds handed out by ``_client.send`` and still awaiting a
+        # response. Upstream ``Client._disconnected`` clears
+        # ``_responseDeferreds`` BEFORE our disconnect callback runs, so a
+        # plain transport loss cannot enumerate them there - the adapter
+        # tracks them itself to errback promptly instead of letting each
+        # caller wait out its response timeout.
+        self._in_flight_request_deferreds: set[Any] = set()
+        # Bumped by every ``_fail_in_flight_requests`` run; ``_send_request``
+        # compares it across the send→track window so a deferred created
+        # while teardown was already failing the previous batch is failed
+        # promptly instead of sitting out its response timeout.
+        self._in_flight_fail_generation = 0
         self._symbol_name_to_id: dict[str, int] = {}
         # #125: pending get_quote calls by symbolId, and one lock per symbol
         # (cTrader allows a single spot subscription per symbol and session).
@@ -1348,6 +1550,19 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._account_type: str | None = None
         self._account_type_unreadable_at: float | None = None
         self._order_id_to_signal_id: dict[int, str] = {}
+        # position_id -> {signal_id: monotonic timestamp}: a ClosePositionReq
+        # has no clientOrderId of ours, so until its broker order id is known
+        # a fill on the position is retained for reconciliation rather than
+        # booked as a broker-side close (see _close_position_fill_pending).
+        # Keyed per signal so two concurrent close submits on one position do
+        # not clear each other's guard when the first finishes.
+        self._pending_close_positions: dict[int, dict[str, float]] = {}
+        # id()s of execution events parked in ``_unresolved_execution_events``
+        # because their own close submit is still in flight. These are
+        # requeued after a reconciliation pass WITHOUT spending the retry
+        # budget: the pending mark can live up to the TTL, and a budgeted
+        # requeue would crash-loop the listener for that whole window.
+        self._pending_close_fill_event_ids: set[int] = set()
         # #80: order id -> upper symbol name (for order-only fills whose
         # payload carries no symbolId).
         self._order_id_to_symbol: dict[int, str] = {}
@@ -1383,6 +1598,8 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._ProtoOAExecutionEvent: Any = None
         self._ProtoOAOrderErrorEvent: Any = None
         self._ProtoOAErrorRes: Any = None
+        self._ProtoOAAccountDisconnectEvent: Any = None
+        self._ProtoOAAccountsTokenInvalidatedEvent: Any = None
         self._ProtoOATraderReq: Any = None
         self._ProtoOATraderRes: Any = None
         self._ProtoOAOrderDetailsReq: Any = None
@@ -1422,6 +1639,8 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._execution_payload_type: int | None = None
         self._error_payload_type: int | None = None
         self._order_error_payload_type: int | None = None
+        self._account_disconnect_payload_type: int | None = None
+        self._accounts_token_invalidated_payload_type: int | None = None
 
     def _load_openapi_types(self) -> None:
         if self._client_class is not None:
@@ -1434,6 +1653,8 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             from ctrader_open_api.messages.OpenApiMessages_pb2 import (
                 ProtoOAAccountAuthReq,
                 ProtoOAAccountAuthRes,
+                ProtoOAAccountDisconnectEvent,
+                ProtoOAAccountsTokenInvalidatedEvent,
                 ProtoOAAmendPositionSLTPReq,
                 ProtoOAApplicationAuthReq,
                 ProtoOAApplicationAuthRes,
@@ -1501,6 +1722,8 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._ProtoOAExecutionEvent = ProtoOAExecutionEvent
         self._ProtoOAOrderErrorEvent = ProtoOAOrderErrorEvent
         self._ProtoOAErrorRes = ProtoOAErrorRes
+        self._ProtoOAAccountDisconnectEvent = ProtoOAAccountDisconnectEvent
+        self._ProtoOAAccountsTokenInvalidatedEvent = ProtoOAAccountsTokenInvalidatedEvent
         self._ProtoOATraderReq = ProtoOATraderReq
         self._ProtoOATraderRes = ProtoOATraderRes
         self._ProtoOAOrderDetailsReq = ProtoOAOrderDetailsReq
@@ -1539,6 +1762,10 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._execution_payload_type = ProtoOAExecutionEvent().payloadType
         self._error_payload_type = ProtoOAErrorRes().payloadType
         self._order_error_payload_type = ProtoOAOrderErrorEvent().payloadType
+        self._account_disconnect_payload_type = ProtoOAAccountDisconnectEvent().payloadType
+        self._accounts_token_invalidated_payload_type = (
+            ProtoOAAccountsTokenInvalidatedEvent().payloadType
+        )
 
     def _raise_if_terminal_auth_failed(self) -> None:
         if not self._terminal_auth_failure_reason:
@@ -1554,6 +1781,159 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._terminal_auth_failure_code = _normalize_error_code(error_code)
         self._authenticated = False
 
+    def _note_session_access_token(self, access_token: str | None = None) -> None:
+        """Record the access token the current session authenticated with.
+
+        ``access_token`` overrides the recorded value: callers that just
+        confirmed an ``AccountAuthRes`` pass the token the request actually
+        carried, so a sibling-pair adoption during the flight cannot make
+        the record describe a token the session never authenticated with.
+        """
+        self._session_access_token = (
+            access_token if access_token is not None else self.access_token
+        )
+
+    def _clear_session_rotation_state(self) -> None:
+        """Drop the recorded session token and any in-flight rotation marker.
+
+        Every session-death path (``_teardown_client``, ``_on_disconnected``,
+        ``disconnect``) must call this: a stale ``_session_access_token`` or
+        a latched ``_own_token_rotation_in_flight`` would let
+        ``_token_invalidation_skip_reason`` treat a genuine invalidation as
+        our own rotation echo and never tear the dead session down. The
+        invalidation handler also self-heals a latched flag on a dead
+        session as a backstop for any future path that forgets.
+        """
+        self._session_access_token = ""
+        self._own_token_rotation_in_flight = 0
+
+    def _self_heal_rotation_marker_on_dead_session(self) -> None:
+        """Clear stale session-rotation state on a dead session.
+
+        ``_session_access_token`` and ``_own_token_rotation_in_flight`` only
+        mean something while a session is connected: no live session can be
+        mid-rotation, and the recorded token describes a session that no
+        longer exists. A session-death path that forgets
+        ``_clear_session_rotation_state`` leaves both behind, which would
+        let ``_token_invalidation_skip_reason`` treat a genuine invalidation
+        as our own rotation echo (latched counter, or the grace branch on a
+        stale session token) and never tear the session down. Kept out of
+        the skip-reason check itself so that check stays pure.
+        """
+        if not self._connected and (
+            self._own_token_rotation_in_flight or self._session_access_token
+        ):
+            self._clear_session_rotation_state()
+
+    def _adopt_persisted_token_pair(self) -> bool:
+        """Adopt the token pair persisted in the accounts env file when it differs.
+
+        Every cTrader adapter in the process shares ONE
+        ``CTRADER_ACCESS_TOKEN``/``CTRADER_REFRESH_TOKEN`` pair, and a cTrader
+        refresh rotates BOTH tokens and invalidates the old ones - so a
+        sibling adapter's refresh leaves this adapter's in-memory copy dead.
+        The accounts env file is the only place the rotated pair survives
+        (file-first credential precedence), so it is re-read here rather than
+        trusting memory. Token values are never logged.
+
+        Returns True when a different complete pair was adopted; the caller
+        then knows the previously held pair was stale and must not spend its
+        (possibly already-consumed) refresh token.
+        """
+        try:
+            file_values = read_accounts_env_file(self.accounts_env_path)
+        except Exception as exc:  # except-kind: money-decision
+            logger.warning(
+                "Could not re-read cTrader accounts env file for token adoption",
+                extra={
+                    "data": {
+                        "account_id": self.ctid_trader_account_id,
+                        "env_path": str(self.accounts_env_path),
+                        "error": str(exc),
+                    }
+                },
+            )
+            return False
+        file_access = str(file_values.get("CTRADER_ACCESS_TOKEN") or "").strip()
+        file_refresh = str(file_values.get("CTRADER_REFRESH_TOKEN") or "").strip()
+        if not file_access or not file_refresh:
+            return False
+        if file_access == self.access_token and file_refresh == self.refresh_token:
+            return False
+        self.access_token = file_access
+        self.refresh_token = file_refresh
+        self._token_pair_rotated_at = time.monotonic()
+        logger.info(
+            "Adopted newer persisted cTrader token pair",
+            extra={
+                "data": {
+                    "account_id": self.ctid_trader_account_id,
+                    "account_config_id": self.account_config_id,
+                    "env_path": str(self.accounts_env_path),
+                }
+            },
+        )
+        return True
+
+    def _token_rotation_in_flight(self) -> bool:
+        """A token refresh or own rotation+re-auth is in flight here.
+
+        ``_refresh_lock`` covers the refresh itself; the lock is released
+        before the re-auth await, which ``_own_token_rotation_in_flight``
+        (a depth counter) spans instead.
+        """
+        return self._refresh_lock.locked() or (
+            self._own_token_rotation_in_flight > 0
+        )
+
+    def _token_invalidation_skip_reason(self) -> str | None:
+        """Why a token-invalidation event must NOT tear down this session.
+
+        ``ProtoOAAccountsTokenInvalidatedEvent`` names accounts, not tokens,
+        and cTrader emits it for EVERY token rotation - including the
+        ``_refresh_access_token`` this adapter (or a sibling sharing the same
+        persisted pair) just performed and the re-auth that followed. Tearing
+        down a session the refresh path already re-authenticated - or is
+        re-authenticating right now - would turn a recoverable submit into an
+        unknown outcome, so the teardown is skipped when:
+
+        - a refresh is in flight on this adapter (``_refresh_lock`` held);
+        - this adapter's own token rotation is still being re-authenticated
+          (``_own_token_rotation_in_flight``: a depth counter incremented
+          when the refresh starts and decremented when the rotation's
+          re-auth completes - this covers the gap between refresh
+          completion and re-auth that a token comparison cannot);
+        - the session already re-authenticated on the current access token
+          and a token-pair rotation completed within
+          ``_TOKEN_INVALIDATION_OWN_ROTATION_GRACE_SECONDS`` (a late event
+          for the OLD token arriving after our re-auth).
+
+        A session token that differs from the current access token is NOT a
+        skip reason: it means the session authenticated with a token that a
+        rotation has since replaced, so the session is dead (a sibling's
+        rotation terminates every account session on the pair) and must be
+        torn down so the next ``connect()`` re-authenticates.
+        """
+        if self._token_rotation_in_flight():
+            if self._refresh_lock.locked():
+                return "a token refresh is in flight on this adapter"
+            return (
+                "this adapter's own token rotation is being "
+                "re-authenticated"
+            )
+        rotated_at = self._token_pair_rotated_at
+        if (
+            self._session_access_token
+            and self.access_token == self._session_access_token
+            and rotated_at
+            and (
+                time.monotonic() - rotated_at
+                < _TOKEN_INVALIDATION_OWN_ROTATION_GRACE_SECONDS
+            )
+        ):
+            return "a token rotation completed moments ago"
+        return None
+
     async def _refresh_access_token(self, *, failed_access_token: str | None = None) -> bool:
         """Refresh cTrader OAuth tokens via Open API and persist them safely."""
         if not self.refresh_token or self._ProtoOARefreshTokenReq is None:
@@ -1562,8 +1942,45 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 extra={"data": {"account_id": self.ctid_trader_account_id}},
             )
             return False
+        # Defensive: the adapter holds an access token the session never
+        # authenticated with and no OTHER own rotation is in flight - the
+        # session is dead (a sibling rotated the shared pair, or our own
+        # earlier rotation's re-auth failed after its refresh succeeded),
+        # not the token. The caller re-authenticates with the adopted pair;
+        # spending the shared single-use refresh token here would rotate
+        # the pair AGAIN and invalidate every sibling account on it.
+        # ``<= 1`` because the production caller
+        # (``_rotate_token_pair_and_reauthenticate``) increments
+        # ``_own_token_rotation_in_flight`` BEFORE calling this, so "no own
+        # rotation in flight" can only mean "no rotation but this one" -
+        # a plain truthiness check would make this guard dead on the real
+        # path. A count above 1 means a concurrent rotation is also in
+        # flight; it adopts-or-refreshes inside the lock below instead.
+        if (
+            self._session_access_token
+            and self.access_token != self._session_access_token
+            and self._own_token_rotation_in_flight <= 1
+        ):
+            # Adopt before re-authenticating: a sibling may have persisted
+            # an even newer pair since this adapter's in-memory copy, and
+            # re-authenticating with a stale access token would just fail
+            # again. Read-only - no refresh token is spent either way.
+            self._adopt_persisted_token_pair()
+            return True
         refresh_token_before_lock = self.refresh_token
-        async with self._refresh_lock:
+        # All cTrader adapters share one persisted token pair and a cTrader
+        # refresh token is single-use: the per-file lock serializes refreshes
+        # so two adapters never spend the same refresh token concurrently.
+        async with _shared_token_refresh_lock(
+            self.accounts_env_path
+        ), self._refresh_lock:
+            # A sibling adapter may already have rotated the shared pair;
+            # the persisted file is the freshest truth. Adopting it IS the
+            # refresh outcome the callers need (they re-authenticate with
+            # ``self.access_token``), and it must happen BEFORE spending a
+            # refresh token that may already have been consumed.
+            if self._adopt_persisted_token_pair():
+                return True
             if failed_access_token is not None and self.access_token != failed_access_token:
                 return True
             if self.refresh_token != refresh_token_before_lock and self.access_token:
@@ -1628,6 +2045,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
 
             self.access_token = access_token
             self.refresh_token = refresh_token
+            self._token_pair_rotated_at = time.monotonic()
             # The accounts file is the source of truth (file-first precedence):
             # refreshed tokens are persisted above and must NOT be mirrored into
             # os.environ, where a stale copy would shadow the fresh file value
@@ -1686,6 +2104,27 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._authenticated = False
         self._already_logged_in_notified = False
         self._connected_event.clear()
+        # The session is dead with the transport: drop the recorded session
+        # token and any in-flight rotation marker so a stale value cannot
+        # make a later invalidation event look like our own rotation echo.
+        # (An in-flight rotation cannot survive this anyway - its pending
+        # send is errbacked by ``_fail_in_flight_requests`` below and the
+        # helper's ``finally`` clears the flag on the way out.)
+        self._clear_session_rotation_state()
+        self._last_session_teardown_at = time.monotonic()
+        # Upstream ``Client._disconnected`` clears ``_responseDeferreds``
+        # BEFORE invoking this callback, so the dict enumeration in
+        # ``_fail_in_flight_requests`` finds nothing - the adapter-side
+        # ``_in_flight_request_deferreds`` set is what still names the
+        # pending requests. Without the errback each in-flight caller would
+        # wait out its own response timeout on a socket that is already gone;
+        # the error is a connection-lost, which every caller classifies as
+        # an UNKNOWN outcome - never as not-submitted.
+        self._fail_in_flight_requests()
+        # Executions may have been missed while the transport was down; flag
+        # broker reconciliation and wake the listener now rather than after
+        # its 30 s queue timeout, same as a session teardown.
+        self._flag_reconciliation_and_wake_listener()
         logger.warning(
             "cTrader transport disconnected",
             extra={
@@ -1720,6 +2159,24 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                     payload_type, payload, payload_account_id
                 )
                 return
+
+        # Server-initiated lifecycle events are not in
+        # ``_account_scoped_payload_types``: they do their own account check
+        # (the invalidation event carries a repeated id list) and log foreign
+        # events at DEBUG rather than the WARNING drop path.
+        if (
+            self._account_disconnect_payload_type is not None
+            and payload_type == self._account_disconnect_payload_type
+        ):
+            self._handle_account_disconnect_event(payload)
+            return
+
+        if (
+            self._accounts_token_invalidated_payload_type is not None
+            and payload_type == self._accounts_token_invalidated_payload_type
+        ):
+            self._handle_accounts_token_invalidated_event(payload)
+            return
 
         if self._spot_payload_type is not None and payload_type == self._spot_payload_type:
             self._handle_spot_event(payload)
@@ -1799,14 +2256,133 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             },
         )
 
+    def _handle_account_disconnect_event(self, payload: Any) -> None:
+        """Server ended this account's session (``ProtoOAAccountDisconnectEvent``).
+
+        Transient by contract: the event carries no terminal reason, so the
+        session state is dropped and the ordinary ``connect()`` path - with
+        its existing retry backoff - re-authenticates on next use. No
+        terminal auth latch is set. Foreign-account events are ignored at
+        DEBUG: a lifecycle event for another account says nothing about this
+        session.
+        """
+        payload_account_id = _payload_ctid_trader_account_id(payload)
+        if payload_account_id and payload_account_id != self.ctid_trader_account_id:
+            logger.debug(
+                "Ignoring cTrader account-disconnect event for a different account",
+                extra={
+                    "data": {
+                        "account_id": self.ctid_trader_account_id,
+                        "payload_account_id": payload_account_id,
+                    }
+                },
+            )
+            return
+        logger.warning(
+            "cTrader account disconnect event: the broker ended this account's "
+            "session; re-authenticating on the next connect",
+            extra={
+                "data": {
+                    "account_id": self.ctid_trader_account_id,
+                    "account_config_id": self.account_config_id,
+                    "payload_account_id": payload_account_id,
+                }
+            },
+        )
+        self._teardown_client()
+
+    def _handle_accounts_token_invalidated_event(self, payload: Any) -> None:
+        """Server invalidated this account's access token
+        (``ProtoOAAccountsTokenInvalidatedEvent``).
+
+        The event names accounts, not tokens, and cTrader emits it for EVERY
+        token rotation - including the ``_refresh_access_token`` this adapter
+        just performed on this same connection. Tearing down a session the
+        refresh path already re-authenticated (or is re-authenticating right
+        now) would turn a recoverable submit into an unknown outcome, so the
+        teardown is skipped when ``_token_invalidation_skip_reason`` finds
+        the event is the echo of a rotation we already handled. Otherwise
+        the dead token must never carry another order: the session is torn
+        down and the next ``connect()`` re-authenticates.
+
+        Sibling caveat: every cTrader adapter shares ONE persisted token
+        pair, and a refresh by adapter A invalidates the tokens adapter B
+        holds in memory AND terminates B's account session. B cannot heal
+        that by spending the shared refresh token again - it is
+        single-use and may already be consumed, so B would rotate the pair
+        a second time and invalidate every sibling in turn. Instead B
+        adopts the persisted pair here (``_adopt_persisted_token_pair``)
+        and drops the dead session; the next ``connect()``
+        re-authenticates with the adopted access token through
+        ``_send_account_auth_with_recovery`` and spends no refresh token.
+        """
+        account_ids = _payload_ctid_trader_account_ids(payload)
+        if account_ids and self.ctid_trader_account_id not in account_ids:
+            logger.debug(
+                "Ignoring cTrader token-invalidation event for different accounts",
+                extra={
+                    "data": {
+                        "account_id": self.ctid_trader_account_id,
+                        "payload_account_ids": list(account_ids),
+                    }
+                },
+            )
+            return
+        reason = str(getattr(payload, "reason", "") or "").strip()
+        # A sibling adapter may already have rotated the shared pair; adopt
+        # the persisted pair BEFORE deciding, so the token comparison below
+        # sees the freshest credentials. Skipped while our own rotation is
+        # in flight - ``_refresh_lock`` held during the refresh, or
+        # ``_own_token_rotation_in_flight`` during the re-auth await (the
+        # lock is already released by then): mutating the pair mid-rotation
+        # could clobber the credentials the in-flight AccountAuthReq carries
+        # and the rotation the refresh is about to persist, and the event is
+        # our own rotation echo anyway (``_token_invalidation_skip_reason``
+        # skips it either way).
+        self._self_heal_rotation_marker_on_dead_session()
+        if not self._token_rotation_in_flight():
+            self._adopt_persisted_token_pair()
+        skip_reason = self._token_invalidation_skip_reason()
+        if skip_reason is not None:
+            logger.info(
+                "cTrader accounts token invalidated event ignored: %s",
+                skip_reason,
+                extra={
+                    "data": {
+                        "account_id": self.ctid_trader_account_id,
+                        "account_config_id": self.account_config_id,
+                        "reason": reason,
+                        "payload_account_ids": list(account_ids),
+                    }
+                },
+            )
+            return
+        logger.warning(
+            "cTrader accounts token invalidated event (reason: %s); "
+            "dropping the session so the next connect refreshes the token "
+            "and re-authenticates",
+            reason or "not given",
+            extra={
+                "data": {
+                    "account_id": self.ctid_trader_account_id,
+                    "account_config_id": self.account_config_id,
+                    "reason": reason,
+                    "payload_account_ids": list(account_ids),
+                }
+            },
+        )
+        self._teardown_client()
+
     def _account_scoped_payload_types(self) -> frozenset[int]:
         """Inbound payload types that name a ``ctidTraderAccountId``.
 
-        These are the only payloads ``_on_message`` acts on (spot quotes,
-        executions, order errors, error responses); a payload of any other
-        type is ignored here anyway, so the foreign-account guard only needs
-        to cover this set. Computed per message because tests bind the
-        ``_*_payload_type`` attributes directly without ``_load_openapi_types``.
+        These are the payloads the foreign-account drop guard in
+        ``_on_message`` covers (spot quotes, executions, order errors, error
+        responses); the server lifecycle events do their own account check
+        with DEBUG-level foreign logging. A payload of any other type is
+        ignored here anyway. Computed per message because tests bind the
+        ``_*_payload_type`` attributes directly without
+        ``_load_openapi_types``.
         """
         return frozenset(
             payload_type
@@ -1895,11 +2471,33 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             f"{self.ctid_trader_account_id}-{self._client_msg_token}-"
             f"{type(request).__name__}-{self._client_msg_seq}"
         )
-        deferred = self._client.send(
+        client = self._client
+        # Capture BEFORE send: moving this after ``client.send`` would miss a
+        # ``_fail_in_flight_requests`` that ran during the send, leaving the
+        # new deferred untracked until its response timeout.
+        fail_generation = self._in_flight_fail_generation
+        deferred = client.send(
             request,
             clientMsgId=client_msg_id,
             responseTimeoutInSeconds=timeout_seconds,
         )
+        self._in_flight_request_deferreds.add(deferred)
+        if self._in_flight_fail_generation != fail_generation:
+            # ``_fail_in_flight_requests`` ran between send() returning and
+            # the deferred being tracked: it can no longer see this deferred,
+            # which would sit until its own response timeout. Fail it now.
+            self._in_flight_request_deferreds.discard(deferred)
+            errback = getattr(deferred, "errback", None)
+            if callable(errback):
+                with contextlib.suppress(Exception):
+                    errback(
+                        CTraderConnectionLostError(
+                            "cTrader connection lost before the response arrived"
+                        )
+                    )
+            raise CTraderConnectionLostError(
+                "cTrader connection lost before the response arrived"
+            )
         try:
             response_message = await deferred.asFuture(self._loop)
         except Exception as exc:  # except-kind: money-decision
@@ -1926,6 +2524,8 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                     },
                 )
             raise
+        finally:
+            self._in_flight_request_deferreds.discard(deferred)
         payload = self._Protobuf.extract(response_message)
         # Upstream resolves the pending Deferred by clientMsgId alone; the
         # ``_on_message`` foreign-account guard never sees this path. A
@@ -1973,26 +2573,81 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         except CTraderApiError as exc:
             error_code = _normalize_error_code(exc.error_code)
             error_text = str(exc)
-            if _is_terminal_auth_error(error_code, error_text) and await self._refresh_access_token(
+            if not _is_terminal_auth_error(error_code, error_text):
+                raise
+            if not await self._rotate_token_pair_and_reauthenticate(
                 failed_access_token=access_token_before_send
             ):
-                # Token was refreshed successfully; re-authorize the account and
-                # retry once with the new token.
-                if (
-                    self._ProtoOAAccountAuthReq is not None
-                    and self._ProtoOAAccountAuthRes is not None
-                ):
-                    account_auth_res = await self._send_account_auth_request(timeout_seconds=15)
-                    if not isinstance(account_auth_res, self._ProtoOAAccountAuthRes):
-                        raise RuntimeError(
-                            "Unexpected account auth response after refresh: "
-                            f"{type(account_auth_res).__name__}"
-                        ) from exc
-                    self._authenticated = True
-                return await self._send_request_with_refresh_retry(
-                    request, timeout_seconds=timeout_seconds, _depth=_depth + 1
+                raise
+            if (
+                self._ProtoOAAccountAuthReq is not None
+                and self._ProtoOAAccountAuthRes is not None
+            ):
+                self._authenticated = True
+            return await self._send_request_with_refresh_retry(
+                request, timeout_seconds=timeout_seconds, _depth=_depth + 1
+            )
+
+    async def _rotate_token_pair_and_reauthenticate(
+        self, *, failed_access_token: str | None = None
+    ) -> bool:
+        """Refresh-or-adopt the shared token pair and re-authenticate the account.
+
+        Returns True when the pair is usable: either the account re-auth
+        request was confirmed (``_note_session_access_token`` records the
+        token the request actually carried), or the OpenAPI auth types are
+        not loaded and the caller retries the original request. Returns
+        False when no usable pair could be produced; whatever the refresh
+        or re-auth raised propagates.
+
+        ``_own_token_rotation_in_flight`` spans the whole refresh+re-auth
+        window - incremented here and decremented unconditionally by the
+        ``finally``. It is a depth counter, not a bool: two requests can hit
+        an auth error concurrently and run overlapping rotations, and a
+        bool would let the first ``finally`` clear the second rotation's
+        marker. While the count is non-zero a
+        ``ProtoOAAccountsTokenInvalidatedEvent`` landing anywhere inside the
+        window (including between refresh completion and the AccountAuthRes)
+        is recognised as our own rotation echo, not a fresh invalidation.
+        The ``finally`` is deliberate: a count left set makes
+        ``_token_invalidation_skip_reason`` ignore every later invalidation
+        event, so a dead session would never be torn down.
+        """
+        self._own_token_rotation_in_flight += 1
+        try:
+            refreshed = await self._refresh_access_token(
+                failed_access_token=failed_access_token
+            )
+            if not refreshed:
+                return False
+            if (
+                self._ProtoOAAccountAuthReq is None
+                or self._ProtoOAAccountAuthRes is None
+            ):
+                # No re-auth will run, so nothing will note the new session
+                # token; the flag must not outlive this rotation attempt.
+                return True
+            # The token the AccountAuthReq carries is fixed at send time; a
+            # sibling-pair adoption during the flight must not make the
+            # session record describe a token the session never
+            # authenticated with.
+            auth_token = self.access_token
+            account_auth_res = await self._send_account_auth_request(
+                timeout_seconds=15
+            )
+            if not isinstance(account_auth_res, self._ProtoOAAccountAuthRes):
+                raise RuntimeError(
+                    "Unexpected account auth response after refresh: "
+                    f"{type(account_auth_res).__name__}"
                 )
-            raise
+            self._note_session_access_token(auth_token)
+            return True
+        finally:
+            # Clamped: a session-death path may have zeroed the counter
+            # while this rotation was still unwinding.
+            self._own_token_rotation_in_flight = max(
+                0, self._own_token_rotation_in_flight - 1
+            )
 
     async def _send_account_auth_request(self, *, timeout_seconds: int = 15) -> Any:
         account_auth_req = self._ProtoOAAccountAuthReq()
@@ -2019,6 +2674,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             )
 
     async def _send_account_auth_with_recovery(self) -> None:
+        auth_token = self.access_token
         try:
             account_auth_res = await self._send_account_auth_request(timeout_seconds=15)
         except CTraderApiError as exc:
@@ -2028,6 +2684,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 raise RuntimeError(
                     f"Unexpected account auth response: {type(account_auth_res).__name__}"
                 )
+            self._note_session_access_token(auth_token)
 
     async def _recover_account_auth_failure(self, exc: CTraderApiError) -> None:
         error_code = _normalize_error_code(exc.error_code)
@@ -2040,16 +2697,10 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             return
         if not _is_terminal_auth_error(error_code, error_text):
             raise exc
-        if not await self._refresh_access_token():
+        if not await self._rotate_token_pair_and_reauthenticate():
             reason = exc.description or error_text or _CTRADER_AUTH_FAILURE_FALLBACK
             self._mark_terminal_auth_failure(reason, error_code=error_code)
             raise CTraderAuthTerminalError(reason, error_code=error_code) from exc
-        account_auth_res = await self._send_account_auth_request(timeout_seconds=15)
-        if not isinstance(account_auth_res, self._ProtoOAAccountAuthRes):
-            raise RuntimeError(
-                "Unexpected account auth response after refresh: "
-                f"{type(account_auth_res).__name__}"
-            )
 
     def _scale_for(self, symbol: str) -> SymbolScale:
         """Return the per-symbol broker scale, failing closed (#80).
@@ -2262,6 +2913,10 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         # _scale_for fall back to static scales that can misstate size.
         await self._load_symbol_props_into_cache(symbol_name_to_id)
         self._authenticated = True
+        # Covers the ALREADY_LOGGED_IN path too: no AccountAuthRes was
+        # confirmed there, so the current access token is the best record of
+        # what the session runs on (a wrong guess only errs toward teardown).
+        self._note_session_access_token()
 
     async def _load_symbol_props_into_cache(self, symbol_name_to_id: dict[str, int]) -> None:
         """Fetch full ProtoOASymbol properties per symbol id (#80).
@@ -2721,6 +3376,85 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         client.setMessageReceivedCallback(self._on_message)
         return client
 
+    def _fail_in_flight_requests(self, client: Any | None = None) -> None:
+        """Errback every pending request deferred.
+
+        Sources: the adapter-side ``_in_flight_request_deferreds`` set (which
+        survives upstream's ``_responseDeferreds.clear()`` on disconnect) and,
+        when ``client`` is given and not yet cleared, the client's
+        ``_responseDeferreds`` dict. Upstream ``Client._disconnected`` only
+        ``clear()``s ``_responseDeferreds`` without errbacking them, so each
+        in-flight ``_send_request`` would otherwise sit until its own
+        ``addTimeout`` fires (up to the request timeout) even though the
+        socket is already gone. Failing them promptly frees callers sooner;
+        the error is a connection-lost, which every caller classifies as an
+        UNKNOWN outcome (the request may already have been written) - never
+        as not-submitted and never as a broker refusal.
+        """
+        self._in_flight_fail_generation += 1
+        pending: list[Any] = []
+        seen: set[int] = set()
+        adapter_pending = list(self._in_flight_request_deferreds)
+        self._in_flight_request_deferreds.clear()
+        client_pending: list[Any] = []
+        if client is not None:
+            try:
+                deferreds = getattr(client, "_responseDeferreds", None)
+                if deferreds is None:
+                    # The attribute itself is gone (ctrader-open-api bump):
+                    # adapter-tracked deferreds are still errbacked below,
+                    # but the miss must not be silent.
+                    logger.warning(
+                        "cTrader client exposes no _responseDeferreds; "
+                        "only adapter-tracked in-flight requests are failed",
+                        extra={"data": {"account_id": self.ctid_trader_account_id}},
+                    )
+                elif deferreds:
+                    # Tolerate a non-mapping shape (list/set) in case a
+                    # ctrader-open-api bump changes the container type.
+                    values = (
+                        deferreds.values()
+                        if hasattr(deferreds, "values")
+                        else deferreds
+                    )
+                    client_pending = list(values)
+            except Exception as exc:  # except-kind: loop-survival
+                # A ctrader-open-api bump that renames or reshapes
+                # ``_responseDeferreds`` must not abort the rest of teardown
+                # (``stopService``, the event clear and the listener wake),
+                # but the missed errbacks must not be silent either.
+                logger.warning(
+                    "Could not enumerate in-flight cTrader requests during teardown",
+                    extra={"data": {"error": str(exc)}},
+                )
+        for deferred in adapter_pending + client_pending:
+            if id(deferred) in seen:
+                continue
+            seen.add(id(deferred))
+            pending.append(deferred)
+        if not pending:
+            return
+        errback_failures = 0
+        for deferred in pending:
+            if getattr(deferred, "called", False):
+                # Already resolved (response arrived or timed out); errback
+                # would raise AlreadyCalledError.
+                continue
+            try:
+                deferred.errback(
+                    CTraderConnectionLostError(
+                        "cTrader connection lost before the response arrived"
+                    )
+                )
+            except Exception:  # except-kind: loop-survival
+                errback_failures += 1
+        if errback_failures:
+            logger.warning(
+                "Could not errback %d in-flight cTrader request(s) during "
+                "teardown; their awaiters will hit their own timeout",
+                errback_failures,
+            )
+
     def _teardown_client(self) -> None:
         """Drop the current client and ask Twisted to stop its service so a later
         connect() attempt can build a fresh one. Safe to call when no client exists.
@@ -2730,7 +3464,10 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._connected = False
         self._authenticated = False
         self._already_logged_in_notified = False
+        self._clear_session_rotation_state()
+        self._last_session_teardown_at = time.monotonic()
         if client is not None:
+            self._fail_in_flight_requests(client)
             try:
                 stop = getattr(client, "stopService", None)
                 if stop is not None:
@@ -2741,6 +3478,28 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             self._connected_event.clear()
         except Exception:  # except-kind: loop-survival
             pass
+        self._flag_reconciliation_and_wake_listener()
+
+    def _flag_reconciliation_and_wake_listener(self) -> None:
+        """Flag broker reconciliation and wake ``listen_executions`` now.
+
+        The teardown/disconnect wakes the listener so the gap is reconciled
+        immediately - it would otherwise sleep out its 30 s ``queue.get``
+        timeout before reconnecting and reconciling. If the queue is full
+        the wake is dropped, so reconciliation is flagged explicitly. Any
+        stale retry backoff is cleared too, or the flagged reconcile would
+        wait out a prior failure's ``_reconciliation_retry_at``.
+        """
+        self._reconciliation_required = True
+        self._reconciliation_retry_at = 0.0
+        try:
+            self._execution_queue.put_nowait(_EXECUTION_RECONCILE_WAKE)
+        except asyncio.QueueFull:
+            logger.warning(
+                "cTrader execution queue full on session loss; "
+                "listener wake dropped, reconciliation already flagged",
+                extra={"data": {"account_id": self.ctid_trader_account_id}},
+            )
 
     async def _recover_broker_order_id(
         self,
@@ -2935,9 +3694,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
 
     async def _persisted_exit_position_id(self, signal_id: str) -> int | None:
         metadata = await asyncio.to_thread(get_live_signal_metadata, signal_id)
-        if not metadata:
-            return None
-        if str(metadata.get("risk_sizing_mode") or "") != EXIT_ONLY_RISK_SIZING_MODE:
+        if not metadata or not is_exit_only_signal_metadata(metadata):
             return None
         return self._requested_exit_position_id(metadata)
 
@@ -2961,6 +3718,11 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             )
             return None
         self._order_id_to_signal_id[int(broker_order_id)] = signal_id
+        if position_id is not None:
+            # The close's broker order id is known now: fills on the position
+            # can attribute to this exit signal, so the pending mark has done
+            # its job (an unknown-outcome submit may have left it behind).
+            self._clear_pending_close_mark(position_id, signal_id)
         return broker_order_id
 
     async def _fetch_reconciliation_order_details(
@@ -3156,8 +3918,10 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._connected = False
         self._connected_event.clear()
         self._already_logged_in_notified = False
+        self._clear_session_rotation_state()
         self._symbol_name_to_id.clear()
         self._order_id_to_signal_id.clear()
+        self._pending_close_positions.clear()
         self._position_ids_by_symbol.clear()
         self._position_volumes.clear()
         self._position_orders_cache.clear()
@@ -3173,11 +3937,29 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             self._asset_names_task.cancel()
             self._asset_names_task = None
         self._order_id_to_symbol.clear()
+        # The queue swap and clears below discard unprocessed execution
+        # events, stored unresolved events and any pending reconcile wake;
+        # if any existed, flag broker reconciliation so the next listener
+        # run reconciles the gap instead of losing the fills silently.
+        had_pending_execution_work = (
+            not self._execution_queue.empty()
+            or bool(self._unresolved_execution_events)
+        )
         self._execution_queue = asyncio.Queue(maxsize=5000)
         self._execution_retry_counts.clear()
         self._unresolved_execution_events.clear()
+        if had_pending_execution_work:
+            self._reconciliation_required = True
+            self._reconciliation_retry_at = 0.0
+        self._pending_close_fill_event_ids.clear()
         self._terminal_auth_failure_reason = ""
         self._terminal_auth_failure_code = ""
+        # A deliberate disconnect leaves the same in-flight requests pending
+        # as a transport loss: fail them now instead of letting each caller
+        # wait out its response timeout. ``_on_disconnected`` cannot cover
+        # this path - ``self._client`` is already None here, so its
+        # identity check returns early.
+        self._fail_in_flight_requests(client)
 
         if client is None:
             return
@@ -3216,6 +3998,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         # the broker sees an order, so a failure here is marked and the caller
         # can safely retry instead of treating the outcome as unknown. The
         # `_submit_new_order_request` call below is deliberately outside.
+        close_position_id: int | None = None
         with order_not_submitted():
             self._raise_if_terminal_auth_failed()
             signal_id = str(signal.id)
@@ -3265,7 +4048,52 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 str((signal.metadata or {}).get("risk_sizing_mode") or "")
                 == EXIT_ONLY_RISK_SIZING_MODE
             )
-            self._resolve_order_volume(signal)
+            order_volume = self._resolve_order_volume(signal)
+            # Persist the quantity the broker is actually asked for, not the
+            # unrounded risk-sized one: the volume grid floor can drop a
+            # sub-step remainder the broker can never work, and a persisted
+            # requested qty larger than the fill reads as a working-order
+            # expectation forever in broker reconciliation. Recomputing the
+            # volume from the normalized qty is idempotent (the lot-grid
+            # floor's noise band absorbs the float round-trip), so the request
+            # builders below still derive the same volume.
+            scale = self._scale_for(signal.symbol)
+            submitted_qty = _broker_volume_to_qty(order_volume, scale.volume_per_qty)
+            # Only the lot-grid noise band (<= 1e-6 of a step, see
+            # floor_qty_to_step/_qty_to_broker_volume) may push the normalized
+            # qty an ulp above the binding qty; anything more means volume
+            # resolution rounded up. The allowance is absolute qty units
+            # scaled to the grid step - a relative tolerance would hide a
+            # small overshoot on a large qty. The band tracks the shared
+            # lot-grid floor's own noise constant (2x for float margin) so
+            # the two cannot drift apart.
+            step_qty = float(max(int(scale.step_volume), 1)) / float(
+                scale.volume_per_qty
+            )
+            if submitted_qty > qty_value and not math.isclose(
+                submitted_qty,
+                qty_value,
+                rel_tol=0.0,
+                abs_tol=2.0 * float(STEP_NOISE) * step_qty,
+            ):
+                # Volume resolution floors, so this can only happen if a
+                # future change rounds up: persisting an oversized qty would
+                # both place an oversized order and hide the excess from
+                # reconciliation. Fail closed instead.
+                raise ValueError(
+                    f"cTrader normalized qty {submitted_qty!r} exceeds the "
+                    f"binding qty {qty_value!r} for {signal.symbol}; refusing "
+                    "to submit an order larger than the risk-sized quantity."
+                )
+            signal = signal.model_copy(
+                update={
+                    "metadata": {
+                        **(signal.metadata or {}),
+                        "qty": submitted_qty,
+                        "explicit_qty": submitted_qty,
+                    }
+                }
+            )
             signal = signal.model_copy(
                 update={
                     "metadata": {
@@ -3275,6 +4103,22 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                     }
                 }
             )
+            # The request builders below re-resolve the volume from this
+            # normalized signal; it must reproduce the volume resolved from
+            # the binding qty, or the wire request and the persisted qty
+            # would diverge. The float round-trip (volume -> qty -> volume)
+            # stays far inside the lot-grid floor's 1e-6-unit noise band for
+            # every volume a broker int32 can express (~5e-7 units at
+            # INT32_MAX), so an exact int compare cannot false-positive.
+            reresolved_volume = self._resolve_order_volume(signal)
+            if reresolved_volume != order_volume:
+                raise RuntimeError(
+                    "cTrader volume resolution is not idempotent under qty "
+                    f"normalization for {signal.symbol}: resolved "
+                    f"{order_volume} from the binding qty but "
+                    f"{reresolved_volume} from the normalized qty; "
+                    "refusing to submit."
+                )
             persisted_timestamp = await asyncio.to_thread(
                 get_live_signal_timestamp, signal_id
             )
@@ -3299,6 +4143,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 position_id = self._position_id_for_exit(
                     signal.symbol, requested_position_id
                 )
+                close_position_id = position_id
                 signal = signal.model_copy(
                     update={
                         "metadata": {
@@ -3332,7 +4177,26 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         # #134: bracket the broker call with the order-timing stamps, persisted
         # with the order id once the broker answers.
         submitted_at = datetime.now(timezone.utc)
-        response = await self._submit_new_order_request(request)
+        if close_position_id is not None:
+            # A ClosePositionReq carries no clientOrderId of ours: until the
+            # broker order id is known, a fill on this position can only be
+            # retained for reconciliation, not attributed - mark the position
+            # so the listener does not book our own exit as a broker-side
+            # close. The mark is per signal so a second concurrent close on
+            # the same position keeps its own guard, and is lifted once this
+            # submit's ownership is recorded below, or expires on its own
+            # after an unknown-outcome submit.
+            self._pending_close_positions.setdefault(close_position_id, {})[
+                canonical_signal_id
+            ] = time.monotonic()
+        try:
+            response = await self._submit_new_order_request(request)
+        except BrokerOrderRejectedError:
+            # A definitive refusal created no order: nothing can fill, so the
+            # pending mark has nothing left to cover.
+            if close_position_id is not None:
+                self._clear_pending_close_mark(close_position_id, canonical_signal_id)
+            raise
         acknowledged_at = datetime.now(timezone.utc)
 
         order_id = self._extract_order_id_from_payload(response)
@@ -3346,6 +4210,14 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 "cannot be tracked or retried safely."
             )
         broker_order_id = str(order_id)
+        # Ownership is registered BEFORE the persist await: a fill event the
+        # listener processes while the DB write is in flight still resolves to
+        # this signal. A persist failure rolls the registration back; the
+        # pending mark stays so fills keep being retained until reconciliation
+        # recovers the broker order id.
+        self._order_id_to_signal_id[order_id] = canonical_signal_id
+        # #80: remember the symbol for order-only fills (no symbolId).
+        self._order_id_to_symbol[order_id] = str(signal.symbol).strip().upper()
         persisted = await asyncio.to_thread(
             set_live_signal_broker_order_id,
             canonical_signal_id,
@@ -3354,10 +4226,11 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             acknowledged_at=acknowledged_at,
         )
         if not persisted:
+            self._order_id_to_signal_id.pop(order_id, None)
+            self._order_id_to_symbol.pop(order_id, None)
             raise RuntimeError("Failed to persist cTrader broker order id.")
-        self._order_id_to_signal_id[order_id] = canonical_signal_id
-        # #80: remember the symbol for order-only fills (no symbolId).
-        self._order_id_to_symbol[order_id] = str(signal.symbol).strip().upper()
+        if close_position_id is not None:
+            self._clear_pending_close_mark(close_position_id, canonical_signal_id)
 
         logger.info(
             "Submitted cTrader live order",
@@ -3395,6 +4268,8 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         if not persisted:
             raise RuntimeError(unpersisted_error)
         self._order_id_to_signal_id[int(recovered_order_id)] = signal_id
+        if position_id is not None:
+            self._clear_pending_close_mark(position_id, signal_id)
         return recovered_order_id
 
     async def _recover_duplicate_signal_order_id(self, canonical_signal_id: str) -> str:
@@ -3408,6 +4283,12 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                     "Persisted cTrader broker order id is invalid; refusing duplicate submission."
                 )
             self._order_id_to_signal_id[normalized_order_id] = canonical_signal_id
+            position_id = await self._persisted_exit_position_id(canonical_signal_id)
+            if position_id is not None:
+                # The close's broker order id is already known, so a pending
+                # mark this exit left on its position has done its job (same
+                # lift as the order-id recovery paths).
+                self._clear_pending_close_mark(position_id, canonical_signal_id)
             return str(normalized_order_id)
         canonical_timestamp = await asyncio.to_thread(
             get_live_signal_timestamp, canonical_signal_id
@@ -3502,12 +4383,17 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             signal, stop_loss, take_profit
         )
         request.relativeStopLoss = relative_stop
-        request.relativeTakeProfit = relative_take
+        if relative_take is not None and relative_take > 0:
+            # proto2 optional int64: assigning 0 would make the field PRESENT
+            # and the broker validates a present relativeTakeProfit as > 0
+            # ("SL/TP have to be positive"). "No take profit" means the field
+            # is absent, so it is only ever assigned a positive distance.
+            request.relativeTakeProfit = relative_take
         return request
 
     def _resolve_relative_sl_tp(
         self, signal: LiveSignal, stop_loss: float, take_profit: float | None
-    ) -> tuple[int, int]:
+    ) -> tuple[int, int | None]:
         """Convert absolute SL/TP prices into cTrader relative units.
 
         Per the cTrader Open API docs, ProtoOANewOrderReq's absolute
@@ -3523,8 +4409,13 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         to the symbol grid of ``10 ** (5 - price_digits)`` units (1 when the symbol
         is finer than 5 digits), i.e. toward the entry, so the real risk never
         exceeds the sized risk (docs/live-risk-consistency.md). A take-profit under
-        one tick is sent as one tick (0 would mean "no TP"); a stop-loss under one
-        tick is refused, because widening it would exceed the sized risk.
+        one tick is sent as one tick; a stop-loss under one tick is refused,
+        because widening it would exceed the sized risk.
+
+        Returns ``(relative_stop, relative_take)`` where ``relative_take`` is
+        ``None`` for the explicit unbounded-TP policy: the caller must leave
+        ``relativeTakeProfit`` unset on the wire, because a present zero is a
+        broker rejection, not "no take profit".
         """
         reference_price = float(signal.theoretical_price)
         if not math.isfinite(reference_price) or reference_price <= 0:
@@ -3554,9 +4445,10 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 f"reference={reference_price!r}; refusing to submit."
             )
         if take_profit is None:
-            # C1: explicit unbounded policy — stop-only order. cTrader treats
-            # a zero relativeTakeProfit as "no take profit".
-            return (distance(stop_loss, is_stop=True), 0)
+            # C1: explicit unbounded policy — stop-only order. cTrader has no
+            # "no take profit" value for a present field: the field must be
+            # left unset entirely (None here -> the caller never assigns it).
+            return (distance(stop_loss, is_stop=True), None)
         take_outward = take_profit - reference_price if buy else reference_price - take_profit
         if take_outward <= 0:
             raise ValueError(
@@ -3572,11 +4464,178 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         except CTraderApiError as exc:
             self._raise_terminal_auth_from_api_error(exc)
             raise
-        if isinstance(response, self._ProtoOAOrderErrorEvent):
-            raise RuntimeError(
-                f"Order rejected ({response.errorCode}): {response.description or 'no description'}"
-            )
+        self._raise_for_refused_submit_response(response, request)
         return response
+
+    @staticmethod
+    def _classify_and_raise_refusal(
+        message: str, *, error_code: str, definitive: bool
+    ) -> None:
+        """A refusal is ``BrokerOrderRejectedError`` only when definitive."""
+        if not definitive:
+            raise RuntimeError(message)
+        raise BrokerOrderRejectedError(message, error_code=error_code)
+
+    def _raise_for_refused_submit_response(self, response: Any, request: Any) -> None:
+        """Raise for a correlated refusal payload; return for anything else.
+
+        cTrader answers a refused NewOrderReq/ClosePositionReq either with a
+        ProtoOAOrderErrorEvent or with a ProtoOAExecutionEvent whose
+        executionType is ORDER_REJECTED; both are matched to THIS request by
+        clientMsgId. Timeouts and transport failures never reach here: the
+        request may have landed, so they stay ordinary exceptions (unknown
+        outcome).
+        """
+        if self._ProtoOAOrderErrorEvent is not None and isinstance(
+            response, self._ProtoOAOrderErrorEvent
+        ):
+            # Only an error event with no broker order id is a clean refusal:
+            # a non-zero orderId means the broker created an order record, and
+            # for a new-order request a non-zero positionId is not provably
+            # pre-position either. A close request echoes positionId, so only
+            # its orderId decides.
+            order_id = _present_proto_field_fail_closed(response, "orderId")
+            position_id = _present_proto_field_fail_closed(response, "positionId")
+            definitive_refusal = order_id in (None, 0) and (
+                self._is_close_position_request(request)
+                or position_id in (None, 0)
+            )
+            message = (
+                f"Order rejected ({getattr(response, 'errorCode', '') or ''}): "
+                f"{getattr(response, 'description', '') or 'no description'}"
+            )
+            self._classify_and_raise_refusal(
+                message,
+                error_code=str(getattr(response, "errorCode", "") or ""),
+                definitive=definitive_refusal,
+            )
+        # Only ProtoOAExecutionEvent carries ``executionType`` in the proto
+        # schema, so this attribute sniff is a fallback for an unloaded class,
+        # not a general detector: an unclassifiable event must fail closed
+        # below, never pass as submitted.
+        is_execution_event = (
+            isinstance(response, self._ProtoOAExecutionEvent)
+            if self._ProtoOAExecutionEvent is not None
+            else getattr(response, "executionType", None) is not None
+            and getattr(response, "ctidTraderAccountId", None) is not None
+        )
+        if is_execution_event:
+            rejected = self._is_order_rejected_execution(response)
+            if rejected is None:
+                # The event's type cannot be classified (proto types not fully
+                # loaded, or an unreadable executionType): it may be the
+                # ORDER_REJECTED refusal this path exists to catch, so it must
+                # not fall through and be reported as a submitted order.
+                # Removing this raise reopens #428.
+                raise RuntimeError(
+                    "cTrader order response was an execution event whose "
+                    "executionType could not be classified; the outcome is "
+                    "unknown and must be reconciled."
+                )
+            if rejected:
+                # Unlike the OrderErrorEvent above, the event typically still
+                # carries an `order` object with a broker-assigned orderId, so
+                # the orderId cannot decide: definiteness comes from the
+                # order's terminal status and the absence of any created
+                # state instead.
+                error_code = str(getattr(response, "errorCode", "") or "")
+                message = (
+                    f"Order rejected ({error_code or 'ORDER_REJECTED'}): "
+                    f"{getattr(response, 'description', '') or 'no description'}"
+                )
+                self._classify_and_raise_refusal(
+                    message,
+                    error_code=error_code,
+                    definitive=self._execution_rejection_is_definitive(
+                        response, request
+                    ),
+                )
+
+    def _is_close_position_request(self, request: Any) -> bool:
+        """Whether the request is a ClosePositionReq.
+
+        ``_ProtoOAClosePositionReq`` is loaded with the other proto types
+        before any submit; if it were missing this returns False and a close
+        rejection is evaluated as a new-order one - with the position echo
+        that stays unknown, i.e. fail-closed.
+        """
+        return (
+            self._ProtoOAClosePositionReq is not None
+            and isinstance(request, self._ProtoOAClosePositionReq)
+        )
+
+    def _is_order_rejected_execution(self, event: Any) -> bool | None:
+        """Whether the event is an ORDER_REJECTED; ``None`` when unclassifiable.
+
+        ``None`` means the proto type was not fully loaded or the event's
+        ``executionType`` cannot be read - the caller must treat the response
+        as an unknown outcome rather than letting it pass as submitted.
+        """
+        execution_type = getattr(self._ProtoOAExecutionType, "ORDER_REJECTED", None)
+        if execution_type is None:
+            return None
+        try:
+            return int(getattr(event, "executionType", -1)) == int(execution_type)
+        except Exception:  # except-kind: money-decision
+            # Any unreadable type is "unclassifiable" (None), never False:
+            # False would let the event pass through as a submitted order.
+            return None
+
+    def _execution_rejection_is_definitive(self, event: Any, request: Any) -> bool:
+        """Whether an ORDER_REJECTED execution event proves nothing was opened.
+
+        Safe means two things: the order can never execute, and no state was
+        created. The event's ``order`` must report ``ORDER_STATUS_REJECTED``
+        (terminal - a rejected order does not fill later), no ``deal`` may be
+        attached (a deal is an execution record, so its presence means an
+        execution may exist), and a new-order request must not carry a
+        ``position`` (a created position is exactly the state a rejection
+        must not have produced). A close request echoes the still-open
+        position it failed to close, so position does not decide there -
+        the same rule the OrderErrorEvent path applies to ``positionId``.
+        Unanswerable field presence fails closed to "unknown".
+
+        Invariant: EVERY presence check in this method goes through
+        ``_present_proto_field_fail_closed`` and every attached-message check
+        stays an ``is not None`` identity test - presence comes only from
+        ``HasField`` (via the fail-closed wrapper); truthiness is not a
+        presence test (a protobuf sub-message's truthiness says nothing about
+        ``HasField``, and test doubles differ), so it must never decide
+        whether a deal/position is attached.
+        """
+        order = _present_proto_field_fail_closed(event, "order")
+        if order is _PRESENT_BUT_UNKNOWN or order is None:
+            return False
+        status_enum = getattr(self, "_ProtoOAOrderStatus", None)
+        rejected_status = (
+            getattr(status_enum, "ORDER_STATUS_REJECTED", None)
+            if status_enum is not None
+            else None
+        )
+        order_status = getattr(order, "orderStatus", None)
+        if order_status is None or rejected_status is None:
+            return False
+        try:
+            if int(order_status) != int(rejected_status):
+                return False
+        except (TypeError, ValueError):
+            return False
+        # ``is not None``, never truthiness: presence comes from ``HasField``
+        # via the fail-closed wrapper, truthiness is not a presence test, and
+        # an attached-but-empty deal is still an execution record whose
+        # presence cannot be proven harmless.
+        if _present_proto_field_fail_closed(event, "deal") is not None:
+            return False
+        position = _present_proto_field_fail_closed(event, "position")
+        if position is _PRESENT_BUT_UNKNOWN:
+            return False
+        if self._is_close_position_request(request):
+            return True
+        # For a new order ANY attached position - even one whose positionId
+        # reads as unset; presence comes from ``HasField`` so this must stay
+        # an identity check, not truthiness - is state the rejection must
+        # not have produced.
+        return position is None
 
     def _handle_spot_event(self, payload: Any) -> None:
         """Feed a spot event to the pending :meth:`get_quote` for its symbol."""
@@ -5634,6 +6693,21 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             client_order_id, order_id=order_id, execution_type=execution_type
         )
         if signal_id is None:
+            # A ClosePositionReq has no clientOrderId of ours: the fill's id
+            # is SDK-assigned, so the broker order id the submit persisted is
+            # the attribution. Only an exit signal may claim a position-close
+            # fill this way - an entry order's id on a close deal still takes
+            # the broker-close path, which resolves the real opener.
+            signal_id = await self._exit_signal_uuid_for_order_id(
+                order_id,
+                position_id=self._position_id_from_payload(order, deal),
+            )
+        if signal_id is None:
+            if self._close_position_fill_pending(order=order, deal=deal):
+                raise _PendingCloseFillRetentionError(
+                    "cTrader fill closes a position whose own close order is "
+                    "still in flight; retaining the event for reconciliation."
+                )
             # #144: a broker-side position close (SL/TP, flatten, manual) names
             # no signal of ours, but its deal still resolves to the position's
             # opening order and through it to the parent signal's ledger. Only
@@ -5943,12 +7017,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         # broker did not flag its order ``closingOrder`` it must still not be
         # booked as the parent, or the close would reduce the wrong ledger side.
         metadata = await asyncio.to_thread(get_live_signal_metadata, candidate)
-        if metadata and (
-            str(metadata.get("signal_intent") or "") == "exit"
-            or bool(metadata.get("exit_only"))
-            or str(metadata.get("risk_sizing_mode") or "")
-            == EXIT_ONLY_RISK_SIZING_MODE
-        ):
+        if is_exit_only_signal_metadata(metadata or {}):
             return None
         return candidate
 
@@ -6379,6 +7448,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         flagged_deal_ids: set[int],
         order_window: tuple[int, int] | None = None,
         pace: dict[str, Any] | None = None,
+        deferred_close_deals: list[Any],
     ) -> int:
         """Book one deal-list close the stream missed, or flag it (#144).
 
@@ -6387,6 +7457,11 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         cause (unreadable order list, refused record, a too-narrow opener
         window) can resolve on a later pass. Booking it then supersedes the
         flag with a ``ledger_reconciliation_resolved`` audit row.
+
+        ``deferred_close_deals`` collects deals skipped because their
+        position's own close submit is still marked pending: the caller puts
+        their windows back on the scan cursor so a later pass books them
+        once the submit's broker order id is known.
         """
         if not self._event_is_position_close(None, deal):
             return 0
@@ -6427,17 +7502,55 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             # A deal our own order made is the per-signal reconcile's job, not
             # this pass's: booking it here too would close the ledger twice.
             if order_id not in own_order_cache:
-                own_order_cache[order_id] = bool(
-                    self._order_id_to_signal_id.get(order_id)
-                ) or bool(
-                    await asyncio.to_thread(
-                        find_live_signal_id_by_broker_order_id,
+                own_order_cache[order_id] = (
+                    self._order_id_to_signal_id.get(order_id) is not None
+                )
+                if not own_order_cache[order_id]:
+                    owner_ids = await asyncio.to_thread(
+                        find_live_signal_ids_by_broker_order_id,
                         self.account_config_id,
                         str(order_id),
                     )
-                )
+                    if len(owner_ids) > 1:
+                        # Ambiguous ownership - broker_order_id is indexed,
+                        # not unique, so recovered duplicates can share one.
+                        # The deal may be ours or a broker-side close and
+                        # booking either way risks the wrong ledger side:
+                        # flag it for an operator instead of guessing.
+                        self._flag_ledger_reconciliation(
+                            self._fill_symbol_name(
+                                order_id=order_id, order=None, deal=deal
+                            )
+                            or "",
+                            "ambiguous_broker_order_id",
+                            {
+                                "position_id": position_id,
+                                "deal_id": deal_id,
+                                "order_id": str(order_id),
+                                "owner_signal_ids": owner_ids,
+                                "deal_timestamp_ms": (
+                                    self._resolve_execution_timestamp_ms(
+                                        order=None, deal=deal
+                                    )
+                                ),
+                                "source": "reconcile",
+                            },
+                            flagged_ids=flagged_deal_ids,
+                        )
+                        own_order_cache[order_id] = True
+                        return 0
+                    own_order_cache[order_id] = bool(owner_ids)
             if own_order_cache[order_id]:
                 return 0
+        if self._pending_close_position_active(position_id):
+            # A ClosePositionReq submit for this position is still in flight
+            # (or its outcome is unknown): this deal may be OUR close, whose
+            # broker order id is not yet attributable - booking it here
+            # would mis-book our own exit as a broker-side close, the exact
+            # bug the pending mark exists to prevent. Defer the deal's
+            # window instead of booking or flagging it.
+            deferred_close_deals.append(deal)
+            return 0
         if position_id not in parent_cache:
             parent_cache[position_id] = await self._resolve_position_parent_signal(
                 position_id, order_window=order_window, pace=pace
@@ -7159,6 +8272,10 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             )
             flagged_deal_ids = set()
         deal_retry_pending: list[list[int]] = []
+        # Deals deferred because their position's close submit is still
+        # marked pending: never booked, never flagged - their windows go
+        # back on the cursor so a later pass retries them.
+        deferred_close_deals: list[Any] = []
         try:
             for index, deal in enumerate(deals):
                 # Windows abut and subdivided halves can both return a boundary
@@ -7177,6 +8294,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                         flagged_deal_ids=flagged_deal_ids,
                         order_window=order_window,
                         pace=budget,
+                        deferred_close_deals=deferred_close_deals,
                     )
                 except CTraderApiError:
                     # This deal and every deal not yet reached stay
@@ -7227,6 +8345,17 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                     )
                     raise
         finally:
+            # Deferred deals' windows re-join the pending set exactly like
+            # failed ones: the cursor may not advance past a deal that was
+            # deliberately not booked this pass.
+            deal_retry_pending.extend(
+                self._broker_close_deal_retry_ranges(
+                    deferred_close_deals,
+                    deal_scan_ranges,
+                    floor_ms=floor_ms,
+                    now_ms=now_ms,
+                )
+            )
             # The cursor advances only now - after every gathered deal was
             # processed or re-queued - so a transient read error can never
             # mark a deal's range covered without booking it.
@@ -7406,6 +8535,159 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 },
             )
             return None
+
+    async def _exit_signal_uuid_for_order_id(
+        self, order_id: int | None, *, position_id: int | None = None
+    ) -> UUID | None:
+        """The exit signal that owns this broker order id, or ``None``.
+
+        ``ProtoOAClosePositionReq`` has no ``clientOrderId`` field (its proto
+        fields are ``payloadType``, ``ctidTraderAccountId``, ``positionId``
+        and ``volume``), so a close we submitted fills under an SDK-assigned
+        id that parses as no signal. Attribution falls back to the broker
+        order id persisted at submit time - the in-memory map first, then the
+        database - but only when the resolved signal is itself an exit *as the
+        ledger defines it* (``is_exit_only_signal_metadata``): a
+        position-close deal carrying an *entry* order's id must still take
+        the broker-close path, which resolves the position's real opener.
+        ``position_id`` is the fill's own position: a resolved exit whose
+        recorded position id disagrees cannot be this fill's owner.
+        """
+        if order_id is None:
+            return None
+        resolved = self._order_id_to_signal_id.get(order_id)
+        if resolved is None:
+            owner_ids = await asyncio.to_thread(
+                find_live_signal_ids_by_broker_order_id,
+                self.account_config_id,
+                str(order_id),
+            )
+            if len(owner_ids) == 1:
+                resolved = owner_ids[0]
+            elif owner_ids:
+                # ``broker_order_id`` is indexed, not unique: a recovered
+                # duplicate can share one. Only an exit-only signal can
+                # claim a position-close fill this way, so when exactly one
+                # match is an exit it is the plausible owner; anything more
+                # ambiguous stays unresolved and takes the broker-close
+                # path, which resolves the position's real opener.
+                exit_owners: list[str] = []
+                for owner_id in owner_ids:
+                    owner_metadata = await asyncio.to_thread(
+                        get_live_signal_metadata, owner_id
+                    )
+                    if is_exit_only_signal_metadata(owner_metadata or {}):
+                        exit_owners.append(owner_id)
+                if len(exit_owners) == 1:
+                    resolved = exit_owners[0]
+        if not resolved:
+            return None
+        metadata = await asyncio.to_thread(
+            get_live_signal_metadata, str(resolved)
+        )
+        # The LEDGER's exit predicate, not a looser one: a fill attributed to
+        # a signal the ledger counts as an entry would open quantity instead
+        # of reducing it.
+        if not is_exit_only_signal_metadata(metadata or {}):
+            return None
+        if position_id is not None:
+            # A broker order id is not unique, so the resolved exit can still
+            # be the wrong owner: its recorded position id is the last check
+            # that it closed THIS position. A signal with none recorded
+            # cannot disprove the match and keeps the attribution.
+            try:
+                owner_position_id = self._requested_exit_position_id(metadata or {})
+            except ValueError:
+                # Malformed position metadata cannot disprove the match, but
+                # a corrupt exit signal must not claim the fill either:
+                # fail closed to the broker-close path.
+                return None
+            if owner_position_id is not None and owner_position_id != position_id:
+                return None
+        try:
+            return UUID(str(resolved))
+        except (ValueError, AttributeError, TypeError):
+            return None
+
+    def _close_position_fill_pending(self, *, order: Any | None, deal: Any | None) -> bool:
+        """Whether this position-close fill belongs to an in-flight close submit.
+
+        While ``submit_order`` waits on a ``ClosePositionReq`` response the
+        broker order id is still unknown, so the fill's order id resolves to
+        nothing and the event would be booked as a broker-side close - the
+        misattribution this guard exists to prevent. The submit registers its
+        position id for exactly that window; a fill on it is retained for
+        reconciliation, which re-reads it once ownership is recorded. Marks
+        expire so a failed submit cannot hold a genuine broker-side close on
+        the position out of the stream path indefinitely.
+        """
+        if not self._pending_close_positions:
+            return False
+        if not self._event_is_position_close(order, deal):
+            return False
+        position_id = self._position_id_from_payload(order, deal)
+        if position_id is None:
+            return False
+        return self._pending_close_position_active(position_id)
+
+    def _pending_close_position_active(self, position_id: int) -> bool:
+        """Whether an unexpired close submit still marks this position pending.
+
+        Marks are per submitting signal and expire individually; expired
+        entries are pruned here so a dead submit cannot hold the guard (or
+        the dict) forever.
+        """
+        marks = self._pending_close_positions.get(position_id)
+        if not marks:
+            return False
+        now = time.monotonic()
+        for signal_id in [
+            sid
+            for sid, marked_at in marks.items()
+            if now - marked_at > _PENDING_CLOSE_POSITION_TTL_SECONDS
+        ]:
+            del marks[signal_id]
+            # An expired mark means a submit's broker outcome stayed unknown
+            # past the TTL: retention is gone, so a later fill on this
+            # position books as a broker-side close. Surface it - silent
+            # expiry would hide exactly the mis-booking the mark prevents.
+            logger.warning(
+                "cTrader pending close mark expired before the submit's "
+                "broker order id was known; fills on the position may book "
+                "as broker-side closes",
+                extra={
+                    "data": {
+                        "account_id": self.account_config_id,
+                        "position_id": position_id,
+                        "signal_id": signal_id,
+                    }
+                },
+            )
+        if not marks:
+            self._pending_close_positions.pop(position_id, None)
+            return False
+        return True
+
+    def _clear_pending_close_mark(self, position_id: int, signal_id: str) -> None:
+        """Lift one submit's pending mark on a position.
+
+        Only this signal's entry is removed: a second close submit still in
+        flight on the same position keeps its own guard. When the position's
+        last mark lifts and fills are parked waiting on it, the next
+        reconciliation pass is expedited - the parked fill can attribute as
+        soon as the order id is known instead of waiting out the retry
+        interval.
+        """
+        marks = self._pending_close_positions.get(position_id)
+        if marks is None:
+            return
+        marks.pop(signal_id, None)
+        if marks:
+            return
+        self._pending_close_positions.pop(position_id, None)
+        if self._pending_close_fill_event_ids:
+            self._reconciliation_required = True
+            self._reconciliation_retry_at = 0.0
 
     @staticmethod
     def _resolve_execution_price(*, order: Any | None, deal: Any | None) -> float:
@@ -7588,6 +8870,75 @@ class CTraderLiveAdapter(BaseLiveAdapter):
 
     def _ack_execution_event(self, event: Any) -> None:
         self._execution_retry_counts.pop(id(event), None)
+        self._pending_close_fill_event_ids.discard(id(event))
+
+    def _park_pending_close_fill(self, event: Any) -> None:
+        """Park a fill retained for an in-flight close submit, budget-free.
+
+        The event waits in ``_unresolved_execution_events`` - the same deque
+        every other retained fill uses - but never spends
+        ``EXECUTION_RETRY_LIMIT``: the pending mark can live up to the TTL
+        after an unknown-outcome submit, and a budgeted requeue would
+        crash-loop the listener (and delay every other fill on the account)
+        for that whole window. Reconciliation is re-armed on a paced interval
+        instead: each pass may recover the close's broker order id, clear the
+        mark, and requeue the event for attribution.
+        """
+        if len(self._unresolved_execution_events) >= UNRESOLVED_EXECUTION_EVENT_LIMIT:
+            # Degenerate overflow: the deque is full, so fall back to the
+            # budgeted path rather than dropping the fill.
+            logger.warning(
+                "cTrader pending-close fill park overflowed the unresolved "
+                "deque; falling back to the budgeted requeue",
+                extra={"data": {"account_id": self.ctid_trader_account_id}},
+            )
+            if not self._requeue_execution_event(event):
+                raise RuntimeError(
+                    "cTrader execution event could not be requeued after "
+                    "pending-close retention; broker reconciliation is "
+                    "required."
+                )
+            return
+        self._reconciliation_required = True
+        self._reconciliation_retry_at = (
+            time.monotonic() + _PENDING_CLOSE_FILL_RECONCILE_SECONDS
+        )
+        self._unresolved_execution_events.append(event)
+        self._pending_close_fill_event_ids.add(id(event))
+        logger.info(
+            "cTrader close fill retained while its submit is unresolved; "
+            "parked for reconciliation",
+            extra={
+                "data": {
+                    "account_id": self.ctid_trader_account_id,
+                    "unresolved_events": len(self._unresolved_execution_events),
+                }
+            },
+        )
+
+    def _requeue_pending_close_fill(self, event: Any) -> bool:
+        """Return a parked pending-close fill to the queue without spending budget."""
+        try:
+            self._execution_queue.put_nowait(event)
+        except asyncio.QueueFull:
+            return False
+        return True
+
+    def _listener_reconnect_delay_seconds(self) -> float:
+        """Seconds ``listen_executions`` should still wait before reconnecting.
+
+        A teardown (or transport loss) wakes the listener immediately so the
+        gap is reconciled now rather than after the 30 s queue timeout, but a
+        broker that keeps dropping the session right after auth would
+        otherwise spin connect/auth/disconnect with no floor. Returns the
+        remaining fraction of ``_LISTENER_RECONNECT_MIN_INTERVAL_SECONDS``.
+        """
+        if not self._last_session_teardown_at:
+            return 0.0
+        elapsed = time.monotonic() - self._last_session_teardown_at
+        return max(
+            0.0, _LISTENER_RECONNECT_MIN_INTERVAL_SECONDS - elapsed
+        )
 
     async def listen_executions(self) -> None:
         backoff_seconds = 2
@@ -7595,6 +8946,9 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             event: Any | None = None
             try:
                 if not self._connected or not self._authenticated:
+                    reconnect_delay = self._listener_reconnect_delay_seconds()
+                    if reconnect_delay > 0:
+                        await asyncio.sleep(reconnect_delay)
                     await self.connect()
 
                 await self._run_pending_reconciliation(backoff_seconds)
@@ -7619,6 +8973,13 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 self._log_listener_terminal_auth_failure(exc)
                 return
             except Exception as exc:  # except-kind: money-decision
+                if event is not None and isinstance(
+                    exc, _PendingCloseFillRetentionError
+                ):
+                    self._park_pending_close_fill(event)
+                    continue
+                if event is not None:
+                    self._pending_close_fill_event_ids.discard(id(event))
                 if event is not None and not self._requeue_execution_event(event):
                     raise RuntimeError(
                         "cTrader execution event exhausted its retry budget; "
@@ -7665,7 +9026,13 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             self._unresolved_execution_events.clear()
             still_unresolved: list[Any] = []
             for pending_event in unresolved:
-                requeued = self._requeue_execution_event(pending_event)
+                if id(pending_event) in self._pending_close_fill_event_ids:
+                    # Parked for an in-flight close submit: requeue WITHOUT
+                    # spending the retry budget - the mark can outlive the
+                    # whole budget many times over.
+                    requeued = self._requeue_pending_close_fill(pending_event)
+                else:
+                    requeued = self._requeue_execution_event(pending_event)
                 if not requeued or any(
                     id(pending_event) == id(stored_event)
                     for stored_event in self._unresolved_execution_events
@@ -7676,9 +9043,17 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 self._unresolved_execution_events.extend(
                     still_unresolved[:UNRESOLVED_EXECUTION_EVENT_LIMIT]
                 )
+                # Forget ids of events that left the deque: an id() is only
+                # meaningful while its event object is still referenced, and
+                # a stale entry would budget-free-requeue an unrelated fill.
+                self._pending_close_fill_event_ids.intersection_update(
+                    id(stored_event)
+                    for stored_event in self._unresolved_execution_events
+                )
                 self._reconciliation_required = True
                 self._reconciliation_retry_at = time.monotonic() + backoff_seconds
                 return
+            self._pending_close_fill_event_ids.clear()
             self._reconciliation_required = False
             self._reconciliation_retry_at = 0.0
 

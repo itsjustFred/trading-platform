@@ -451,8 +451,9 @@ class LiveExecution(BaseModel):
     # The fill's fee in account currency (USD), or ``None`` when it is not known (#124).
     #
     # ``0.0`` is a *known* zero (Alpaca equities are commission-free) and ``None`` is "the broker
-    # has not told us yet": Alpaca posts crypto fees end of day as ``CFEE`` account activities, so
-    # at fill time the fee is unknown and a later backfill fills it in. The field is required on
+    # has not told us yet": Alpaca reports crypto fees only as ``CFEE`` account activities
+    # posted in batches after the fill, so at fill time the fee is unknown and a later
+    # backfill fills it in. The field is required on
     # purpose - an adapter must decide which of the two it has, rather than inherit a default
     # zero that silently overstates net PnL. Readers treat ``None`` as "net PnL incomplete".
     #
@@ -523,10 +524,20 @@ class LiveLossBreakerRecord(BaseModel):
 
     One row per scope: ``account:<account_id>`` covers every deployment on the
     account and observes the broker account's equity; ``deployment:<id>``
-    covers that deployment alone and observes a synthetic equity - the account
-    equity minus every OTHER deployment's trading P&L - so the scope moves
-    only with its own deployment's P&L. ``day_start_equity``/``peak_equity``/
-    ``last_equity`` are always in the scope's own equity units.
+    covers that deployment alone and observes a synthetic equity anchored at
+    first observation - ``equity_anchor + own trading P&L`` - so the scope
+    moves only with its own deployment's P&L and is immune to P&L no
+    deployment owns, deposits/withdrawals and other deployments' P&L.
+    ``day_start_equity``/``peak_equity``/``last_equity`` are always in the
+    scope's own equity units.
+
+    ``equity_anchor`` is the deployment scope's anchored base: the scope's
+    equity with its own P&L removed (``scope_equity - own_pnl``), captured on
+    the first anchored observation and shifted by ``reset_live_loss_breaker_drawdown``
+    so an operator reset re-bases the series. It is ``None`` for account
+    scopes and for deployment rows written before the anchor existed; such a
+    row anchors on its next observation, continuing from its last observed
+    equity so migration itself cannot trip the breaker.
 
     ``utc_day`` is the UTC day ``day_start_equity`` belongs to; the daily
     breaker re-bases automatically when it changes. ``peak_equity`` is the
@@ -546,6 +557,11 @@ class LiveLossBreakerRecord(BaseModel):
     drawdown_breached: bool = False
     last_equity: float | None = None
     last_observed_at: datetime | None = None
+    # Deployment scopes only: the anchored base the synthetic equity is
+    # measured from (``last_equity = equity_anchor + own trading P&L`` at the
+    # anchoring observation). ``None`` on account scopes and on deployment
+    # rows that have not anchored yet.
+    equity_anchor: float | None = None
     # JSON detail of the most recent breach latch (kind, equity, threshold,
     # observed loss/drawdown fraction, UTC instant) for `status` output.
     breach_detail: dict[str, Any] | None = None
