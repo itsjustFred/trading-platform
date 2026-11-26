@@ -1737,6 +1737,26 @@ def test_an_execution_event_without_an_account_id_still_classifies() -> None:
         _run(sweep)
 
 
+def test_an_empty_error_code_still_counts_as_a_refusal() -> None:
+    """`errorCode=""` is present, not absent: presence (`is not None`) decides."""
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOAOrderType
+
+    adapter = _control_adapter(
+        orders=[
+            _order(615, ProtoOAOrderType.LIMIT),
+            _order(616, ProtoOAOrderType.LIMIT),
+        ]
+    )
+    adapter._ProtoOAOrderErrorEvent = None
+    adapter.exec_event[615] = SimpleNamespace(errorCode="")
+
+    outcome = _run(adapter.cancel_open_orders())
+
+    assert outcome.completed == 1
+    assert outcome.failed == ("615",)
+    assert outcome.complete is False
+
+
 def test_an_unclassifiable_execution_event_is_not_misread_as_an_order_error() -> None:
     """`errorCode` + `description` + `executionType` is an execution event.
 

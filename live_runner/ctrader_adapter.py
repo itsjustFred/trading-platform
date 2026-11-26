@@ -1807,13 +1807,19 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         )
 
         # Refusal classification depends on reading every execution-type
-        # member; an enum shape this adapter cannot enumerate would make
-        # every control response fail closed at request time, so fail at
+        # member; an enum shape this adapter cannot enumerate - or a proto
+        # bump that renamed the classified members out from under the
+        # explicit sets - would make every control response fail closed (or
+        # worse, pass a refusal as success) at request time, so fail at
         # load instead.
-        if not self._execution_type_members(ProtoOAExecutionType):
+        members = self._execution_type_members(ProtoOAExecutionType)
+        member_names = {name for name, _ in members}
+        stale = (_REJECTION_EXECUTION_TYPES | _NON_REJECTION_EXECUTION_TYPES) - member_names
+        if not members or stale:
             raise RuntimeError(
-                "ProtoOAExecutionType member extraction returned nothing; "
-                "refusal classification cannot run against this proto build."
+                "ProtoOAExecutionType member extraction cannot classify "
+                f"this proto build (missing: {sorted(stale) or 'all members'}); "
+                "refusal classification cannot run against it."
             )
 
     def _raise_if_terminal_auth_failed(self) -> None:
