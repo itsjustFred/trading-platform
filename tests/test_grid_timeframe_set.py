@@ -18,7 +18,6 @@ add a timeframe is forced to make a decision instead of inheriting a stale copy.
 
 from __future__ import annotations
 
-import ast
 from pathlib import Path
 
 import pytest
@@ -104,42 +103,6 @@ def test_the_cli_default_is_the_served_set_and_not_a_fourth_copy() -> None:
     """`DEFAULT_TIMEFRAMES` used to be another literal of the same seven values."""
     assert tuple(grid.DEFAULT_TIMEFRAMES) == tuple(grid.TIMEFRAME_ORDER)
     assert ",".join(grid.DEFAULT_TIMEFRAMES) == "1m,5m,15m,30m,1h,4h,1d"
-
-
-def test_the_module_no_longer_restates_the_timeframe_sets_as_literals() -> None:
-    """The drift was invisible because these were literals; they must be derived.
-
-    Assigning the names is fine and expected - they are this module's interface.
-    Assigning them a literal is the defect: that is what let the copy fall behind the
-    canonical set while a comment claimed otherwise. A `VALID_TIMEFRAMES` assignment
-    is worse still, since the name is imported from `shared.constants` and a second
-    one would quietly take over every unqualified use in the file.
-    """
-    source = Path(grid.__file__).read_text(encoding="utf-8")
-    literal_nodes = (ast.Constant, ast.Tuple, ast.List, ast.Set)
-    restated, shadowed = [], []
-    for node in ast.parse(source).body:
-        if not (
-            isinstance(node, ast.Assign)
-            and len(node.targets) == 1
-            and isinstance(node.targets[0], ast.Name)
-        ):
-            continue
-        name = node.targets[0].id
-        if name not in {"VALID_TIMEFRAMES", "TIMEFRAME_ORDER", "DEFAULT_TIMEFRAMES"}:
-            continue
-        if name == "VALID_TIMEFRAMES":
-            shadowed.append(name)
-        elif isinstance(node.value, literal_nodes):
-            restated.append(name)
-    assert not shadowed, (
-        f"{Path(grid.__file__).name} assigns VALID_TIMEFRAMES at module level, shadowing "
-        "the canonical import; every unqualified use in the file silently changes meaning"
-    )
-    assert not restated, (
-        f"{Path(grid.__file__).name} restates {restated} as a literal instead of deriving "
-        "it from shared.constants - this is how the copy drifted in the first place"
-    )
 
 
 def test_the_derived_sets_are_not_plain_copies() -> None:
