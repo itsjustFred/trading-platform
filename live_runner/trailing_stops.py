@@ -56,10 +56,12 @@ from shared.logging import get_logger
 from shared.models import LiveDeploymentConfig
 from shared.sentry import capture_exception
 from shared.trailing import (
+    REMOVED_TRAILING_MODES,
     TRAILING_MODE_NONE,
     TRAILING_SL_CONFIG_METADATA_KEY,
     live_supported_trailing_modes,
     live_trailing_timeframes,
+    normalize_trailing_mode,
     validate_live_trailing_timeframe,
     validate_trailing_sl_config,
 )
@@ -578,9 +580,18 @@ class LiveTrailingStopManager:
         if entry is None:
             return None
         trailing_cfg = (entry.get("metadata") or {}).get(TRAILING_SL_CONFIG_METADATA_KEY)
-        # A persisted signal whose mode this adapter cannot execute — including
-        # a removed mode — should have been refused at submission; if one
-        # exists the validation below raises and it is reported, never
+        # A persisted entry signal can still name a removed mode (e.g. a
+        # position opened before the workflow was deleted): the order is
+        # already at the broker, so there is nothing left to refuse — the
+        # position simply has no trailing, exactly as the removed
+        # ``supertrend_flip`` skip did on main. New signals naming a removed
+        # mode are still refused at submission and validation.
+        if isinstance(trailing_cfg, Mapping) and normalize_trailing_mode(
+            trailing_cfg.get("mode")
+        ) in REMOVED_TRAILING_MODES:
+            return None
+        # A persisted signal whose mode this adapter cannot execute should
+        # have been refused at submission; if one exists it is reported, never
         # silently skipped.
         mode = validate_trailing_sl_config(
             trailing_cfg,
