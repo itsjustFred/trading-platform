@@ -1554,8 +1554,10 @@ def test_normal_execution_events_still_count_as_success() -> None:
     assert flatten_outcome.completed == 1 and flatten_outcome.complete is True
 
 
-def test_an_unclassifiable_execution_event_aborts_the_cancel_sweep() -> None:
-    """An execution event whose type cannot be read is unknown, never done."""
+def test_an_unclassifiable_execution_event_is_unknown_and_the_cancel_sweep_continues() -> None:
+    """An unreadable execution type is unknown per item, never done - and the
+    sweep still cancels the remaining orders: closing what can be closed is
+    the safety action, and the unknown item is retried on the next pass."""
     from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOAOrderType
 
     adapter = _control_adapter(
@@ -1569,34 +1571,71 @@ def test_an_unclassifiable_execution_event_aborts_the_cancel_sweep() -> None:
         _execution_type("ORDER_CANCELLED"), order_id=851
     )
 
-    sweep = adapter.cancel_open_orders()
-    with pytest.raises(RuntimeError, match="could not be classified"):
-        _run(sweep)
-    # The second order was never attempted: a pass that cannot read its own
-    # responses does not keep firing blind requests.
-    assert [int(request.orderId) for request in adapter.sent] == [851]
+    outcome = _run(adapter.cancel_open_orders())
+
+    assert outcome.completed == 1
+    assert outcome.unknown == ("851",)
+    assert outcome.failed == ()
+    assert outcome.complete is False
+    assert sorted(int(request.orderId) for request in adapter.sent) == [851, 852]
 
 
-def test_an_unclassifiable_execution_event_aborts_the_flatten() -> None:
-    adapter = _control_adapter(positions=[_position(861, 1000)])
+def test_an_unclassifiable_execution_event_is_unknown_and_the_flatten_continues() -> None:
+    """Same rule on the flatten: the position after the unreadable answer is
+    still sent a close - a halted sweep must not strand open exposure."""
+    adapter = _control_adapter(positions=[_position(861, 1000), _position(862, 1000)])
     adapter._ProtoOAExecutionType = None
     adapter.exec_event[861] = _execution_event(
         _execution_type("ORDER_FILLED"), order_id=861
     )
 
-    flatten = adapter.close_all_positions()
-    with pytest.raises(RuntimeError, match="could not be classified"):
-        _run(flatten)
+    outcome = _run(adapter.close_all_positions())
+
+    assert outcome.completed == 1
+    assert outcome.unknown == ("861",)
+    assert outcome.failed == ()
+    assert outcome.complete is False
+    assert sorted(int(r.positionId) for r in adapter.sent) == [861, 862]
+
+
+def test_an_unclassifiable_orphaned_protection_cancel_is_unknown_and_continues() -> None:
+    """The orphan sweep records the unreadable cancel as unknown and still
+    attempts the remaining protections."""
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOAOrderType
+
+    adapter = _control_adapter(
+        orders=[
+            _order(895, ProtoOAOrderType.STOP_LOSS_TAKE_PROFIT, position_id=999),
+            _order(896, ProtoOAOrderType.STOP_LOSS_TAKE_PROFIT, position_id=998),
+        ]
+    )
+    adapter._ProtoOAExecutionType = None
+    adapter.exec_event[895] = _execution_event(
+        _execution_type("ORDER_CANCELLED"), order_id=895
+    )
+
+    outcome = _run(adapter.cancel_orphaned_protections())
+
+    assert outcome.completed == 1
+    assert outcome.unknown == ("895",)
+    assert outcome.failed == ()
+    assert outcome.complete is False
+    assert sorted(int(request.orderId) for request in adapter.sent) == [895, 896]
 
 
 def test_an_execution_type_outside_the_enum_is_unclassifiable() -> None:
-    """A value the loaded enum does not know may be a future rejection type."""
+    """A value the loaded enum does not know may be a future rejection type:
+    it lands in ``unknown`` - never done, never refused - and the sweep still
+    attempts the remaining orders."""
     from types import SimpleNamespace
 
     from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOAOrderType
 
     adapter = _control_adapter(
-        orders=[_order(881, ProtoOAOrderType.LIMIT)]
+        orders=[
+            _order(881, ProtoOAOrderType.LIMIT),
+            _order(882, ProtoOAOrderType.LIMIT),
+        ]
     )
     # Duck-typed event + enum: the class is unloaded so the attribute sniff
     # applies, and 99 is not a member of the loaded enum.
@@ -1608,13 +1647,18 @@ def test_an_execution_type_outside_the_enum_is_unclassifiable() -> None:
         ctidTraderAccountId=46736452, executionType=99, errorCode="FUTURE_TYPE"
     )
 
-    sweep = adapter.cancel_open_orders()
-    with pytest.raises(RuntimeError, match="could not be classified"):
-        _run(sweep)
+    outcome = _run(adapter.cancel_open_orders())
+
+    assert outcome.completed == 1
+    assert outcome.unknown == ("881",)
+    assert outcome.failed == ()
+    assert outcome.complete is False
+    assert sorted(int(request.orderId) for request in adapter.sent) == [881, 882]
 
 
-def test_an_unknown_cancel_outcome_aborts_the_sweep() -> None:
-    """A RuntimeError from one cancel must propagate, not be swallowed per item."""
+def test_a_generic_runtime_error_still_aborts_the_cancel_sweep() -> None:
+    """Only ``CTraderUnknownOutcomeError`` is per-item: any other RuntimeError
+    - including a terminal auth failure - still aborts the sweep."""
     from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOAOrderType
 
     adapter = _control_adapter(
@@ -1635,8 +1679,8 @@ def test_an_unknown_cancel_outcome_aborts_the_sweep() -> None:
     assert adapter.sent == []
 
 
-def test_an_unknown_flatten_outcome_aborts_the_sweep() -> None:
-    """Same invariant on the flatten path: unknown is not failed, not done."""
+def test_a_generic_runtime_error_still_aborts_the_flatten() -> None:
+    """Same invariant on the flatten path: a non-outcome RuntimeError aborts."""
     adapter = _control_adapter(positions=[_position(897, 1000)])
 
     async def _send_unknown(request: Any, **_kwargs: Any) -> Any:
@@ -1648,8 +1692,9 @@ def test_an_unknown_flatten_outcome_aborts_the_sweep() -> None:
         _run(adapter.close_all_positions())
 
 
-def test_an_unknown_orphaned_protection_cancel_aborts_the_sweep() -> None:
-    """RuntimeError propagates here too - unknown is not a per-item failure."""
+def test_a_generic_runtime_error_still_aborts_the_orphaned_protection_sweep() -> None:
+    """Only the dedicated unknown-outcome error continues; a plain
+    RuntimeError still propagates here too."""
     from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOAOrderType
 
     adapter = _control_adapter(
@@ -1669,8 +1714,9 @@ def test_an_execution_event_with_a_zero_type_is_unclassifiable_not_an_error() ->
     """`executionType=0` is not None: the event still reaches the classifier.
 
     With the error-event class unloaded, an `errorCode` + `executionType=0`
-    response is an execution event with an unreadable type -> RuntimeError,
-    never the definite-refusal branch (which requires executionType absent).
+    response is an execution event with an unreadable type -> unknown
+    outcome, never the definite-refusal branch (which requires
+    executionType absent) and never counted done.
     """
     from types import SimpleNamespace
 
@@ -1688,9 +1734,12 @@ def test_an_execution_event_with_a_zero_type_is_unclassifiable_not_an_error() ->
         ctidTraderAccountId=46736452, executionType=0, errorCode="UNSET"
     )
 
-    sweep = adapter.cancel_open_orders()
-    with pytest.raises(RuntimeError, match="could not be classified"):
-        _run(sweep)
+    outcome = _run(adapter.cancel_open_orders())
+
+    assert outcome.completed == 0
+    assert outcome.unknown == ("893",)
+    assert outcome.failed == ()
+    assert outcome.complete is False
 
 
 def test_an_execution_type_alias_with_an_unknown_name_is_unclassifiable() -> None:
@@ -1713,6 +1762,35 @@ def test_an_execution_type_alias_with_an_unknown_name_is_unclassifiable() -> Non
     assert adapter._execution_event_rejection(event) == (None, True)
 
 
+def test_an_execution_type_unknown_to_this_build_is_unclassifiable_on_the_wire() -> None:
+    """A future enum member arrives in the unknown fields and reads as the
+    ORDER_ACCEPTED default: presence must decide, on every response path.
+
+    protobuf moves an enum value it cannot name into the message's unknown
+    fields, so ``HasField('executionType')`` is False and the typed attribute
+    reports 2 - a classified non-rejection. Reading the attribute alone would
+    pass a future rejection type as a success, the exact #439 failure, so an
+    absent-or-unknown ``executionType`` is unclassifiable on the classifier,
+    the control path and the submit path alike.
+    """
+    from ctrader_open_api.messages.OpenApiMessages_pb2 import ProtoOAExecutionEvent
+
+    from live_runner.ctrader_adapter import CTraderUnknownOutcomeError
+
+    adapter = _control_adapter()
+    # ctidTraderAccountId=1, executionType=99: a member this build cannot name.
+    event = ProtoOAExecutionEvent()
+    event.ParseFromString(b"\x10\x01\x18\x63")
+    assert event.HasField("executionType") is False
+    assert int(event.executionType) == _execution_type("ORDER_ACCEPTED")
+
+    assert adapter._execution_event_rejection(event) == (None, True)
+    with pytest.raises(CTraderUnknownOutcomeError, match="could not be classified"):
+        adapter._raise_for_refused_control_response(event)
+    with pytest.raises(RuntimeError, match="could not be classified"):
+        adapter._raise_for_refused_submit_response(event, object())
+
+
 def test_an_execution_event_without_an_account_id_still_classifies() -> None:
     """`executionType` alone marks an execution event when the class is unloaded.
 
@@ -1732,9 +1810,12 @@ def test_an_execution_event_without_an_account_id_still_classifies() -> None:
     )
     adapter.exec_event[871] = SimpleNamespace(executionType=99)
 
-    sweep = adapter.cancel_open_orders()
-    with pytest.raises(RuntimeError, match="could not be classified"):
-        _run(sweep)
+    outcome = _run(adapter.cancel_open_orders())
+
+    assert outcome.completed == 0
+    assert outcome.unknown == ("871",)
+    assert outcome.failed == ()
+    assert outcome.complete is False
 
 
 def test_an_empty_error_code_still_counts_as_a_refusal() -> None:
@@ -1762,7 +1843,7 @@ def test_an_unclassifiable_execution_event_is_not_misread_as_an_order_error() ->
 
     Even with `_ProtoOAOrderErrorEvent` unloaded, a response exposing
     `executionType` must reach the execution classifier: an unreadable type
-    is an unknown outcome (RuntimeError), never a definite refusal.
+    is an unknown outcome (the `unknown` bucket), never a definite refusal.
     """
     from types import SimpleNamespace
 
@@ -1783,9 +1864,12 @@ def test_an_unclassifiable_execution_event_is_not_misread_as_an_order_error() ->
         description="also carries a description",
     )
 
-    sweep = adapter.cancel_open_orders()
-    with pytest.raises(RuntimeError, match="could not be classified"):
-        _run(sweep)
+    outcome = _run(adapter.cancel_open_orders())
+
+    assert outcome.completed == 0
+    assert outcome.unknown == ("891",)
+    assert outcome.failed == ()
+    assert outcome.complete is False
 
 
 def test_an_orphaned_protection_cancel_rejected_is_a_failure() -> None:
@@ -1999,6 +2083,13 @@ def test_describe_reports_a_clean_sweep_differently_from_a_partial_one() -> None
     failed_only = ControlOutcome(completed=0, failed=("42",))
     assert failed_only.complete is False
     assert "nothing outstanding" not in failed_only.describe()
+
+    unknown_only = ControlOutcome(completed=0, unknown=("77",))
+    assert unknown_only.complete is False
+    description = unknown_only.describe()
+    assert "nothing outstanding" not in description, description
+    assert "unknown" in description, description
+    assert "77" in description, description
 
 
 # ─── #121 review: what an exit needs to know before it is sized ──────────────

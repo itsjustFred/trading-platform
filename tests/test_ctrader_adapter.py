@@ -12,6 +12,7 @@ from live_runner.ctrader_adapter import (
     CTraderApiError,
     CTraderAuthTerminalError,
     CTraderLiveAdapter,
+    CTraderUnknownOutcomeError,
     _is_already_logged_in_error,
     _is_terminal_auth_error,
 )
@@ -140,6 +141,35 @@ def test_load_openapi_types_installs_connection_scoped_protocol(monkeypatch) -> 
     assert adapter._TcpProtocol is not TcpProtocol
     first, second = adapter._TcpProtocol(), adapter._TcpProtocol()
     assert first._send_queue is not second._send_queue
+
+
+def test_load_openapi_types_rejects_a_classification_set_naming_a_missing_member(
+    monkeypatch,
+) -> None:
+    """The load-time check must fire when an explicit set names a member the
+    loaded enum does not have.
+
+    Without it a renamed or future member would only surface at request time -
+    every event failing closed, or worse, a refusal passing as success. The
+    reactor install is stubbed exactly like the protocol test above; the real
+    ``ctrader_open_api`` messages are what make the member check meaningful.
+    """
+    from live_runner import ctrader_adapter as module
+
+    adapter = CTraderLiveAdapter(
+        app_id="app", app_secret="secret", access_token="token", account_id="1"
+    )
+    adapter._client_class = None
+    adapter._loop = object()
+    monkeypatch.setattr(module, "_ensure_asyncio_twisted_reactor", lambda _loop: None)
+    monkeypatch.setattr(
+        module,
+        "_REJECTION_EXECUTION_TYPES",
+        module._REJECTION_EXECUTION_TYPES | {"ORDER_AMEND_REJECTED"},
+    )
+
+    with pytest.raises(RuntimeError, match="cannot classify"):
+        adapter._load_openapi_types()
 
 
 def test_upstream_tcp_protocol_layout_is_pinned() -> None:
@@ -5698,6 +5728,29 @@ def test_cancel_orders_refused_cancel_is_failed_not_dropped() -> None:
     assert outcome.failed == ("1",)
 
 
+def test_cancel_orders_unknown_outcome_is_recorded_and_the_rest_continue() -> None:
+    """An unclassifiable answer is ``unknown`` per item - not done, not
+    refused - and the remaining named orders are still cancelled."""
+    adapter, cancelled = _cancel_test_adapter(
+        [_book_order(1), _book_order(2), _book_order(3)]
+    )
+
+    async def _cancel(order_id: int) -> None:
+        if order_id == 1:
+            raise CTraderUnknownOutcomeError("outcome cannot be classified")
+        cancelled.append(order_id)
+
+    adapter._cancel_order_id = _cancel
+
+    outcome = asyncio.run(adapter.cancel_orders({"1", "2", "3"}, symbol="EURUSD"))
+
+    assert sorted(cancelled) == [2, 3]
+    assert outcome.completed == 2
+    assert outcome.unknown == ("1",)
+    assert outcome.failed == ()
+    assert outcome.complete is False
+
+
 # ─── Submit refusal classification (INVALID_REQUEST soak, 2026-11-25) ─────────
 #
 # cTrader answers a refused NewOrderReq/ClosePositionReq with a
@@ -6155,7 +6208,11 @@ def test_order_rejected_execution_unanswerable_presence_stays_unknown() -> None:
         executionType = ProtoOAExecutionType.ORDER_REJECTED
         errorCode = "TRADING_BAD_VOLUME"
 
-        def HasField(self, _name: str) -> bool:
+        def HasField(self, name: str) -> bool:
+            # executionType is set on this double, so its presence is answered;
+            # every other field's presence is the unanswerable one under test.
+            if name == "executionType":
+                return True
             raise ValueError("not a proto2 optional field")
 
     adapter = _execution_event_response_adapter(_BrokenHasFieldEvent())
@@ -6328,6 +6385,8 @@ def test_order_rejected_execution_unanswerable_order_presence_stays_unknown() ->
         def HasField(self, name: str) -> bool:
             if name == "order":
                 raise ValueError("order presence unavailable")
+            if name == "executionType":
+                return True
             return False
 
     adapter = _execution_event_response_adapter(_OrderPresenceUnknownEvent())
@@ -6464,7 +6523,7 @@ def _unanswerable_field_event(unanswerable: str):
         def HasField(self, name: str) -> bool:
             if name == unanswerable:
                 raise ValueError(f"{name} presence unavailable")
-            if name == "order":
+            if name in ("order", "executionType"):
                 return True
             return False
 

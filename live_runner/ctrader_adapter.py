@@ -107,6 +107,20 @@ class CTraderAuthTerminalError(RuntimeError):
         super().__init__(message)
 
 
+class CTraderUnknownOutcomeError(RuntimeError):
+    """A control response whose outcome cannot be classified.
+
+    Raised for an execution event whose ``executionType`` is absent,
+    unreadable or a member this build does not know: the request may or may
+    not have landed, so the answer is neither a refusal nor a success. It is
+    deliberately NOT a ``CTraderApiError`` - the broker did not refuse
+    anything - and NOT a ``CTraderAuthTerminalError`` - the connection is
+    fine. The cancel/flatten sweeps catch it per item, record the item under
+    ``ControlOutcome.unknown`` and continue with the rest; every other caller
+    treats it like any other RuntimeError (an unknown outcome to reconcile).
+    """
+
+
 class CTraderConnectionLostError(ConnectionError):
     """An in-flight cTrader request was abandoned by a session teardown.
 
@@ -1659,6 +1673,9 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._ProtoOAOrderType: Any = None
         self._ProtoOATradeSide: Any = None
         self._ProtoOAExecutionType: Any = None
+        # (enum object, member list) extracted once at load; a swapped test
+        # double is a different object and gets its own extraction.
+        self._execution_type_members_cache: tuple[Any, list[tuple[str, int]]] | None = None
         self._ProtoOATimeInForce: Any = None
 
         self._ProtoOASubscribeSpotsReq: Any = None
@@ -1821,6 +1838,9 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 f"this proto build (missing: {sorted(stale) or 'all members'}); "
                 "refusal classification cannot run against it."
             )
+        # The classifier reuses this extraction per event instead of walking
+        # the descriptor again on every execution event.
+        self._execution_type_members_cache = (ProtoOAExecutionType, members)
 
     def _raise_if_terminal_auth_failed(self) -> None:
         if not self._terminal_auth_failure_reason:
@@ -4675,20 +4695,38 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         rejection type cannot pass as success even if it is miscatalogued.
 
         ``(None, True)`` - the unclassifiable outcome - covers proto types
-        not fully loaded, an unreadable ``executionType``, and a value that
-        is not a member of the loaded enum at all: the caller must treat it
-        as an unknown outcome, never as a success.
+        not fully loaded, an ``executionType`` whose presence cannot be
+        proven, an unreadable value, and a value that is not a member of the
+        loaded enum at all: the caller must treat it as an unknown outcome,
+        never as a success.
         """
         enum = getattr(self, "_ProtoOAExecutionType", None)
         if enum is None:
             return None, True
+        # Presence decides before the value is ever read. For a required
+        # proto2 enum, ``HasField`` False means the field was never sent -
+        # either an unset message or a value protobuf moved to the unknown
+        # fields because this build cannot name it. A future member reads
+        # back as the ORDER_ACCEPTED default, so reading the attribute alone
+        # would pass a refusal as success (#439).
         try:
-            value = int(getattr(event, "executionType", -1))
+            raw_type = _present_proto_field_fail_closed(event, "executionType")
+        except Exception:  # except-kind: money-decision
+            return None, True
+        if raw_type is None or raw_type is _PRESENT_BUT_UNKNOWN:
+            return None, True
+        try:
+            value = int(raw_type)
         except Exception:  # except-kind: money-decision
             # Any unreadable type is "unclassifiable", never a pass: the
             # caller must not let the event through as success.
             return None, True
-        members = self._execution_type_members(enum)
+        cached = getattr(self, "_execution_type_members_cache", None)
+        if cached is not None and cached[0] is enum:
+            members = cached[1]
+        else:
+            members = self._execution_type_members(enum)
+            self._execution_type_members_cache = (enum, members)
         if not members:
             logger.warning(
                 "cTrader ProtoOAExecutionType member extraction returned "
@@ -5662,11 +5700,12 @@ class CTraderLiveAdapter(BaseLiveAdapter):
 
         An execution event whose ``executionType`` cannot be classified is
         neither a refusal nor a success: the outcome is unknown, so it raises
-        RuntimeError. On the amend path that becomes the send error the
-        caller resolves against broker state; on the sweeps it aborts the
-        pass rather than counting the item - conservative per path means
-        cancel/flatten never count it done and amend verifies the broker's
-        SL/TP before believing anything.
+        ``CTraderUnknownOutcomeError``. On the amend path that becomes the
+        send error the caller resolves against broker state; on the sweeps it
+        is caught per item, recorded under ``ControlOutcome.unknown`` and the
+        remaining items are still attempted - a sweep that cannot read one
+        answer must not strand the positions after it. Only a
+        ``CTraderAuthTerminalError`` or any other RuntimeError still aborts.
         """
         event_type = getattr(self, "_ProtoOAOrderErrorEvent", None)
         if event_type is not None:
@@ -5676,20 +5715,21 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                     description=str(getattr(response, "description", ""))
                     or "no description",
                 )
-        elif (
-            getattr(response, "errorCode", None) is not None
-            and getattr(response, "executionType", None) is None
-        ):
-            # The error-event class is not loaded, so isinstance cannot
-            # prove this is NOT a ProtoOAOrderErrorEvent - and a real one
-            # carries errorCode and no executionType (its description may be
-            # unset, so it cannot be required here). Fail closed: a refusal
-            # must never pass as done.
-            raise CTraderApiError(
-                error_code=str(getattr(response, "errorCode", "")),
-                description=str(getattr(response, "description", ""))
-                or "no description",
-            )
+        else:
+            if (
+                getattr(response, "errorCode", None) is not None
+                and getattr(response, "executionType", None) is None
+            ):
+                # The error-event class is not loaded, so isinstance cannot
+                # prove this is NOT a ProtoOAOrderErrorEvent - and a real one
+                # carries errorCode and no executionType (its description may be
+                # unset, so it cannot be required here). Fail closed: a refusal
+                # must never pass as done.
+                raise CTraderApiError(
+                    error_code=str(getattr(response, "errorCode", "")),
+                    description=str(getattr(response, "description", ""))
+                    or "no description",
+                )
         # Only ProtoOAExecutionEvent carries ``executionType`` in the proto
         # schema, so this attribute sniff is a fallback for an unloaded class,
         # not a general detector: ``executionType`` alone decides (requiring
@@ -5706,7 +5746,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             return
         rejection, unclassifiable = self._execution_event_rejection(response)
         if unclassifiable:
-            raise RuntimeError(
+            raise CTraderUnknownOutcomeError(
                 "cTrader control response was an execution event whose "
                 "executionType could not be classified; the outcome is "
                 "unknown and must be reconciled."
@@ -5974,9 +6014,11 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         removed by :meth:`cancel_orphaned_protections` instead.
 
         One refusal does not strand the rest: the remaining orders still need cancelling, and a
-        rejection on one says nothing about the next. Every refusal and every unaddressable
-        order is reported in the outcome, because a caller cannot tell a complete sweep from a
-        partial one by the count alone.
+        rejection on one says nothing about the next. An answer that cannot be classified is
+        recorded as ``unknown`` per item - never done, never refused - and the sweep continues
+        for the same reason. Every refusal, unknown outcome and unaddressable order is reported
+        in the outcome, because a caller cannot tell a complete sweep from a partial one by the
+        count alone.
         """
         reconcile_res = await self._reconcile_state()
 
@@ -5989,6 +6031,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         cancelled = 0
         unidentified: list[str] = []
         failed: list[str] = []
+        unknown: list[str] = []
         # `ProtoOAReconcileRes` names the repeated field `order`, not `orders`.
         for order in getattr(reconcile_res, "order", []) or []:
             try:
@@ -6009,9 +6052,6 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 # `CTraderAuthTerminalError` is a RuntimeError, not a CTraderApiError, so an
                 # auth-terminal failure still propagates and ends the sweep - correct, because
                 # the connection is no longer usable and the remaining cancels would fail too.
-                # The same holds for the unclassifiable-execution-event RuntimeError: an
-                # unknown outcome must abort the sweep, never be swallowed into `failed` or
-                # counted done - keep this except narrow.
                 self._raise_terminal_auth_from_api_error(exc)
                 failed.append(str(order_id))
                 logger.warning(
@@ -6021,11 +6061,26 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                     exc,
                 )
                 continue
+            except CTraderUnknownOutcomeError as exc:
+                # The broker answered in a way that cannot be classified: the
+                # cancel may or may not have landed. Record it unknown -
+                # never done, never refused - and keep cancelling: leaving the
+                # other orders resting is the unsafe direction.
+                unknown.append(str(order_id))
+                logger.warning(
+                    "cTrader cancel of order %s returned an execution event "
+                    "whose outcome cannot be classified: %s. Recording it "
+                    "unknown and continuing the sweep.",
+                    order_id,
+                    exc,
+                )
+                continue
             cancelled += 1
         return ControlOutcome(
             completed=cancelled,
             unidentified=tuple(unidentified),
             failed=tuple(failed),
+            unknown=tuple(unknown),
         )
 
     async def cancel_orders(
@@ -6053,6 +6108,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         cancelled = 0
         unidentified: list[str] = []
         failed: list[str] = []
+        unknown: list[str] = []
         for order in getattr(reconcile_res, "order", []) or []:
             try:
                 order_type = int(getattr(order, "orderType", 0) or 0)
@@ -6110,11 +6166,25 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                     exc,
                 )
                 continue
+            except CTraderUnknownOutcomeError as exc:
+                # Same per-item rule as the blanket cancel: an answer that
+                # cannot be classified is unknown, not done - and the
+                # remaining refs are still attempted.
+                unknown.append(str(order_id))
+                logger.warning(
+                    "cTrader cancel of named order %s returned an execution "
+                    "event whose outcome cannot be classified: %s. Recording "
+                    "it unknown and continuing.",
+                    order_id,
+                    exc,
+                )
+                continue
             cancelled += 1
         return ControlOutcome(
             completed=cancelled,
             unidentified=tuple(unidentified),
             failed=tuple(failed),
+            unknown=tuple(unknown),
         )
 
     async def cancel_orphaned_protections(self) -> ControlOutcome:
@@ -6145,6 +6215,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
 
         cancelled = 0
         failed: list[str] = []
+        unknown: list[str] = []
         for order in getattr(reconcile_res, "order", []) or []:
             try:
                 order_type = int(getattr(order, "orderType", 0) or 0)
@@ -6163,27 +6234,45 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             try:
                 await self._cancel_order_id(order_id)
             except CTraderApiError as exc:
-                # Narrow on purpose, same as the other sweeps: an
-                # unclassifiable execution event raises RuntimeError, which
-                # must abort - the outcome is unknown, not failed.
+                # Narrow on purpose, same as the other sweeps: a terminal
+                # auth failure is a RuntimeError, not a CTraderApiError, and
+                # still aborts - the connection is unusable.
                 self._raise_terminal_auth_from_api_error(exc)
                 failed.append(str(order_id))
                 continue
+            except CTraderUnknownOutcomeError as exc:
+                # An answer that cannot be classified is unknown, not done -
+                # and the remaining protections are still attempted.
+                unknown.append(str(order_id))
+                logger.warning(
+                    "cTrader cancel of orphaned protection order %s returned "
+                    "an execution event whose outcome cannot be classified: "
+                    "%s. Recording it unknown and continuing.",
+                    order_id,
+                    exc,
+                )
+                continue
             cancelled += 1
-        return ControlOutcome(completed=cancelled, failed=tuple(failed))
+        return ControlOutcome(
+            completed=cancelled,
+            failed=tuple(failed),
+            unknown=tuple(unknown),
+        )
 
     async def close_all_positions(self) -> ControlOutcome:
         """Flatten every open position for this cTrader account, at market.
 
         A position whose id or volume cannot be read is reported as unidentifiable rather than
         skipped: it is still open, and a caller that only sees a count would read the sweep as
-        successful while exposure remains. The same holds for a broker refusal - the other
-        positions are still attempted, and the refusal is named in the outcome.
+        successful while exposure remains. The same holds for a broker refusal or an answer
+        that cannot be classified - the other positions are still attempted, and the item is
+        named in the outcome (``failed`` or ``unknown``).
         """
         positions = await self._fetch_open_positions()
         closed = 0
         unidentified: list[str] = []
         failed: list[str] = []
+        unknown: list[str] = []
         for position in positions:
             # `positionId` and `volume` are protobuf int64 fields: the string form cannot be
             # assigned, a float raises TypeError, and an unset volume serializes as 0, which
@@ -6217,9 +6306,8 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 )
                 self._raise_for_refused_control_response(response)
             except CTraderApiError as exc:
-                # Narrow on purpose: an unclassifiable execution event raises
-                # RuntimeError, which must abort the flatten - a position whose
-                # close outcome is unknown is neither failed nor done.
+                # Narrow on purpose: a terminal auth failure is a RuntimeError,
+                # not a CTraderApiError, and still aborts the flatten.
                 self._raise_terminal_auth_from_api_error(exc)
                 failed.append(str(position_id))
                 logger.warning(
@@ -6229,11 +6317,26 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                     exc,
                 )
                 continue
+            except CTraderUnknownOutcomeError as exc:
+                # The close answer cannot be classified: the position may or
+                # may not be closed. Record it unknown - never done, never
+                # refused - and keep flattening: a position left open because
+                # an earlier answer was unreadable is the unsafe direction.
+                unknown.append(str(position_id))
+                logger.warning(
+                    "cTrader close of position %s returned an execution event "
+                    "whose outcome cannot be classified: %s. Recording it "
+                    "unknown and continuing the flatten.",
+                    position_id,
+                    exc,
+                )
+                continue
             closed += 1
         return ControlOutcome(
             completed=closed,
             unidentified=tuple(unidentified),
             failed=tuple(failed),
+            unknown=tuple(unknown),
         )
 
     async def get_positions(self) -> list[dict[str, Any]]:
