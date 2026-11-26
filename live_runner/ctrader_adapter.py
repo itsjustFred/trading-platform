@@ -3523,6 +3523,12 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                     "Persisted cTrader broker order id is invalid; refusing duplicate submission."
                 )
             self._order_id_to_signal_id[normalized_order_id] = canonical_signal_id
+            position_id = await self._persisted_exit_position_id(canonical_signal_id)
+            if position_id is not None:
+                # The close's broker order id is already known, so a pending
+                # mark this exit left on its position has done its job (same
+                # lift as the order-id recovery paths).
+                self._clear_pending_close_mark(position_id, canonical_signal_id)
             return str(normalized_order_id)
         canonical_timestamp = await asyncio.to_thread(
             get_live_signal_timestamp, canonical_signal_id

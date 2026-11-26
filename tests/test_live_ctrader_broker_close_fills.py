@@ -1064,6 +1064,27 @@ def test_a_recovered_persisted_signal_order_id_clears_the_pending_mark(
     assert POSITION_ID not in adapter._pending_close_positions
 
 
+def test_a_duplicate_signal_with_persisted_order_id_clears_the_pending_mark(
+    database,
+) -> None:
+    """Pre-mortem: the duplicate early-return must lift the mark too - the
+    close's broker order id is already known, so a genuine broker-side close
+    on the position must not stay parked until the TTL."""
+    exit_id = _persist_exit_signal(
+        database,
+        order_id=CLOSE_ORDER_ID,
+        metadata_extra={"position_id": POSITION_ID},
+    )
+    adapter = _adapter(database)
+    adapter._pending_close_positions[POSITION_ID] = {exit_id: time.monotonic()}
+
+    recovered = asyncio.run(adapter._recover_duplicate_signal_order_id(exit_id))
+
+    assert recovered == str(CLOSE_ORDER_ID)
+    assert POSITION_ID not in adapter._pending_close_positions
+    assert adapter._order_id_to_signal_id[CLOSE_ORDER_ID] == exit_id
+
+
 # ─── the reconciliation backfill ──────────────────────────────────────────────────────────────
 
 
