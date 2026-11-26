@@ -584,7 +584,9 @@ def _present_proto_field(
         try:
             if not bool(has_field(name)):
                 return None
-        except (TypeError, ValueError):
+        except Exception:  # except-kind: money-decision
+            # Presence is unanswerable: fail_closed callers get the sentinel,
+            # everyone else reads the field as absent - never as proof.
             if fail_closed:
                 return _PRESENT_BUT_UNKNOWN
             return None
@@ -3646,39 +3648,64 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         if (
             self._ProtoOAExecutionEvent is not None
             and isinstance(response, self._ProtoOAExecutionEvent)
-            and self._is_order_rejected_execution(response)
         ):
-            # Unlike the OrderErrorEvent above, the event typically still
-            # carries an `order` object with a broker-assigned orderId, so the
-            # orderId cannot decide: definiteness comes from the order's
-            # terminal status and the absence of any created state instead.
-            error_code = str(getattr(response, "errorCode", "") or "")
-            message = (
-                f"Order rejected ({error_code or 'ORDER_REJECTED'}): "
-                f"{getattr(response, 'description', '') or 'no description'}"
-            )
-            self._raise_submit_refusal(
-                message,
-                error_code=error_code,
-                definitive=self._execution_rejection_is_definitive(
-                    response, request
-                ),
-            )
+            rejected = self._is_order_rejected_execution(response)
+            if rejected is None:
+                # The event's type cannot be classified (proto types not fully
+                # loaded, or an unreadable executionType): it may be the
+                # ORDER_REJECTED refusal this path exists to catch, so it must
+                # not fall through and be reported as a submitted order.
+                raise RuntimeError(
+                    "cTrader order response was an execution event whose "
+                    "executionType could not be classified; the outcome is "
+                    "unknown and must be reconciled."
+                )
+            if rejected:
+                # Unlike the OrderErrorEvent above, the event typically still
+                # carries an `order` object with a broker-assigned orderId, so
+                # the orderId cannot decide: definiteness comes from the
+                # order's terminal status and the absence of any created
+                # state instead.
+                error_code = str(getattr(response, "errorCode", "") or "")
+                message = (
+                    f"Order rejected ({error_code or 'ORDER_REJECTED'}): "
+                    f"{getattr(response, 'description', '') or 'no description'}"
+                )
+                self._raise_submit_refusal(
+                    message,
+                    error_code=error_code,
+                    definitive=self._execution_rejection_is_definitive(
+                        response, request
+                    ),
+                )
 
     def _is_close_position_request(self, request: Any) -> bool:
+        """Whether the request is a ClosePositionReq.
+
+        ``_ProtoOAClosePositionReq`` is loaded with the other proto types
+        before any submit; if it were missing this returns False and a close
+        rejection is evaluated as a new-order one - with the position echo
+        that stays unknown, i.e. fail-closed.
+        """
         return (
             self._ProtoOAClosePositionReq is not None
             and isinstance(request, self._ProtoOAClosePositionReq)
         )
 
-    def _is_order_rejected_execution(self, event: Any) -> bool:
+    def _is_order_rejected_execution(self, event: Any) -> bool | None:
+        """Whether the event is an ORDER_REJECTED; ``None`` when unclassifiable.
+
+        ``None`` means the proto type was not fully loaded or the event's
+        ``executionType`` cannot be read - the caller must treat the response
+        as an unknown outcome rather than letting it pass as submitted.
+        """
         execution_type = getattr(self._ProtoOAExecutionType, "ORDER_REJECTED", None)
         if execution_type is None:
-            return False
+            return None
         try:
             return int(getattr(event, "executionType", -1)) == int(execution_type)
         except (AttributeError, TypeError, ValueError):
-            return False
+            return None
 
     def _execution_rejection_is_definitive(self, event: Any, request: Any) -> bool:
         """Whether an ORDER_REJECTED execution event proves nothing was opened.
@@ -3716,12 +3743,11 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         position = _present_proto_field(event, "position", fail_closed=True)
         if position is _PRESENT_BUT_UNKNOWN:
             return False
-        if self._is_close_position_request(request) or position is None:
+        if self._is_close_position_request(request):
             return True
-        position_id = _present_proto_field(
-            position, "positionId", fail_closed=True
-        )
-        return position_id in (None, 0)
+        # For a new order ANY attached position - even one whose positionId
+        # reads as unset - is state the rejection must not have produced.
+        return position is None
 
     def _handle_spot_event(self, payload: Any) -> None:
         """Feed a spot event to the pending :meth:`get_quote` for its symbol."""
