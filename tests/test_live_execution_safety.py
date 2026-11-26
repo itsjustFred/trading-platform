@@ -1722,8 +1722,11 @@ def test_ctrader_direct_persistence_strips_raw_broker_volume_keys(monkeypatch):
 
     assert len(persisted) == 1
     metadata = persisted[0].metadata
-    assert metadata["qty"] == pytest.approx(3.0)
-    assert metadata["explicit_qty"] == pytest.approx(3.0)
+    # The persisted qty is the quantity the broker was asked for: the mocked
+    # volume resolution returns 5000 broker units, which is 5.0 qty units at
+    # the EURUSD fallback scale (volume_per_qty 1000) - not the binding 3.0.
+    assert metadata["qty"] == pytest.approx(5.0)
+    assert metadata["explicit_qty"] == pytest.approx(5.0)
     assert metadata["note"] == "keep"
     assert "volume" not in metadata
     assert "ctrader_volume" not in metadata
@@ -5513,6 +5516,109 @@ def test_ctrader_adapter_treats_incoming_qty_as_binding(monkeypatch) -> None:
 
     assert asyncio.run(adapter.submit_order(signal, qty=2.0)) == "777"
     assert volumes == [2000]
+
+
+def _ctrader_submit_harness(monkeypatch):
+    """A connected cTrader adapter with the broker boundary stubbed out.
+
+    Returns ``(module, adapter, saved, volumes)``: ``saved`` collects the
+    signals handed to ``save_live_signal`` and ``volumes`` the order volumes
+    the wire request carried.
+    """
+    module, adapter = _make_ctrader_adapter()
+    adapter._connected = True
+    adapter._authenticated = True
+    adapter._symbol_name_to_id = {"EURUSD": 1}
+    saved: list[LiveSignal] = []
+    volumes: list[int] = []
+
+    monkeypatch.setattr(
+        module,
+        "save_live_signal",
+        lambda persisted: saved.append(persisted) or (str(persisted.id), True),
+    )
+    monkeypatch.setattr(module, "get_live_signal_broker_order_id", lambda _sid: "")
+    monkeypatch.setattr(module, "get_live_signal_timestamp", lambda _sid: None)
+    monkeypatch.setattr(
+        module,
+        "set_live_signal_broker_order_id",
+        lambda _sid, _oid, *, submitted_at=None, acknowledged_at=None: True,
+    )
+
+    class _Req:
+        def __init__(self) -> None:
+            self.volume = 0
+
+    adapter._ProtoOANewOrderReq = _Req
+    adapter._ProtoOAOrderType = SimpleNamespace(MARKET=1)
+    adapter._ProtoOATradeSide = SimpleNamespace(BUY=1, SELL=2)
+    adapter._ProtoOATimeInForce = SimpleNamespace(IMMEDIATE_OR_CANCEL=1)
+
+    async def _send(request, **_kwargs):
+        volumes.append(request.volume)
+        return SimpleNamespace(orderId=777)
+
+    adapter._submit_new_order_request = _send
+    adapter._extract_order_id_from_payload = lambda _payload: 777
+    return module, adapter, saved, volumes
+
+
+def test_ctrader_submit_persists_the_normalized_qty_it_sends(monkeypatch) -> None:
+    """The persisted requested qty is the volume-grid quantity actually sent,
+    not the unrounded risk-sized qty.
+
+    Live repro (cTrader demo 49714635, 2026-11-26): an entry sized 1174.9875
+    was floored onto the broker volume grid and filled 1174; the persisted
+    ``qty``/``explicit_qty`` kept the unrounded size, so broker reconciliation
+    expected a working order for the sub-step remainder forever.
+    """
+    _module, adapter, saved, volumes = _ctrader_submit_harness(monkeypatch)
+    # EURUSD fallback scale: volume_per_qty 1000, step_volume 1 -> one qty
+    # unit is 1000 broker volume units and the grid step is 0.001 qty.
+    signal = LiveSignal(
+        deployment_id="dep-1",
+        symbol="EURUSD",
+        action="buy",
+        theoretical_price=1.1,
+        timestamp=datetime.now(timezone.utc),
+        metadata={"stop_loss": 1.05, "take_profit": 1.2},
+    )
+
+    assert asyncio.run(adapter.submit_order(signal, qty=2.0007)) == "777"
+
+    # 2.0007 qty -> 2000.7 volume units -> floored to 2000 -> 2.0 qty units.
+    assert volumes == [2000]
+    assert saved[0].metadata["qty"] == pytest.approx(2.0)
+    assert saved[0].metadata["explicit_qty"] == pytest.approx(2.0)
+
+
+def test_ctrader_exit_submit_persists_the_floored_qty_it_sends(monkeypatch) -> None:
+    """Same invariant on the exit path: the close's persisted qty is the
+    floored volume-grid quantity, matching the close request's volume."""
+    _module, adapter, saved, _volumes = _ctrader_submit_harness(monkeypatch)
+    adapter._position_ids_by_symbol = {"EURUSD": (7,)}
+    close_volumes: list[int] = []
+
+    def _close_request(*, position_id: int, volume: int):
+        close_volumes.append(volume)
+        return SimpleNamespace(volume=volume)
+
+    monkeypatch.setattr(adapter, "_build_close_position_request", _close_request)
+    signal = LiveSignal(
+        deployment_id="dep-1",
+        symbol="EURUSD",
+        action="sell",
+        theoretical_price=1.1,
+        timestamp=datetime.now(timezone.utc),
+        metadata={"exit_only": True, "risk_sizing_mode": "exit_only"},
+    )
+
+    assert asyncio.run(adapter.submit_order(signal, qty=1.3336)) == "777"
+
+    # 1.3336 qty -> 1333.6 volume units -> floored to the 0.001-qty grid: 1333.
+    assert close_volumes == [1333]
+    assert saved[0].metadata["qty"] == pytest.approx(1.333)
+    assert saved[0].metadata["explicit_qty"] == pytest.approx(1.333)
 
 
 def _ctrader_entry_signal() -> LiveSignal:

@@ -487,7 +487,10 @@ sending); a take profit below one tick is sent as one tick (never 0).
 `live_runner/broker_reconciliation.py` periodically compares the local ledger truth
 (`live_executions` fills per deployment) with the broker state per account: net
 position per symbol, expected working orders and - where the adapter can list them -
-protective stops. An unreadable broker state counts as a mismatch (fail closed), but
+protective stops. The expected order quantity is the normalized submitted qty the
+adapter persisted (cTrader volume grid, Alpaca whole shares); a sub-step remainder on
+older unnormalized rows is never expected, while a remainder of one broker volume step
+or more still is. An unreadable broker state counts as a mismatch (fail closed), but
 only stops the deployment's **entries** after
 `broker_reconciliation_consecutive_mismatches` consecutive failed passes (default 2)
 (the status stays ACTIVE; exits and trailing keep running); a clean pass resets the

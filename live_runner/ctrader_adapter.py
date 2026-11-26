@@ -3302,7 +3302,27 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 str((signal.metadata or {}).get("risk_sizing_mode") or "")
                 == EXIT_ONLY_RISK_SIZING_MODE
             )
-            self._resolve_order_volume(signal)
+            order_volume = self._resolve_order_volume(signal)
+            # Persist the quantity the broker is actually asked for, not the
+            # unrounded risk-sized one: the volume grid floor can drop a
+            # sub-step remainder the broker can never work, and a persisted
+            # requested qty larger than the fill reads as a working-order
+            # expectation forever in broker reconciliation. Recomputing the
+            # volume from the normalized qty is idempotent (the lot-grid
+            # floor's noise band absorbs the float round-trip), so the request
+            # builders below still derive the same volume.
+            submitted_qty = _broker_volume_to_qty(
+                order_volume, self._scale_for(signal.symbol).volume_per_qty
+            )
+            signal = signal.model_copy(
+                update={
+                    "metadata": {
+                        **(signal.metadata or {}),
+                        "qty": submitted_qty,
+                        "explicit_qty": submitted_qty,
+                    }
+                }
+            )
             signal = signal.model_copy(
                 update={
                     "metadata": {
