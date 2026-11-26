@@ -1420,24 +1420,44 @@ def _execution_type(name: str) -> int:
 
 
 def test_execution_type_classifier_covers_every_proto_member() -> None:
-    """A proto bump adding an execution type must fail loudly here, not pass as success."""
+    """Every loaded member lands in exactly one explicit set - no substring rules."""
     from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOAExecutionType
 
     from live_runner.ctrader_adapter import (
         _NON_REJECTION_EXECUTION_TYPES,
+        _REJECTION_EXECUTION_TYPES,
         CTraderLiveAdapter,
     )
 
     members = CTraderLiveAdapter._execution_type_members(ProtoOAExecutionType)
     assert members, "proto enum member extraction returned nothing"
     names = {name for name, _ in members}
-    unclassified = names - _NON_REJECTION_EXECUTION_TYPES - {
-        name for name in names if "REJECT" in name
-    }
+    unclassified = (
+        names - _NON_REJECTION_EXECUTION_TYPES - _REJECTION_EXECUTION_TYPES
+    )
     assert not unclassified, (
         "new ProtoOAExecutionType members need a refusal/non-rejection "
         f"decision: {sorted(unclassified)}"
     )
+    assert not (_NON_REJECTION_EXECUTION_TYPES & _REJECTION_EXECUTION_TYPES), (
+        "a member cannot be both a refusal and a non-rejection"
+    )
+
+
+def test_the_known_rejection_values_classify_as_rejections() -> None:
+    """ORDER_REJECTED and ORDER_CANCEL_REJECTED are refusals by explicit name."""
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOAExecutionType
+
+    from live_runner.ctrader_adapter import CTraderLiveAdapter
+
+    adapter = CTraderLiveAdapter.__new__(CTraderLiveAdapter)
+    adapter._ProtoOAExecutionType = ProtoOAExecutionType
+    for name in ("ORDER_REJECTED", "ORDER_CANCEL_REJECTED"):
+        event = SimpleNamespace(
+            ctidTraderAccountId=46736452,
+            executionType=int(getattr(ProtoOAExecutionType, name)),
+        )
+        assert adapter._execution_event_rejection(event) == (name, False)
 
 
 def test_a_cancel_refused_with_order_cancel_rejected_is_a_failure() -> None:

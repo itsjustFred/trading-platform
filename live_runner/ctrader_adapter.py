@@ -667,10 +667,25 @@ class _SpotWaiter:
 # so an unanswerable ``HasField`` must read as "present / unknown" instead.
 _PRESENT_BUT_UNKNOWN = object()
 
+#: ``ProtoOAExecutionType`` members that ARE a refusal, named explicitly.
+#: ``ORDER_REJECTED`` is the operation itself refused; ``ORDER_CANCEL_REJECTED``
+#: is a refused cancel. The proto defines no amend-specific rejection, so a
+#: refused amend surfaces as one of them (#439). The set is exhaustive on
+#: purpose: a future member in neither this set nor
+#: ``_NON_REJECTION_EXECUTION_TYPES`` is unclassifiable and fails closed.
+_REJECTION_EXECUTION_TYPES = frozenset(
+    {
+        "ORDER_REJECTED",
+        "ORDER_CANCEL_REJECTED",
+    }
+)
+
 #: ``ProtoOAExecutionType`` members that are never a refusal. The classifier
 #: in ``_execution_event_rejection`` accepts a member as a non-rejection only
-#: when its name is in this set or contains ``REJECT``; anything else fails
-#: closed to unclassifiable so a future enum member cannot pass as success.
+#: when its name is in this set; a member in neither set fails closed to
+#: unclassifiable so a future enum member cannot pass as success. The two
+#: sets must stay disjoint - ``test_execution_type_classifier_covers_every_
+#: proto_member`` asserts every loaded member lands in exactly one of them.
 _NON_REJECTION_EXECUTION_TYPES = frozenset(
     {
         "ORDER_ACCEPTED",
@@ -4625,13 +4640,14 @@ class CTraderLiveAdapter(BaseLiveAdapter):
 
         Returns ``(rejection_name, False)`` for a rejection, ``(None, False)``
         for a classified non-rejection and ``(None, True)`` when the type
-        cannot be classified. A rejection is any enum member whose name
-        contains ``REJECT`` - today ``ORDER_REJECTED`` (the operation itself
-        was refused) and ``ORDER_CANCEL_REJECTED`` (a cancel was refused);
-        the proto defines no amend-specific rejection, so a refused
+        cannot be classified. A rejection is a member of
+        ``_REJECTION_EXECUTION_TYPES`` - ``ORDER_REJECTED`` (the operation
+        itself was refused) and ``ORDER_CANCEL_REJECTED`` (a cancel was
+        refused); the proto defines no amend-specific rejection, so a refused
         ``ProtoOAAmendPositionSLTPReq`` or ``ProtoOAAmendOrderReq`` surfaces
-        as one of them (#439). Deriving the set from the enum keeps a future
-        rejection type from silently passing as success.
+        as one of them (#439). The sets are explicit, not name-derived: a
+        member in neither fails closed to unclassifiable, so a future
+        rejection type cannot pass as success even if it is miscatalogued.
 
         ``(None, True)`` - the unclassifiable outcome - covers proto types
         not fully loaded, an unreadable ``executionType``, and a value that
@@ -4653,14 +4669,14 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         known = {number for _, number in members}
         if value not in known:
             return None, True
-        matched = [name for name, number in members if number == value]
-        # Any member named *REJECT* is a refusal; anything else must be a
-        # known non-rejection outcome. A member that is neither - a future
-        # rejection type named without "REJECT", or an unknown outcome -
-        # fails closed to unclassifiable rather than passing as success.
-        if any("REJECT" in name for name in matched):
-            return next(name for name in matched if "REJECT" in name), False
-        if all(name in _NON_REJECTION_EXECUTION_TYPES for name in matched):
+        matched = {name for name, number in members if number == value}
+        # Membership in the explicit sets decides: a rejection name wins
+        # over a non-rejection alias on the same number, a member in neither
+        # set fails closed to unclassifiable rather than passing as success.
+        rejections = matched & _REJECTION_EXECUTION_TYPES
+        if rejections:
+            return sorted(rejections)[0], False
+        if matched <= _NON_REJECTION_EXECUTION_TYPES:
             return None, False
         return None, True
 
@@ -5602,8 +5618,8 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         trading refusals on the cancel, flatten and amend paths
         (``MARKET_CLOSED``, ``POSITION_NOT_FOUND``, ``TRADING_BAD_VOLUME``,
         ...) either as a `ProtoOAOrderErrorEvent` or as a correlated
-        `ProtoOAExecutionEvent` whose ``executionType`` is a rejection - any
-        enum member named ``*REJECT*`` (today ``ORDER_REJECTED`` and
+        `ProtoOAExecutionEvent` whose ``executionType`` is a rejection - a
+        member of ``_REJECTION_EXECUTION_TYPES`` (``ORDER_REJECTED`` and
         ``ORDER_CANCEL_REJECTED``; the proto defines no amend-specific
         rejection, so a refused amend surfaces as one of them, #439).
         Either payload means the operation changed nothing, so the refusal
@@ -5958,6 +5974,9 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 # `CTraderAuthTerminalError` is a RuntimeError, not a CTraderApiError, so an
                 # auth-terminal failure still propagates and ends the sweep - correct, because
                 # the connection is no longer usable and the remaining cancels would fail too.
+                # The same holds for the unclassifiable-execution-event RuntimeError: an
+                # unknown outcome must abort the sweep, never be swallowed into `failed` or
+                # counted done - keep this except narrow.
                 self._raise_terminal_auth_from_api_error(exc)
                 failed.append(str(order_id))
                 logger.warning(
@@ -6160,6 +6179,9 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 )
                 self._raise_for_refused_control_response(response)
             except CTraderApiError as exc:
+                # Narrow on purpose: an unclassifiable execution event raises
+                # RuntimeError, which must abort the flatten - a position whose
+                # close outcome is unknown is neither failed nor done.
                 self._raise_terminal_auth_from_api_error(exc)
                 failed.append(str(position_id))
                 logger.warning(
