@@ -3607,12 +3607,9 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             # may have landed.
             order_id = _present_proto_field(response, "orderId", fail_closed=True)
             position_id = _present_proto_field(response, "positionId", fail_closed=True)
-            is_close_position = (
-                self._ProtoOAClosePositionReq is not None
-                and isinstance(request, self._ProtoOAClosePositionReq)
-            )
             definitive_refusal = order_id in (None, 0) and (
-                is_close_position or position_id in (None, 0)
+                self._is_close_position_request(request)
+                or position_id in (None, 0)
             )
             message = (
                 f"Order rejected ({getattr(response, 'errorCode', '') or ''}): "
@@ -3624,7 +3621,83 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 message,
                 error_code=str(getattr(response, "errorCode", "") or ""),
             )
+        if (
+            self._ProtoOAExecutionEvent is not None
+            and self._ProtoOAExecutionType is not None
+            and isinstance(response, self._ProtoOAExecutionEvent)
+            and self._is_order_rejected_execution(response)
+        ):
+            # cTrader also answers a refused NewOrderReq/ClosePositionReq with
+            # a ProtoOAExecutionEvent whose executionType is ORDER_REJECTED.
+            # Unlike the OrderErrorEvent above, the event typically still
+            # carries an `order` object with a broker-assigned orderId, so the
+            # orderId cannot decide: definiteness comes from the order's
+            # terminal status and the absence of any created state instead.
+            definitive_refusal = self._execution_rejection_is_definitive(
+                response, request
+            )
+            error_code = str(getattr(response, "errorCode", "") or "")
+            message = (
+                f"Order rejected ({error_code or 'ORDER_REJECTED'}): "
+                f"{getattr(response, 'description', '') or 'no description'}"
+            )
+            if not definitive_refusal:
+                raise RuntimeError(message)
+            raise BrokerOrderRejectedError(message, error_code=error_code)
         return response
+
+    def _is_close_position_request(self, request: Any) -> bool:
+        return (
+            self._ProtoOAClosePositionReq is not None
+            and isinstance(request, self._ProtoOAClosePositionReq)
+        )
+
+    def _is_order_rejected_execution(self, event: Any) -> bool:
+        try:
+            return int(getattr(event, "executionType", -1)) == int(
+                self._ProtoOAExecutionType.ORDER_REJECTED
+            )
+        except (TypeError, ValueError):
+            return False
+
+    def _execution_rejection_is_definitive(self, event: Any, request: Any) -> bool:
+        """Whether an ORDER_REJECTED execution event proves nothing was opened.
+
+        Safe means two things: the order can never execute, and no state was
+        created. The event's ``order`` must report ``ORDER_STATUS_REJECTED``
+        (terminal - a rejected order does not fill later), no ``deal`` may be
+        attached (a deal is an execution record, so its presence means an
+        execution may exist), and a new-order request must not carry a
+        ``position`` (a created position is exactly the state a rejection
+        must not have produced). A close request echoes the still-open
+        position it failed to close, so position does not decide there -
+        the same rule the OrderErrorEvent path applies to ``positionId``.
+        Unanswerable field presence fails closed to "unknown".
+        """
+        order = _present_proto_field(event, "order", fail_closed=True)
+        if order is _PRESENT_BUT_UNKNOWN or order is None:
+            return False
+        status_enum = getattr(self, "_ProtoOAOrderStatus", None)
+        if status_enum is None:
+            return False
+        try:
+            if int(getattr(order, "orderStatus", -1)) != int(
+                getattr(status_enum, "ORDER_STATUS_REJECTED", -1)
+            ):
+                return False
+        except (TypeError, ValueError):
+            return False
+        if _present_proto_field(event, "deal", fail_closed=True) is not None:
+            return False
+        position = _present_proto_field(event, "position", fail_closed=True)
+        if position is _PRESENT_BUT_UNKNOWN:
+            return False
+        if self._is_close_position_request(request) or position is None:
+            return True
+        position_id = _present_proto_field(
+            position, "positionId", fail_closed=True
+        )
+        return position_id in (None, 0)
 
     def _handle_spot_event(self, payload: Any) -> None:
         """Feed a spot event to the pending :meth:`get_quote` for its symbol."""

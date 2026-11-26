@@ -3896,3 +3896,274 @@ def test_submit_transport_error_stays_an_ordinary_unknown_outcome() -> None:
     with pytest.raises(ConnectionResetError) as excinfo:
         asyncio.run(submission)
     assert not isinstance(excinfo.value, BrokerOrderRejectedError)
+
+
+# ─── ORDER_REJECTED execution-event refusal classification (#428) ─────────────
+#
+# cTrader answers a NewOrderReq/ClosePositionReq with a ProtoOAExecutionEvent
+# whose executionType is ORDER_REJECTED when validation refuses the order; the
+# event is the correlated response (matched by clientMsgId) and typically still
+# carries an `order` object with a broker-assigned orderId and
+# orderStatus=ORDER_STATUS_REJECTED. That is a definitive refusal - nothing was
+# opened or closed and a rejected order cannot execute later - only when the
+# event proves no state was created: the order's status is REJECTED, no deal is
+# attached (a deal is an execution record), and for a new-order request no
+# position is attached. Anything else stays an ordinary exception (unknown
+# outcome) held for reconciliation.
+
+
+def _execution_event_response_adapter(event, order_status=None):
+    from ctrader_open_api.messages.OpenApiMessages_pb2 import (
+        ProtoOAClosePositionReq,
+        ProtoOAExecutionEvent,
+        ProtoOANewOrderReq,
+        ProtoOAOrderErrorEvent,
+    )
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import (
+        ProtoOAExecutionType,
+        ProtoOAOrderStatus,
+    )
+
+    adapter = CTraderLiveAdapter(
+        app_id="app", app_secret="secret", access_token="token", account_id="1"
+    )
+    adapter._ProtoOAExecutionEvent = ProtoOAExecutionEvent
+    adapter._ProtoOAOrderErrorEvent = ProtoOAOrderErrorEvent
+    adapter._ProtoOANewOrderReq = ProtoOANewOrderReq
+    adapter._ProtoOAClosePositionReq = ProtoOAClosePositionReq
+    adapter._ProtoOAExecutionType = ProtoOAExecutionType
+    adapter._ProtoOAOrderStatus = order_status or ProtoOAOrderStatus
+
+    async def send(_request, *, timeout_seconds: int = 20):
+        return event
+
+    adapter._send_request_with_refresh_retry = send
+    return adapter
+
+
+def _rejected_order(order_id: int = 123, status: int = 3):
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOAOrder
+
+    return ProtoOAOrder(orderId=order_id, orderStatus=status)
+
+
+def test_order_rejected_execution_event_is_a_definitive_broker_rejection() -> None:
+    """A rejected order still carries an orderId; status REJECTED makes it final."""
+    from ctrader_open_api.messages.OpenApiMessages_pb2 import (
+        ProtoOAExecutionEvent,
+        ProtoOANewOrderReq,
+    )
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import (
+        ProtoOAExecutionType,
+        ProtoOAOrderStatus,
+    )
+
+    from live_runner.base_adapter import BrokerOrderRejectedError
+
+    adapter = _execution_event_response_adapter(
+        ProtoOAExecutionEvent(
+            ctidTraderAccountId=1,
+            executionType=ProtoOAExecutionType.ORDER_REJECTED,
+            order=_rejected_order(
+                order_id=123, status=ProtoOAOrderStatus.ORDER_STATUS_REJECTED
+            ),
+            errorCode="TRADING_BAD_VOLUME",
+        )
+    )
+    submission = adapter._submit_new_order_request(ProtoOANewOrderReq())
+
+    with pytest.raises(BrokerOrderRejectedError, match="Order rejected") as excinfo:
+        asyncio.run(submission)
+    assert excinfo.value.error_code == "TRADING_BAD_VOLUME"
+
+
+def test_order_rejected_execution_with_position_stays_an_unknown_outcome() -> None:
+    """A position attached to a new-order rejection may be newly created state."""
+    from ctrader_open_api.messages.OpenApiMessages_pb2 import (
+        ProtoOAExecutionEvent,
+        ProtoOANewOrderReq,
+    )
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import (
+        ProtoOAExecutionType,
+        ProtoOAOrderStatus,
+        ProtoOAPosition,
+    )
+
+    from live_runner.base_adapter import BrokerOrderRejectedError
+
+    adapter = _execution_event_response_adapter(
+        ProtoOAExecutionEvent(
+            ctidTraderAccountId=1,
+            executionType=ProtoOAExecutionType.ORDER_REJECTED,
+            order=_rejected_order(status=ProtoOAOrderStatus.ORDER_STATUS_REJECTED),
+            position=ProtoOAPosition(positionId=55),
+            errorCode="TRADING_BAD_VOLUME",
+        )
+    )
+    submission = adapter._submit_new_order_request(ProtoOANewOrderReq())
+
+    with pytest.raises(RuntimeError, match="Order rejected") as excinfo:
+        asyncio.run(submission)
+    assert not isinstance(excinfo.value, BrokerOrderRejectedError)
+
+
+def test_order_rejected_execution_close_request_is_definitive() -> None:
+    """A close echoes the still-open position; order status REJECTED decides."""
+    from ctrader_open_api.messages.OpenApiMessages_pb2 import (
+        ProtoOAClosePositionReq,
+        ProtoOAExecutionEvent,
+    )
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import (
+        ProtoOAExecutionType,
+        ProtoOAOrderStatus,
+        ProtoOAPosition,
+    )
+
+    from live_runner.base_adapter import BrokerOrderRejectedError
+
+    adapter = _execution_event_response_adapter(
+        ProtoOAExecutionEvent(
+            ctidTraderAccountId=1,
+            executionType=ProtoOAExecutionType.ORDER_REJECTED,
+            order=_rejected_order(status=ProtoOAOrderStatus.ORDER_STATUS_REJECTED),
+            position=ProtoOAPosition(positionId=123),
+            errorCode="TRADING_BAD_VOLUME",
+        )
+    )
+    request = ProtoOAClosePositionReq(
+        ctidTraderAccountId=1, positionId=123, volume=1000
+    )
+    submission = adapter._submit_new_order_request(request)
+
+    with pytest.raises(BrokerOrderRejectedError, match="Order rejected") as excinfo:
+        asyncio.run(submission)
+    assert excinfo.value.error_code == "TRADING_BAD_VOLUME"
+
+
+def test_order_rejected_execution_with_working_order_status_stays_unknown() -> None:
+    """An order still ACCEPTED in the event is not proof nothing will execute."""
+    from ctrader_open_api.messages.OpenApiMessages_pb2 import (
+        ProtoOAExecutionEvent,
+        ProtoOANewOrderReq,
+    )
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import (
+        ProtoOAExecutionType,
+        ProtoOAOrderStatus,
+    )
+
+    from live_runner.base_adapter import BrokerOrderRejectedError
+
+    adapter = _execution_event_response_adapter(
+        ProtoOAExecutionEvent(
+            ctidTraderAccountId=1,
+            executionType=ProtoOAExecutionType.ORDER_REJECTED,
+            order=_rejected_order(status=ProtoOAOrderStatus.ORDER_STATUS_ACCEPTED),
+            errorCode="TRADING_BAD_VOLUME",
+        )
+    )
+    submission = adapter._submit_new_order_request(ProtoOANewOrderReq())
+
+    with pytest.raises(RuntimeError, match="Order rejected") as excinfo:
+        asyncio.run(submission)
+    assert not isinstance(excinfo.value, BrokerOrderRejectedError)
+
+
+def test_order_rejected_execution_without_order_stays_unknown() -> None:
+    """No order object means the terminal status cannot be proven: fail closed."""
+    from ctrader_open_api.messages.OpenApiMessages_pb2 import (
+        ProtoOAExecutionEvent,
+        ProtoOANewOrderReq,
+    )
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOAExecutionType
+
+    from live_runner.base_adapter import BrokerOrderRejectedError
+
+    adapter = _execution_event_response_adapter(
+        ProtoOAExecutionEvent(
+            ctidTraderAccountId=1,
+            executionType=ProtoOAExecutionType.ORDER_REJECTED,
+            errorCode="TRADING_BAD_VOLUME",
+        )
+    )
+    submission = adapter._submit_new_order_request(ProtoOANewOrderReq())
+
+    with pytest.raises(RuntimeError, match="Order rejected") as excinfo:
+        asyncio.run(submission)
+    assert not isinstance(excinfo.value, BrokerOrderRejectedError)
+
+
+def test_order_rejected_execution_with_deal_stays_an_unknown_outcome() -> None:
+    """A deal is an execution record; a rejected order carrying one is not clean."""
+    from ctrader_open_api.messages.OpenApiMessages_pb2 import (
+        ProtoOAExecutionEvent,
+        ProtoOANewOrderReq,
+    )
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import (
+        ProtoOADeal,
+        ProtoOAExecutionType,
+        ProtoOAOrderStatus,
+    )
+
+    from live_runner.base_adapter import BrokerOrderRejectedError
+
+    adapter = _execution_event_response_adapter(
+        ProtoOAExecutionEvent(
+            ctidTraderAccountId=1,
+            executionType=ProtoOAExecutionType.ORDER_REJECTED,
+            order=_rejected_order(status=ProtoOAOrderStatus.ORDER_STATUS_REJECTED),
+            deal=ProtoOADeal(dealId=7, orderId=123, filledVolume=1000),
+            errorCode="TRADING_BAD_VOLUME",
+        )
+    )
+    submission = adapter._submit_new_order_request(ProtoOANewOrderReq())
+
+    with pytest.raises(RuntimeError, match="Order rejected") as excinfo:
+        asyncio.run(submission)
+    assert not isinstance(excinfo.value, BrokerOrderRejectedError)
+
+
+def test_order_rejected_execution_unanswerable_presence_stays_unknown() -> None:
+    """A HasField failure must read as present/unknown, never as absent."""
+    from ctrader_open_api.messages.OpenApiMessages_pb2 import ProtoOANewOrderReq
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOAExecutionType
+
+    from live_runner.base_adapter import BrokerOrderRejectedError
+
+    class _BrokenHasFieldEvent:
+        executionType = ProtoOAExecutionType.ORDER_REJECTED
+        errorCode = "TRADING_BAD_VOLUME"
+
+        def HasField(self, _name: str) -> bool:
+            raise ValueError("not a proto2 optional field")
+
+    adapter = _execution_event_response_adapter(_BrokenHasFieldEvent())
+
+    adapter._ProtoOAExecutionEvent = _BrokenHasFieldEvent
+    submission = adapter._submit_new_order_request(ProtoOANewOrderReq())
+
+    with pytest.raises(RuntimeError, match="Order rejected") as excinfo:
+        asyncio.run(submission)
+    assert not isinstance(excinfo.value, BrokerOrderRejectedError)
+
+
+def test_non_rejected_execution_event_response_passes_through() -> None:
+    """Only ORDER_REJECTED is a refusal; other execution events keep flowing."""
+    from ctrader_open_api.messages.OpenApiMessages_pb2 import (
+        ProtoOAExecutionEvent,
+        ProtoOANewOrderReq,
+    )
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import (
+        ProtoOAExecutionType,
+        ProtoOAOrderStatus,
+    )
+
+    event = ProtoOAExecutionEvent(
+        ctidTraderAccountId=1,
+        executionType=ProtoOAExecutionType.ORDER_FILLED,
+        order=_rejected_order(status=ProtoOAOrderStatus.ORDER_STATUS_FILLED),
+    )
+    adapter = _execution_event_response_adapter(event)
+    response = asyncio.run(
+        adapter._submit_new_order_request(ProtoOANewOrderReq())
+    )
+    assert response is event
