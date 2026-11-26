@@ -126,3 +126,60 @@ def test_trailing_eligible_adapters_hard_block_real_money() -> None:
     )
 
     assert eligible == {"demo": demo}
+
+
+def test_run_daemon_starts_the_protective_maintenance_loop(
+    monkeypatch, tmp_path
+) -> None:
+    """The daemon must actually create the protective-stop maintenance
+    task: removing it would leave expired and aged-out stops unhealed
+    until the next adapter connect."""
+    from live_runner import daemon
+
+    calls: list[object] = []
+
+    def _recorder(*args, **kwargs):
+        calls.append((args, kwargs))
+
+        async def _coro() -> None:
+            return None
+
+        return _coro()
+
+    async def _noop_async(*args, **kwargs) -> None:
+        return None
+
+    def _noop_sync(*args, **kwargs):
+        return None
+
+    class _Scheduler:
+        async def start(self):
+            return None
+
+        async def stop(self):
+            return None
+
+    monkeypatch.setattr(
+        daemon, "_discover_and_register_discord_services", _noop_sync
+    )
+    monkeypatch.setattr(daemon, "_recover_failed_services", _noop_sync)
+    monkeypatch.setattr(daemon, "ServiceScheduler", lambda: _Scheduler())
+    monkeypatch.setattr(daemon, "sync_deployments_loop", _noop_async)
+    monkeypatch.setattr(daemon, "sync_services_loop", _noop_async)
+    monkeypatch.setattr(daemon, "run_trailing_stops_loop", _noop_async)
+    monkeypatch.setattr(daemon, "_backfill_commissions_loop", _noop_async)
+    monkeypatch.setattr(daemon, "run_internal_strategy_loop", _noop_async)
+    monkeypatch.setattr(daemon, "run_flip_workflow_loop", _noop_async)
+    monkeypatch.setattr(
+        daemon, "run_protective_stop_maintenance_loop", _recorder
+    )
+    monkeypatch.setattr(daemon, "run_broker_reconciliation_loop", _noop_async)
+    monkeypatch.setattr(
+        daemon,
+        "_start_balance_poller",
+        lambda *a, **k: asyncio.ensure_future(_noop_async()),
+    )
+
+    asyncio.run(daemon.run_daemon(accounts_env=tmp_path / "accounts.env"))
+
+    assert calls

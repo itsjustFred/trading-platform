@@ -4076,6 +4076,9 @@ _BROKER_CLOSE_NAMESPACE = uuid5(NAMESPACE_URL, "trading-platform/live/broker-sid
 BROKER_CLOSE_REASON_ALPACA_STOP_LEG = "alpaca_bracket_stop"
 BROKER_CLOSE_REASON_ALPACA_TARGET_LEG = "alpaca_bracket_target"
 BROKER_CLOSE_REASON_ALPACA_LEG = "alpaca_bracket_leg"
+#: The protective-stop heal's market close (#435): a ``-reprotect`` order that
+#: is not a bracket leg at all, so it must not book as ``alpaca_bracket_leg``.
+BROKER_CLOSE_REASON_ALPACA_REPROTECT_CLOSE = "alpaca_reprotect_close"
 #: A cTrader position close the platform did not submit (SL/TP, flatten, manual).
 #: cTrader does not say WHICH of those fired, so one reason covers them all; the
 #: deal -> position -> opening-order -> clientOrderId chain is what makes the

@@ -439,6 +439,10 @@ class ProtectiveStop:
     #: (excluded from equality): an amendment moves the price only, so the caller
     #: can warn when it differs from the position, never correct it.
     qty: float | None = field(default=None, compare=False)
+    #: The order's client order id as the broker knows it, so an amendment can
+    #: carry it through a replace instead of losing its attribution marker.
+    #: Informational (excluded from equality), like ``qty``.
+    client_order_id: str = field(default="", compare=False)
 
 
 class BaseLiveAdapter(ABC):

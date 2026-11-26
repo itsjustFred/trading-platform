@@ -569,14 +569,16 @@ legs and restored stops the adapter submits `GTC` - is cancelled by Alpaca
 (`AlpacaLiveAdapter.maintain_protective_stops`, driven at connect by the
 exit re-protection recovery and by the daemon's
 `protective-stop-maintenance` loop under the broker mutation gate) re-places
-such orders before they age out (~3 trading days of lead, measured from
+such orders before they age out (5 calendar days of lead, measured from
 `expires_at` or `created_at` + 90 days) and heals ones already lost - an
 `expired` leg, or a `canceled` order provably killed by the policy
 (`canceled_at` landing at the computed expiry; an operator or own cancel is
 alerted, never healed). A recorded stop already through the market closes
 the position at market instead of re-placing a stop that would fill
 instantly; a stale/missing quote or a closed session fails closed and
-retries next pass. Every heal event alerts once and writes a
+retries next pass. The quote feed is stock-only, so a lost crypto stop
+always fails closed on `heal_quote_unusable` - the ERROR alert is the
+prompt to protect that position by hand. Every heal event alerts once and writes a
 `alpaca_expired_entry_stop_heal` audit row; heals only run when the ledger
 proves the position is a single deployment's open lot matching the broker
 quantity, no exit is in flight, and no `exit_reprotection` marker is

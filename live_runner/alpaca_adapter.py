@@ -63,6 +63,7 @@ from shared.alpaca_symbols import classify_alpaca_symbol, crypto_pair_key
 from shared.constants import DATA_DIR
 from shared.database import (
     BROKER_CLOSE_REASON_ALPACA_LEG,
+    BROKER_CLOSE_REASON_ALPACA_REPROTECT_CLOSE,
     BROKER_CLOSE_REASON_ALPACA_STOP_LEG,
     BROKER_CLOSE_REASON_ALPACA_TARGET_LEG,
     apply_live_execution_commissions,
@@ -828,6 +829,12 @@ def _bracket_leg_close_reason(leg: Any) -> str:
         return BROKER_CLOSE_REASON_ALPACA_STOP_LEG
     if order_type == "limit":
         return BROKER_CLOSE_REASON_ALPACA_TARGET_LEG
+    coid = str(_order_attr(leg, "client_order_id", "") or "")
+    if _REPROTECT_CLIENT_ORDER_MARKER in coid:
+        # A ``-reprotect`` order that is not a stop/limit leg is the heal's
+        # market close (or a stop-limit re-place): label it as the heal's,
+        # not as a bracket leg it never was.
+        return BROKER_CLOSE_REASON_ALPACA_REPROTECT_CLOSE
     return BROKER_CLOSE_REASON_ALPACA_LEG
 
 
@@ -974,6 +981,9 @@ def _protective_stop_of(
         side=_order_side(candidate),
         stop_price=stop_price,
         qty=qty if qty is not None and qty > 0 else None,
+        client_order_id=str(
+            _order_attr(candidate, "client_order_id", "") or ""
+        ),
     )
 
 
@@ -1666,6 +1676,11 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         # literal ``0.0`` would read as "just ran" and throttle the first
         # periodic pass forever.
         self._expired_stop_heal_last_run = float("-inf")
+        # A persistent scan failure (for example an order history that
+        # outgrows the page budget) would otherwise log an ERROR every tick;
+        # the ERROR is throttled to one per heal interval, repeats log at
+        # WARNING so the condition stays visible without flooding.
+        self._expired_stop_heal_scan_error_last_log = float("-inf")
         self._expired_stop_heal_alerted: set[str] = set()
         self._heal_replaced_order_ids: set[str] = set()
         # One maintenance pass at a time per adapter: the connect-time
@@ -6372,7 +6387,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
     # once per process and writes an audit row; every ambiguity fails closed
     # to an alert and places nothing.
 
-    def _expired_stop_heal_alert(
+    async def _expired_stop_heal_alert(
         self, symbol: str, reason: str, detail: Mapping[str, Any]
     ) -> None:
         """One deduped ERROR alert plus an audit row for a heal decision.
@@ -6380,7 +6395,8 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         The expired leg stays in the broker's history forever, so without
         dedupe every periodic pass would re-alert the same finding. The key
         carries the reason and the leg ids: a NEW expired leg on the same
-        symbol alerts again.
+        symbol alerts again. The audit write is a synchronous database call,
+        so it runs in a thread rather than on the event loop.
         """
         leg_ids = detail.get("leg_order_ids") or ()
         key = f"{symbol}:{reason}:{','.join(str(item) for item in leg_ids)}"
@@ -6392,7 +6408,8 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         if len(self._expired_stop_heal_alerted) > 500:
             self._expired_stop_heal_alerted.clear()
         self._expired_stop_heal_alerted.add(key)
-        record_live_control_audit(
+        await asyncio.to_thread(
+            record_live_control_audit,
             action=_EXPIRED_STOP_HEAL_AUDIT_ACTION,
             target_type="account_symbol",
             target_id=f"{self.account_id}:{symbol}",
@@ -6509,14 +6526,14 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             if not symbol:
                 continue
             if position.get("qty_unparseable"):
-                self._expired_stop_heal_alert(
+                await self._expired_stop_heal_alert(
                     symbol, "position_qty_unreadable", {}
                 )
                 continue
             try:
                 qty = _position_qty(position)
             except ValueError:
-                self._expired_stop_heal_alert(
+                await self._expired_stop_heal_alert(
                     symbol, "position_qty_unreadable", {}
                 )
                 continue
@@ -6682,16 +6699,32 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # except-kind: money-decision
-            logger.error(
-                "ALERT: Alpaca protective-stop maintenance scan failed",
-                extra={
-                    "data": {
-                        "alert": "expired_entry_stop_heal_failed",
-                        "account_id": self.account_id,
-                        "error": repr(exc),
-                    }
-                },
-            )
+            if (
+                now - self._expired_stop_heal_scan_error_last_log
+                >= _EXPIRED_STOP_HEAL_INTERVAL_SECONDS
+            ):
+                self._expired_stop_heal_scan_error_last_log = now
+                logger.error(
+                    "ALERT: Alpaca protective-stop maintenance scan failed",
+                    extra={
+                        "data": {
+                            "alert": "expired_entry_stop_heal_failed",
+                            "account_id": self.account_id,
+                            "error": repr(exc),
+                        }
+                    },
+                )
+            else:
+                logger.warning(
+                    "Alpaca protective-stop maintenance scan failed again "
+                    "within the alert interval",
+                    extra={
+                        "data": {
+                            "account_id": self.account_id,
+                            "error": repr(exc),
+                        }
+                    },
+                )
             return
         work = {
             symbol: parts
@@ -6735,7 +6768,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 raise
             except Exception as exc:  # except-kind: money-decision
                 heal_failed = True
-                self._expired_stop_heal_alert(
+                await self._expired_stop_heal_alert(
                     symbol, "heal_error", {"error": repr(exc)}
                 )
         # Stamp once per pass, after every symbol was attempted - and not at
@@ -6753,7 +6786,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
     ) -> None:
         """Act on one symbol's scan buckets; locks are already held."""
         for _parent, item, cause in parts.get("skipped", []):
-            self._expired_stop_heal_alert(
+            await self._expired_stop_heal_alert(
                 symbol,
                 "expired_leg_skipped",
                 {
@@ -6864,7 +6897,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 list_live_account_open_position_lots, self.account_id
             )
         except Exception as exc:  # except-kind: money-decision
-            self._expired_stop_heal_alert(
+            await self._expired_stop_heal_alert(
                 symbol, "open_lots_unreadable", {"error": repr(exc)}
             )
             return "blocked", None
@@ -6882,7 +6915,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 get_account_net_filled_qty_by_deployment, self.account_id, symbol
             )
         except Exception as exc:  # except-kind: money-decision
-            self._expired_stop_heal_alert(
+            await self._expired_stop_heal_alert(
                 symbol, "ledger_unreadable", {"error": repr(exc)}
             )
             return "blocked", None
@@ -6892,7 +6925,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             if abs(float(net)) > tolerance
         }
         if len(nonzero) != 1:
-            self._expired_stop_heal_alert(
+            await self._expired_stop_heal_alert(
                 symbol,
                 "ledger_multi_deployment",
                 {
@@ -6907,14 +6940,14 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         deployment_id = next(iter(nonzero))
         ledger_net = nonzero[deployment_id]
         if abs(ledger_net - qty) > tolerance:
-            self._expired_stop_heal_alert(
+            await self._expired_stop_heal_alert(
                 symbol,
                 "ledger_mismatch",
                 {"broker_qty": qty, "ledger_qty": ledger_net},
             )
             return "blocked", None
         if deployment_id not in deployments:
-            self._expired_stop_heal_alert(
+            await self._expired_stop_heal_alert(
                 symbol,
                 "ledger_deployment_unmatched",
                 {"deployment_id": deployment_id, "broker_qty": qty},
@@ -6927,7 +6960,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             and lot.get("signal_id")
         }
         if not entry_candidates:
-            self._expired_stop_heal_alert(
+            await self._expired_stop_heal_alert(
                 symbol,
                 "entry_not_open_lot",
                 {"deployment_id": deployment_id, "broker_qty": qty},
@@ -6950,7 +6983,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 list_pending_exit_reprotections, self.account_id
             )
         except Exception as exc:  # except-kind: money-decision
-            self._expired_stop_heal_alert(
+            await self._expired_stop_heal_alert(
                 symbol,
                 "exit_markers_unreadable",
                 {"error": repr(exc)},
@@ -6988,7 +7021,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         try:
             working = await self._working_book_on_symbol(client, symbol)
         except Exception as exc:  # except-kind: money-decision
-            self._expired_stop_heal_alert(
+            await self._expired_stop_heal_alert(
                 symbol,
                 "working_book_unreadable",
                 {"leg_order_ids": leg_ids, "error": repr(exc)},
@@ -7014,7 +7047,47 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                     _control_order_id(_order_attr(working_stop, "id")),
                 )
                 return "protected", None
-            self._expired_stop_heal_alert(
+            # A stop the trailing loop amended off a healed order keeps the
+            # position covered but loses the ``-reprotect`` client order id
+            # (a broker replace may re-key it): it is still attributed to the
+            # entry through the leg-order-id map, and a stop covering the
+            # whole position is protection whatever placed it. Both are
+            # informational - an ERROR here would re-alert on every pass for
+            # as long as the position lives.
+            working_stop_id = _control_order_id(
+                _order_attr(working_stop, "id")
+            )
+            leg_key = _bracket_leg_key(working_stop_id)
+            if leg_key is not None and (
+                leg_key in self._bracket_leg_order_id_to_signal_id
+            ):
+                logger.info(
+                    "Alpaca protective-stop maintenance: %s is already "
+                    "protected by entry-attributed stop %s",
+                    symbol,
+                    working_stop_id,
+                )
+                return "protected", None
+            try:
+                working_stop_qty = parse_optional(
+                    _order_attr(working_stop, "qty", None)
+                )
+            except MoneyParseError:
+                working_stop_qty = None
+            if (
+                working_stop_qty is not None
+                and working_stop_qty > 0
+                and working_stop_qty
+                >= abs(qty) - self.position_qty_tolerance(symbol)
+            ):
+                logger.info(
+                    "Alpaca protective-stop maintenance: %s is already "
+                    "protected by position-covering stop %s",
+                    symbol,
+                    working_stop_id,
+                )
+                return "protected", None
+            await self._expired_stop_heal_alert(
                 symbol,
                 "stop_already_working",
                 {"leg_order_ids": leg_ids},
@@ -7022,7 +7095,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             return "blocked", None
         exit_order = self._find_exit_in_flight_order(working, symbol, side)
         if exit_order is not None:
-            self._expired_stop_heal_alert(
+            await self._expired_stop_heal_alert(
                 symbol,
                 "exit_in_flight",
                 {
@@ -7037,7 +7110,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         if pending_marker is not False:
             if pending_marker is None:
                 return "blocked", None
-            self._expired_stop_heal_alert(
+            await self._expired_stop_heal_alert(
                 symbol,
                 "exit_reprotection_pending",
                 {"leg_order_ids": leg_ids},
@@ -7059,7 +7132,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         entry_candidates = ctx["entry_candidates"]
         if verified is not None:
             if verified not in entry_candidates:
-                self._expired_stop_heal_alert(
+                await self._expired_stop_heal_alert(
                     symbol,
                     "entry_not_open_lot",
                     {
@@ -7072,7 +7145,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         elif len(entry_candidates) == 1:
             entry_signal_id = next(iter(entry_candidates))
         else:
-            self._expired_stop_heal_alert(
+            await self._expired_stop_heal_alert(
                 symbol,
                 "entry_ambiguous",
                 {
@@ -7085,7 +7158,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         ctx["working"] = working
         return "ok", ctx
 
-    def _build_reprotect_request(
+    async def _build_reprotect_request(
         self,
         symbol: str,
         qty: float,
@@ -7121,7 +7194,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             except MoneyParseError:
                 limit_price = None
             if stop_price is None or limit_price is None:
-                self._expired_stop_heal_alert(
+                await self._expired_stop_heal_alert(
                     symbol,
                     "unusable_stop_level",
                     {"order_type": order_type},
@@ -7138,7 +7211,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             )
         if order_type == "stop":
             if stop_price is None:
-                self._expired_stop_heal_alert(
+                await self._expired_stop_heal_alert(
                     symbol,
                     "unusable_stop_level",
                     {"order_type": order_type},
@@ -7152,7 +7225,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 stop_price=stop_price,
                 client_order_id=client_order_id,
             )
-        self._expired_stop_heal_alert(
+        await self._expired_stop_heal_alert(
             symbol,
             "unhandled_leg_type",
             {"order_type": order_type},
@@ -7176,7 +7249,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         try:
             order = await asyncio.to_thread(client.submit_order, order_data=request)
         except Exception as exc:  # except-kind: money-decision
-            self._expired_stop_heal_alert(
+            await self._expired_stop_heal_alert(
                 symbol,
                 "place_failed",
                 {
@@ -7193,7 +7266,8 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             order,
             nested_lookup=False,
         )
-        record_live_control_audit(
+        await asyncio.to_thread(
+            record_live_control_audit,
             action=_EXPIRED_STOP_HEAL_AUDIT_ACTION,
             target_type="account_symbol",
             target_id=f"{self.account_id}:{symbol}",
@@ -7212,8 +7286,8 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             },
         )
         logger.error(
-            "ALERT: Alpaca position %s was unprotected - protective order %s "
-            "had been lost; %s",
+            "ALERT: Alpaca position %s protective order %s was lost or "
+            "expiring; replacement outcome: %s",
             symbol,
             leg_ids,
             outcome,
@@ -7262,6 +7336,10 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         market through the same attributed ``-reprotect`` order id. The
         decision needs a fresh, valid quote and an open venue session; any
         unreadable input fails closed to an alert and no action.
+
+        ``get_quote`` is stock-only (IEX): a crypto symbol raises inside it,
+        so a lost crypto stop always lands on ``heal_quote_unusable`` - fail
+        closed, alerted, never guessed into a price.
         """
         try:
             quote = await self.get_quote(symbol)
@@ -7269,7 +7347,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 quote, symbol=symbol, label="Protective-stop heal quote"
             )
         except Exception as exc:  # except-kind: money-decision
-            self._expired_stop_heal_alert(
+            await self._expired_stop_heal_alert(
                 symbol, "heal_quote_unusable", {"error": repr(exc)}
             )
             return None
@@ -7279,7 +7357,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             max_age_seconds=_HEAL_QUOTE_MAX_AGE_SECONDS,
         )
         if rule is not None:
-            self._expired_stop_heal_alert(
+            await self._expired_stop_heal_alert(
                 symbol, "heal_quote_unusable", {"quote_time_rule": rule}
             )
             return None
@@ -7290,7 +7368,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             return "place"
         state = self._heal_market_state(symbol)
         if state != "open":
-            self._expired_stop_heal_alert(
+            await self._expired_stop_heal_alert(
                 symbol,
                 "heal_market_closed",
                 {"session_state": state, "stop_price": stop_price},
@@ -7320,7 +7398,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         try:
             working = await self._working_book_on_symbol(client, symbol)
         except Exception as exc:  # except-kind: money-decision
-            self._expired_stop_heal_alert(
+            await self._expired_stop_heal_alert(
                 symbol, "heal_close_book_unreadable", {"error": repr(exc)}
             )
             return
@@ -7337,7 +7415,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                     continue
                 if stop_price is not None:
                     await self._restore_stop(client, symbol, stop_price)
-                self._expired_stop_heal_alert(
+                await self._expired_stop_heal_alert(
                     symbol,
                     "heal_close_cancel_failed",
                     {"order_id": order_id, "error": repr(exc)},
@@ -7348,14 +7426,14 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         except Exception as exc:  # except-kind: money-decision
             if stop_price is not None:
                 await self._restore_stop(client, symbol, stop_price)
-            self._expired_stop_heal_alert(
+            await self._expired_stop_heal_alert(
                 symbol, "heal_close_book_unreadable", {"error": repr(exc)}
             )
             return
         if remaining:
             if stop_price is not None:
                 await self._restore_stop(client, symbol, stop_price)
-            self._expired_stop_heal_alert(
+            await self._expired_stop_heal_alert(
                 symbol,
                 "heal_close_cancel_pending",
                 {
@@ -7384,7 +7462,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         except Exception as exc:  # except-kind: money-decision
             if stop_price is not None:
                 await self._restore_stop(client, symbol, stop_price)
-            self._expired_stop_heal_alert(
+            await self._expired_stop_heal_alert(
                 symbol,
                 "heal_close_place_failed",
                 {"entry_signal_id": entry_signal_id, "error": repr(exc)},
@@ -7396,7 +7474,8 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             order,
             nested_lookup=False,
         )
-        record_live_control_audit(
+        await asyncio.to_thread(
+            record_live_control_audit,
             action=_EXPIRED_STOP_HEAL_AUDIT_ACTION,
             target_type="account_symbol",
             target_id=f"{self.account_id}:{symbol}",
@@ -7461,7 +7540,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             }
         )
         if len(found) != 1:
-            self._expired_stop_heal_alert(
+            await self._expired_stop_heal_alert(
                 symbol,
                 "ambiguous_lost_stop_orders",
                 {"leg_order_ids": leg_ids, "candidate_count": len(found)},
@@ -7494,7 +7573,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 return
             if decision is None:
                 return
-        request = self._build_reprotect_request(
+        request = await self._build_reprotect_request(
             symbol,
             qty,
             side,
@@ -7542,7 +7621,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             }
         )
         if len(found) != 1:
-            self._expired_stop_heal_alert(
+            await self._expired_stop_heal_alert(
                 symbol,
                 "ambiguous_expiring_stop_orders",
                 {"leg_order_ids": leg_ids, "candidate_count": len(found)},
@@ -7551,7 +7630,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         parent, order = found[0]
         order_id = _control_order_id(_order_attr(order, "id"))
         if order_id is None:
-            self._expired_stop_heal_alert(
+            await self._expired_stop_heal_alert(
                 symbol,
                 "unreadable_order_id",
                 {"leg_order_ids": leg_ids},
@@ -7575,22 +7654,31 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         )
         if not still_working:
             return
-        try:
-            await self._cancel_one(client, order_id)
-        except Exception as exc:  # except-kind: money-decision
-            if await self._cancel_already_gone(client, order_id):
-                return
-            self._expired_stop_heal_alert(
-                symbol,
-                "replace_cancel_failed",
-                {"leg_order_ids": leg_ids, "error": repr(exc)},
-            )
+        # B2: never cancel a working stop into a through-market print or a
+        # closed session. The replacement at the same level would be
+        # rejected - or fill at once - where the resting order would simply
+        # have triggered at the open. There are days of lead left, so
+        # deferring to a later pass costs nothing; the lost-stop path owns
+        # the position if the order expires first.
+        stop_price = _usable_stop_price(order)
+        if stop_price is None:
             return
-        # Durable intent first: ``_heal_replaced_order_ids`` is in-memory, so
-        # a crash between this cancel and the replacement would otherwise
-        # leave the canceled order reading as an unproven operator cancel on
-        # the next process - alerted forever, never healed.
-        record_live_control_audit(
+        decision = await self._heal_price_decision(
+            symbol, position[1], stop_price
+        )
+        if decision != "place":
+            return
+        if self._heal_market_state(symbol) != "open":
+            return
+        # Durable intent BEFORE the cancel: ``_heal_replaced_order_ids`` is
+        # in-memory, so a crash while the cancel call is in flight (cancel
+        # applied, response never processed) would otherwise leave the
+        # canceled order reading as an unproven operator cancel on the next
+        # process - alerted forever, never healed. An intent for a cancel
+        # that never happened is harmless: the order still works, and the
+        # intent only matters once that order id reads ``canceled``.
+        await asyncio.to_thread(
+            record_live_control_audit,
             action=_EXPIRED_STOP_REPLACE_CANCEL_ACTION,
             target_type="alpaca_order",
             target_id=order_id,
@@ -7602,12 +7690,23 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 "leg_order_ids": leg_ids,
             },
         )
+        try:
+            await self._cancel_one(client, order_id)
+        except Exception as exc:  # except-kind: money-decision
+            if await self._cancel_already_gone(client, order_id):
+                return
+            await self._expired_stop_heal_alert(
+                symbol,
+                "replace_cancel_failed",
+                {"leg_order_ids": leg_ids, "error": repr(exc)},
+            )
+            return
         self._heal_replaced_order_ids.add(order_id)
         for _attempt in range(3):
             try:
                 remaining = await self._working_book_on_symbol(client, symbol)
             except Exception as exc:  # except-kind: money-decision
-                self._expired_stop_heal_alert(
+                await self._expired_stop_heal_alert(
                     symbol,
                     "replace_cancel_pending",
                     {"leg_order_ids": leg_ids, "error": repr(exc)},
@@ -7621,7 +7720,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 break
             await asyncio.sleep(0.5)
         else:
-            self._expired_stop_heal_alert(
+            await self._expired_stop_heal_alert(
                 symbol,
                 "replace_cancel_pending",
                 {"leg_order_ids": leg_ids},
@@ -7632,7 +7731,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         if qty is None or _is_flat(qty):
             return
         position = (qty, "sell" if qty > 0 else "buy")
-        request = self._build_reprotect_request(
+        request = await self._build_reprotect_request(
             symbol,
             qty,
             position[1],
@@ -7720,7 +7819,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             entry_signal_id = next(iter(entry_candidates))
         else:
             return
-        self._expired_stop_heal_alert(
+        await self._expired_stop_heal_alert(
             symbol,
             "canceled_stop_unproven",
             {
@@ -8102,7 +8201,15 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             raise RuntimeError("Alpaca client cannot replace an order by id")
         async with self._order_book_lock():
             replaced = await asyncio.to_thread(
-                replace, stop.order_id, order_data=ReplaceOrderRequest(stop_price=price)
+                replace,
+                stop.order_id,
+                # Carry the original client order id through the replace: a
+                # fresh one would drop the ``-reprotect`` attribution marker
+                # and every later pass would read our own stop as foreign.
+                order_data=ReplaceOrderRequest(
+                    stop_price=price,
+                    client_order_id=stop.client_order_id or None,
+                ),
             )
         new_order_id = _control_order_id(_order_attr(replaced, "id"))
         confirmed_price = parse_optional(_order_attr(replaced, "stop_price", None))
@@ -8149,6 +8256,11 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             side=stop.side,
             stop_price=confirmed_price,
             qty=stop.qty,
+            client_order_id=str(
+                _order_attr(replaced, "client_order_id", "")
+                or stop.client_order_id
+                or ""
+            ),
         )
 
     async def get_positions(self) -> list[dict[str, Any]]:
