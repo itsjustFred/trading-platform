@@ -22,7 +22,6 @@ from live_runner.deployment_policy import (
     signal_source_can_trade,
     untradeable_signal_source_reason,
 )
-
 from tests.conftest import sandboxed_env
 
 REPO_ROOT = Path(__file__).resolve().parents[1]

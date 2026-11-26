@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 import subprocess
 import sys
 from pathlib import Path
@@ -11,9 +10,8 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from tests.conftest import sandboxed_env
-
 from scripts import signal_archive_market_features as saf
+from tests.conftest import sandboxed_env
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 

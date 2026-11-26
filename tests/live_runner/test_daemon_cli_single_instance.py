@@ -28,14 +28,13 @@ from typing import Any
 
 import pytest
 
-from tests.conftest import sandboxed_env
-
 from live_runner import daemon_cli
 from shared.single_instance import (
     SingleInstanceError,
     SingleInstanceLock,
     process_lifetime_locks,
 )
+from tests.conftest import sandboxed_env
 from tests.helpers.lock_holder import await_held, read_holder_line, spawn_holder
 
 REPO_ROOT = Path(__file__).resolve().parents[2]

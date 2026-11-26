@@ -11,9 +11,8 @@ from typing import Any
 
 import pytest
 
-from tests.conftest import sandboxed_env
-
 from shared.models import Trade, TradeExit
+from tests.conftest import sandboxed_env
 from validation import cli as validation_cli
 from validation.reference import ValidationReference
 
