@@ -159,12 +159,19 @@ def test_secret_scan_covers_only_the_change_range() -> None:
 
     commands = _run_commands(workflow)
     scans = [c for c in commands if "gitleaks git" in c]
-    assert len(scans) == 2, "one scan step for pull_request, one for push"
-    for scan in scans:
-        # --redact keeps a finding's secret out of the public log, and an
-        # explicit --log-opts range keeps the scan off the whole history.
-        assert "--redact" in scan, scan
-        assert "--log-opts" in scan, scan
+    # One scan step derives the range from the event: a trigger added later
+    # without a range hits the `*)` branch and fails instead of scanning
+    # nothing while reporting green.
+    assert len(scans) == 1, scans
+    scan = scans[0]
+    # --redact keeps a finding's secret out of the public log, and an
+    # explicit --log-opts range keeps the scan off the whole history.
+    assert "--redact" in scan, scan
+    assert "--log-opts" in scan, scan
+    assert "pull_request" in scan and "push" in scan, scan
+    # Fail closed where the range cannot be determined: a push with no
+    # 'before' SHA and any event the case does not name.
+    assert scan.count("exit 1") >= 2, scan
     assert not any("gitleaks dir" in c for c in commands)
 
     # The range commits must exist locally: a shallow checkout would make
@@ -195,6 +202,17 @@ def test_gitleaks_allowlist_stays_path_and_value_scoped() -> None:
     assert str(allowlist["condition"]).upper() == "AND"
     assert allowlist["regexTarget"] == "match"
     assert allowlist["paths"] and allowlist["regexes"]
+    # Anchored paths: an unanchored pattern would also suppress e.g.
+    # `foo/tests/x.py` or `tests/x.py.bak`. Values stay specific too - no
+    # bare wildcard that would allowlist every secret in those files.
+    assert all(p.startswith("^") and p.endswith("$") for p in allowlist["paths"])
+    assert all("*" not in p for p in allowlist["paths"]), (
+        "path entries name exact files; a wildcard would widen the allowlist"
+    )
     assert all("tests/" in p for p in allowlist["paths"]), (
         "the allowlist may only name test fixtures"
     )
+    assert all(
+        r.strip() not in {".*", "^.*$"} and ".*" not in r
+        for r in allowlist["regexes"]
+    ), "value patterns must stay specific, not wildcard matches"

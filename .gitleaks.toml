@@ -16,10 +16,10 @@ condition = "AND"
 # prefix.
 regexTarget = "match"
 paths = [
-  '''tests/test_agent_sibling_hardening\.py''',
-  '''tests/test_live_api\.py''',
-  '''tests/test_live_preflight\.py''',
-  '''tests/test_preflight_db\.py''',
+  '''^tests/test_agent_sibling_hardening\.py$''',
+  '''^tests/test_live_api\.py$''',
+  '''^tests/test_live_preflight\.py$''',
+  '''^tests/test_preflight_db\.py$''',
 ]
 regexes = [
   # Fake NVIDIA API keys seeded for workflow-file scans.
