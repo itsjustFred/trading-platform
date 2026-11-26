@@ -2112,8 +2112,12 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         reason = str(getattr(payload, "reason", "") or "").strip()
         # A sibling adapter may already have rotated the shared pair; adopt
         # the persisted pair BEFORE deciding, so the token comparison below
-        # sees the freshest credentials.
-        self._adopt_persisted_token_pair()
+        # sees the freshest credentials. Skipped while our own refresh holds
+        # ``_refresh_lock``: mutating the pair mid-refresh could clobber the
+        # rotation the refresh is about to persist, and the event is our own
+        # rotation echo anyway (``_token_invalidation_skip_reason`` skips).
+        if not self._refresh_lock.locked():
+            self._adopt_persisted_token_pair()
         skip_reason = self._token_invalidation_skip_reason()
         if skip_reason is not None:
             logger.info(
