@@ -7518,7 +7518,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         )
         try:
             working = await self._working_book_on_symbol(client, symbol)
-        except Exception:
+        except Exception:  # except-kind: money-decision
             return
         if self._find_working_stop_order(working, symbol, side) is not None:
             return
