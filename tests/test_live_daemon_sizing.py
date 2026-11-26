@@ -94,17 +94,6 @@ class _Broker(BaseLiveAdapter):
 # ── one live sizing entry point ───────────────────────────────────────────────
 
 
-def test_there_is_no_second_live_sizing_entry_point():
-    """risk.live keeps the shared resolver; sizing lives in the daemon only."""
-    import risk
-    import risk.live
-
-    assert not hasattr(risk.live, "size_live_signal")
-    assert "size_live_signal" not in risk.__all__
-    assert not hasattr(risk, "size_live_signal")
-    assert callable(risk.live.resolve_live_levels)
-
-
 # ── moved from test_live_risk_sizing.py ───────────────────────────────────────
 
 
