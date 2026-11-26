@@ -47,6 +47,7 @@ from shared.database import (
     BROKER_CLOSE_REASON_CTRADER_POSITION_CLOSE,
     broker_close_signal_id,
     find_live_signal_id_by_broker_order_id,
+    find_live_signal_ids_by_broker_order_id,
     flag_live_ledger_reconciliation,
     get_live_adapter_state,
     get_live_signal_account_id,
@@ -54,6 +55,7 @@ from shared.database import (
     get_live_signal_metadata,
     get_live_signal_reconciliation_cursor,
     get_live_signal_timestamp,
+    is_exit_only_signal_metadata,
     list_live_account_open_position_lots,
     list_live_ledger_reconciliation_deal_ids,
     list_live_ledger_reconciliation_flag_entries,
@@ -99,6 +101,19 @@ class CTraderAuthTerminalError(RuntimeError):
     def __init__(self, message: str, *, error_code: str = "") -> None:
         self.error_code = str(error_code or "").strip()
         super().__init__(message)
+
+
+class _PendingCloseFillRetentionError(ValueError):
+    """A position-close fill retained while its own close submit is unresolved.
+
+    Subclasses ``ValueError`` so every existing retain-for-reconciliation
+    handler still applies, but ``listen_executions`` recognises it and parks
+    the event in ``_unresolved_execution_events`` WITHOUT spending the retry
+    budget: a pending mark can live up to ``_PENDING_CLOSE_POSITION_TTL_SECONDS``
+    (an unknown-outcome submit), and a budgeted requeue would crash-loop the
+    listener - delaying every other fill on the account - for that whole
+    window.
+    """
 
 
 _TRUE_BOOL_TOKENS = {"1", "true", "yes", "y", "on"}
@@ -207,6 +222,24 @@ MAX_CONVERSION_HOPS = 3
 CTRADER_RELATIVE_PRICE_UNIT_DIVISOR = 100_000
 EXECUTION_RETRY_LIMIT = 3
 UNRESOLVED_EXECUTION_EVENT_LIMIT = 1000
+#: How long a ``ClosePositionReq`` submit keeps its position marked pending
+#: (position_id -> (signal_id, monotonic timestamp)). ``ProtoOAClosePositionReq``
+#: carries no ``clientOrderId`` of ours, so while the submit is in flight - or
+#: after an unknown-outcome submit until reconciliation persists the broker
+#: order id - a fill on the position can only be retained, not attributed.
+#: The mark expires so a failed submit cannot hold a genuine broker-side
+#: close on the position out of the stream path indefinitely. The TTL is a
+#: bound, not a guarantee: a submit whose broker outcome stays unknown past
+#: it loses retention, and a later fill on the position books as a
+#: broker-side close - acceptable because an unknown-outcome submit is
+#: already an operator-visible reconciliation case. The TTL must stay well
+#: above the reconciliation cadence so an ordinary in-flight submit cannot
+#: outlive it.
+_PENDING_CLOSE_POSITION_TTL_SECONDS = 3600.0
+#: How often a parked pending-close fill triggers a reconciliation pass while
+#: its submit's mark is still live. Budget-free parking would otherwise never
+#: re-arm the pass that can recover the close's broker order id.
+_PENDING_CLOSE_FILL_RECONCILE_SECONDS = 30.0
 #: Bounded broker-state confirmation for ProtoOAAmendPositionSLTPReq (#168):
 #: the request has no dedicated response, so the amended stop is confirmed by
 #: re-reading the position. The broker applies the amend asynchronously, so a
@@ -1385,6 +1418,19 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._account_type: str | None = None
         self._account_type_unreadable_at: float | None = None
         self._order_id_to_signal_id: dict[int, str] = {}
+        # position_id -> {signal_id: monotonic timestamp}: a ClosePositionReq
+        # has no clientOrderId of ours, so until its broker order id is known
+        # a fill on the position is retained for reconciliation rather than
+        # booked as a broker-side close (see _close_position_fill_pending).
+        # Keyed per signal so two concurrent close submits on one position do
+        # not clear each other's guard when the first finishes.
+        self._pending_close_positions: dict[int, dict[str, float]] = {}
+        # id()s of execution events parked in ``_unresolved_execution_events``
+        # because their own close submit is still in flight. These are
+        # requeued after a reconciliation pass WITHOUT spending the retry
+        # budget: the pending mark can live up to the TTL, and a budgeted
+        # requeue would crash-loop the listener for that whole window.
+        self._pending_close_fill_event_ids: set[int] = set()
         # #80: order id -> upper symbol name (for order-only fills whose
         # payload carries no symbolId).
         self._order_id_to_symbol: dict[int, str] = {}
@@ -2972,9 +3018,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
 
     async def _persisted_exit_position_id(self, signal_id: str) -> int | None:
         metadata = await asyncio.to_thread(get_live_signal_metadata, signal_id)
-        if not metadata:
-            return None
-        if str(metadata.get("risk_sizing_mode") or "") != EXIT_ONLY_RISK_SIZING_MODE:
+        if not metadata or not is_exit_only_signal_metadata(metadata):
             return None
         return self._requested_exit_position_id(metadata)
 
@@ -2998,6 +3042,11 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             )
             return None
         self._order_id_to_signal_id[int(broker_order_id)] = signal_id
+        if position_id is not None:
+            # The close's broker order id is known now: fills on the position
+            # can attribute to this exit signal, so the pending mark has done
+            # its job (an unknown-outcome submit may have left it behind).
+            self._clear_pending_close_mark(position_id, signal_id)
         return broker_order_id
 
     async def _fetch_reconciliation_order_details(
@@ -3195,6 +3244,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._already_logged_in_notified = False
         self._symbol_name_to_id.clear()
         self._order_id_to_signal_id.clear()
+        self._pending_close_positions.clear()
         self._position_ids_by_symbol.clear()
         self._position_volumes.clear()
         self._position_orders_cache.clear()
@@ -3213,6 +3263,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._execution_queue = asyncio.Queue(maxsize=5000)
         self._execution_retry_counts.clear()
         self._unresolved_execution_events.clear()
+        self._pending_close_fill_event_ids.clear()
         self._terminal_auth_failure_reason = ""
         self._terminal_auth_failure_code = ""
 
@@ -3253,6 +3304,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         # the broker sees an order, so a failure here is marked and the caller
         # can safely retry instead of treating the outcome as unknown. The
         # `_submit_new_order_request` call below is deliberately outside.
+        close_position_id: int | None = None
         with order_not_submitted():
             self._raise_if_terminal_auth_failed()
             signal_id = str(signal.id)
@@ -3397,6 +3449,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 position_id = self._position_id_for_exit(
                     signal.symbol, requested_position_id
                 )
+                close_position_id = position_id
                 signal = signal.model_copy(
                     update={
                         "metadata": {
@@ -3430,7 +3483,26 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         # #134: bracket the broker call with the order-timing stamps, persisted
         # with the order id once the broker answers.
         submitted_at = datetime.now(timezone.utc)
-        response = await self._submit_new_order_request(request)
+        if close_position_id is not None:
+            # A ClosePositionReq carries no clientOrderId of ours: until the
+            # broker order id is known, a fill on this position can only be
+            # retained for reconciliation, not attributed - mark the position
+            # so the listener does not book our own exit as a broker-side
+            # close. The mark is per signal so a second concurrent close on
+            # the same position keeps its own guard, and is lifted once this
+            # submit's ownership is recorded below, or expires on its own
+            # after an unknown-outcome submit.
+            self._pending_close_positions.setdefault(close_position_id, {})[
+                canonical_signal_id
+            ] = time.monotonic()
+        try:
+            response = await self._submit_new_order_request(request)
+        except BrokerOrderRejectedError:
+            # A definitive refusal created no order: nothing can fill, so the
+            # pending mark has nothing left to cover.
+            if close_position_id is not None:
+                self._clear_pending_close_mark(close_position_id, canonical_signal_id)
+            raise
         acknowledged_at = datetime.now(timezone.utc)
 
         order_id = self._extract_order_id_from_payload(response)
@@ -3444,6 +3516,14 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 "cannot be tracked or retried safely."
             )
         broker_order_id = str(order_id)
+        # Ownership is registered BEFORE the persist await: a fill event the
+        # listener processes while the DB write is in flight still resolves to
+        # this signal. A persist failure rolls the registration back; the
+        # pending mark stays so fills keep being retained until reconciliation
+        # recovers the broker order id.
+        self._order_id_to_signal_id[order_id] = canonical_signal_id
+        # #80: remember the symbol for order-only fills (no symbolId).
+        self._order_id_to_symbol[order_id] = str(signal.symbol).strip().upper()
         persisted = await asyncio.to_thread(
             set_live_signal_broker_order_id,
             canonical_signal_id,
@@ -3452,10 +3532,11 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             acknowledged_at=acknowledged_at,
         )
         if not persisted:
+            self._order_id_to_signal_id.pop(order_id, None)
+            self._order_id_to_symbol.pop(order_id, None)
             raise RuntimeError("Failed to persist cTrader broker order id.")
-        self._order_id_to_signal_id[order_id] = canonical_signal_id
-        # #80: remember the symbol for order-only fills (no symbolId).
-        self._order_id_to_symbol[order_id] = str(signal.symbol).strip().upper()
+        if close_position_id is not None:
+            self._clear_pending_close_mark(close_position_id, canonical_signal_id)
 
         logger.info(
             "Submitted cTrader live order",
@@ -3493,6 +3574,8 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         if not persisted:
             raise RuntimeError(unpersisted_error)
         self._order_id_to_signal_id[int(recovered_order_id)] = signal_id
+        if position_id is not None:
+            self._clear_pending_close_mark(position_id, signal_id)
         return recovered_order_id
 
     async def _recover_duplicate_signal_order_id(self, canonical_signal_id: str) -> str:
@@ -3506,6 +3589,12 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                     "Persisted cTrader broker order id is invalid; refusing duplicate submission."
                 )
             self._order_id_to_signal_id[normalized_order_id] = canonical_signal_id
+            position_id = await self._persisted_exit_position_id(canonical_signal_id)
+            if position_id is not None:
+                # The close's broker order id is already known, so a pending
+                # mark this exit left on its position has done its job (same
+                # lift as the order-id recovery paths).
+                self._clear_pending_close_mark(position_id, canonical_signal_id)
             return str(normalized_order_id)
         canonical_timestamp = await asyncio.to_thread(
             get_live_signal_timestamp, canonical_signal_id
@@ -5910,6 +5999,21 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             client_order_id, order_id=order_id, execution_type=execution_type
         )
         if signal_id is None:
+            # A ClosePositionReq has no clientOrderId of ours: the fill's id
+            # is SDK-assigned, so the broker order id the submit persisted is
+            # the attribution. Only an exit signal may claim a position-close
+            # fill this way - an entry order's id on a close deal still takes
+            # the broker-close path, which resolves the real opener.
+            signal_id = await self._exit_signal_uuid_for_order_id(
+                order_id,
+                position_id=self._position_id_from_payload(order, deal),
+            )
+        if signal_id is None:
+            if self._close_position_fill_pending(order=order, deal=deal):
+                raise _PendingCloseFillRetentionError(
+                    "cTrader fill closes a position whose own close order is "
+                    "still in flight; retaining the event for reconciliation."
+                )
             # #144: a broker-side position close (SL/TP, flatten, manual) names
             # no signal of ours, but its deal still resolves to the position's
             # opening order and through it to the parent signal's ledger. Only
@@ -6219,12 +6323,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         # broker did not flag its order ``closingOrder`` it must still not be
         # booked as the parent, or the close would reduce the wrong ledger side.
         metadata = await asyncio.to_thread(get_live_signal_metadata, candidate)
-        if metadata and (
-            str(metadata.get("signal_intent") or "") == "exit"
-            or bool(metadata.get("exit_only"))
-            or str(metadata.get("risk_sizing_mode") or "")
-            == EXIT_ONLY_RISK_SIZING_MODE
-        ):
+        if is_exit_only_signal_metadata(metadata or {}):
             return None
         return candidate
 
@@ -6655,6 +6754,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         flagged_deal_ids: set[int],
         order_window: tuple[int, int] | None = None,
         pace: dict[str, Any] | None = None,
+        deferred_close_deals: list[Any],
     ) -> int:
         """Book one deal-list close the stream missed, or flag it (#144).
 
@@ -6663,6 +6763,11 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         cause (unreadable order list, refused record, a too-narrow opener
         window) can resolve on a later pass. Booking it then supersedes the
         flag with a ``ledger_reconciliation_resolved`` audit row.
+
+        ``deferred_close_deals`` collects deals skipped because their
+        position's own close submit is still marked pending: the caller puts
+        their windows back on the scan cursor so a later pass books them
+        once the submit's broker order id is known.
         """
         if not self._event_is_position_close(None, deal):
             return 0
@@ -6703,17 +6808,55 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             # A deal our own order made is the per-signal reconcile's job, not
             # this pass's: booking it here too would close the ledger twice.
             if order_id not in own_order_cache:
-                own_order_cache[order_id] = bool(
-                    self._order_id_to_signal_id.get(order_id)
-                ) or bool(
-                    await asyncio.to_thread(
-                        find_live_signal_id_by_broker_order_id,
+                own_order_cache[order_id] = (
+                    self._order_id_to_signal_id.get(order_id) is not None
+                )
+                if not own_order_cache[order_id]:
+                    owner_ids = await asyncio.to_thread(
+                        find_live_signal_ids_by_broker_order_id,
                         self.account_config_id,
                         str(order_id),
                     )
-                )
+                    if len(owner_ids) > 1:
+                        # Ambiguous ownership - broker_order_id is indexed,
+                        # not unique, so recovered duplicates can share one.
+                        # The deal may be ours or a broker-side close and
+                        # booking either way risks the wrong ledger side:
+                        # flag it for an operator instead of guessing.
+                        self._flag_ledger_reconciliation(
+                            self._fill_symbol_name(
+                                order_id=order_id, order=None, deal=deal
+                            )
+                            or "",
+                            "ambiguous_broker_order_id",
+                            {
+                                "position_id": position_id,
+                                "deal_id": deal_id,
+                                "order_id": str(order_id),
+                                "owner_signal_ids": owner_ids,
+                                "deal_timestamp_ms": (
+                                    self._resolve_execution_timestamp_ms(
+                                        order=None, deal=deal
+                                    )
+                                ),
+                                "source": "reconcile",
+                            },
+                            flagged_ids=flagged_deal_ids,
+                        )
+                        own_order_cache[order_id] = True
+                        return 0
+                    own_order_cache[order_id] = bool(owner_ids)
             if own_order_cache[order_id]:
                 return 0
+        if self._pending_close_position_active(position_id):
+            # A ClosePositionReq submit for this position is still in flight
+            # (or its outcome is unknown): this deal may be OUR close, whose
+            # broker order id is not yet attributable - booking it here
+            # would mis-book our own exit as a broker-side close, the exact
+            # bug the pending mark exists to prevent. Defer the deal's
+            # window instead of booking or flagging it.
+            deferred_close_deals.append(deal)
+            return 0
         if position_id not in parent_cache:
             parent_cache[position_id] = await self._resolve_position_parent_signal(
                 position_id, order_window=order_window, pace=pace
@@ -7435,6 +7578,10 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             )
             flagged_deal_ids = set()
         deal_retry_pending: list[list[int]] = []
+        # Deals deferred because their position's close submit is still
+        # marked pending: never booked, never flagged - their windows go
+        # back on the cursor so a later pass retries them.
+        deferred_close_deals: list[Any] = []
         try:
             for index, deal in enumerate(deals):
                 # Windows abut and subdivided halves can both return a boundary
@@ -7453,6 +7600,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                         flagged_deal_ids=flagged_deal_ids,
                         order_window=order_window,
                         pace=budget,
+                        deferred_close_deals=deferred_close_deals,
                     )
                 except CTraderApiError:
                     # This deal and every deal not yet reached stay
@@ -7503,6 +7651,17 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                     )
                     raise
         finally:
+            # Deferred deals' windows re-join the pending set exactly like
+            # failed ones: the cursor may not advance past a deal that was
+            # deliberately not booked this pass.
+            deal_retry_pending.extend(
+                self._broker_close_deal_retry_ranges(
+                    deferred_close_deals,
+                    deal_scan_ranges,
+                    floor_ms=floor_ms,
+                    now_ms=now_ms,
+                )
+            )
             # The cursor advances only now - after every gathered deal was
             # processed or re-queued - so a transient read error can never
             # mark a deal's range covered without booking it.
@@ -7682,6 +7841,159 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 },
             )
             return None
+
+    async def _exit_signal_uuid_for_order_id(
+        self, order_id: int | None, *, position_id: int | None = None
+    ) -> UUID | None:
+        """The exit signal that owns this broker order id, or ``None``.
+
+        ``ProtoOAClosePositionReq`` has no ``clientOrderId`` field (its proto
+        fields are ``payloadType``, ``ctidTraderAccountId``, ``positionId``
+        and ``volume``), so a close we submitted fills under an SDK-assigned
+        id that parses as no signal. Attribution falls back to the broker
+        order id persisted at submit time - the in-memory map first, then the
+        database - but only when the resolved signal is itself an exit *as the
+        ledger defines it* (``is_exit_only_signal_metadata``): a
+        position-close deal carrying an *entry* order's id must still take
+        the broker-close path, which resolves the position's real opener.
+        ``position_id`` is the fill's own position: a resolved exit whose
+        recorded position id disagrees cannot be this fill's owner.
+        """
+        if order_id is None:
+            return None
+        resolved = self._order_id_to_signal_id.get(order_id)
+        if resolved is None:
+            owner_ids = await asyncio.to_thread(
+                find_live_signal_ids_by_broker_order_id,
+                self.account_config_id,
+                str(order_id),
+            )
+            if len(owner_ids) == 1:
+                resolved = owner_ids[0]
+            elif owner_ids:
+                # ``broker_order_id`` is indexed, not unique: a recovered
+                # duplicate can share one. Only an exit-only signal can
+                # claim a position-close fill this way, so when exactly one
+                # match is an exit it is the plausible owner; anything more
+                # ambiguous stays unresolved and takes the broker-close
+                # path, which resolves the position's real opener.
+                exit_owners: list[str] = []
+                for owner_id in owner_ids:
+                    owner_metadata = await asyncio.to_thread(
+                        get_live_signal_metadata, owner_id
+                    )
+                    if is_exit_only_signal_metadata(owner_metadata or {}):
+                        exit_owners.append(owner_id)
+                if len(exit_owners) == 1:
+                    resolved = exit_owners[0]
+        if not resolved:
+            return None
+        metadata = await asyncio.to_thread(
+            get_live_signal_metadata, str(resolved)
+        )
+        # The LEDGER's exit predicate, not a looser one: a fill attributed to
+        # a signal the ledger counts as an entry would open quantity instead
+        # of reducing it.
+        if not is_exit_only_signal_metadata(metadata or {}):
+            return None
+        if position_id is not None:
+            # A broker order id is not unique, so the resolved exit can still
+            # be the wrong owner: its recorded position id is the last check
+            # that it closed THIS position. A signal with none recorded
+            # cannot disprove the match and keeps the attribution.
+            try:
+                owner_position_id = self._requested_exit_position_id(metadata or {})
+            except ValueError:
+                # Malformed position metadata cannot disprove the match, but
+                # a corrupt exit signal must not claim the fill either:
+                # fail closed to the broker-close path.
+                return None
+            if owner_position_id is not None and owner_position_id != position_id:
+                return None
+        try:
+            return UUID(str(resolved))
+        except (ValueError, AttributeError, TypeError):
+            return None
+
+    def _close_position_fill_pending(self, *, order: Any | None, deal: Any | None) -> bool:
+        """Whether this position-close fill belongs to an in-flight close submit.
+
+        While ``submit_order`` waits on a ``ClosePositionReq`` response the
+        broker order id is still unknown, so the fill's order id resolves to
+        nothing and the event would be booked as a broker-side close - the
+        misattribution this guard exists to prevent. The submit registers its
+        position id for exactly that window; a fill on it is retained for
+        reconciliation, which re-reads it once ownership is recorded. Marks
+        expire so a failed submit cannot hold a genuine broker-side close on
+        the position out of the stream path indefinitely.
+        """
+        if not self._pending_close_positions:
+            return False
+        if not self._event_is_position_close(order, deal):
+            return False
+        position_id = self._position_id_from_payload(order, deal)
+        if position_id is None:
+            return False
+        return self._pending_close_position_active(position_id)
+
+    def _pending_close_position_active(self, position_id: int) -> bool:
+        """Whether an unexpired close submit still marks this position pending.
+
+        Marks are per submitting signal and expire individually; expired
+        entries are pruned here so a dead submit cannot hold the guard (or
+        the dict) forever.
+        """
+        marks = self._pending_close_positions.get(position_id)
+        if not marks:
+            return False
+        now = time.monotonic()
+        for signal_id in [
+            sid
+            for sid, marked_at in marks.items()
+            if now - marked_at > _PENDING_CLOSE_POSITION_TTL_SECONDS
+        ]:
+            del marks[signal_id]
+            # An expired mark means a submit's broker outcome stayed unknown
+            # past the TTL: retention is gone, so a later fill on this
+            # position books as a broker-side close. Surface it - silent
+            # expiry would hide exactly the mis-booking the mark prevents.
+            logger.warning(
+                "cTrader pending close mark expired before the submit's "
+                "broker order id was known; fills on the position may book "
+                "as broker-side closes",
+                extra={
+                    "data": {
+                        "account_id": self.account_config_id,
+                        "position_id": position_id,
+                        "signal_id": signal_id,
+                    }
+                },
+            )
+        if not marks:
+            self._pending_close_positions.pop(position_id, None)
+            return False
+        return True
+
+    def _clear_pending_close_mark(self, position_id: int, signal_id: str) -> None:
+        """Lift one submit's pending mark on a position.
+
+        Only this signal's entry is removed: a second close submit still in
+        flight on the same position keeps its own guard. When the position's
+        last mark lifts and fills are parked waiting on it, the next
+        reconciliation pass is expedited - the parked fill can attribute as
+        soon as the order id is known instead of waiting out the retry
+        interval.
+        """
+        marks = self._pending_close_positions.get(position_id)
+        if marks is None:
+            return
+        marks.pop(signal_id, None)
+        if marks:
+            return
+        self._pending_close_positions.pop(position_id, None)
+        if self._pending_close_fill_event_ids:
+            self._reconciliation_required = True
+            self._reconciliation_retry_at = 0.0
 
     @staticmethod
     def _resolve_execution_price(*, order: Any | None, deal: Any | None) -> float:
@@ -7864,6 +8176,59 @@ class CTraderLiveAdapter(BaseLiveAdapter):
 
     def _ack_execution_event(self, event: Any) -> None:
         self._execution_retry_counts.pop(id(event), None)
+        self._pending_close_fill_event_ids.discard(id(event))
+
+    def _park_pending_close_fill(self, event: Any) -> None:
+        """Park a fill retained for an in-flight close submit, budget-free.
+
+        The event waits in ``_unresolved_execution_events`` - the same deque
+        every other retained fill uses - but never spends
+        ``EXECUTION_RETRY_LIMIT``: the pending mark can live up to the TTL
+        after an unknown-outcome submit, and a budgeted requeue would
+        crash-loop the listener (and delay every other fill on the account)
+        for that whole window. Reconciliation is re-armed on a paced interval
+        instead: each pass may recover the close's broker order id, clear the
+        mark, and requeue the event for attribution.
+        """
+        if len(self._unresolved_execution_events) >= UNRESOLVED_EXECUTION_EVENT_LIMIT:
+            # Degenerate overflow: the deque is full, so fall back to the
+            # budgeted path rather than dropping the fill.
+            logger.warning(
+                "cTrader pending-close fill park overflowed the unresolved "
+                "deque; falling back to the budgeted requeue",
+                extra={"data": {"account_id": self.ctid_trader_account_id}},
+            )
+            if not self._requeue_execution_event(event):
+                raise RuntimeError(
+                    "cTrader execution event could not be requeued after "
+                    "pending-close retention; broker reconciliation is "
+                    "required."
+                )
+            return
+        self._reconciliation_required = True
+        self._reconciliation_retry_at = (
+            time.monotonic() + _PENDING_CLOSE_FILL_RECONCILE_SECONDS
+        )
+        self._unresolved_execution_events.append(event)
+        self._pending_close_fill_event_ids.add(id(event))
+        logger.info(
+            "cTrader close fill retained while its submit is unresolved; "
+            "parked for reconciliation",
+            extra={
+                "data": {
+                    "account_id": self.ctid_trader_account_id,
+                    "unresolved_events": len(self._unresolved_execution_events),
+                }
+            },
+        )
+
+    def _requeue_pending_close_fill(self, event: Any) -> bool:
+        """Return a parked pending-close fill to the queue without spending budget."""
+        try:
+            self._execution_queue.put_nowait(event)
+        except asyncio.QueueFull:
+            return False
+        return True
 
     async def listen_executions(self) -> None:
         backoff_seconds = 2
@@ -7895,6 +8260,13 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 self._log_listener_terminal_auth_failure(exc)
                 return
             except Exception as exc:  # except-kind: money-decision
+                if event is not None and isinstance(
+                    exc, _PendingCloseFillRetentionError
+                ):
+                    self._park_pending_close_fill(event)
+                    continue
+                if event is not None:
+                    self._pending_close_fill_event_ids.discard(id(event))
                 if event is not None and not self._requeue_execution_event(event):
                     raise RuntimeError(
                         "cTrader execution event exhausted its retry budget; "
@@ -7941,7 +8313,13 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             self._unresolved_execution_events.clear()
             still_unresolved: list[Any] = []
             for pending_event in unresolved:
-                requeued = self._requeue_execution_event(pending_event)
+                if id(pending_event) in self._pending_close_fill_event_ids:
+                    # Parked for an in-flight close submit: requeue WITHOUT
+                    # spending the retry budget - the mark can outlive the
+                    # whole budget many times over.
+                    requeued = self._requeue_pending_close_fill(pending_event)
+                else:
+                    requeued = self._requeue_execution_event(pending_event)
                 if not requeued or any(
                     id(pending_event) == id(stored_event)
                     for stored_event in self._unresolved_execution_events
@@ -7952,9 +8330,17 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 self._unresolved_execution_events.extend(
                     still_unresolved[:UNRESOLVED_EXECUTION_EVENT_LIMIT]
                 )
+                # Forget ids of events that left the deque: an id() is only
+                # meaningful while its event object is still referenced, and
+                # a stale entry would budget-free-requeue an unrelated fill.
+                self._pending_close_fill_event_ids.intersection_update(
+                    id(stored_event)
+                    for stored_event in self._unresolved_execution_events
+                )
                 self._reconciliation_required = True
                 self._reconciliation_retry_at = time.monotonic() + backoff_seconds
                 return
+            self._pending_close_fill_event_ids.clear()
             self._reconciliation_required = False
             self._reconciliation_retry_at = 0.0
 

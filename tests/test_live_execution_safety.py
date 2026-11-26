@@ -2860,6 +2860,35 @@ def test_broker_order_id_lookup_is_scoped_to_account(isolated_db):
     assert database.find_live_signal_id_by_broker_order_id("", "45678") is None
 
 
+def test_broker_order_id_lookup_fails_closed_on_ambiguous_match(isolated_db):
+    """``broker_order_id`` is indexed, not unique: two signals on one account
+    can share it (a recovered duplicate, a broker-side id reuse). Picking the
+    newest would attribute a fill to a possibly-wrong signal, so the lookup
+    returns None and callers take their unresolved path instead."""
+    database = isolated_db
+    deployment = _deployment()
+    database.ensure_live_account("acc-1", "ctrader")
+    database.create_live_deployment(deployment)
+    signal_a = LiveSignal(
+        deployment_id=str(deployment.id), symbol="EURUSD", action="buy",
+        theoretical_price=1.1,
+        timestamp=datetime(2026, 7, 15, 10, 0, tzinfo=timezone.utc),
+        metadata={},
+    )
+    signal_b = LiveSignal(
+        deployment_id=str(deployment.id), symbol="EURUSD", action="sell",
+        theoretical_price=1.2,
+        timestamp=datetime(2026, 7, 15, 10, 1, tzinfo=timezone.utc),
+        metadata={},
+    )
+    database.save_live_signal(signal_a)
+    database.save_live_signal(signal_b)
+    assert database.set_live_signal_broker_order_id(str(signal_a.id), "99999") is True
+    assert database.set_live_signal_broker_order_id(str(signal_b.id), "99999") is True
+
+    assert database.find_live_signal_id_by_broker_order_id("acc-1", "99999") is None
+
+
 def test_alpaca_partial_fill_persists_event_qty_not_cumulative(monkeypatch):
     from live_runner import alpaca_adapter as module
 
@@ -3220,7 +3249,11 @@ def test_ctrader_fill_fallback_lookup_uses_canonical_account_scope(monkeypatch):
     with pytest.raises(ValueError, match="could not be mapped"):
         asyncio.run(adapter._persist_execution_event(event))
 
-    assert queried == [("local-account-123", "45678")]
+    # The order-id fallback runs once to backfill an empty clientOrderId and
+    # again for exit-signal attribution; every call must use the canonical
+    # account scope, never a deployment-local id.
+    assert queried
+    assert set(queried) == {("local-account-123", "45678")}
 
 
 def test_ctrader_reconcile_backfills_missing_fill(monkeypatch):
