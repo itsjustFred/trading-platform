@@ -51,8 +51,8 @@ _guard.ensure_own_checkout("run_risk_parity_backtest")
 # dropping it would take this script off the roster and out of the gate that keeps it alive.
 import shared  # noqa: F401
 from runner.risk_parity_optimizer import (
-    project_to_capped_simplex,
     inverse_volatility_weights,
+    project_to_capped_simplex,
     resolve_weight_bounds,
 )
 from shared.constants import ensure_path_within_workspace

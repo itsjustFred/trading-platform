@@ -363,7 +363,7 @@ def test_exit_signal_is_exit_only_even_when_shorting_is_allowed() -> None:
 
 
 def test_prepare_sizes_an_exit_from_the_own_ledger(monkeypatch) -> None:
-    from live_runner.daemon import trade_signal_to_live_signal, prepare_order_with_risk
+    from live_runner.daemon import prepare_order_with_risk, trade_signal_to_live_signal
 
     deployment = _deployment(allow_short=True)
     calls = _patch_ledger(monkeypatch, deployment, 10.0, others={_OTHER: 15.0})
@@ -392,8 +392,8 @@ def test_exit_drops_spoofed_entry_gate_fields(monkeypatch) -> None:
     """
     from live_runner.daemon import (
         _ENTRY_QUOTE_METADATA_KEYS,
-        trade_signal_to_live_signal,
         prepare_order_with_risk,
+        trade_signal_to_live_signal,
     )
 
     deployment = _deployment(allow_short=True)
@@ -415,7 +415,7 @@ def test_exit_drops_spoofed_entry_gate_fields(monkeypatch) -> None:
 
 
 def test_prepare_takes_the_close_side_from_the_position(monkeypatch) -> None:
-    from live_runner.daemon import trade_signal_to_live_signal, prepare_order_with_risk
+    from live_runner.daemon import prepare_order_with_risk, trade_signal_to_live_signal
 
     deployment = _deployment(allow_short=True)
     _patch_ledger(monkeypatch, deployment, -4.0)
@@ -429,7 +429,7 @@ def test_prepare_takes_the_close_side_from_the_position(monkeypatch) -> None:
 
 
 def test_prepare_partial_exit(monkeypatch) -> None:
-    from live_runner.daemon import trade_signal_to_live_signal, prepare_order_with_risk
+    from live_runner.daemon import prepare_order_with_risk, trade_signal_to_live_signal
 
     deployment = _deployment()
     _patch_ledger(monkeypatch, deployment, 10.0)

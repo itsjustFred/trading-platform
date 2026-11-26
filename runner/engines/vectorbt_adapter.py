@@ -33,11 +33,7 @@ from runner.engines._indicator_series import _build_indicator_series
 from runner.engines._shared import (
     resolve_ask_high_low,
     resolve_bar_spread,
-)
-from runner.engines._shared import (
     resolve_max_leverage,
-)
-from runner.engines._shared import (
     resolve_max_position_exposure_pct,
 )
 from runner.engines._shared import (

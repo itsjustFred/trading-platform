@@ -10,9 +10,9 @@ from runner.engine_pkg.trading_engine import _floor_to_lot_grid
 from scripts.regenerate_mt5_parity_artifacts import (
     COMPARISON_CASES,
     _build_trades,
-    load_ohlcv,
     _price_unit_value,
     _round_mt5_lots,
+    load_ohlcv,
 )
 from shared.strategy_registry import (
     DEFAULT_STRATEGIES_DIR,

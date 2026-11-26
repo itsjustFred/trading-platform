@@ -1095,7 +1095,7 @@ class _DiscordSmokeAdapter:
 async def _discord_replay_smoke() -> list[SmokeCheck]:
     from types import SimpleNamespace
 
-    from live_runner.daemon import trade_signal_to_live_signal, submit_order_with_risk
+    from live_runner.daemon import submit_order_with_risk, trade_signal_to_live_signal
     from live_runner.signal_sources.discord_source import parse_trade_signal_from_message
     from shared.models import LiveDeploymentConfig
 

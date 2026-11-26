@@ -31,11 +31,7 @@ from runner.engines import contract
 from runner.engines._drawings import _normalize_drawings
 from runner.engines._shared import (
     resolve_bar_spread,
-)
-from runner.engines._shared import (
     resolve_max_leverage,
-)
-from runner.engines._shared import (
     resolve_max_position_exposure_pct,
 )
 from runner.engines._shared import (

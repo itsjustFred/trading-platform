@@ -46,9 +46,9 @@ _guard.ensure_own_checkout("adaptive_harvester")
 import shared  # noqa: F401
 from data_tools.downloaders.dukascopy_native import (
     SYMBOL_CONFIG,
-    get_decimal_factor,
     decompress_bi5,
     generate_tick_urls,
+    get_decimal_factor,
     parse_ticks,
 )
 from shared.atomic_io import write_text_atomically
