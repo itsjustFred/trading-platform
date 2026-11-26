@@ -3355,7 +3355,10 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             # The request builders below re-resolve the volume from this
             # normalized signal; it must reproduce the volume resolved from
             # the binding qty, or the wire request and the persisted qty
-            # would diverge.
+            # would diverge. The float round-trip (volume -> qty -> volume)
+            # stays far inside the lot-grid floor's 1e-6-unit noise band for
+            # every volume a broker int32 can express (~5e-7 units at
+            # INT32_MAX), so an exact int compare cannot false-positive.
             if self._resolve_order_volume(signal) != order_volume:
                 raise RuntimeError(
                     "cTrader volume resolution is not idempotent under qty "

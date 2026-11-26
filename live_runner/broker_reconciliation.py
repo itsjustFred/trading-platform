@@ -577,7 +577,7 @@ def _instrument_qty_step(adapter: BaseLiveAdapter, symbol: str) -> float | None:
         # One misbehaving adapter/symbol must not abort the whole account
         # pass: an unusable step keeps the expectation (fail closed).
         # (asyncio.CancelledError is BaseException and still propagates.)
-        logger.debug(
+        logger.warning(
             "broker reconciliation: unusable qty step for %s on %s: %r",
             symbol,
             type(adapter).__name__,
