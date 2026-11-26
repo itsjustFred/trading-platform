@@ -215,7 +215,7 @@ def _normalize_ohlcv_frame(df: pd.DataFrame, source_path: Path, timeframe: str) 
     return frame
 
 
-def _load_ohlcv(data_dir: Path, symbol: str, timeframe: str, start: str, end: str) -> pd.DataFrame:
+def load_ohlcv(data_dir: Path, symbol: str, timeframe: str, start: str, end: str) -> pd.DataFrame:
     matches = _candidate_ohlcv_paths(data_dir, symbol, timeframe)
     if not matches:
         raise FileNotFoundError(f"No OHLCV parquet for {symbol}/{timeframe} under {data_dir / 'ohlcv'}")
@@ -248,7 +248,7 @@ def _load_ohlcv(data_dir: Path, symbol: str, timeframe: str, start: str, end: st
 
 
 def _load_daily_ohlcv(data_dir: Path, symbol: str, start: str, end: str) -> pd.DataFrame:
-    return _load_ohlcv(data_dir, symbol, "1d", start, end)
+    return load_ohlcv(data_dir, symbol, "1d", start, end)
 
 
 def _to_iso(value: Any) -> str:
@@ -261,7 +261,7 @@ def _to_iso(value: Any) -> str:
 
 
 def _conversion_series(data_dir: Path, start: str, end: str) -> pd.Series:
-    frame = _load_ohlcv(data_dir, "EURUSD", "1m", start, end)
+    frame = load_ohlcv(data_dir, "EURUSD", "1m", start, end)
     ts = pd.to_datetime(frame["timestamp"], utc=True, errors="coerce")
     close = pd.to_numeric(frame["close"], errors="coerce")
     series = pd.Series(close.values, index=ts).dropna().sort_index()
@@ -315,7 +315,7 @@ def _opposite_side_price(row: pd.Series, side: str, field: str) -> float:
     return float(row[field])
 
 
-def _opposite_side_series(frame: pd.DataFrame, side: str, field: str) -> pd.Series:
+def opposite_side_series(frame: pd.DataFrame, side: str, field: str) -> pd.Series:
     prefix = "bid" if side == "LONG" else "ask"
     column = f"{prefix}_{field}"
     if column in frame.columns:
@@ -452,10 +452,10 @@ def _build_trades(
             # Fill-Bar-Annahme: Close-seitige Ausführungsordnung (Signal-Close
             # -> Fill-Next-Bar), daher Stop-Prüfung inkl. Fill-Bar (MT5-Parity).
             if side == "LONG":
-                lows = _opposite_side_series(df, side, "low").iloc[fill_index : exit_index + 1]
+                lows = opposite_side_series(df, side, "low").iloc[fill_index : exit_index + 1]
                 hit = lows[lows <= stop]
             else:
-                highs = _opposite_side_series(df, side, "high").iloc[fill_index : exit_index + 1]
+                highs = opposite_side_series(df, side, "high").iloc[fill_index : exit_index + 1]
                 hit = highs[highs >= stop]
             if not hit.empty:
                 exit_index = int(hit.index[0])
@@ -555,7 +555,7 @@ def regenerate_case(
             "broker_clock": case["broker_clock"],
         }
     )
-    df = _load_ohlcv(
+    df = load_ohlcv(
         data_dir,
         str(case["execution_symbol"]),
         str(case["execution_timeframe"]),

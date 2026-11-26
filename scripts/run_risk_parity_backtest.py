@@ -51,7 +51,7 @@ _guard.ensure_own_checkout("run_risk_parity_backtest")
 # dropping it would take this script off the roster and out of the gate that keeps it alive.
 import shared  # noqa: F401
 from runner.risk_parity_optimizer import (
-    _project_to_capped_simplex,
+    project_to_capped_simplex,
     inverse_volatility_weights,
     resolve_weight_bounds,
 )
@@ -186,7 +186,7 @@ def calculate_risk_parity_weights(
         weights = inverse_volatility_weights(cov)
     # #129: the inverse-vol fallback ignores the bounds and SLSQP can overshoot
     # them by float noise; project onto the capped simplex on every path.
-    weights = _project_to_capped_simplex(
+    weights = project_to_capped_simplex(
         np.asarray(weights, dtype=float), lower=lower, upper=upper
     )
 

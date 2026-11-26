@@ -46,7 +46,7 @@ _guard.ensure_own_checkout("adaptive_harvester")
 import shared  # noqa: F401
 from data_tools.downloaders.dukascopy_native import (
     SYMBOL_CONFIG,
-    _get_decimal_factor,
+    get_decimal_factor,
     decompress_bi5,
     generate_tick_urls,
     parse_ticks,
@@ -466,7 +466,7 @@ def _assemble_tick_dataframe(
     successful_results: list[tuple[datetime, bytes]],
     instrument: str,
 ) -> pd.DataFrame:
-    decimal_factor = int(_get_decimal_factor(instrument))
+    decimal_factor = int(get_decimal_factor(instrument))
     all_ticks: list[tuple[datetime, float, float, float, float]] = []
     for hour_start, data in sorted(successful_results, key=lambda item: item[0]):
         raw = decompress_bi5(data)
