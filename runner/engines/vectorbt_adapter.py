@@ -35,10 +35,10 @@ from runner.engines._shared import (
     resolve_bar_spread,
 )
 from runner.engines._shared import (
-    resolve_max_leverage as _resolve_max_leverage,
+    resolve_max_leverage,
 )
 from runner.engines._shared import (
-    resolve_max_position_exposure_pct as _resolve_max_position_exposure_pct,
+    resolve_max_position_exposure_pct,
 )
 from runner.engines._shared import (
     serialize_meta_value as _shared_serialize_meta_value,
@@ -197,10 +197,10 @@ def _size_trade(
 
     if config.risk_per_trade_pct is not None and config.risk_per_trade_pct > 0:
         sizing_mode = "risk_pct"
-        max_position_exposure_pct = _resolve_max_position_exposure_pct(
+        max_position_exposure_pct = resolve_max_position_exposure_pct(
             config.max_position_exposure_pct, asset_class
         )
-        max_leverage = _resolve_max_leverage(config.max_leverage)
+        max_leverage = resolve_max_leverage(config.max_leverage)
         # D10/16-E (F7/F35): max_position_exposure_pct is the per-position
         # notional cap; it is an INDEPENDENT cap, not an implicit leverage
         # floor — a conservative max_leverage < max_position_exposure_pct is
@@ -1998,15 +1998,15 @@ def _extract_trade_meta(
 
 
 def _resolve_max_position_pct(explicit: float | None, asset_class: str) -> float:
-    """Deprecated alias of :func:`_resolve_max_position_exposure_pct` (16-E rename)."""
+    """Deprecated alias of :func:`resolve_max_position_exposure_pct` (16-E rename)."""
     import warnings
 
     warnings.warn(
-        "_resolve_max_position_pct is deprecated; use _resolve_max_position_exposure_pct",
+        "_resolve_max_position_pct is deprecated; use resolve_max_position_exposure_pct",
         DeprecationWarning,
         stacklevel=2,
     )
-    return _resolve_max_position_exposure_pct(explicit, asset_class)
+    return resolve_max_position_exposure_pct(explicit, asset_class)
 
 
 def _serialize_meta_value(value: Any) -> Any | None:
