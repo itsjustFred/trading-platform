@@ -391,10 +391,9 @@ def _recover_failed_services() -> list[Service]:
     """Retry FAILED services on startup; never resurrect PAUSED/STOPPED ones.
 
     PAUSED/STOPPED encode operator intent and must survive a daemon restart.
-    FAILED is system state (e.g. transient auth/network) and is safe to retry —
-    but bounded (B2): each resuscitated service starts with its reconnect
-    floor armed, so a still-broken credential backs off instead of hot-looping
-    from the first tick. Terminal auth failures re-block immediately.
+    FAILED is system state (e.g. transient auth/network) and is safe to retry.
+    DISCORD_BOT rows are skipped entirely: Discord signal ingestion was
+    removed, so nothing can run one again and a FAILED row stays FAILED.
     """
     services = list_services()
     for service in services:

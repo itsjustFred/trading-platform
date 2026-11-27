@@ -685,8 +685,11 @@ def test_arming_a_deployment_with_an_unresolved_conflict_is_refused(
             "confirmation": {"confirmed_deployment_id": deployment_id},
         },
     )
-    assert resumed.status_code == 200, resumed.text
-    assert database_module.get_live_deployment(deployment_id).status == "ACTIVE"
+    # The conflict gate is cleared, so the refusal now comes from the next gate:
+    # an internal deployment has no viewer arm path (arming internal deployments
+    # is a separate follow-up), which proves the conflict check no longer fires.
+    assert resumed.status_code == 409, resumed.text
+    assert "internal" in resumed.json()["detail"]
 
 
 def test_resolving_on_a_missing_deployment_is_a_404_and_is_audited(
@@ -1081,9 +1084,8 @@ def test_services_crud_and_logs_endpoints(monkeypatch):
         return [service for service in payload if service.type == service_type]
 
     def _create_service(service: Service):
-        created = service.model_copy(update={"id": service_id})
-        services[service_id] = created
-        return created
+        services[str(service.id)] = service
+        return service
 
     def _get_service(value: str):
         return services.get(value)
@@ -1137,7 +1139,9 @@ def test_services_crud_and_logs_endpoints(monkeypatch):
 
     client = TestClient(viewer_main_module.app)
 
-    create_response = client.post(
+    # discord_bot creation is refused (retired source), so the stored row the
+    # rest of this test exercises is seeded directly, as a pre-removal row.
+    retired_response = client.post(
         "/api/services",
         json={
             "name": "RAMJET",
@@ -1149,18 +1153,47 @@ def test_services_crud_and_logs_endpoints(monkeypatch):
             },
         },
     )
+    assert retired_response.status_code == 400
+    assert "retired" in retired_response.json()["detail"]
+
+    services[service_id] = Service(
+        id=service_id,
+        name="RAMJET",
+        type=ServiceType.DISCORD_BOT,
+        status=ServiceStatus.RUNNING,
+        config={
+            "token_env_key": "DISCORD_BOT_RAMJET_TOKEN",
+            "channel_id": "1431465140905185452",
+        },
+        created_at=datetime.now(timezone.utc),
+    )
+
+    create_response = client.post(
+        "/api/services",
+        json={
+            "name": "weekly-refresh",
+            "type": "scheduled_job",
+            "status": "running",
+            "config": {"cron": "0 2 * * 1", "job_type": "refresh"},
+        },
+    )
     assert create_response.status_code == 201
     created = create_response.json()
-    assert created["id"] == service_id
-    assert created["name"] == "RAMJET"
-    assert created["type"] == "discord_bot"
+    assert created["name"] == "weekly-refresh"
+    assert created["type"] == "scheduled_job"
     assert created["status"] == "running"
+
+    # The retired discord_bot row is still listed, marked retired.
+    discord_list = client.get("/api/services", params={"type": "discord_bot"})
+    assert discord_list.status_code == 200
+    discord_rows = discord_list.json()
+    assert len(discord_rows) == 1
+    assert discord_rows[0]["retired"] is True
 
     list_response = client.get("/api/services")
     assert list_response.status_code == 200
     listed = list_response.json()
-    assert len(listed) == 1
-    assert listed[0]["name"] == "RAMJET"
+    assert {row["name"] for row in listed} == {"RAMJET", "weekly-refresh"}
 
     detail_response = client.get(f"/api/services/{service_id}")
     assert detail_response.status_code == 200
@@ -2104,7 +2137,7 @@ def test_arming_an_internal_source_deployment_is_refused_by_the_api(
     assert response.status_code == 409
     detail = response.json()["detail"]
     assert "internal" in detail
-    assert "internal_runner_enabled" in detail
+    assert "no live evaluator" in detail
     # The broker was never contacted: the refusal is not a broker problem.
     assert broker_calls == []
     # And the row is untouched.
@@ -3566,3 +3599,93 @@ def test_live_dashboard_passes_unknown_totals_through_as_null(monkeypatch):
     (row,) = response.json()["accounts"]
     assert row["total_trades"] is None
     assert row["total_pnl"] is None
+
+
+def _stored_discord_live_deployment(deployment_id: str) -> "LiveDeploymentConfig":
+    """A discord deployment as the DB read path rehydrates it (stored-row context)."""
+    from shared.models import STORED_ROW_CONTEXT
+
+    return LiveDeploymentConfig.model_validate(
+        {
+            "id": deployment_id,
+            "strategy_name": "discord::nitro",
+            "account_id": "acc-disc",
+            "symbols": ["AAPL"],
+            "timeframe": "1h",
+            "status": "PAUSED",
+            "signal_source": "discord",
+            "signal_source_type": "discord",
+            "signal_config": {"channel_id": "123456789012345678"},
+        },
+        context={STORED_ROW_CONTEXT: True},
+    )
+
+
+def test_arming_a_retired_discord_deployment_is_refused_without_broker_contact(
+    monkeypatch, isolated_db_sandbox
+):
+    """PUT /status ACTIVE on a stored discord row: 409 'retired', no broker call."""
+    import uuid as _uuid
+
+    from fastapi.testclient import TestClient
+
+    import viewer.main as viewer_main_module
+
+    database_module, _engine, _data_dir = isolated_db_sandbox
+    database_module.ensure_live_account("acc-disc", "alpaca", is_demo=True)
+
+    broker_calls: list[str] = []
+
+    async def _must_not_reverify(account_id: str) -> bool:
+        broker_calls.append(account_id)
+        return True
+
+    monkeypatch.setattr(
+        viewer_main_module, "_reverify_account_against_broker", _must_not_reverify
+    )
+
+    deployment_id = str(_uuid.uuid4())
+    database_module.create_live_deployment(
+        _stored_discord_live_deployment(deployment_id)
+    )
+
+    client = TestClient(viewer_main_module.app)
+    response = client.put(
+        f"/api/live/deployments/{deployment_id}/status",
+        json={
+            "status": "ACTIVE",
+            "confirmation": {"confirmed_deployment_id": deployment_id},
+        },
+    )
+
+    assert response.status_code == 409
+    assert "retired" in response.json()["detail"]
+    assert broker_calls == []
+    assert database_module.get_live_deployment(deployment_id).status == "PAUSED"
+
+
+def test_creating_a_deployment_with_a_discord_signal_source_is_refused(isolated_db_sandbox):
+    """POST /api/live/deployments with signal_source_type 'discord' -> 400."""
+    from fastapi.testclient import TestClient
+
+    import viewer.main as viewer_main_module
+
+    database_module, _engine, _data_dir = isolated_db_sandbox
+    database_module.ensure_live_account("acc-1", "alpaca", is_demo=True)
+
+    client = TestClient(viewer_main_module.app)
+    response = client.post(
+        "/api/live/deployments",
+        json={
+            "strategy_name": "discord::nitro",
+            "account_id": "acc-1",
+            "symbols": ["AAPL"],
+            "timeframe": "1h",
+            "signal_source_type": "discord",
+            "signal_source": "discord",
+            "signal_config": {"channel_id": "123456789012345678"},
+        },
+    )
+
+    assert response.status_code == 400
+    assert "retired" in response.json()["detail"]

@@ -53,8 +53,8 @@ KNOWN_DEPLOYMENT_STATUSES: frozenset[str] = frozenset({"ACTIVE", "PAUSED", "STOP
 #: source a stored row may still legitimately carry, retired ones included. A
 #: value outside this set is a configuration error the operator has to see
 #: spelled out; a retired one is recognised and simply never trades.
-KNOWN_SIGNAL_SOURCES: frozenset[str] = frozenset(
-    {DEFAULT_SIGNAL_SOURCE, RETIRED_DISCORD_SIGNAL_SOURCE}
+KNOWN_SIGNAL_SOURCES: frozenset[str] = (
+    TRADEABLE_SIGNAL_SOURCES | {DEFAULT_SIGNAL_SOURCE, RETIRED_DISCORD_SIGNAL_SOURCE}
 )
 
 

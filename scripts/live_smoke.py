@@ -1032,6 +1032,52 @@ class contextlib_suppress:
         return True
 
 
+async def _ctrader_strategy_e2e(
+    env: Mapping[str, str],
+    *,
+    accounts_env: Path,
+    timeout_seconds: int,
+) -> SmokeCheck:
+    from live_runner.account_discovery import discover_ctrader_accounts
+
+    symbol = "EURUSD"
+    details: dict[str, Any] = {
+        "status": "not_started",
+        "symbol": symbol,
+        "broker_order_ids": [],
+        "filled_volume": 0,
+        "remaining_volume": None,
+        "error": "",
+    }
+    try:
+        accounts = await asyncio.wait_for(
+            discover_ctrader_accounts(
+                env.get("CTRADER_APP_ID", ""),
+                env.get("CTRADER_APP_SECRET", ""),
+                env.get("CTRADER_ACCESS_TOKEN", ""),
+            ),
+            timeout=timeout_seconds,
+        )
+        demo_accounts = [account for account in accounts if account.is_demo]
+        if not demo_accounts:
+            raise RuntimeError("No cTrader demo account found.")
+        selected = max(demo_accounts, key=lambda account: float(account.balance or 0.0))
+        account_id = str(selected.ctid or selected.id)
+        details.update({"account_id": account_id, "balance": float(selected.balance or 0.0)})
+
+        worker_details = await _run_ctrader_strategy_e2e_subprocess(
+            account_id=account_id,
+            accounts_env=accounts_env,
+            timeout_seconds=timeout_seconds,
+        )
+        details.update(worker_details)
+        return SmokeCheck("ctrader-strategy-e2e", True, details)
+    except Exception as exc:
+        details["status"] = "failed"
+        details["error"] = _public_error(exc)
+        return SmokeCheck("ctrader-strategy-e2e", False, details, details["error"])
+
+
 async def run_smoke(
     *,
     mode: str,
@@ -1076,6 +1122,14 @@ async def run_smoke(
                 timeout_seconds=timeout_seconds,
             )
         )
+    if normalized_mode in {"ctrader-strategy-e2e"}:
+        checks.append(
+            await _ctrader_strategy_e2e(
+                env,
+                accounts_env=accounts_env,
+                timeout_seconds=timeout_seconds,
+            )
+        )
 
     return SmokeReport(
         mode=normalized_mode,
@@ -1096,6 +1150,7 @@ def main(argv: list[str] | None = None) -> int:
             "alpaca-crypto-roundtrip",
             "ctrader",
             "ctrader-demo-roundtrip",
+            "ctrader-strategy-e2e",
             "all",
             "ctrader-adapter-worker",
             "ctrader-order-worker",

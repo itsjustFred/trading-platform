@@ -1271,3 +1271,26 @@ def test_a_stamped_deployment_in_the_ledger_needs_no_adapter(isolated_db_sandbox
     assert (
         daemon._account_ids_needing_stopped_enforcement([_deployment(database)], ledger) == set()
     )
+
+
+def test_recover_failed_services_never_resurrects_a_discord_bot(
+    isolated_db_sandbox,
+) -> None:
+    """Discord signal ingestion was removed: a FAILED discord_bot row has no
+    runner left, so recovery leaves it FAILED while a scheduled job recovers."""
+    database, _, _ = isolated_db_sandbox
+    discord_bot = database.create_service(
+        Service(name="bot", type=ServiceType.DISCORD_BOT, status=ServiceStatus.FAILED)
+    )
+    job = database.create_service(
+        Service(
+            name="job",
+            type=ServiceType.SCHEDULED_JOB,
+            status=ServiceStatus.FAILED,
+        )
+    )
+
+    daemon._recover_failed_services()
+
+    assert database.get_service(str(discord_bot.id)).status == ServiceStatus.FAILED
+    assert database.get_service(str(job.id)).status == ServiceStatus.RUNNING

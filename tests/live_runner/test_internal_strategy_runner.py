@@ -2569,3 +2569,22 @@ def test_lot_position_map_skipped_for_single_lot_symbols(
     assert adapter.resolver_calls == []
     assert len(sent) == 1
     assert sent[0].symbol == "N2"
+
+
+def test_retired_discord_deployments_are_never_evaluated(tmp_path: Path) -> None:
+    """A stored discord row is inert to the internal runner: it is filtered
+    before strategy resolution, so nothing is submitted and nothing reported."""
+    path = _strategy_file(tmp_path, META)
+    sent, submit = _collect()
+    runner = _runner(submit, path=path, module=_module_with(_entry_strategy))
+    discord_deployment = _deployment(
+        status="ACTIVE", source="discord", source_type="discord"
+    )
+
+    asyncio.run(
+        runner.run_once(
+            [discord_deployment], {"acct-1": FakeAdapter()}, now=BASE + timedelta(seconds=70)
+        )
+    )
+
+    assert sent == []

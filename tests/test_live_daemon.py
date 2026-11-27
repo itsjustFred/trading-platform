@@ -769,12 +769,13 @@ class _RecordingLogger:
     """The logger the daemon uses, keeping every level for an assertion."""
 
     errors: list[tuple] = field(default_factory=list)
+    warnings: list[tuple] = field(default_factory=list)
 
     def error(self, msg, *args, **kwargs) -> None:
         self.errors.append((msg, args, kwargs))
 
     def warning(self, msg, *args, **kwargs) -> None:
-        pass
+        self.warnings.append((msg, args, kwargs))
 
     def info(self, msg, *args, **kwargs) -> None:
         pass
@@ -783,8 +784,8 @@ class _RecordingLogger:
         pass
 
 
-def _run_ticks(deployments, ticks: int):
-    """Run the real deployment-sync loop for ``ticks`` ticks, capturing its ERRORs.
+def _run_ticks_recorder(deployments, ticks: int, *, accounts=None, adapters=None, tasks=None):
+    """Run the real deployment-sync loop for ``ticks`` ticks, returning the recorder.
 
     Only the DB read is stubbed (``_load_db_accounts_and_deployments``) and the
     enforcement ledger it seeds itself from; everything else -- the sync loop, the
@@ -799,7 +800,7 @@ def _run_ticks(deployments, ticks: int):
     ticks_run = {"count": 0}
 
     async def _load_state():
-        return [], deployments
+        return list(accounts or []), deployments
 
     async def _sleep(_seconds: float) -> None:
         ticks_run["count"] += 1
@@ -814,8 +815,8 @@ def _run_ticks(deployments, ticks: int):
         with pytest.raises(asyncio.CancelledError):
             asyncio.run(
                 daemon.sync_deployments_loop(
-                    {},
-                    {},
+                    adapters if adapters is not None else {},
+                    tasks if tasks is not None else {},
                     accounts_env=Path("/nonexistent/accounts.env"),
                     interval_seconds=0,
                 )
@@ -825,7 +826,11 @@ def _run_ticks(deployments, ticks: int):
         daemon.asyncio.sleep = original_sleep
         daemon.logger = original_logger
         daemon.list_stopped_enforced_deployment_ids = original_ledger
-    return recorder.errors
+    return recorder
+
+
+def _run_ticks(deployments, ticks: int):
+    return _run_ticks_recorder(deployments, ticks).errors
 
 
 def _untradeable_alerts(errors):
@@ -865,7 +870,7 @@ def test_a_stopped_or_paused_row_is_not_alerted() -> None:
     assert _untradeable_alerts(_run_ticks([_internal_deployment("STOPPED")], ticks=2)) == []
 
 
-def test_a_tradeable_row_is_not_alerted() -> None:
+def test_a_retired_discord_row_is_not_alerted_as_untradeable() -> None:
     assert _untradeable_alerts(_run_ticks([_stored_discord_deployment()], ticks=2)) == []
 
 
@@ -904,3 +909,97 @@ def test_repointing_a_row_alerts_the_change_and_the_stop() -> None:
     deployment.signal_source = "internal"
     deployment.signal_source_type = "internal"
     assert len(_untradeable_alerts(_run_ticks([deployment], ticks=2))) == 1
+
+
+def test_retired_discord_warning_fires_once_per_deployment_per_process() -> None:
+    """M3: one WARNING per stored discord deployment, not one per sync tick."""
+    deployments = [
+        _stored_discord_deployment("PAUSED"),
+        _stored_discord_deployment("PAUSED").model_copy(
+            update={"id": "44444444-4444-4444-4444-444444444444"}
+        ),
+    ]
+
+    recorder = _run_ticks_recorder(deployments, ticks=3)
+
+    retired_warnings = [
+        w for w in recorder.warnings if "retired 'discord' signal source" in str(w[0])
+    ]
+    assert len(retired_warnings) == 2
+    warned_ids = {
+        w[2]["extra"]["data"]["deployment_id"] for w in retired_warnings
+    }
+    assert warned_ids == {str(d.id) for d in deployments}
+
+
+class _SpyAdapter:
+    """Records every broker-facing call the sync loop can make."""
+
+    demo = True
+
+    def __init__(self) -> None:
+        self.mutations: list[str] = []
+        self.listener_started = False
+
+    async def listen_executions(self) -> None:
+        self.listener_started = True
+
+    async def connect(self) -> None:
+        pass
+
+    async def disconnect(self) -> None:
+        pass
+
+    async def get_positions(self):
+        return []
+
+    async def working_order_ids(self):
+        return set()
+
+    async def submit_order(self, *args, **kwargs):
+        self.mutations.append("submit_order")
+
+    async def cancel_order(self, *args, **kwargs):
+        self.mutations.append("cancel_order")
+
+    async def flatten_positions(self, *args, **kwargs):
+        self.mutations.append("flatten_positions")
+
+    async def cancel_working_orders(self, *args, **kwargs):
+        self.mutations.append("cancel_working_orders")
+
+    async def amend_protective_stop(self, *args, **kwargs):
+        self.mutations.append("amend_protective_stop")
+
+
+def test_paused_retired_discord_rows_get_no_broker_mutation_on_a_sync_tick() -> None:
+    """B1 core + B3: three stored discord rows (the real shape: PAUSED,
+    signal_source='discord', signal_source_type='discord', channel_id in
+    signal_config) on a sync tick place no order, do no cancel/flatten - the
+    account keeps its adapter and listener exactly as on main."""
+    from shared.models import LiveAccountConfig
+
+    deployments = [
+        _stored_discord_deployment("PAUSED"),
+        _stored_discord_deployment("PAUSED").model_copy(
+            update={"id": "55555555-5555-5555-5555-555555555555"}
+        ),
+        _stored_discord_deployment("PAUSED").model_copy(
+            update={"id": "66666666-6666-6666-6666-666666666666"}
+        ),
+    ]
+    account = LiveAccountConfig(
+        id="acc-1", broker="alpaca", name="Paper", broker_login="", is_demo=True
+    )
+    adapter = _SpyAdapter()
+    adapters = {"acc-1": adapter}
+
+    _run_ticks_recorder(
+        deployments, ticks=2, accounts=[account], adapters=adapters, tasks={}
+    )
+
+    assert adapter.mutations == []
+    # The adapter and its execution listener are retained (same as main): the
+    # rows are recognised, listed and enforced like any other - they simply
+    # have no signal source left to dispatch from.
+    assert adapter.listener_started

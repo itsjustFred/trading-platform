@@ -232,7 +232,7 @@ const LiveDeploymentCard = memo(function LiveDeploymentCard({
           : "Internal Strategy"}
       </div>
       <div style={{ display: "flex", gap: "8px", position: "relative", zIndex: 2 }}>
-        {card.status === "PAUSED" && (
+        {card.status === "PAUSED" && card.signal_source !== "discord" && (
           <button
             type="button"
             onClick={(event) => onPlay(card, event)}
@@ -604,7 +604,6 @@ export function LiveHubPage() {
       .split(",")
       .map((item) => item.trim().toUpperCase())
       .filter(Boolean);
-    const selectedProcessor = createForm.signal_processor.trim().toLowerCase();
     const symbols = resolveCreateSymbols(createForm, symbolFilter);
     const validationError = validateCreateDeploymentForm(
       strategyName,
@@ -633,7 +632,7 @@ export function LiveHubPage() {
         signal_source_type: createForm.signal_source,
         symbol_filter: symbolFilter,
         signal_source: createForm.signal_source,
-        signal_config: buildSignalConfig(selectedProcessor),
+        signal_config: {},
         settings: settingsPayload,
       });
       setCreateOpenAccountId("");
@@ -863,29 +862,6 @@ export function LiveHubPage() {
             </div>
           </div>
 
-
-          <label style={fieldLabelStyle}>
-            Signal Processor (optional){" "}
-            <select
-              value={createForm.signal_processor}
-              onChange={(event) =>
-                setCreateForm((current) => ({
-                  ...current,
-                  signal_processor: event.target.value,
-                }))
-              }
-              style={fieldInputStyle}
-            >
-              <option value="">
-                {signalProcessorsLoading ? "Loading processors..." : "No processor override"}
-              </option>
-              {signalProcessors.map((option) => (
-                <option key={option.id} value={option.id}>
-                  {option.label}
-                </option>
-              ))}
-            </select>
-          </label>
 
           <label style={fieldLabelStyle}>
             Timeframe{" "}
@@ -1573,19 +1549,6 @@ const WIN_RATE_TONES = {
     color: "#cbd5e1",
   },
 } as const;
-
-type SignalConfigPayload = Record<string, string>;
-
-/** Builds the signal config for a new deployment. */
-function buildSignalConfig(
-  selectedProcessor: string,
-): SignalConfigPayload {
-  const config: SignalConfigPayload = {};
-  if (selectedProcessor) {
-    config.signal_processor = selectedProcessor;
-  }
-  return config;
-}
 
 function winRateTone(rate: number): keyof typeof WIN_RATE_TONES {
   if (rate >= 55) {

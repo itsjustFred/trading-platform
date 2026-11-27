@@ -5409,6 +5409,10 @@ def _serialize_service_payload(service: Service) -> dict[str, Any]:
         # one, which is exactly the ambiguity a heartbeat exists to remove.
         "last_activity_age_seconds": None if age_seconds is None else max(0.0, age_seconds),
         "is_stale": last_activity is None or age_seconds > SERVICE_STALE_AFTER_SECONDS,
+        # Discord signal ingestion was removed: stored discord_bot rows are
+        # retired - nothing runs them, so the UI marks them instead of
+        # showing a RUNNING nothing executes.
+        "retired": service.type == ServiceType.DISCORD_BOT,
         "created_at": service.created_at.isoformat(),
     }
     safe_payload = redact_value(payload)
@@ -13479,6 +13483,14 @@ async def get_services_endpoint(
 
 @app.post("/api/services", status_code=201)
 async def create_service_endpoint(payload: ServiceCreateRequest) -> dict[str, Any]:
+    if str(payload.type or "").strip().lower() == ServiceType.DISCORD_BOT.value:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "service type 'discord_bot' is retired: Discord signal ingestion "
+                "was removed and nothing can run one"
+            ),
+        )
     try:
         service = Service(
             name=str(payload.name or "").strip(),
@@ -14403,30 +14415,40 @@ async def update_live_deployment_status_endpoint(
             )
 
         # Check what can actually trade before spending a broker round-trip on
-        # it. The internal strategy runner's own answer decides: an internal
-        # deployment that opted in and resolves a strategy arms fine, anything
-        # else (no opt-in, unresolvable strategy, a retired discord row) can
-        # never produce a signal, and a 409 naming that reason is far more
-        # actionable than a broker error. The reason helper keys on ACTIVE
-        # status, so it is asked about the row as it would be once armed.
-        from live_runner.deployment_policy import (
-            DEFAULT_SIGNAL_SOURCE,
-            normalize_signal_source,
-            untradeable_signal_source_reason,
-        )
-        from live_runner.internal_strategy_runner import (
-            internal_runner_untradeable_reason,
-        )
+        # it. An internal-source deployment has no viewer arm path, so no
+        # account verification can make it capable of trading, and a 409 naming
+        # that reason is far more actionable than a broker error.
+        source_type = str(deployment.signal_source_type or "").strip().lower()
+        if source_type == "internal":
+            await _audit_live_control(
+                action="deployment.status",
+                target_type="live_deployment",
+                target_id=deployment_id,
+                request=request,
+                succeeded=False,
+                detail={
+                    "requested_status": requested_status,
+                    "reason": "internal signal source has no live evaluator",
+                    "account_id": str(deployment.account_id or ""),
+                },
+            )
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "This deployment uses the 'internal' signal source, which has "
+                    "no live evaluator on this path, so it can never produce a "
+                    "signal. Arming it would report it as trading while it never "
+                    "can."
+                ),
+            )
 
-        if normalize_signal_source(deployment.signal_source) == DEFAULT_SIGNAL_SOURCE:
-            untradeable_reason = internal_runner_untradeable_reason(
-                deployment.model_copy(update={"status": "ACTIVE"})
-            )
-        else:
-            untradeable_reason = untradeable_signal_source_reason(
-                deployment.signal_source
-            )
-        if untradeable_reason is not None:
+        # A retired source (discord) can never produce a signal either; refuse
+        # it with the policy's own reason instead of spending broker
+        # round-trips on a deployment that is recognised but inert.
+        from live_runner.deployment_policy import untradeable_signal_source_reason
+
+        untradeable_reason = untradeable_signal_source_reason(deployment.signal_source)
+        if untradeable_reason is not None and "retired" in untradeable_reason:
             await _audit_live_control(
                 action="deployment.status",
                 target_type="live_deployment",

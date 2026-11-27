@@ -172,7 +172,7 @@ export function ServicesPage() {
             >
               <div>
                 <div style={{ fontWeight: 700, fontSize: "0.92rem" }}>
-                  {service.type === "discord_bot" ? "Discord Bot: " : ""}
+                  {service.type === "discord_bot" ? "Discord Bot (retired): " : ""}
                   {service.name}
                 </div>
                 <div style={metaLineStyle}>{metaLine}</div>
@@ -208,19 +208,21 @@ export function ServicesPage() {
                 flexWrap: "wrap",
               }}
             >
-              <button
-                type="button"
-                style={secondaryButtonStyle}
-                onClick={() =>
-                  void handleStatus(
-                    service,
-                    isRunning ? "paused" : "running",
-                  )
-                }
-                disabled={statusMutation.isPending}
-              >
-                {isRunning ? "Pause" : "Start"}
-              </button>
+              {!service.retired && (
+                <button
+                  type="button"
+                  style={secondaryButtonStyle}
+                  onClick={() =>
+                    void handleStatus(
+                      service,
+                      isRunning ? "paused" : "running",
+                    )
+                  }
+                  disabled={statusMutation.isPending}
+                >
+                  {isRunning ? "Pause" : "Start"}
+                </button>
+              )}
               <button
                 type="button"
                 style={secondaryButtonStyle}
