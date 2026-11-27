@@ -4323,7 +4323,7 @@ def test_ctrader_resolved_volume_ignores_exit_position_metadata(key: str) -> Non
 
 
 @pytest.mark.parametrize(
-    "volume", [0, -1, False, float("nan"), 1.5, 1000.5, 0.5, "1000"]
+    "volume", [0, -1, False, float("nan"), 1.5, 1000.5, 0.5, "1000", 1000.0, 1.0]
 )
 def test_ctrader_new_order_request_fails_closed_on_an_unusable_volume(volume) -> None:
     """The volume reaches this seam from the submit path, so it must be
@@ -4347,7 +4347,7 @@ def test_ctrader_new_order_request_fails_closed_on_an_unusable_volume(volume) ->
 
 
 @pytest.mark.parametrize(
-    "volume", [0, -1, False, float("nan"), 1.5, 1000.5, 0.5, "3000"]
+    "volume", [0, -1, False, float("nan"), 1.5, 1000.5, 0.5, "3000", 3000.0, 1.0]
 )
 def test_ctrader_close_position_request_fails_closed_on_an_unusable_volume(
     volume,
