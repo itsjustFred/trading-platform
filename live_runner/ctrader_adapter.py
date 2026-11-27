@@ -922,7 +922,7 @@ def _qty_to_broker_volume(qty: float, volume_per_qty: float = QTY_VOLUME_SCALE) 
     return int(volume)
 
 
-def _coerce_broker_volume(volume: Any, *, field_name: str) -> int:
+def _validate_broker_volume(volume: Any, *, field_name: str) -> int:
     """Coerce the broker volume a request builder was handed, failing closed.
 
     Both builders receive the volume ``submit_order`` resolved once, as a
@@ -3086,6 +3086,53 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         # only removes float noise.
         return round(floored_qty * float(scale.volume_per_qty))
 
+    def _verify_sizing_scale(
+        self, *, symbol: str, metadata: Mapping[str, Any], scale: SymbolScale
+    ) -> None:
+        """The #146 guard: refuse a qty sized against a scale that moved.
+
+        The daemon sizes this qty with a pip value derived from the symbol
+        scale at sizing time and records it as
+        ``pip_value_units_per_qty``. If the scale changed since (e.g. a
+        reconnect whose props fetch failed fell back to the static table), the
+        same qty would be a different position size, so the submit fails closed.
+        A caller pip value carries no units-per-qty, so the check cannot run
+        for it: converting the sized qty with whatever scale is current could
+        be a different position size (#146), and that fails closed too.
+
+        Called from :meth:`_resolve_order_volume` and again by ``submit_order``
+        immediately before the request is built, because a symbol scale can
+        move across that submit's awaits (a reconnect's props refresh inside
+        ``_resolve_symbol_id``) and the resolved volume is pinned, not
+        re-resolved, against the new scale.
+        """
+        sized_units = metadata.get("pip_value_units_per_qty")
+        if sized_units is None and metadata.get("pip_value_source") == "caller":
+            # An explicit caller pip value carries no units-per-qty, so the
+            # submit-time scale check cannot run; converting the sized qty with
+            # whatever scale is current could be a different position size
+            # (#146). Fail closed instead of skipping the check.
+            raise ValueError(
+                f"cTrader cannot verify the volume scale for {symbol}: the "
+                "caller-supplied pip value carries no pip_value_units_per_qty; "
+                "refusing to submit a qty whose sizing scale is unknown."
+            )
+        if sized_units is None:
+            return
+        current_units = scale.volume_per_qty / CTRADER_VOLUME_PER_BASE_UNIT
+        try:
+            sized_units_value = float(sized_units)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(
+                f"Invalid pip_value_units_per_qty for {symbol}: {sized_units!r}"
+            ) from exc
+        if not math.isclose(sized_units_value, current_units, rel_tol=1e-9, abs_tol=0.0):
+            raise ValueError(
+                f"cTrader volume scale for {symbol} changed since sizing "
+                f"({sized_units_value!r} -> {current_units!r} units per qty); "
+                "refusing to submit a qty sized for a different contract."
+            )
+
     def _resolve_order_volume(self, signal: LiveSignal) -> int:
         """Resolve broker volume from the binding risk-engine ``qty``.
 
@@ -3118,35 +3165,9 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 "Signal has no positive quantity ('qty'); refusing to "
                 "submit an order with a default size."
             ) from exc
-        sized_units = metadata.get("pip_value_units_per_qty")
-        if sized_units is None and metadata.get("pip_value_source") == "caller":
-            # An explicit caller pip value carries no units-per-qty, so the
-            # submit-time scale check below cannot run; converting the sized
-            # qty with whatever scale is current could be a different
-            # position size (#146). Fail closed instead of skipping the check.
-            raise ValueError(
-                f"cTrader cannot verify the volume scale for {signal.symbol}: the "
-                "caller-supplied pip value carries no pip_value_units_per_qty; "
-                "refusing to submit a qty whose sizing scale is unknown."
-            )
-        if sized_units is not None:
-            # #146: the daemon sized this qty with a pip value derived from the
-            # symbol scale at sizing time. If the scale changed since (e.g. a
-            # reconnect whose props fetch failed fell back to the static
-            # table), the same qty would be a different position size.
-            current_units = scale.volume_per_qty / CTRADER_VOLUME_PER_BASE_UNIT
-            try:
-                sized_units_value = float(sized_units)
-            except (TypeError, ValueError, OverflowError) as exc:
-                raise ValueError(
-                    f"Invalid pip_value_units_per_qty for {signal.symbol}: {sized_units!r}"
-                ) from exc
-            if not math.isclose(sized_units_value, current_units, rel_tol=1e-9, abs_tol=0.0):
-                raise ValueError(
-                    f"cTrader volume scale for {signal.symbol} changed since sizing "
-                    f"({sized_units_value!r} -> {current_units!r} units per qty); "
-                    "refusing to submit a qty sized for a different contract."
-                )
+        self._verify_sizing_scale(
+            symbol=signal.symbol, metadata=metadata, scale=scale
+        )
         if str(metadata.get("risk_sizing_mode") or "") == EXIT_ONLY_RISK_SIZING_MODE:
             volume = self._exit_volume(signal.symbol, qty, scale)
         else:
@@ -4203,6 +4224,18 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             # row that reads as "an order may exist" and routes retries into
             # the persisted-signal recovery path.
             symbol_id = await self._resolve_symbol_id(signal.symbol)
+            # #146: the request builders used to re-resolve the volume, which
+            # re-ran the "scale changed since sizing" check after these awaits -
+            # so a symbol scale that moved in this window (a reconnect's props
+            # refresh inside ``_resolve_symbol_id``) refused the submit. The
+            # volume is now resolved once and passed down, so the check is
+            # re-run here instead, against the scale as it stands right before
+            # the request is built and before anything is persisted.
+            self._verify_sizing_scale(
+                symbol=signal.symbol,
+                metadata=signal.metadata or {},
+                scale=self._scale_for(signal.symbol),
+            )
             if exit_only:
                 if position_id is None:
                     raise RuntimeError("cTrader exit-only position id was not resolved.")
@@ -4386,7 +4419,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             isinstance(position_id, float) and position_id != position_id_value
         ):
             raise ValueError("cTrader close position id must be positive integer.")
-        broker_volume = _coerce_broker_volume(
+        broker_volume = _validate_broker_volume(
             volume, field_name="cTrader close volume"
         )
         request = self._ProtoOAClosePositionReq()
@@ -4422,7 +4455,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         # The volume no longer arrives validated from the resolver, so validate
         # it here, on the same contract the close request uses: whole broker
         # volume units or nothing.
-        request.volume = _coerce_broker_volume(
+        request.volume = _validate_broker_volume(
             volume, field_name="cTrader new-order volume"
         )
         request.timeInForce = self._ProtoOATimeInForce.IMMEDIATE_OR_CANCEL

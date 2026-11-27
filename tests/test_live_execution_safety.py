@@ -6121,6 +6121,61 @@ def test_ctrader_submit_keeps_the_resolved_volume_when_the_scale_moves_mid_submi
     assert saved[0].metadata["qty"] == pytest.approx(2.0)
 
 
+def test_ctrader_submit_refuses_a_daemon_entry_whose_scale_moved_mid_submit(
+    monkeypatch,
+) -> None:
+    """#146: a scale move in that same window must still refuse a daemon entry.
+
+    Daemon entries carry ``pip_value_units_per_qty`` (``live_runner/daemon.py``
+    writes it), and the builder's own resolution used to re-run the "scale
+    changed since sizing" check after ``submit_order``'s awaits - so on main a
+    scale refresh landing in this window refused the order instead of sending
+    it. The builder no longer re-resolves, so the check is re-run explicitly
+    before the request is built: the size the risk engine covered was computed
+    against the old scale, so the submit must fail closed rather than send the
+    pre-move volume.
+
+    This is the daemon variant of
+    ``test_ctrader_submit_keeps_the_resolved_volume_when_the_scale_moves_mid_submit``,
+    which pins the units-less variant that main sent.
+    """
+    from live_runner import ctrader_adapter as module
+
+    _module, adapter, saved, volumes = _ctrader_submit_harness(monkeypatch)
+
+    async def _refresh_then_resolve(symbol: str) -> int:
+        # A concurrent reconnect/props refresh lands during the submit's await:
+        # the cached scale moves from 1000 to 100 units per qty, i.e. from 10.0
+        # to 1.0 pip-value units per qty.
+        adapter._symbol_props["EURUSD"] = module.SymbolScale(
+            volume_per_qty=100.0,
+            price_digits=5,
+            min_volume=1,
+            lot_size=10_000.0,
+            source="broker",
+        )
+        return 1
+
+    monkeypatch.setattr(adapter, "_resolve_symbol_id", _refresh_then_resolve)
+    daemon_signal = _ctrader_entry_signal().model_copy(
+        update={
+            "metadata": {
+                "pip_value_units_per_qty": 10.0,
+                "pip_value_source": "broker",
+            }
+        }
+    )
+    submit = adapter.submit_order(daemon_signal, qty=2.0007)
+
+    with pytest.raises(ValueError, match="changed since sizing") as excinfo:
+        asyncio.run(submit)
+
+    assert "10.0 -> 1.0" in str(excinfo.value)
+    assert is_order_not_submitted(excinfo.value)
+    assert saved == []
+    assert volumes == []
+
+
 def test_ctrader_volume_resolution_is_idempotent_at_the_int32_bound(
     monkeypatch,
 ) -> None:
