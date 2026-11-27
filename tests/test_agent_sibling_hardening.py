@@ -41,6 +41,7 @@ WORKFLOWS = REPO_ROOT / ".github" / "workflows"
 
 REVIEW = "agent-code-review.yml"
 MUTATION = "agent-mutation-testing.yml"
+PROBE = "agent-quota-probe.yml"
 SIBLINGS = (REVIEW, MUTATION)
 
 # The names each copy substitutes for its own: (what the review copy carries, what the mutation
@@ -85,11 +86,49 @@ def _run(step: dict) -> str:
     return str(step.get("run", ""))
 
 
+# The shared step bodies live in scripts/agents/ now: the workflows call them by
+# path, and the tests below either inline the script's own text (for the string
+# and executable-line assertions that used to read the step body) or rewrite the
+# call to an absolute path (for the tests that execute the body).
+AGENTS_DIR = REPO_ROOT / "scripts" / "agents"
+_SCRIPT_CALL = re.compile(
+    r"^(?P<interp>bash|python3)\s+(?P<path>scripts/agents/[\w./-]+\.(?:sh|py))\s*(?P<rest>.*)$",
+    re.M,
+)
+
+
+def _script_source(rel_path: str) -> str:
+    return (REPO_ROOT / rel_path).read_text(encoding="utf-8")
+
+
+def _run_source(step: dict) -> str:
+    """The step body with every scripts/agents call inlined as the script's text."""
+
+    def inline(match: re.Match) -> str:
+        return _script_source(match.group("path"))
+
+    return _SCRIPT_CALL.sub(inline, _run(step))
+
+
+def _run_exec(step: dict) -> str:
+    """The step body runnable as-is: script calls get absolute paths."""
+    body = _run(step)
+
+    def absolute(match: re.Match) -> str:
+        rest = match.group("rest")
+        return (
+            f"{match.group('interp')} {AGENTS_DIR / Path(match.group('path')).name}"
+            f"{rest and ' ' + rest.strip()}"
+        )
+
+    return _SCRIPT_CALL.sub(absolute, body)
+
+
 def _selection(job: dict) -> tuple[str, list[str]]:
     """The selection step's body, and its executable shell lines (stripped, prose comments
     dropped). A check that only exists on a `#` line is a check that does not run, so the
     strictness assertions below read these lines and never the raw body."""
-    body = _run(_find_step(job, r"^Select skill revision$"))
+    body = _run_source(_find_step(job, r"^Select skill revision$"))
     lines = []
     for line in body.splitlines():
         line = line.strip()
@@ -149,15 +188,23 @@ def test_the_base_commit_guard_must_not_be_a_comment_line() -> None:
     a substring assertion over the step body cannot see. So the line is commented out in a copy of
     each workflow here and the same executable-line check runs over that copy: it fails."""
     guard = 'git cat-file -e "${BASE_SHA}^{commit}"'
-    for name in SIBLINGS:
-        text = (WORKFLOWS / name).read_text(encoding="utf-8")
-        mutated = re.sub(rf"(?m)^(\s*){re.escape(guard)}\s*$", rf"\1# {guard}", text)
-        assert mutated != text, f"{name}: the guard is not a line of its own"
-        _, job = _agent_job(_parse(mutated))
-        failures = _strictness_failures(*_selection(job))
-        assert any("unreachable base" in message for message in failures), (
-            f"{name}: commenting the guard out does not fail the strictness check: {failures}"
-        )
+    # The guard lives in the shared scripts/agents/select_skill.sh now: one copy
+    # for both siblings, so commenting it out fails both at once.
+    text = (AGENTS_DIR / "select_skill.sh").read_text(encoding="utf-8")
+    mutated = re.sub(rf"(?m)^(\s*){re.escape(guard)}\s*$", rf"\1# {guard}", text)
+    assert mutated != text, "the guard is not a line of its own"
+    lines = [
+        line.strip()
+        for line in mutated.splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+    assert not any(guard in line for line in lines), (
+        "a commented-out guard is still an executable line"
+    )
+    failures = _strictness_failures(lines, mutated)
+    assert any("unreachable base" in message for message in failures), (
+        f"commenting the guard out does not fail the strictness check: {failures}"
+    )
 
 
 def test_the_two_selections_stay_identical() -> None:
@@ -187,9 +234,13 @@ def test_both_siblings_print_whose_rules_ran() -> None:
     mutation copy's empty-scope footer is excluded by design - no agent ran, so no rules ran."""
     for name in SIBLINGS:
         _, job = _agent_job(_load(name))
-        bodies = "\n".join(_run(step) for step in job.get("steps", []))
-        assert re.search(r"::notice::[A-Za-z-]+ rules from: \$\{SKILL_SOURCE\}", bodies), (
+        bodies = "\n".join(_run_source(step) for step in job.get("steps", []))
+        assert "::notice::${notice_label} from: ${SKILL_SOURCE}" in bodies, (
             f"{name}: the run log does not print whose rules ran"
+        )
+        label = {"review": "Review rules", "mutation": "Mutation-testing rules"}[_stage(name)]
+        assert f'notice_label="{label}"' in bodies, (
+            f"{name}: the rules notice is not labelled for this stage"
         )
         assert "skill (rules from %s)" in bodies, (
             f"{name}: the comment footer drops the rules' source"
@@ -280,7 +331,6 @@ def _run_selection(job: dict, probe: dict, *, base: str, skill_path: str | None)
     The block is the workflow's own: the environment is the one it declares (the workflow-level
     `env:` of file-level names, filled in from the probe), and the repository is real, so every
     `git` call in it does what it does in CI."""
-    body, _ = _selection(job)
     runner_temp = probe["runner_temp"]
     github_env = probe["github_env"]
     github_env.write_text("", encoding="utf-8")
@@ -297,7 +347,9 @@ def _run_selection(job: dict, probe: dict, *, base: str, skill_path: str | None)
         }
     )
     script = probe["repo"] / "selection.sh"
-    script.write_text(body, encoding="utf-8")
+    script.write_text(
+        _run_exec(_find_step(job, r"^Select skill revision$")), encoding="utf-8"
+    )
     result = subprocess.run(
         [shutil.which("bash") or "bash", str(script)],
         cwd=probe["repo"],
@@ -445,15 +497,23 @@ def test_the_quota_probe_gates_the_agent_job() -> None:
         assert "same_repo" in _workflow_if(probe), (
             f"{name}: the probe pings the model for a fork PR"
         )
-        assert probe.get("permissions") == {}, (
+        # The probe is a reusable-workflow call: it has no steps of its own, so
+        # it cannot check out the PR it is only meant to price; the called job
+        # holds no token scope and reports the `available` output the callers
+        # gate on.
+        assert not probe.get("steps"), f"{name}: the probe call carries steps"
+        assert probe.get("uses") == "./.github/workflows/agent-quota-probe.yml"
+        probe_job = _load(PROBE)["jobs"]["probe"]
+        assert probe_job.get("permissions") == {}, (
             f"{name}: the probe holds a token scope it does not need"
         )
-        assert not any(
-            str(s.get("uses", "")).startswith("actions/checkout") for s in probe.get("steps", [])
-        ), f"{name}: the probe checks out the PR it is only meant to price"
-        assert "steps.probe.outputs.available" in str(probe.get("outputs", {})), (
+        assert "steps.probe.outputs.available" in str(probe_job.get("outputs", {})), (
             f"{name}: the probe reports no `available` output"
         )
+        assert not any(
+            str(s.get("uses", "")).startswith("actions/checkout")
+            for s in probe_job.get("steps", [])
+        ), f"{name}: the probe checks out the PR it is only meant to price"
 
         agent_job = jobs[agent]
         needs = agent_job.get("needs")
@@ -512,12 +572,14 @@ def test_the_quota_probe_gates_the_agent_job() -> None:
         )
         quota_comment = _find_step(post, r"^Write quota comment$")
         body = _run(quota_comment)
-        assert "Not run: quota" in body, f"{name}: the quota comment does not say why"
-        titles = {
-            "agent-code-review.yml": "# Code Review Action",
-            "agent-mutation-testing.yml": "# Mutation Testing Action",
-        }
-        assert titles[name] in body, f"{name}: the quota comment has no title"
+        assert "scripts/agents/quota_comment.py" in body, (
+            f"{name}: the quota comment is not written by the shared script"
+        )
+        assert f"--stage {_stage(name)}" in body and "--when probe" in body, (
+            f"{name}: the quota comment call lost its stage or path"
+        )
+        # The shared script owns the title and the "Not run: quota" body; its
+        # own unit tests pin both per stage.
         # The probe path has no agent artifact, so the download and the post must
         # both be gated: a skipped download would otherwise fail the post job.
         download = next(
@@ -625,87 +687,87 @@ def test_the_quota_probe_step_reports_only_a_positive_quota_signature(tmp_path) 
     reply and a string assertion cannot tell a pattern that matches from one
     that does not. A success and a non-quota failure both fail open - the agent
     job runs and the genuine failure surfaces there."""
-    for name in SIBLINGS:
-        stage = _stage(name)
-        job = _load(name)["jobs"]["quota-probe"]
-        step = _find_step(job, r"^Probe model quota$")
-        for mode, expected in (
-            ("ok", "true"),
-            ("quota", "false"),
-            # The cap has been observed arriving on a ZERO exit, on either
-            # stream: the signature is grepped over stdout and stderr whatever
-            # the status, so a capped model cannot report `available=true`.
-            ("quota-out", "false"),
-            ("quota-err", "false"),
-            ("no-ok", "true"),
-            ("other", "true"),
-        ):
-            case = tmp_path / f"{stage}-{mode}"
-            case.mkdir(parents=True, exist_ok=True)
-            runner_temp = case / "runner-temp"
-            runner_temp.mkdir(exist_ok=True)
-            output = case / "github-output"
-            output.write_text("", encoding="utf-8")
-            env = {
-                **os.environ,
-                "PATH": os.pathsep.join([str(_stub_bin(case)), os.environ["PATH"]]),
-                "STUB_OPENCODE_MODE": mode,
-                "RUNNER_TEMP": str(runner_temp),
-                "GITHUB_OUTPUT": str(output),
-                "OPENCODE_DISABLE_PROJECT_CONFIG": "1",
-            }
-            script = case / "probe.sh"
-            script.write_text(_run(step), encoding="utf-8")
-            result = subprocess.run(
-                [shutil.which("bash") or "bash", str(script)],
-                env=env,
-                capture_output=True,
-                text=True,
+    probe_job = _load(PROBE)["jobs"]["probe"]
+    step = _find_step(probe_job, r"^Probe model quota$")
+    for mode, expected in (
+        ("ok", "true"),
+        ("quota", "false"),
+        # The cap has been observed arriving on a ZERO exit, on either
+        # stream: the signature is grepped over stdout and stderr whatever
+        # the status, so a capped model cannot report `available=true`.
+        ("quota-out", "false"),
+        ("quota-err", "false"),
+        ("no-ok", "true"),
+        ("other", "true"),
+    ):
+        case = tmp_path / f"probe-{mode}"
+        case.mkdir(parents=True, exist_ok=True)
+        runner_temp = case / "runner-temp"
+        runner_temp.mkdir(exist_ok=True)
+        output = case / "github-output"
+        output.write_text("", encoding="utf-8")
+        env = {
+            **os.environ,
+            "PATH": os.pathsep.join([str(_stub_bin(case)), os.environ["PATH"]]),
+            "STUB_OPENCODE_MODE": mode,
+            "RUNNER_TEMP": str(runner_temp),
+            "GITHUB_OUTPUT": str(output),
+            "OPENCODE_DISABLE_PROJECT_CONFIG": "1",
+        }
+        script = case / "probe.sh"
+        script.write_text(_run(step), encoding="utf-8")
+        result = subprocess.run(
+            [shutil.which("bash") or "bash", str(script)],
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, (
+            f"probe ({mode}): the probe step failed:\n{result.stderr}"
+        )
+        written = output.read_text(encoding="utf-8")
+        assert f"available={expected}" in written, (
+            f"probe ({mode}): the probe reported {written!r}, expected {expected}"
+        )
+        if mode == "ok":
+            # The probe's output is logged on every path, bounded: the
+            # success path used to log nothing, which is why run
+            # 44962245768 could pass the probe and cap 26 s later with no
+            # way to tell a real reach from a capped one.
+            assert "::group::Quota probe output" in result.stdout, (
+                "the probe does not log its output on success"
             )
-            assert result.returncode == 0, (
-                f"{name} ({mode}): the probe step failed:\n{result.stderr}"
+        if mode == "no-ok":
+            assert "::warning::" in result.stdout, (
+                "the inconclusive probe (no OK, no signature) "
+                "fails open silently"
             )
-            written = output.read_text(encoding="utf-8")
-            assert f"available={expected}" in written, (
-                f"{name} ({mode}): the probe reported {written!r}, expected {expected}"
-            )
-            if mode == "ok":
-                # The probe's output is logged on every path, bounded: the
-                # success path used to log nothing, which is why run
-                # 44962245768 could pass the probe and cap 26 s later with no
-                # way to tell a real reach from a capped one.
-                assert "::group::Quota probe output" in result.stdout, (
-                    f"{name}: the probe does not log its output on success"
-                )
-            if mode == "no-ok":
-                assert "::warning::" in result.stdout, (
-                    f"{name}: the inconclusive probe (no OK, no signature) "
-                    "fails open silently"
-                )
 
 
 def test_the_quota_probe_agent_is_denied_every_tool_and_the_probe_is_identical() -> None:
     """The probe pings the model with a one-word prompt; it needs no tool at
     all, so its agent config is a deny-all and a misbehaving reply cannot make
-    the probe act. And the probe job is copied into both siblings: the config
-    and the step body must be identical, or a classification fix that lands in
-    one copy and not the other is exactly the drift the bundle-26 review
-    found."""
-    seen: dict[str, set[str]] = {}
+    the probe act. And the probe is one shared reusable workflow now, called
+    by both siblings with the same inputs - there is only one copy left to
+    drift, which is what the identical-copies assertion used to guard."""
+    job = _load(PROBE)["jobs"]["probe"]
+    for step_name in ("Configure quota probe agent", "Probe model quota"):
+        body = _run(_find_step(job, rf"^{re.escape(step_name)}$"))
+        if step_name == "Configure quota probe agent":
+            assert "effect: allow" not in body, (
+                "the quota probe agent is allowed tools it does not need"
+            )
+            assert "effect: deny" in body, "the quota probe agent has no deny rule"
     for name in SIBLINGS:
-        job = _load(name)["jobs"]["quota-probe"]
-        for step_name in ("Configure quota probe agent", "Probe model quota"):
-            body = _run(_find_step(job, rf"^{re.escape(step_name)}$"))
-            seen.setdefault(step_name, set()).add(body)
-            if step_name == "Configure quota probe agent":
-                assert "effect: allow" not in body, (
-                    f"{name}: the quota probe agent is allowed tools it does not need"
-                )
-    for step_name, bodies in seen.items():
-        assert len(bodies) == 1, (
-            f"{step_name} differs between the siblings - the probe "
-            "classification must not drift"
+        call = _load(name)["jobs"].get("quota-probe")
+        assert call is not None, f"{name}: no quota-probe job"
+        assert call.get("uses") == "./.github/workflows/agent-quota-probe.yml", (
+            f"{name}: quota-probe does not call the shared workflow"
         )
+        for key in ("model", "variant", "opencode-version"):
+            assert (call.get("with") or {}).get(key), (
+                f"{name}: quota-probe passes no {key}"
+            )
 
 
 _AGENT_STEP = {
@@ -748,19 +810,19 @@ def test_the_mid_run_quota_skip_reports_instead_of_failing(tmp_path) -> None:
         stage = _stage(name)
         agent = _load(name)["jobs"][agent_name]
         step = _find_step(agent, rf"^{re.escape(step_name)}$")
-        body = _run(step)
+        body = _run_exec(step)
         # The two zero-exit dead ends (no summary line, no verdict line)
         # classify the quota signature over the raw stream and stderr before
-        # they fail - the cap has been seen arriving on a zero exit.
-        transient = (
-            "usage limit|rate.?limit|quota|insufficient credits|limit reached|"
-            "not available in your country|service unavailable|overloaded|"
-            "sign up for free to continue|too many requests"
-        )
-        dead_end_grep = f"grep -qiE '{transient}' \"$out.raw\" \"$out.stderr.final\""
-        assert body.count(dead_end_grep) == 2, (
+        # they fail - the cap has been seen arriving on a zero exit. The
+        # classifier is the shared scripts/agents/run_agent.sh now.
+        source = _run_source(step)
+        dead_end_probe = 'has_quota_signature "$out.raw" "$out.stderr.final"'
+        assert source.count(dead_end_probe) == 2, (
             f"{name}: the two zero-exit dead ends do not both classify the "
             "quota signature"
+        )
+        assert "QUOTA_GREP=" in source and "rate.?limit" in source, (
+            f"{name}: the shared classifier lost the transient signature"
         )
         # The cap has been seen arriving on a ZERO exit: with no report at all
         # (quota-zero), or with a report that never reaches a verdict
@@ -791,6 +853,7 @@ def test_the_mid_run_quota_skip_reports_instead_of_failing(tmp_path) -> None:
                 "PATH": os.pathsep.join([str(_stub_bin(case)), os.environ["PATH"]]),
                 "STUB_OPENCODE_MODE": mode,
                 "RUNNER_TEMP": str(runner_temp),
+                "GITHUB_OUTPUT": str(case / "github-output"),
                 "GITHUB_STEP_SUMMARY": str(case / "step-summary"),
                 "PR_NUMBER": "296",
                 "BASE_SHA": "1" * 40,
@@ -881,7 +944,9 @@ def test_an_agent_output_carrying_the_nvidia_key_is_never_kept(tmp_path) -> None
     for name in SIBLINGS:
         agent_name, step_name = _AGENT_STEP[name]
         stage = _stage(name)
-        body = _run(_find_step(_load(name)["jobs"][agent_name], rf"^{re.escape(step_name)}$"))
+        body = _run_exec(
+            _find_step(_load(name)["jobs"][agent_name], rf"^{re.escape(step_name)}$")
+        )
         for mode in ("leak", "leak-fail"):
             case = tmp_path / f"{stage}-{mode}"
             runner_temp = case / "runner-temp"
@@ -932,7 +997,9 @@ def test_the_leak_guard_still_refuses_when_one_stream_is_missing(tmp_path) -> No
     key = "nvapi-test-0123456789"
     steps = {**_AGENT_STEP, "agent-pre-mortem.yml": ("premortem", "Run pre-mortem agent")}
     for name, (agent_name, step_name) in steps.items():
-        body = _run(_find_step(_load(name)["jobs"][agent_name], rf"^{re.escape(step_name)}$"))
+        body = _run_source(
+            _find_step(_load(name)["jobs"][agent_name], rf"^{re.escape(step_name)}$")
+        )
         match = re.search(r"^( *)refuse_leaked_key\(\) \{\n.*?^\1\}\n", body, re.M | re.S)
         assert match, f"{name}: no refuse_leaked_key function"
         for present in ("raw", "stderr"):

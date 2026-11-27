@@ -128,6 +128,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -140,6 +141,7 @@ SKILLS = REPO_ROOT / ".agents" / "skills"
 REVIEW = "agent-code-review.yml"
 MUTATION = "agent-mutation-testing.yml"
 PREMORTEM = "agent-pre-mortem.yml"
+PROBE = "agent-quota-probe.yml"
 AGENT_WORKFLOWS = (REVIEW, MUTATION, PREMORTEM)
 
 # The workflow that reports its verdict on the commit. The siblings present as comments and are
@@ -226,6 +228,46 @@ def _run(step: dict) -> str:
     return str(step.get("run", ""))
 
 
+# The shared step bodies live in scripts/agents/ now: the workflows call them by
+# path, and the tests below either inline the script's own text (for the string
+# and executable-line assertions that used to read the step body) or rewrite the
+# call to an absolute path (for the tests that execute the body). Keeping both
+# views means a step that stops calling the shared script fails the same way a
+# drifted copy used to.
+AGENTS_DIR = REPO_ROOT / "scripts" / "agents"
+_SCRIPT_CALL = re.compile(
+    r"^(?P<interp>bash|python3)\s+(?P<path>scripts/agents/[\w./-]+\.(?:sh|py))\s*(?P<rest>.*)$",
+    re.M,
+)
+
+
+def _script_source(rel_path: str) -> str:
+    return (REPO_ROOT / rel_path).read_text(encoding="utf-8")
+
+
+def _run_source(step: dict) -> str:
+    """The step body with every scripts/agents call inlined as the script's text."""
+
+    def inline(match: re.Match) -> str:
+        return _script_source(match.group("path"))
+
+    return _SCRIPT_CALL.sub(inline, _run(step))
+
+
+def _run_exec(step: dict) -> str:
+    """The step body runnable as-is: script calls get absolute paths."""
+    body = _run(step)
+
+    def absolute(match: re.Match) -> str:
+        rest = match.group("rest")
+        return (
+            f"{match.group('interp')} {AGENTS_DIR / Path(match.group('path')).name}"
+            f"{rest and ' ' + rest.strip()}"
+        )
+
+    return _SCRIPT_CALL.sub(absolute, body)
+
+
 def _agent_job(data: dict) -> tuple[str, dict]:
     """The job that runs the agent: the one that installs opencode."""
     for job_name, job in data["jobs"].items():
@@ -243,7 +285,7 @@ def _selection_lines(job: dict) -> list[str]:
     `test_the_base_commit_guard_must_not_be_a_comment_line` pins.
     """
     lines = []
-    for line in _run(_find_step(job, r"^Select skill revision$")).splitlines():
+    for line in _run_source(_find_step(job, r"^Select skill revision$")).splitlines():
         line = line.strip()
         if line and not line.startswith("#"):
             lines.append(line)
@@ -338,7 +380,6 @@ def _run_selection(probe: dict, tmp_path, *, base: str, skill_path: str | None) 
     is a command in an `if` condition does not - which is the whole difference between the two
     forms, and the reason the step is run here rather than read.
     """
-    body = _run(_find_step(_agent_job(_load(PREMORTEM))[1], r"^Select skill revision$"))
     runner_temp = tmp_path / "premortem"
     github_env = tmp_path / "github-env"
     github_env.write_text("", encoding="utf-8")
@@ -352,7 +393,10 @@ def _run_selection(probe: dict, tmp_path, *, base: str, skill_path: str | None) 
         }
     )
     script = probe["repo"] / "selection.sh"
-    script.write_text(body, encoding="utf-8")
+    script.write_text(
+        _run_exec(_find_step(_agent_job(_load(PREMORTEM))[1], r"^Select skill revision$")),
+        encoding="utf-8",
+    )
     result = subprocess.run(
         [shutil.which("bash") or "bash", str(script)],
         cwd=probe["repo"],
@@ -373,7 +417,7 @@ def _all_run_bodies(data: dict) -> str:
 
 
 def _job_bodies(jobs) -> str:
-    return "\n".join(_run(s) for job in jobs for s in _steps(job))
+    return "\n".join(_run_source(s) for job in jobs for s in _steps(job))
 
 
 def _step_env(job: dict, step: dict) -> dict:
@@ -1227,7 +1271,7 @@ def test_the_agent_workflows_share_one_free_model_configuration() -> None:
         )
         _job_name, job = _agent_job(_load(name))
         bodies = _job_bodies([job])
-        assert "$MODEL" in bodies and "$VARIANT" in bodies, (
+        assert "${MODEL" in bodies and "${VARIANT" in bodies, (
             f"{name}: the agent is not configured from MODEL/VARIANT"
         )
 
@@ -1275,15 +1319,26 @@ def test_no_verdict_ever_reports_a_blocking_failure() -> None:
 
 
 def test_the_verdict_regex_accepts_exactly_the_mapped_verdicts() -> None:
-    """The regex decides what the workflow will post at all: an alternation wider than the map
-    accepts a verdict the post job cannot place, and one that is narrower drops a documented
-    verdict on the floor. The trailing annotation is allowed - a verdict line carries the reason
-    and, for this stage, the hand-written sign-off note."""
-    bodies = _all_run_bodies(_load(PREMORTEM))
-    m = re.search(r"sed -nE 's/\^Verdict:\[\[:space:\]\]\*\((.*?)\)", bodies)
-    assert m, "no verdict regex in the pre-mortem workflow"
-    assert set(m.group(1).split("|")) == set(VERDICT_STATUS), (
-        f"regex accepts {sorted(m.group(1).split('|'))}, map has {sorted(VERDICT_STATUS)}"
+    """The parser decides what the workflow will post at all: a vocabulary wider
+    than the map accepts a verdict the post job cannot place, and one that is
+    narrower drops a documented verdict on the floor. The shared parser's stage
+    vocabularies are pinned against the skill's own verdict line, so the three
+    cannot drift apart silently."""
+    sys.path.insert(0, str(AGENTS_DIR))
+    try:
+        import parse_verdict
+    finally:
+        sys.path.remove(str(AGENTS_DIR))
+    skill = (SKILLS / SKILL_DIR / "SKILL.md").read_text(encoding="utf-8")
+    verdicts_line = re.search(r"^- Verdicts:.*$", skill, re.M)
+    assert verdicts_line, f"{SKILL_DIR}: the skill documents no verdict line"
+    documented = set(re.findall(r"`([A-Z-]+)`", verdicts_line.group(0)))
+    assert documented == set(VERDICT_STATUS), (
+        f"skill verdicts {sorted(documented)} != map {sorted(VERDICT_STATUS)}"
+    )
+    stage_vocab = parse_verdict.STAGES["premortem"][1]
+    assert set(stage_vocab) == set(VERDICT_STATUS), (
+        f"parser accepts {sorted(stage_vocab)}, map has {sorted(VERDICT_STATUS)}"
     )
 
 
@@ -1375,39 +1430,35 @@ def test_a_superseded_result_does_not_overwrite_a_newer_comment() -> None:
     """A rerun of an older commit (an infra failure, a head that moved past it) must not replace
     the comment of the newer result: the comment is the PR's view of the head, so the poster
     compares the current head with the analysed SHA first and stops. Its status still lands on
-    its own commit, which is the point of asking for it."""
+    its own commit, which is the point of asking for it. The poster is the shared,
+    unit-tested scripts/agents/post_comment.py now; what is pinned here is that the pre-mortem
+    post job calls it and that the script keeps every guard the inline copy had."""
     post = _load(PREMORTEM)["jobs"]["post"]
-    body = _run(_find_step(post, r"^Post or update pre-mortem comment$"))
-    assert '"$HEAD_SHA"' in body and ".head.sha" in body, "no head comparison"
-    assert "exit 0" in body, "a superseded result does not stop the job"
-    assert "not updating the comment" in body, "no reason is logged"
-    # The comparison is made twice, and the second one gates the write: the first ran before the
-    # marker search and the body was assembled, and a synchronize event inside that window still
-    # had a comment describing a diff nobody looks at posted as the current result. What is left
-    # is the window of the write itself, which no API can close - there is no conditional comment
-    # update - so the footer's base...head pair is what keeps that result readable.
-    assert body.count("--jq .head.sha") == 2, "the head is read once, before the write"
-    reread = body.index("moved=$(gh api")
-    written = body.index("-F body=@body.md")
+    step = _find_step(post, r"^Post or update pre-mortem comment$")
+    body = _run(step)
+    assert "scripts/agents/post_comment.py" in body, "the post job does not call the shared poster"
+    assert "--stage premortem" in body and MARKER in body, (
+        "the poster call lost its stage or marker"
+    )
+    source = (AGENTS_DIR / "post_comment.py").read_text(encoding="utf-8")
+    # The head is read before the comment list is fetched and again immediately
+    # before the write: a synchronize inside that window still had a comment
+    # describing a diff nobody looks at posted as the current result.
+    assert source.count("_head_sha(repo, pr)") >= 2, "the head is read once, before the write"
+    reread = source.index("moved = _head_sha(repo, pr)")
+    written = source.index('"-F", "body=@body.md"')
     assert reread < written, "the write does not happen under the re-read head"
-    # ... and that claim is only true if the re-read is the *last* thing the step does before the
-    # write. Both reads used to sit above the body assembly and the comment-list fetch, so the
-    # "window of the write itself" the comment swore to was the whole of that work - two API
-    # round trips wide - and a synchronize landing inside it was still written over. So the work
-    # that builds the write has to be *behind* the re-read, and a test that only compares the
-    # re-read with the write cannot see the difference.
-    for prepared in ("> body.md", "existing=$(gh api --paginate"):
-        assert body.index(prepared) < reread, (
+    for prepared in ("Path(\"body.md\").write_text", "_comment_ids(repo, pr"):
+        assert source.index(prepared) < reread, (
             f"the re-read does not gate the write: '{prepared}' runs after the head was last read"
         )
-    assert MARKER in body, "the poster carries no marker of its own"
-    assert "gh api" in body, "the poster does not use the REST API"
-    # A second comment carrying the marker (a duplicate from an interrupted run, or one
-    # created outside the workflow) used to be left alone by `tail -n 1`: the stale
-    # `# Pre-Mortem Action` stayed readable next to the current one forever. Every match is
-    # now updated, and the duplicate is logged rather than silently dropped.
-    assert "for id in $existing" in body, "a duplicate marker comment is left stale"
-    assert "::warning::" in body, "a duplicate marker comment is not reported"
+    assert "not updating the comment" in source, "a superseded result does not stop the job"
+    # Every marker match is updated, and a duplicate is reported rather than
+    # silently dropped by taking the last id.
+    assert "for comment_id in existing" in source, "a duplicate marker comment is left stale"
+    assert "::warning::" in source or "_warning(" in source, (
+        "a duplicate marker comment is not reported"
+    )
 
 
 def test_the_pre_mortem_status_names_the_pr_it_was_written_for() -> None:
@@ -1430,9 +1481,12 @@ def test_the_comment_and_the_status_record_the_analysed_shas() -> None:
     the description has GitHub's 140 characters to work with and still has to name the verdict,
     the commit and the PR."""
     data = _load(PREMORTEM)
-    body = _run(_find_step(_agent_job(data)[1], r"^Run pre-mortem agent$"))
+    body = _run_source(_find_step(_agent_job(data)[1], r"^Run pre-mortem agent$"))
     lines = body.splitlines()
-    footer_at = next(i for i, line in enumerate(lines) if "skill (rules from %s)" in line)
+    pair_at = next(i for i, line in enumerate(lines) if "_Analysed base" in line)
+    footer_at = next(
+        i for i in range(pair_at, len(lines)) if "skill (rules from %s)" in lines[i]
+    )
     footer = "\n".join(lines[footer_at - 4 : footer_at + 3])
     assert "${BASE_SHA:0:8}" in footer and "${HEAD_SHA:0:8}" in footer, (
         "the comment footer does not name the analysed base and head"
@@ -1659,12 +1713,15 @@ def test_the_free_model_quota_is_a_skip_not_a_failure() -> None:
     until PREMORTEM_MODEL / PREMORTEM_VARIANT changes."""
     data = _load(PREMORTEM)
     agent = _agent_job(data)[1]
-    body = _run(_find_step(agent, r"^Run pre-mortem agent$"))
-    classes = re.findall(r"grep -qiE '([^']+)'", body)
-    assert len(classes) >= 2, (
-        "the failure classifier is one grep, so it cannot tell a cap from a misconfiguration"
+    body = _run_source(_find_step(agent, r"^Run pre-mortem agent$"))
+    transient = re.search(r"QUOTA_GREP='([^']+)'", body)
+    assert transient, "the transient quota class is not named once for both classifiers"
+    transient = transient.group(1)
+    misconfigured = re.search(
+        r"grep -qiE '([^']*(?:no provider|not \(found)[^']*)'", body
     )
-    transient, misconfigured = classes[0], classes[1]
+    assert misconfigured, "the misconfiguration class has no classifier of its own"
+    misconfigured = misconfigured.group(1)
     for known in ("usage limit", "rate.?limit", "quota"):
         assert known in transient, f"{known!r} is not recognised as transient"
     for misconfiguration in ("no provider", "model (is )?(not (found|available|supported))"):
@@ -1681,22 +1738,23 @@ def test_the_free_model_quota_is_a_skip_not_a_failure() -> None:
             "would take the quota path"
         )
     # The transient class takes the quota path: a warning that names the remedy, the
-    # "not run: quota" comment body, the `quota` output the post job reads, and a clean
-    # exit - the step does not fail, so the job does not go red. The body lives in
-    # `report_quota_skip`, reached from the non-zero-exit classifier and from the two
-    # zero-exit dead ends (no summary line, no valid verdict) where the cap has been
-    # seen arriving on a zero exit.
-    quota_branch = body.split("grep -qiE '" + transient + "'", 1)[1]
-    head = quota_branch.split("elif", 1)[0]
+    # "not run: quota" comment body written by the shared quota_comment.py, the
+    # `quota` output the post job reads, and a clean exit - the step does not fail,
+    # so the job does not go red. The body lives in `report_quota_skip`, reached
+    # from the non-zero-exit classifier and from the two zero-exit dead ends (no
+    # summary line, no valid verdict) where the cap has been seen arriving on a
+    # zero exit.
+    fail_classifier = body.index('if has_quota_signature "$out.stderr.final"; then')
+    head = body[fail_classifier:].split("elif", 1)[0]
     assert "report_quota_skip" in head, "the transient class does not take the quota path"
-    func_body = body.split("report_quota_skip() {", 1)[1].split("\n          }", 1)[0]
+    func_body = body.split("report_quota_skip() {", 1)[1].split("\n}", 1)[0]
     assert "::warning::" in func_body and "not run: quota" in func_body, (
         "the transient class does not warn and name the quota skip"
     )
     assert 'echo "quota=true" >> "$GITHUB_OUTPUT"' in func_body, (
         "the agent step does not report the quota skip to the post job"
     )
-    assert "Not run: quota" in func_body and "comment.md" in func_body, (
+    assert '"$QUOTA_COMMENT"' in func_body and "--when midrun" in func_body, (
         "the mid-run quota path writes no 'not run: quota' comment"
     )
     assert "exit 0" in func_body, "the mid-run quota path still fails the step"
@@ -1704,7 +1762,7 @@ def test_the_free_model_quota_is_a_skip_not_a_failure() -> None:
     # grepped over the raw stream and stderr at both, so a cap on a zero exit takes
     # the quota path instead of going red. Only on those paths - a produced report's
     # own text may mention "quota".
-    dead_end_grep = f"grep -qiE '{transient}' \"$out.raw\" \"$out.stderr.final\""
+    dead_end_grep = 'has_quota_signature "$out.raw" "$out.stderr.final"'
     assert body.count(dead_end_grep) == 2, (
         "the two zero-exit dead ends do not both classify the quota signature"
     )
@@ -1767,10 +1825,16 @@ def test_the_quota_probe_gates_the_agent_job() -> None:
     assert "same_repo" in str(probe.get("if", "")), (
         "the probe pings the model for a fork PR or a skipped resolve"
     )
-    assert probe.get("permissions") == {}, "the probe holds a token scope it does not need"
-    assert not any(str(s.get("uses", "")).startswith("actions/checkout") for s in _steps(probe)), (
-        "the probe checks out the PR it is only meant to price"
-    )
+    # The probe is a reusable-workflow call: it has no steps of its own, so it
+    # cannot check out the PR it is only meant to price, and the called job
+    # holds no token scope it does not need.
+    assert not probe.get("steps"), "the probe call carries steps of its own"
+    assert probe.get("uses") == "./.github/workflows/agent-quota-probe.yml"
+    probe_job = _load(PROBE)["jobs"]["probe"]
+    assert probe_job.get("permissions") == {}, "the probe holds a token scope it does not need"
+    assert not any(
+        str(s.get("uses", "")).startswith("actions/checkout") for s in _steps(probe_job)
+    ), "the probe checks out the PR it is only meant to price"
     assert jobs["premortem"].get("needs") == ["resolve", "quota-probe"] or set(
         jobs["premortem"].get("needs") or []
     ) >= {"resolve", "quota-probe"}, "the agent job does not need the probe"
@@ -1944,7 +2008,7 @@ esac
 
 def _run_probe_step(tmp_path, mode: str):
     """Execute the probe step's own `run:` body against a stub `opencode`."""
-    job = _load(PREMORTEM)["jobs"]["quota-probe"]
+    job = _load(PROBE)["jobs"]["probe"]
     step = _find_step(job, r"^Probe model quota$")
     bindir = tmp_path / "bin"
     bindir.mkdir(exist_ok=True)
@@ -2116,8 +2180,13 @@ def test_the_nvidia_key_reaches_only_the_probe_and_agent_steps(name) -> None:
                     f"{name}/{step.get('name')}: the key is not gated on an nvidia model"
                 )
     agent_step = _find_step(_agent_job(data)[1], r"^Run .* agent$")["name"]
-    assert sorted(holders) == sorted(["Probe model quota", agent_step]), (
-        f"{name}: the key reaches {holders}"
+    assert holders == [agent_step], f"{name}: the key reaches {holders}"
+    # The probe's half of the pair lives in the shared reusable workflow.
+    probe = _load(PROBE)
+    assert "ACTIONS_NVIDIA_API_KEY" not in str(probe.get("env", {})), "probe workflow env"
+    probe_step = _find_step(probe["jobs"]["probe"], r"^Probe model quota$")
+    assert probe_step["env"].get("NVIDIA_API_KEY") == NVIDIA_KEY_EXPR, (
+        "the probe step's key is not gated on an nvidia model"
     )
 
 
@@ -2127,14 +2196,15 @@ def test_an_nvidia_model_without_the_key_fails_with_its_reason(name, tmp_path) -
     """Without the secret an `nvidia/...` model can only fail with a 401 that reads like
     any broken run. The probe and the agent step both stop first and name the secret."""
     data = _load(name)
-    for step in (
-        _find_step(data["jobs"]["quota-probe"], r"^Probe model quota$"),
+    steps = [
+        _find_step(_load(PROBE)["jobs"]["probe"], r"^Probe model quota$"),
         _find_step(_agent_job(data)[1], r"^Run .* agent$"),
-    ):
+    ]
+    for step in steps:
         case = tmp_path / step["name"].replace(" ", "-")
         case.mkdir()
         script = case / "step.sh"
-        script.write_text(_run(step), encoding="utf-8")
+        script.write_text(_run_exec(step), encoding="utf-8")
         env = {**os.environ, "MODEL": "nvidia/stepfun-ai/step-5-preview", "NVIDIA_API_KEY": "",
                "RUNNER_TEMP": str(case), "GITHUB_OUTPUT": str(case / "out")}
         result = subprocess.run(
@@ -2155,7 +2225,7 @@ def test_a_kilo_model_enables_the_kilo_provider_and_nothing_else_changes(name, t
     config names it, so a `kilo/...` model in a stage variable needs the provider in the
     generated config - and every other model must keep the config it always had. Executed
     on the probe's config step, which needs no opencode, for each workflow."""
-    step = _find_step(_load(name)["jobs"]["quota-probe"], r"^Configure quota probe agent$")
+    step = _find_step(_load(PROBE)["jobs"]["probe"], r"^Configure quota probe agent$")
     zen = json.loads(ZEN_CONFIG)
     for model, expected in (
         ("kilo/reflection/beam-free", _kilo_config("reflection/beam-free")),
@@ -2169,7 +2239,7 @@ def test_a_kilo_model_enables_the_kilo_provider_and_nothing_else_changes(name, t
         home.mkdir()
         env = {**os.environ, "HOME": str(home), "MODEL": model, "VARIANT": "high"}
         script = home / "configure.sh"
-        script.write_text(_run(step), encoding="utf-8")
+        script.write_text(_run_exec(step), encoding="utf-8")
         result = subprocess.run(
             [shutil.which("bash") or "bash", str(script)], env=env, capture_output=True, text=True
         )
@@ -2196,9 +2266,9 @@ def test_a_model_without_a_provider_or_an_id_stops_with_its_name(name, tmp_path)
     data = _load(name)
     steps = [
         step
-        for job in data["jobs"].values()
+        for job in [*data["jobs"].values(), *_load(PROBE)["jobs"].values()]
         for step in _steps(job)
-        if "opencode.json" in _run(step)
+        if "opencode.json" in _run_source(step)
     ]
     for step in steps:
         for model in ("nvidia/", "nvidia", "kilo/", ""):
@@ -2206,7 +2276,7 @@ def test_a_model_without_a_provider_or_an_id_stops_with_its_name(name, tmp_path)
             home = tmp_path / label.replace("/", "_").replace(" ", "-")
             home.mkdir()
             script = home / "configure.sh"
-            script.write_text(_run(step), encoding="utf-8")
+            script.write_text(_run_exec(step), encoding="utf-8")
             env = {**os.environ, "HOME": str(home), "MODEL": model, "VARIANT": "high",
                    "RUNNER_TEMP": str(home)}
             result = subprocess.run(
@@ -2228,16 +2298,31 @@ def test_every_agent_config_step_writes_the_same_provider_choice() -> None:
     start. Every step that writes the opencode config, in every agent workflow, carries
     the one provider choice - Kilo, NVIDIA, or the Zen config it always had."""
     seen = set()
+    writers_per_workflow = []
     for name in AGENT_WORKFLOWS:
         writers = [
             step
             for job in _load(name)["jobs"].values()
             for step in _steps(job)
-            if "opencode.json" in _run(step)
+            if "opencode.json" in _run_source(step)
         ]
-        assert len(writers) == 2, f"{name}: expected the probe and the agent config steps"
-        for step in writers:
-            seen.add(_provider_choice(_run(step)))
+        writers_per_workflow.append((name, writers))
+    # Each agent workflow's one config writer is the shared configure_agent.sh;
+    # the probe's own config step lives in the reusable workflow. Two bodies,
+    # one provider choice between them.
+    probe_writers = [
+        step
+        for job in _load(PROBE)["jobs"].values()
+        for step in _steps(job)
+        if "opencode.json" in _run_source(step)
+    ]
+    all_writers = [w for _n, ws in writers_per_workflow for w in ws] + probe_writers
+    assert len(all_writers) == 4, (
+        f"expected one config step per agent workflow plus the probe's: "
+        f"{[(n, [s.get('name') for s in ws]) for n, ws in writers_per_workflow]} + probe"
+    )
+    for step in all_writers:
+        seen.add(_provider_choice(_run_source(step)))
     assert len(seen) == 1, f"the provider choice drifted between config steps: {seen}"
     choice = seen.pop()
     assert f"baseURL: \"{KILO_GATEWAY}\"" in choice, "the Kilo branch lost its gateway"
@@ -2249,12 +2334,12 @@ def test_every_agent_step_names_an_exhausted_retry_before_classifying() -> None:
     """The probe is not the only place a Kilo rate limit lands: a run cleared by the probe
     can hit it mid-run. Every agent step marks an exhausted retry on stderr before its
     classifier reads it, with the same helper the probe uses."""
-    probe_body = _run(_find_step(_load(MUTATION)["jobs"]["quota-probe"], r"^Probe model quota$"))
+    probe_body = _run(_find_step(_load(PROBE)["jobs"]["probe"], r"^Probe model quota$"))
     start = probe_body.index("note_exhausted_retries() {")
     helper = probe_body[start : probe_body.index("\n}\n", start) + 3]
     for name in AGENT_WORKFLOWS:
         _job_name, agent = _agent_job(_load(name))
-        body = _run(_find_step(agent, r"^Run .* agent$"))
+        body = _run_source(_find_step(agent, r"^Run .* agent$"))
         assert helper in body, f"{name}: the agent step's retry helper drifted from the probe's"
         failed = body.index('2> "$out.stderr"); then\n')
         after = body[failed:].split("\n", 2)[1]
@@ -2268,7 +2353,7 @@ def test_the_quota_probe_agent_is_denied_every_tool() -> None:
     all. Its agent config is a deny-all, so a misbehaving model reply cannot
     make the probe act - the earlier copy allowed shell, read and
     external_directory for a ping that uses none of them."""
-    job = _load(PREMORTEM)["jobs"]["quota-probe"]
+    job = _load(PROBE)["jobs"]["probe"]
     body = _run(_find_step(job, r"^Configure quota probe agent$"))
     assert "effect: allow" not in body, (
         "the quota probe agent is allowed tools it does not need"
@@ -2277,23 +2362,25 @@ def test_the_quota_probe_agent_is_denied_every_tool() -> None:
 
 
 def test_the_quota_probe_is_identical_in_every_workflow_that_has_one() -> None:
-    """The probe job is copied into each agent workflow; a fix to the
-    classification that lands in one copy and not the others is the drift the
-    bundle-26 review found. Every workflow that defines `quota-probe` must
-    carry the same probe agent config and the same probe step body."""
-    seen: dict[str, dict[str, str]] = {}
+    """The probe is one shared reusable workflow now, called by every agent
+    workflow with the same inputs: a fix to the classification lands once, in
+    `.github/workflows/agent-quota-probe.yml`, and cannot drift between the
+    agent workflows because there is only one copy left to drift."""
+    probe_job = _load(PROBE)["jobs"]["probe"]
+    for step_name in ("Configure quota probe agent", "Probe model quota"):
+        _find_step(probe_job, rf"^{re.escape(step_name)}$")
     for name in AGENT_WORKFLOWS:
-        job = _load(name)["jobs"].get("quota-probe")
-        if job is None:
-            continue
-        for step_name in ("Configure quota probe agent", "Probe model quota"):
-            body = _run(_find_step(job, rf"^{re.escape(step_name)}$"))
-            seen.setdefault(step_name, {})[name] = body
-    for step_name, by_workflow in seen.items():
-        unique = set(by_workflow.values())
-        assert len(unique) == 1, (
-            f"{step_name} differs across {sorted(by_workflow)} - the probe "
-            "classification must not drift between the agent workflows"
+        call = _load(name)["jobs"].get("quota-probe")
+        assert call is not None, f"{name}: no quota-probe job"
+        assert call.get("uses") == "./.github/workflows/agent-quota-probe.yml", (
+            f"{name}: quota-probe does not call the shared workflow"
+        )
+        with_inputs = call.get("with") or {}
+        for key in ("model", "variant", "opencode-version"):
+            assert with_inputs.get(key), f"{name}: quota-probe passes no {key}"
+        secrets = call.get("secrets") or {}
+        assert "ACTIONS_NVIDIA_API_KEY" in secrets, (
+            f"{name}: quota-probe does not forward the NVIDIA key"
         )
 
 
@@ -2351,7 +2438,7 @@ def test_the_mid_run_quota_skip_reports_instead_of_failing(tmp_path) -> None:
     head = _git(repo, "rev-parse", "HEAD")
 
     agent = _agent_job(_load(PREMORTEM))[1]
-    body = _run(_find_step(agent, r"^Run pre-mortem agent$"))
+    body = _run_exec(_find_step(agent, r"^Run pre-mortem agent$"))
     bindir = tmp_path / "bin"
     bindir.mkdir()
     stub = bindir / "opencode"
@@ -2490,9 +2577,10 @@ def _run_comment_post(tmp_path, *, quota_skip: bool, prior_body: str | None):
         "HEAD_SHA": REPORTER_ENV["HEAD_SHA"],
         "BASE_SHA": REPORTER_ENV["BASE_SHA"],
         "QUOTA_SKIP": "true" if quota_skip else "false",
+        "GH_TOKEN": "stub-token",
     }
     script = tmp_path / "post.sh"
-    script.write_text(_run(step), encoding="utf-8")
+    script.write_text(_run_exec(step), encoding="utf-8")
     result = subprocess.run(
         [shutil.which("bash") or "bash", str(script)],
         cwd=work,
@@ -2581,9 +2669,12 @@ def test_the_pre_mortem_comment_records_whose_rules_ran() -> None:
     has failed silently. This is not a hypothetical ordering: on this very PR the base has no
     skill, so every run so far is the fallback."""
     data = _load(PREMORTEM)
-    body = _run(_find_step(_agent_job(data)[1], r"^Run pre-mortem agent$"))
-    assert "::notice::Pre-mortem rules from: ${SKILL_SOURCE}" in body, (
+    body = _run_source(_find_step(_agent_job(data)[1], r"^Run pre-mortem agent$"))
+    assert "::notice::${notice_label} from: ${SKILL_SOURCE}" in body, (
         "the run log does not name whose rules ran"
+    )
+    assert 'notice_label="Pre-mortem rules"' in body, (
+        "the pre-mortem run does not label its rules notice"
     )
     assert "skill (rules from %s)" in body, "the comment footer drops the rules' source"
     assert "${SKILL_SOURCE}" in body, "the footer is not filled from the skill-source variable"
@@ -2607,7 +2698,7 @@ def test_skill_selection_refuses_an_unreachable_base_and_keeps_two_levels() -> N
     passed over them - they are hardened, and pinned, by the PR that owns them."""
     for name in (PREMORTEM,):
         job = _agent_job(_load(name))[1]
-        body = _run(_find_step(job, r"^Select skill revision$"))
+        body = _run_source(_find_step(job, r"^Select skill revision$"))
         # What the selection must contain is matched on its executable lines, not as a
         # substring of the body: a commented-out guard is not a guard.
         failures = _strictness_failures(_selection_lines(job))
@@ -2625,22 +2716,25 @@ def test_the_base_commit_guard_must_not_be_a_comment_line() -> None:
     guard is commented out in a copy of each workflow here and the same check runs over that
     copy: it fails. That is what the assertion it replaced claimed to be."""
     guard = 'git cat-file -e "${BASE_SHA}^{commit}"'
-    for name in AGENT_WORKFLOWS:
-        text = (WORKFLOWS / name).read_text(encoding="utf-8")
-        # Every occurrence, not just the first: the mutation copy carries the same line in its
-        # scope step, so a copy with only the selection's line commented out would still be
-        # analysed with a base whose tip it cannot read.
-        mutated = re.sub(rf"(?m)^(\s*){re.escape(guard)}\s*$", rf"\1# {guard}", text)
-        assert mutated.count(f"# {guard}") >= 1, f"{name}: the guard is not a line of its own"
-        assert mutated != text, f"{name}: the base-commit guard is not a line of its own"
-        job = _agent_job(_parse(mutated))[1]
-        assert not any(guard in line for line in _selection_lines(job)), (
-            f"{name}: a commented-out guard is still an executable line"
-        )
-        failures = _strictness_failures(_selection_lines(job))
-        assert any("unreachable base" in message for message in failures), (
-            f"{name}: commenting the guard out does not fail the strictness check: {failures}"
-        )
+    # The guard lives in the shared scripts/agents/select_skill.sh now: one copy
+    # for all three workflows, so commenting it out anywhere fails every stage.
+    script_path = AGENTS_DIR / "select_skill.sh"
+    text = script_path.read_text(encoding="utf-8")
+    mutated = re.sub(rf"(?m)^(\s*){re.escape(guard)}\s*$", rf"\1# {guard}", text)
+    assert mutated.count(f"# {guard}") >= 1, "the guard is not a line of its own"
+    assert mutated != text, "the base-commit guard is not a line of its own"
+    lines = [
+        line.strip()
+        for line in mutated.splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+    assert not any(guard in line for line in lines), (
+        "a commented-out guard is still an executable line"
+    )
+    failures = _strictness_failures(lines)
+    assert any("unreachable base" in message for message in failures), (
+        f"commenting the guard out does not fail the strictness check: {failures}"
+    )
 
 
 @needs_bash
@@ -2654,7 +2748,7 @@ def test_a_truncated_report_is_diagnosable_from_the_run_log(tmp_path) -> None:
     that the truncation cannot happen unnoticed: the byte counts are logged and the raw stream is
     an artifact of the run, so a comment that lost its opening sections is a run someone can
     reconstruct and read."""
-    body = _run(_find_step(_agent_job(_load(PREMORTEM))[1], r"^Run pre-mortem agent$"))
+    body = _run_source(_find_step(_agent_job(_load(PREMORTEM))[1], r"^Run pre-mortem agent$"))
     block = re.search(
         r"^\s*start=\$\(.*?^.*bytes of streamed messages[^\n]*\n", body, flags=re.S | re.M
     )
@@ -2674,7 +2768,7 @@ def test_a_truncated_report_is_diagnosable_from_the_run_log(tmp_path) -> None:
     (tmp_path / "out.md.raw").write_text(
         "streamed preamble\n\n" + report + "\n---\n\n" + quoted, encoding="utf-8"
     )
-    script = f'out="{out.as_posix()}"\n{block.group(0)}'
+    script = f'out="{out.as_posix()}"\nreport_noun="pre-mortem"\n{block.group(0)}'
     result = subprocess.run(
         [shutil.which("bash") or "bash", "-c", script],
         capture_output=True,
@@ -2772,56 +2866,25 @@ def test_the_selection_stops_on_what_it_cannot_read(probe_repo, tmp_path) -> Non
     assert not source, f"recorded a skill source on a failure: {source!r}"
 
 
-def test_the_duplicated_comment_guards_stay_in_sync_across_the_copies() -> None:
-    """The three workflows duplicate the blocks that decide what gets posted: the summary-line
-    extraction, the fence strip, the head-unchanged and tree-clean check, and the output path.
-    Nothing forces the three copies to be edited together - the workflow comments do not swear to
-    it - so this test is what makes it true mechanically instead of by memory: a guard changed in
-    one copy and not in the others fails here.
-
-    The per-copy substitutions below are the documented ones (the temp directory, the agent id),
-    applied agent-id first so "pr-review" cannot be eaten by the shorter "review". A guard that
-    only one copy needs is not here: the pre-mortem's stricter verdict prelude (it tolerates the
-    sign-off note the skill requires) and its head-moved comment guard are pinned separately. The
-    two-level skill selection is not one of those exclusions either: it is strict in this
-    workflow and pinned by `test_skill_selection_refuses_an_unreachable_base_and_keeps_two_levels`
-    and `test_the_base_commit_guard_must_not_be_a_comment_line`, and the two siblings' copy of it
-    is pinned by the PR that owns their hunks (`test_agent_sibling_hardening.py`), which is where
-    a sibling copy that is not strict has to fail. This PR touches neither sibling file.
-    """
-    substitutions = {
-        REVIEW: (("pr-review", "<agent>"), ("review", "<stage>")),
-        MUTATION: (("pr-mutation", "<agent>"), ("mutation", "<stage>")),
-        PREMORTEM: (("pr-premortem", "<agent>"), ("premortem", "<stage>")),
-    }
-    guard_tags = ("grep -n", 'tail -n "+${start}"', "git status --porcelain", 'out="$RUNNER_TEMP')
-
-    def guards(name: str) -> list[str]:
-        out = []
-        for job in _load(name)["jobs"].values():
-            for step in _steps(job):
-                for line in _run(step).splitlines():
-                    line = line.strip()
-                    if not line or line.startswith("#"):  # prose, not a guard
-                        continue
-                    if any(tag in line for tag in guard_tags):
-                        for old, new in substitutions[name]:
-                            line = line.replace(old, new)
-                        out.append(line)
-        return out
-
-    review_guards = guards(REVIEW)
-    assert review_guards, "parsed no guard lines out of the review workflow"
-    for other in (MUTATION, PREMORTEM):
-        other_guards = guards(other)
-        missing = [g for g in review_guards if g not in other_guards]
-        assert not missing, f"{other} is missing the shared guard lines:\n" + "\n".join(missing)
-        extra = [
-            g
-            for g in other_guards
-            if g not in review_guards and not g.startswith('echo "**Summary:**')
-        ]
-        assert not extra, f"{other} has guard lines the review copy lacks:\n" + "\n".join(extra)
+def test_the_comment_guards_live_in_one_shared_script() -> None:
+    """The blocks that decide what gets posted - the summary-line extraction, the
+    fence strip, the head-unchanged and tree-clean check, the output path - used
+    to be duplicated across the three workflows, and this test is what made a
+    guard changed in one copy and not the others fail. They now live once, in
+    `scripts/agents/run_agent.sh`, which every agent job calls: the drift this
+    test guarded against is impossible by construction, and what is pinned here
+    is that the delegation stays - a workflow whose agent step stops calling the
+    shared script re-opens the drift, and a script that loses a guard fails the
+    per-tag assertions below."""
+    script = (AGENTS_DIR / "run_agent.sh").read_text(encoding="utf-8")
+    for tag in ("grep -n", 'tail -n "+${start}"', "git status --porcelain", 'out="$RUNNER_TEMP'):
+        assert tag in script, f"run_agent.sh lost the shared guard {tag!r}"
+    for name, stage in ((REVIEW, "review"), (MUTATION, "mutation"), (PREMORTEM, "premortem")):
+        _job_name, agent = _agent_job(_load(name))
+        body = _run(_find_step(agent, r"^Run .* agent$"))
+        assert body.strip() == f"bash scripts/agents/run_agent.sh {stage}", (
+            f"{name}: the agent step does not call the shared run_agent.sh: {body!r}"
+        )
 
 
 def test_the_agent_jobs_hold_no_token_and_verify_the_tree() -> None:
@@ -2852,7 +2915,7 @@ def test_opencode_is_installed_without_dependency_lifecycle_scripts() -> None:
     that one rule was what kept the quality gate red on every agent workflow PR."""
     for name in AGENT_WORKFLOWS:
         _job_name, job = _agent_job(_load(name))
-        body = _run(_find_step(job, r"^Install opencode$"))
+        body = _run_source(_find_step(job, r"^Install opencode$"))
         installs = [line for line in body.splitlines() if "npm install" in line]
         assert installs, f"{name}: the install step runs no npm install"
         for line in installs:
@@ -2861,20 +2924,24 @@ def test_opencode_is_installed_without_dependency_lifecycle_scripts() -> None:
 
 
 def _premortem_verdict(output: str, tmp_path) -> str:
-    """Run the pre-mortem workflow's own verdict-extraction lines on ``output``."""
-    body = _run(_find_step(_agent_job(_load(PREMORTEM))[1], r"^Run pre-mortem agent$"))
-    match = re.search(r"^\s*last=\$\(.*?/p'\)\s*$", body, flags=re.MULTILINE | re.DOTALL)
-    assert match, "verdict extraction lines not found in 'Run pre-mortem agent'"
+    """Run the shared verdict parser the 'Run pre-mortem agent' step calls."""
     out = tmp_path / "out.md"
     out.write_text(output, encoding="utf-8")
-    script = f'out="{out.as_posix()}"\n{match.group(0)}\nprintf "%s" "$verdict"\n'
     result = subprocess.run(
-        [shutil.which("bash") or "bash", "-c", script],
+        [
+            shutil.which("python3") or "python3",
+            str(AGENTS_DIR / "parse_verdict.py"),
+            "verdict",
+            "--stage",
+            "premortem",
+            str(out),
+        ],
         capture_output=True,
         text=True,
-        check=True,
     )
-    return result.stdout
+    if result.returncode != 0:
+        return ""
+    return result.stdout.strip()
 
 
 @needs_bash
@@ -2919,7 +2986,7 @@ def test_every_agent_step_checks_both_captured_streams_for_the_key() -> None:
     streams are captured and once after a clean run's - so none of the three can post or
     upload an output that carries the NVIDIA key."""
     for name in AGENT_WORKFLOWS:
-        body = _run(_find_step(_agent_job(_load(name))[1], r"^Run .* agent$"))
+        body = _run_source(_find_step(_agent_job(_load(name))[1], r"^Run .* agent$"))
         calls = [line.strip() for line in body.splitlines() if line.strip() == "refuse_leaked_key"]
         assert len(calls) == 2, f"{name}: the key check runs {len(calls)} times, not on both paths"
         failed = body.index('cat "$out.stderr" >> "$out.raw"\n')

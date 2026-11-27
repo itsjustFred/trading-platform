@@ -104,7 +104,9 @@ def build_body(stage: str, when: str, env: dict[str, str]) -> str:
     # action title so the comment is recognisable among the other bots'.
     if not (when == "midrun" and stage == "mutation"):
         parts.append(f"{title}\n\n")
-    parts.append(_SUMMARY.format(when_clause=spec["when_clause"], produced=_STAGES[stage]["produced"]))
+    parts.append(
+        _SUMMARY.format(when_clause=spec["when_clause"], produced=_STAGES[stage]["produced"])
+    )
     parts.append(spec["rerun"] + "\n")
     parts.append(f"\n_Analysed base `{base_sha[:8]}` ... head `{head_sha[:8]}`._\n")
     if spec["footer"] is not None:

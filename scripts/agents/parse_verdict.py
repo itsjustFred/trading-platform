@@ -113,7 +113,7 @@ def _cmd_verdict(args: argparse.Namespace) -> int:
     raw = Path(args.file).read_text(encoding="utf-8", errors="replace")
     report = extract_report(raw)
     if not report:
-        return _fail(f"agent output has no '**Summary:' report line; not posting.")
+        return _fail("agent output has no '**Summary:' report line; not posting.")
     verdict = parse_verdict(report, args.stage)
     if verdict is None:
         return _fail(

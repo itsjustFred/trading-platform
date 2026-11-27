@@ -55,9 +55,13 @@ def _gh(*args: str) -> subprocess.CompletedProcess[str]:
         capture_output=True,
         text=True,
         env=env,
+        check=False,
     )
     if result.returncode != 0:
-        print(f"::error::gh api {' '.join(args[:3])} failed: {result.stderr.strip()}", file=sys.stderr)
+        print(
+            f"::error::gh api {' '.join(args[:3])} failed: {result.stderr.strip()}",
+            file=sys.stderr,
+        )
         raise SystemExit(1)
     return result
 

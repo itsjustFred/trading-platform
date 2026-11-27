@@ -67,13 +67,13 @@ run-name: "Agent Pre-Mortem PR #${{ github.event.pull_request.number || github.e
 # no API key, so this workflow holds no secret besides the default GITHUB_TOKEN
 # (and, only for an `nvidia/...` model, ACTIONS_NVIDIA_API_KEY - see Configuration)
 # of the jobs that run no repo code. Those models do cap usage, and an exhausted cap must not read as a
-# pre-mortem result: the `quota-probe` job pings the same model before the
-# agent job installs anything, and a cap, rate limit or region refusal there
-# skips the agent job - a grey check, not a red one - while the post job
-# comments "not run: quota" and warns (decision of 2026-11-21, issue #296).
-# The probe's reply is logged on every path, its quota signature is grepped
-# over stdout and stderr whatever the exit status (opencode has been seen
-# exiting 0 on the cap for this tiny prompt), and `available=true` is only
+# pre-mortem result: the shared `agent-quota-probe` workflow pings the same
+# model before the agent job installs anything, and a cap, rate limit or region
+# refusal there skips the agent job - a grey check, not a red one - while the
+# post job comments "not run: quota" and warns (decision of 2026-11-21, issue
+# #296). The probe's reply is logged on every path, its quota signature is
+# grepped over stdout and stderr whatever the exit status (opencode has been
+# seen exiting 0 on the cap for this tiny prompt), and `available=true` is only
 # claimed when the reply actually carries the OK token - every other outcome
 # fails open so a genuine failure still fails.
 #
@@ -123,6 +123,11 @@ run-name: "Agent Pre-Mortem PR #${{ github.event.pull_request.number || github.e
 # not reachable and a push is the only re-run - every push re-analyses the new
 # head, which is the normal path anyway. After the merge the commands above work
 # from any branch.
+#
+# The step bodies live in `scripts/agents/` (install_opencode.sh,
+# select_skill.sh, configure_agent.sh, run_agent.sh, quota_comment.py,
+# post_comment.py, parse_verdict.py) so all three agent workflows share one
+# tested copy; this file is only the stage-specific wiring.
 #
 # Configuration (Settings -> Secrets and variables -> Actions -> Variables):
 #   PREMORTEM_MODEL    opencode model, provider/model (default: opencode/inkling-2-small-free)
@@ -190,13 +195,14 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # Pinned, and the extraction below is written against this pin: `opencode run --standalone
-  # --archived` is expected to print the assistant messages, the report to start at a column-0
-  # `**Summary:**` line and to end with the verdict on its last non-empty line. A release that
-  # prefixes the streamed lines, prints reasoning or reorders the messages breaks all three, and
-  # every PR's stage then fails closed with "does not end with a valid verdict line" until a
-  # human reads a log. So a bump means reading the extraction below against the new version's
-  # output before it lands, not after.
+  # Pinned, and the extraction the shared run_agent.sh is written against this
+  # pin: `opencode run --standalone --archived` is expected to print the assistant
+  # messages, the report to start at a column-0 `**Summary:**` line and to end
+  # with the verdict on its last non-empty line. A release that prefixes the
+  # streamed lines, prints reasoning or reorders the messages breaks all three,
+  # and every PR's stage then fails closed with "does not end with a valid
+  # verdict line" until a human reads a log. So a bump means reading the
+  # extraction against the new version's output before it lands, not after.
   OPENCODE_VERSION: "2.2.7"
   MODEL: ${{ vars.PREMORTEM_MODEL || 'opencode/inkling-2-small-free' }}
   VARIANT: ${{ vars.PREMORTEM_VARIANT || 'max' }}
@@ -340,7 +346,7 @@ jobs:
             echo "same_repo=$(jq -r --arg r "$GITHUB_REPOSITORY" '.head.repo.full_name == $r' pr.json)"
           } >> "$GITHUB_OUTPUT"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: agent-pre-mortem-meta
           path: meta.json
@@ -349,13 +355,15 @@ jobs:
   # A cheap probe of the free model's quota, run after resolve and before the
   # agent job installs anything: an exhausted cap, a rate limit or a region
   # refusal is an infrastructure state, not a pre-mortem result, so it must not
-  # turn the run red. The probe pings the same model and variant the agent will
-  # use; only a positive quota signature - grepped over stdout and stderr,
-  # whatever the exit status, because opencode has been seen exiting 0 on the
-  # cap for this tiny prompt - reports `available=false`, and `available=true`
-  # is only claimed when the reply actually carries the OK token. Everything
-  # else - a success without OK, a failure of any other kind, even a dead probe
-  # job - leaves the agent job to run and surface the genuine failure itself.
+  # turn the run red. The probe itself is the shared reusable workflow
+  # `.github/workflows/agent-quota-probe.yml` - one copy for all three agent
+  # workflows. It pings the same model and variant the agent will use; only a
+  # positive quota signature - grepped over stdout and stderr, whatever the
+  # exit status, because opencode has been seen exiting 0 on the cap for this
+  # tiny prompt - reports `available=false`, and `available=true` is only
+  # claimed when the reply actually carries the OK token. Everything else - a
+  # success without OK, a failure of any other kind, even a dead probe job -
+  # leaves the agent job to run and surface the genuine failure itself.
   # The agent job is gated on the output, so a quota skip shows as a skipped
   # (grey) check, and the post job comments "not run: quota" and warns.
   quota-probe:
@@ -363,160 +371,13 @@ jobs:
     # Same gates as the agent job's resolve half: a fork PR or a skipped resolve
     # (a draft, a text-only edit) never reaches the model at all.
     if: ${{ needs.resolve.result == 'success' && needs.resolve.outputs.same_repo == 'true' }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    # No checkout and no token: the probe needs neither the repository nor a
-    # credential - the free models take no key.
-    permissions: {}
-    outputs:
-      available: ${{ steps.probe.outputs.available }}
-    steps:
-      - uses: actions/setup-node@v7
-        with:
-          node-version: 22
-
-      - name: Install opencode CLI
-        run: |
-          npm install -g --ignore-scripts "@opencode/cli@${OPENCODE_VERSION}"
-          (cd "$(npm root -g)/@opencode/cli" && node ./postinstall.mjs)
-          opencode --version
-
-      # The probe agent lives in the global config, like the real one, so the
-      # ping exercises the same model resolution the agent run will.
-      # The agent is named `model-probe`, not `quota-probe`: opencode prints
-      # "> <agent> · <model>" on stderr, the probe greps stderr for `quota`, and
-      # with the old name every reply - "OK" included - read as a cap, so the
-      # agent job was skipped on every run the probe reached the model.
-      - name: Configure quota probe agent
-        run: |
-          conf="$HOME/.config/opencode"
-          mkdir -p "$conf/agents"
-          # A `kilo/...` model runs on Kilo's anonymous gateway (ai-gateway.kilo.ai, no key,
-          # like the Zen free models) and an `nvidia/...` model on NVIDIA's API (below);
-          # every other model gets the config it always had.
-          # The gateway URL and the model itself are declared, not left to opencode's
-          # catalog: with only `"kilo": {}` opencode 2.2.7 resolved the model in some fresh
-          # homes and in others silently ran its default model instead (run 45239957263
-          # pinged `nex-agi/nex-n2.6`, "You need to sign in"). Declared, 5 of 5 fresh homes
-          # reached the configured model.
-          # MODEL is provider/model; a bare or empty model id would only reach
-          # opencode as a model it cannot resolve, so it stops here with its name.
-          if [ "${MODEL%%/*}" = "$MODEL" ] || [ -z "${MODEL#*/}" ]; then
-            echo "::error::MODEL '${MODEL}' is not provider/model (e.g. nvidia/stepfun-ai/step-5-preview)."
-            exit 1
-          fi
-          if [ "${MODEL%%/*}" = "kilo" ]; then
-            jq -cn --arg model "${MODEL#kilo/}" '{"$schema": "https://opencode.ai/config.json", update: "disable", providers: {kilo: {settings: {baseURL: "https://ai-gateway.kilo.ai/api/v1"}, models: {($model): {}}}}}' > "$conf/opencode.json"
-          elif [ "${MODEL%%/*}" = "nvidia" ]; then
-            # An `nvidia/...` model runs on NVIDIA's API with the key from the
-            # ACTIONS_NVIDIA_API_KEY secret, which only the probe and agent steps
-            # receive (as NVIDIA_API_KEY, the variable opencode's built-in provider
-            # reads). The model is declared for the same reason as Kilo's.
-            jq -cn --arg model "${MODEL#nvidia/}" '{"$schema": "https://opencode.ai/config.json", update: "disable", providers: {nvidia: {models: {($model): {}}}}}' > "$conf/opencode.json"
-          else
-            printf '{"$schema":"https://opencode.ai/config.json","update":"disable"}\n' > "$conf/opencode.json"
-          fi
-          model="$MODEL"
-          if [ -n "$VARIANT" ]; then model="${MODEL}#${VARIANT}"; fi
-          {
-            printf -- '---\n'
-            printf 'description: Read-only model quota probe (CI only)\n'
-            printf 'mode: primary\n'
-            printf 'model: "%s"\n' "$model"
-            # The ping needs no tool at all: deny everything, so a misbehaving
-            # model reply cannot make the probe act.
-            printf 'permissions:\n'
-            printf '  - { action: "*", resource: "*", effect: deny }\n'
-            printf -- '---\n'
-            printf 'Reply with the single word OK and nothing else.\n'
-          } > "$conf/agents/model-probe.md"
-
-      - name: Probe model quota
-        id: probe
-        env:
-          OPENCODE_DISABLE_PROJECT_CONFIG: "1"
-          NVIDIA_API_KEY: ${{ startsWith(env.MODEL, 'nvidia/') && secrets.ACTIONS_NVIDIA_API_KEY || '' }}
-        run: |
-          set -euo pipefail
-          # Without the secret an `nvidia/...` model can only fail with a 401; say why.
-          if [ -n "${MODEL:-}" ] && [ "${MODEL%%/*}" = "nvidia" ] && [ -z "${NVIDIA_API_KEY:-}" ]; then
-            echo "::error::MODEL is ${MODEL}, but the ACTIONS_NVIDIA_API_KEY secret is not set (Settings -> Secrets and variables -> Actions)."
-            exit 1
-          fi
-          probe_dir="$RUNNER_TEMP/quota-probe"
-          mkdir -p "$probe_dir"
-          # Over Kilo's OpenAI-compatible gateway a 429 reaches opencode only as the bare
-          # "Provider returned error": opencode retries it ("retrying (attempt N)") and, once
-          # it gives up, ends on the same line a 400 ends on without any retry. Only the
-          # retries tell a rate limit from a broken request, so a run that ended on that line
-          # after retrying gets a rate-limit line the quota classifier recognises; a run that
-          # retried and then went on is left alone.
-          note_exhausted_retries() {
-            local final_line
-            final_line=$(grep -v '^[[:space:]]*$' "$1" | tail -n 1) || true
-            if grep -q 'retrying (attempt' "$1" && [[ "$final_line" == *'rror: '*'Provider returned error'* ]]; then
-              echo 'rate limit: opencode gave up retrying a retryable provider error' >> "$1"
-            fi
-          }
-          # opencode repeats the provider's error on every retry line ("retrying
-          # (attempt N): ... Too Many Requests"), also when a later retry succeeds.
-          # A cap only counts once all retries are through, so the quota classifier
-          # reads stderr without those lines (<file>.final); the final error line
-          # stays, and so does note_exhausted_retries' synthetic line, which must
-          # therefore never contain "retrying (attempt".
-          drop_retry_lines() {
-            grep -v 'retrying (attempt' "$1" > "$1.final" || true
-          }
-          # A failed probe whose last stderr line is a retry line was cut off mid-retry:
-          # that line is why it failed, so it goes back into the classifier's view (only
-          # for a failed probe - after a retry that cleared it must not count).
-          keep_last_retry_line() {
-            local final_line
-            final_line=$(grep -v '^[[:space:]]*$' "$1" | tail -n 1) || true
-            case "$final_line" in
-              *'retrying (attempt'*) printf '%s\n' "$final_line" >> "$1.final" ;;
-            esac
-          }
-          # opencode has been seen exiting 0 on the cap for this tiny prompt,
-          # so the exit status alone cannot clear the model: the quota
-          # signature is grepped over BOTH streams whatever the status, and
-          # `available=true` is only claimed when the reply actually carries
-          # the OK token. Every other outcome - a non-quota failure, a zero
-          # exit with no OK, even a dead probe - fails open: the agent job runs
-          # and the genuine failure surfaces there.
-          status=0
-          raw=$(opencode run --standalone --archived --agent model-probe \
-            "Reply with the single word: OK" 2> "$probe_dir/stderr") || status=$?
-          printf '%s\n' "$raw" > "$probe_dir/stdout"
-          note_exhausted_retries "$probe_dir/stderr"
-          drop_retry_lines "$probe_dir/stderr"
-          [ "$status" -eq 0 ] || keep_last_retry_line "$probe_dir/stderr"
-          cat "$probe_dir/stdout" "$probe_dir/stderr" > "$probe_dir/combined"
-          # Always logged, bounded like the agent step's echo: run 44962236033
-          # passed this probe and hit "Free usage limit reached" 26 s later,
-          # and with the output unlogged there was no way to tell a real reach
-          # from a capped one - the success path used to log nothing at all.
-          echo "::group::Quota probe output (last 4000 bytes)"
-          tail -c 4000 "$probe_dir/combined"
-          echo "::endgroup::"
-          # Only a positive quota signature skips the agent job - on either
-          # stream, whatever the exit status. The pattern is the transient
-          # class the agent step below classifies with - a cap, a rate limit,
-          # an exhausted quota or a region refusal - and deliberately not the
-          # misconfiguration class (a model or variant that cannot be resolved
-          # at all): that is a genuine failure, and the agent job reports it.
-          if grep -qiE 'usage limit|rate.?limit|quota|insufficient credits|limit reached|not available in your country|service unavailable|overloaded|sign up for free to continue|too many requests' "$probe_dir/stdout" "$probe_dir/stderr.final"; then
-            echo "available=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::The free model is capped, rate-limited, region-refused or unavailable; the agent job is skipped - not run: quota. Re-run the workflow after the quota resets."
-          elif [ "$status" -eq 0 ] && grep -qw 'OK' "$probe_dir/stdout"; then
-            echo "available=true" >> "$GITHUB_OUTPUT"
-            echo "::notice::Quota probe reached the model; the agent job will run."
-          else
-            # Inconclusive - a non-quota failure, or a zero exit whose reply
-            # carried no OK. Fail open, exactly as before the probe existed.
-            echo "available=true" >> "$GITHUB_OUTPUT"
-            echo "::warning::The quota probe was inconclusive (exit ${status}, no OK token, no quota signature); the agent job will run and report the real failure."
-          fi
+    uses: ./.github/workflows/agent-quota-probe.yml
+    with:
+      model: ${{ vars.PREMORTEM_MODEL || 'opencode/inkling-2-small-free' }}
+      variant: ${{ vars.PREMORTEM_VARIANT || 'max' }}
+      opencode-version: "2.2.7"
+    secrets:
+      ACTIONS_NVIDIA_API_KEY: ${{ secrets.ACTIONS_NVIDIA_API_KEY }}
 
   premortem:
     needs: [resolve, quota-probe]
@@ -558,361 +419,41 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.resolve.outputs.head }}
           fetch-depth: 0
           persist-credentials: false
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: agent-pre-mortem-meta
           path: ${{ runner.temp }}/premortem
 
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 22
 
-      # --ignore-scripts keeps every dependency's lifecycle scripts from running;
-      # only @opencode/cli's own postinstall (it links the platform binary from
-      # the optional dependency) is then run explicitly.
       - name: Install opencode
-        run: |
-          npm install -g --ignore-scripts "@opencode/cli@${OPENCODE_VERSION}"
-          (cd "$(npm root -g)/@opencode/cli" && node ./postinstall.mjs)
-          opencode --version
+        run: bash scripts/agents/install_opencode.sh
 
       # Rules: the base branch's skill if it has one. Otherwise (only while the
-      # skill is not merged yet) the PR's own copy. A base commit that
-      # cannot be read aborts the step before the `if`, at the standalone
-      # `git cat-file -e`: that check is the guard, because GitHub's default
-      # shell for a `run:` block is already `bash -e {0}` and fail-fast needs no
-      # help - and inside the `if` condition that follows, a failure is a false
-      # branch, not an abort. `set -euo pipefail` adds `pipefail` and `-u` (an
-      # unset variable now fails the step instead of expanding to nothing) and
-      # states the strictness, so it is not the guard and must not be read as
-      # one.
-      #
-      # The path lookup inside the `if` is a plain assignment rather than a command
-      # in a condition, so `errexit` does apply to it: `git ls-tree` is asked for
-      # the path and the *result* decides the branch, instead of `git cat-file`
-      # being run as the condition with its failure suppressed. The distinction
-      # matters: a suppressed failure inside a condition is only a false branch, so
-      # any `git` error - a missing object, an unreadable repository, a wrong
-      # revision syntax - fell through to the PR's own copy under a prompt that
-      # said the rules came from the base branch. Now only an empty listing
-      # (the base genuinely has no skill at that path) takes that branch, and every
-      # other failure stops the job.
+      # skill is not merged yet) the PR's own copy.
       - name: Select skill revision
-        run: |
-          set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/premortem"
-          skill="$RUNNER_TEMP/premortem/skill.md"
-          git cat-file -e "${BASE_SHA}^{commit}"
-          listing=$(git ls-tree "$BASE_SHA" -- "$SKILL_PATH")
-          if [ -n "$listing" ]; then
-            git show "${BASE_SHA}:${SKILL_PATH}" > "$skill"
-            echo "SKILL_SOURCE=base branch" >> "$GITHUB_ENV"
-          elif [ -f "$SKILL_PATH" ]; then
-            cp "$SKILL_PATH" "$skill"
-            echo "SKILL_SOURCE=this PR (not on the base branch yet)" >> "$GITHUB_ENV"
-          else
-            echo "::error::No pre-mortem skill found at base or PR head."
-            exit 1
-          fi
+        run: bash scripts/agents/select_skill.sh premortem "pre-mortem skill"
 
       # The agent lives in the global config, not in the checkout. Its system
       # prompt is the skill body (the skill's own frontmatter is dropped). It is
       # read-only; .env reads stay denied.
       - name: Configure pre-mortem agent
-        run: |
-          conf="$HOME/.config/opencode"
-          mkdir -p "$conf/agents"
-          # A `kilo/...` model runs on Kilo's anonymous gateway (ai-gateway.kilo.ai, no key,
-          # like the Zen free models) and an `nvidia/...` model on NVIDIA's API (below);
-          # every other model gets the config it always had.
-          # The gateway URL and the model itself are declared, not left to opencode's
-          # catalog: with only `"kilo": {}` opencode 2.2.7 resolved the model in some fresh
-          # homes and in others silently ran its default model instead (run 45239957263
-          # pinged `nex-agi/nex-n2.6`, "You need to sign in"). Declared, 5 of 5 fresh homes
-          # reached the configured model.
-          # MODEL is provider/model; a bare or empty model id would only reach
-          # opencode as a model it cannot resolve, so it stops here with its name.
-          if [ "${MODEL%%/*}" = "$MODEL" ] || [ -z "${MODEL#*/}" ]; then
-            echo "::error::MODEL '${MODEL}' is not provider/model (e.g. nvidia/stepfun-ai/step-5-preview)."
-            exit 1
-          fi
-          if [ "${MODEL%%/*}" = "kilo" ]; then
-            jq -cn --arg model "${MODEL#kilo/}" '{"$schema": "https://opencode.ai/config.json", update: "disable", providers: {kilo: {settings: {baseURL: "https://ai-gateway.kilo.ai/api/v1"}, models: {($model): {}}}}}' > "$conf/opencode.json"
-          elif [ "${MODEL%%/*}" = "nvidia" ]; then
-            # An `nvidia/...` model runs on NVIDIA's API with the key from the
-            # ACTIONS_NVIDIA_API_KEY secret, which only the probe and agent steps
-            # receive (as NVIDIA_API_KEY, the variable opencode's built-in provider
-            # reads). The model is declared for the same reason as Kilo's.
-            jq -cn --arg model "${MODEL#nvidia/}" '{"$schema": "https://opencode.ai/config.json", update: "disable", providers: {nvidia: {models: {($model): {}}}}}' > "$conf/opencode.json"
-          else
-            printf '{"$schema":"https://opencode.ai/config.json","update":"disable"}\n' > "$conf/opencode.json"
-          fi
-          model="$MODEL"
-          if [ -n "$VARIANT" ]; then model="${MODEL}#${VARIANT}"; fi
-          {
-            printf -- '---\n'
-            printf 'description: Read-only automated PR pre-mortem (CI only)\n'
-            printf 'mode: primary\n'
-            printf 'model: "%s"\n' "$model"
-            printf 'permissions:\n'
-            printf '  - { action: "*", resource: "*", effect: deny }\n'
-            printf '  - { action: read, resource: "*", effect: allow }\n'
-            printf '  - { action: glob, resource: "*", effect: allow }\n'
-            printf '  - { action: grep, resource: "*", effect: allow }\n'
-            printf '  - { action: shell, resource: "*", effect: allow }\n'
-            printf '  - { action: external_directory, resource: "*", effect: allow }\n'
-            printf '  - { action: edit, resource: "*", effect: deny }\n'
-            printf '  - { action: read, resource: "*.env", effect: deny }\n'
-            printf '  - { action: read, resource: "*.env.*", effect: deny }\n'
-            printf -- '---\n'
-            awk 'BEGIN { n = 0 } /^---$/ && n < 2 { n++; next } n >= 2' "$RUNNER_TEMP/premortem/skill.md"
-          } > "$conf/agents/pr-premortem.md"
-          # The system prompt must not be empty (e.g. a skill without frontmatter).
-          if [ "$(awk 'BEGIN{n=0} /^---$/ && n<2 {n++; next} n>=2' "$conf/agents/pr-premortem.md" | tr -d '[:space:]' | wc -c)" -eq 0 ]; then
-            echo "::error::Pre-mortem agent has an empty system prompt."
-            exit 1
-          fi
-          OPENCODE_DISABLE_PROJECT_CONFIG=1 opencode debug agents --standalone \
-            | jq -e '.[] | select(.id == "pr-premortem") | .model' > /dev/null
+        run: bash scripts/agents/configure_agent.sh premortem
 
       - name: Run pre-mortem agent
         id: run
         env:
           OPENCODE_DISABLE_PROJECT_CONFIG: "1"
           NVIDIA_API_KEY: ${{ startsWith(env.MODEL, 'nvidia/') && secrets.ACTIONS_NVIDIA_API_KEY || '' }}
-        run: |
-          set -euo pipefail
-          # Without the secret an `nvidia/...` model can only fail with a 401; say why.
-          if [ -n "${MODEL:-}" ] && [ "${MODEL%%/*}" = "nvidia" ] && [ -z "${NVIDIA_API_KEY:-}" ]; then
-            echo "::error::MODEL is ${MODEL}, but the ACTIONS_NVIDIA_API_KEY secret is not set (Settings -> Secrets and variables -> Actions)."
-            exit 1
-          fi
-          out="$RUNNER_TEMP/premortem/comment.md"
-          # Captured through a variable, never a file the agent can reach: it
-          # has a shell, and an appended "**Summary:** ... Verdict: PASS" block
-          # would otherwise be posted as the verdict. stderr goes to a file so
-          # a failed run's reason stays greppable below.
-          # Whose rules ran is the one thing the report itself cannot show, and it is the
-          # fallback's whole point: while the base branch has no skill, the PR's own copy
-          # runs. Name it in the log and in the comment footer (below), so a verdict produced
-          # by a PR's own rules is never indistinguishable from one the base produced.
-          # The quota path is one body reached from three places: the non-zero-exit
-          # classifier below, and the two zero-exit dead ends (no summary line, no
-          # valid verdict) where the cap has been seen arriving on a zero exit -
-          # opencode exiting 0 on "Free usage limit reached" is exactly the run
-          # shape that used to reach "no summary line" and go red, the outcome
-          # the decision of 2026-11-21 forbids. It writes the same "not run:
-          # quota" report the probe-skip path posts, sets the `quota` output the
-          # post job reads, and exits clean, so the step does not fail.
-          # Over Kilo's OpenAI-compatible gateway a 429 reaches opencode only as the bare
-          # "Provider returned error": opencode retries it ("retrying (attempt N)") and, once
-          # it gives up, ends on the same line a 400 ends on without any retry. Only the
-          # retries tell a rate limit from a broken request, so a run that ended on that line
-          # after retrying gets a rate-limit line the quota classifier recognises; a run that
-          # retried and then went on is left alone.
-          note_exhausted_retries() {
-            local final_line
-            final_line=$(grep -v '^[[:space:]]*$' "$1" | tail -n 1) || true
-            if grep -q 'retrying (attempt' "$1" && [[ "$final_line" == *'rror: '*'Provider returned error'* ]]; then
-              echo 'rate limit: opencode gave up retrying a retryable provider error' >> "$1"
-            fi
-          }
-          # opencode repeats the provider's error on every retry line ("retrying
-          # (attempt N): ... Too Many Requests"), also when a later retry succeeds.
-          # A cap only counts once all retries are through, so the quota classifier
-          # reads stderr without those lines (<file>.final); the final error line
-          # stays, and so does note_exhausted_retries' synthetic line, which must
-          # therefore never contain "retrying (attempt".
-          drop_retry_lines() {
-            grep -v 'retrying (attempt' "$1" > "$1.final" || true
-          }
-          # The agent has a shell and its stdout becomes a public PR comment (and, for the
-          # pre-mortem, an artifact). An `nvidia/...` run holds the key in this step's env,
-          # so before anything is kept the captured streams are checked for it: a stream
-          # that carries the key fails the step, which uploads and posts nothing (the later
-          # steps only run on success), and the files are removed besides. Actions masks
-          # the secret in the log on its own.
-          refuse_leaked_key() {
-            if [ -n "${NVIDIA_API_KEY:-}" ] \
-              && grep -qF -- "$NVIDIA_API_KEY" "$out.raw" "$out.stderr" 2>/dev/null; then
-              rm -f "$out" "$out.raw" "$out.stderr" "$out.stderr.final"
-              echo "::error::The agent output contains the NVIDIA API key; nothing is posted or uploaded. Rotate ACTIONS_NVIDIA_API_KEY."
-              exit 1
-            fi
-          }
-          # A failed run's retries are over, so if its last stderr line is a retry line
-          # (opencode cut off mid-retry) that line is the final word on why it failed and
-          # goes back into the classifier's view. Only for a failed run: after a retry that
-          # cleared, the last stderr line can be that retry too, and it must not count.
-          keep_last_retry_line() {
-            local final_line
-            final_line=$(grep -v '^[[:space:]]*$' "$1" | tail -n 1) || true
-            case "$final_line" in
-              *'retrying (attempt'*) printf '%s\n' "$final_line" >> "$1.final" ;;
-            esac
-          }
-          report_quota_skip() {
-            echo "::warning::The pre-mortem agent could not run - the free model was capped, rate-limited, refused or unavailable (see the group above for the exact reason). That is a transient infra failure, not a pre-mortem result: not run: quota. Re-run this job after the quota resets."
-            # The same report the probe-skip path posts, written here because the agent
-            # job already ran: the comment is the PR's view either way, and the `quota`
-            # output is what keeps the post job from mapping an empty verdict to `error`.
-            {
-              printf '# Pre-Mortem Action\n\n'
-              printf '**Summary:** Not run: quota - the free model was capped, rate-limited, refused or unavailable while the agent ran; no pre-mortem was produced for this commit.\n\n'
-              printf 'Re-run the job after the quota resets.\n'
-              printf '\n_Analysed base `%s` ... head `%s`._\n' "${BASE_SHA:0:8}" "${HEAD_SHA:0:8}"
-              printf '\n---\n_Automated pre-mortem not run: quota (%s)_\n' "${MODEL#*/}${VARIANT:+ (${VARIANT})}"
-            } > "$RUNNER_TEMP/premortem/comment.md"
-            echo "quota=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          }
-          echo "::notice::Pre-mortem rules from: ${SKILL_SOURCE}."
-          if ! raw=$(opencode run --standalone --archived --agent pr-premortem \
-            "Pre-mortem PR #${PR_NUMBER}. Base ${BASE_SHA}, head ${HEAD_SHA}. PR metadata: $RUNNER_TEMP/premortem/meta.json. Rules loaded from: ${SKILL_SOURCE}." 2> "$out.stderr"); then
-            note_exhausted_retries "$out.stderr"
-            drop_retry_lines "$out.stderr"
-            keep_last_retry_line "$out.stderr"
-            printf '%s\n' "$raw" > "$out.raw"
-            cat "$out.stderr" >> "$out.raw"
-            refuse_leaked_key
-            # The reason the agent failed is only in stderr, and a file no one
-            # reads is not a diagnosis: a failed run of this job has ended with
-            # a bare "Process completed with exit code 1" and no cause, which
-            # cannot tell a capped free model from a broken prompt. So the
-            # captured output is echoed, bounded so a runaway agent cannot flood
-            # the log, before the classification below reads it.
-            echo "::group::Agent stdout and stderr (last 4000 bytes)"
-            tail -c 4000 "$out.raw"
-            echo "::endgroup::"
-            # Two causes share this grep and need opposite remedies, so they are classified
-            # separately. A cap, a rate limit, an exhausted quota or a region refusal is
-            # transient infra, not a pre-mortem result: by the decision of 2026-11-21 the run
-            # does not go red for it - the step writes the "not run: quota" comment and the
-            # `quota` output instead of failing, the post job comments it and rewrites this
-            # run's pending mark to say so, and the remedy is to re-run the job once the quota
-            # resets. A model or variant that cannot be resolved at all (a typo'd
-            # PREMORTEM_MODEL, a variant the model does not offer, no provider for it, a
-            # rejected token) is not transient: the run cannot succeed until the repository
-            # variable changes, and telling an operator to re-run it would send them into a
-            # loop while the stage stays `error` for everyone. So only the first class takes
-            # the quota path; the second fails with its own message, and a reason in neither
-            # class (an `unauthorized` that could be either) is left to the bare failure and
-            # the captured stderr above it, which is the reason itself - better than guessing
-            # for it.
-            if grep -qiE 'usage limit|rate.?limit|quota|insufficient credits|limit reached|not available in your country|service unavailable|overloaded|sign up for free to continue|too many requests' "$out.stderr.final"; then
-              report_quota_skip
-            elif grep -qiE 'model (is )?(not (found|available|supported))|no provider|invalid model|unknown variant' "$out.stderr"; then
-              echo "::error::The pre-mortem agent could not resolve its model - PREMORTEM_MODEL / PREMORTEM_VARIANT name a model, variant or provider that does not exist or is not authorised (see the group above for the exact reason). That is a configuration error, not a transient one: re-running this job cannot succeed until the repository variable changes. The stage status is reported as \`error\`."
-            else
-              echo "::error::The pre-mortem agent run failed."
-            fi
-            exit 1
-          fi
-          printf '%s\n' "$raw" > "$out.raw"
-          drop_retry_lines "$out.stderr"
-          refuse_leaked_key
-          # stderr went to a file for the failure classifier; on success it
-          # would otherwise never reach the log, so it is echoed bounded too.
-          if [ -s "$out.stderr" ]; then
-            echo "::group::Agent stderr (last 4000 bytes)"
-            tail -c 4000 "$out.stderr"
-            echo "::endgroup::"
-          fi
-          # opencode prints every assistant message; keep only the final comment,
-          # which starts at the last "**Summary:**" line. Drop a closing code
-          # fence the model may have wrapped around it.
-          start=$(grep -n '^\*\*Summary:' "$out.raw" | tail -n 1 | cut -d: -f1 || true)
-          if [ -z "$start" ]; then
-            # opencode has been seen exiting 0 on the cap, with the signature on
-            # stdout: a zero exit is not a clean run, so this dead end is
-            # classified before it fails. The grep covers the raw stream and
-            # stderr both, and runs only here - a real report's own text may
-            # mention "quota", so a produced report is never re-classified.
-            if grep -qiE 'usage limit|rate.?limit|quota|insufficient credits|limit reached|not available in your country|service unavailable|overloaded|sign up for free to continue|too many requests' "$out.raw" "$out.stderr.final"; then
-              echo "::group::Agent output (last 4000 bytes)"
-              tail -c 4000 "$out.raw"
-              echo "::endgroup::"
-              report_quota_skip
-            fi
-            echo "::error::Pre-mortem output has no summary line; not posting."
-            cat "$out.raw"
-            exit 1
-          fi
-          tail -n "+${start}" "$out.raw" | sed -e '${/^```[[:space:]]*$/d}' > "$out"
-          # The posted report is the tail of the agent's stream, and the anchor above is a
-          # heuristic: it takes the *last* line starting `**Summary:**` anywhere in the stream,
-          # so a later one at column 0 - the skill's own template quoted back inside a
-          # Mitigation block, say - moves the anchor down and the comment then starts at the
-          # quote instead of at the report. That is the shared extraction all three agent
-          # workflows carry (the two siblings' identical line is on main here), so it is not
-          # changed in this PR. What *is* diagnosable has to be diagnosable without the stream:
-          # the raw output is uploaded with the comment below, and the byte counts are logged, so
-          # a comment that lost its opening sections is a run someone can reconstruct and read
-          # rather than one whose report silently changed shape.
-          kept=$(wc -c < "$out" | tr -d '[:space:]')
-          total=$(wc -c < "$out.raw" | tr -d '[:space:]')
-          echo "::notice::The pre-mortem report is ${kept} of the agent's ${total} bytes of output; $((total - kept)) bytes of streamed messages and tool output are not posted (the raw output is an artifact of this run)."
-          # The verdict must be the last non-empty line (a verdict quoted from the
-          # diff elsewhere in the output does not count), and it must be one of
-          # the four the skill allows. What follows the verdict word must start with
-          # something that is not a letter, an underscore or a hyphen, so
-          # `Verdict: PASSed` and `Verdict: BLOCKED` - a word the skill does not
-          # allow, wearing a suffix that reads like the reason - are refused instead
-          # of matching as PASS and BLOCK: posting a verdict the model never wrote
-          # and mapping it to a state is a status nobody can explain. An annotation
-          # that begins with a space, a dash or punctuation is still accepted.
-          # A sign-off note the model put on its own line after the verdict (the
-          # skill asks for it on the verdict line) is tolerated: it is skipped
-          # when looking for the verdict, and stays in the posted comment.
-          last=$(grep -v '^[[:space:]]*$' "$out" \
-            | grep -vxE '[[:space:]*_]*Human sign-off required\.[[:space:]*_]*' \
-            | tail -n 1)
-          verdict=$(printf '%s\n' "$last" | tr -d '*' \
-            | sed -nE 's/^Verdict:[[:space:]]*(BLOCK|CHANGES-REQUESTED|PASS|INCOMPLETE)([^[:alpha:]_-].*)?$/\1/p')
-          if [ -z "$verdict" ]; then
-            # Same zero-exit cap as above: a report that starts but never reaches
-            # a valid verdict can still be the quota signature, on either stream.
-            if grep -qiE 'usage limit|rate.?limit|quota|insufficient credits|limit reached|not available in your country|service unavailable|overloaded|sign up for free to continue|too many requests' "$out.raw" "$out.stderr.final"; then
-              echo "::group::Agent output (last 4000 bytes)"
-              tail -c 4000 "$out.raw"
-              echo "::endgroup::"
-              report_quota_skip
-            fi
-            echo "::error::Pre-mortem output does not end with a valid verdict line; not posting."
-            cat "$out.raw"
-            exit 1
-          fi
-          if [ "$(git rev-parse HEAD)" != "$HEAD_SHA" ] || [ -n "$(git status --porcelain)" ]; then
-            echo "::error::The pre-mortem agent modified the checkout; not posting."
-            git status --porcelain
-            exit 1
-          fi
-          # A file, not $GITHUB_OUTPUT: the agent shares this step's
-          # environment and could otherwise append its own verdict.
-          printf '%s\n' "$verdict" > "$RUNNER_TEMP/premortem/verdict.txt"
-          # Footer: which diff was analysed, then the model, its variant and the skill
-          # the rules came from (the skill directory's name, not its path), so a
-          # reader can map the verdict to the rules that produced it. The pair comes
-          # first because it is the one thing that cannot be re-derived from the
-          # comment: a verdict is current for its base...head and nothing else, and a
-          # retarget, a base branch that moved or a head that moved on can each leave
-          # this comment describing a diff nobody is looking at any more.
-          skill_name=$(basename "$(dirname "$SKILL_PATH")")
-          {
-            printf '\n_Analysed base `%s` ... head `%s`._\n' "${BASE_SHA:0:8}" "${HEAD_SHA:0:8}"
-            printf '\n---\n_Automated pre-mortem using %s with `%s` skill (rules from %s)_\n' \
-              "${MODEL#*/}${VARIANT:+ (${VARIANT})}" "$skill_name" "${SKILL_SOURCE}"
-          } >> "$out"
-          # Title first, so the comment is recognisable among the other bots'.
-          { printf '# Pre-Mortem Action\n\n'; cat "$out"; } > "$out.titled"
-          mv "$out.titled" "$out"
-          cat "$out" >> "$GITHUB_STEP_SUMMARY"
+        run: bash scripts/agents/run_agent.sh premortem
 
       # A separate step, so the verdict reaches $GITHUB_OUTPUT from a file the
       # agent never had this step's env file to append to. A quota skip wrote no
@@ -925,7 +466,7 @@ jobs:
           set -euo pipefail
           echo "verdict=$(cat "$RUNNER_TEMP/premortem/verdict.txt")" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: agent-pre-mortem
           # The posted comment, and the agent's raw stdout beside it. The comment is the tail of
@@ -937,7 +478,7 @@ jobs:
             ${{ runner.temp }}/premortem/comment.md.raw
           retention-days: 14
 
-  # Posts the comment and sets the status. Runs no repo code. Also reports a
+  # Posts the comment and sets the status. Also reports a
   # failed run (an infra failure, e.g. the free model's usage limit) as `error`,
   # and a quota skip - the probe's or the agent step's - as "not run: quota",
   # which is never `error` and never a verdict `success`.
@@ -953,8 +494,10 @@ jobs:
     timeout-minutes: 5
     # Verified on PR #178 for the review workflow's identical steps:
     # pull-requests: write is enough for the issues/{n}/comments endpoints on a
-    # pull request; issues: write is not needed.
+    # pull request; issues: write is not needed. contents: read is for the
+    # checkout the shared posting script needs.
     permissions:
+      contents: read
       pull-requests: write
       statuses: write
     env:
@@ -965,6 +508,10 @@ jobs:
       VERDICT: ${{ needs.premortem.outputs.verdict }}
       RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
       - name: Report failed pre-mortem run
         if: needs.premortem.result == 'failure'
         run: |
@@ -1008,86 +555,27 @@ jobs:
       # probe path's alone.
       - name: Write quota comment
         if: needs.quota-probe.outputs.available == 'false'
-        run: |
-          set -euo pipefail
-          skill_name=$(basename "$(dirname "$SKILL_PATH")")
-          {
-            printf '# Pre-Mortem Action\n\n'
-            printf '**Summary:** Not run: quota - the free model was capped, rate-limited, refused or unavailable before the agent could start; no pre-mortem was produced for this commit.\n\n'
-            printf 'Re-run the workflow after the quota resets.\n'
-            printf '\n_Analysed base `%s` ... head `%s`._\n' "${BASE_SHA:0:8}" "${HEAD_SHA:0:8}"
-            printf '\n---\n_Automated pre-mortem not run: quota (%s skill)_\n' "$skill_name"
-          } > comment.md
+        run: python3 scripts/agents/quota_comment.py --stage premortem --when probe > comment.md
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         if: needs.premortem.result == 'success'
         with:
           name: agent-pre-mortem
 
       # One comment per PR, identified by a hidden marker and updated in place.
-      # Uses the REST API only. A result for a commit that is no longer the PR
-      # head does not overwrite the comment (its status still lands on its SHA).
+      # Uses the REST API only, through the shared post_comment.py: a result
+      # for a commit that is no longer the PR head does not overwrite the
+      # comment, and a "not run: quota" body never overwrites a real verdict
+      # for the same head.
       - name: Post or update pre-mortem comment
         if: needs.premortem.result == 'success' || needs.quota-probe.outputs.available == 'false'
         env:
           # True when the body being posted is the "not run: quota" report -
-          # the probe path's or the mid-run path's - so the guard below can
-          # keep it from overwriting a real verdict for this same head.
+          # the probe path's or the mid-run path's - so the guard in
+          # post_comment.py can keep it from overwriting a real verdict for
+          # this same head.
           QUOTA_SKIP: ${{ needs.premortem.outputs.quota == 'true' || needs.quota-probe.outputs.available == 'false' }}
-        run: |
-          set -euo pipefail
-          current=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" --jq .head.sha)
-          if [ "$current" != "$HEAD_SHA" ]; then
-            echo "::notice::PR head moved to ${current}; not updating the comment for ${HEAD_SHA}."
-            exit 0
-          fi
-          marker='<!-- actions-pre-mortem -->'
-          { echo "$marker"; cat comment.md; } > body.md
-          existing=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
-            --jq ".[] | select(.user.login == \"github-actions[bot]\" and (.body | startswith(\"$marker\"))) | .id")
-          # The head is read again with the body in hand, immediately before the write. The guard
-          # above ran before the body was assembled and before the comment-list fetch, and a
-          # synchronize event landing inside that window would still have been written over: a
-          # comment describing a diff nobody is looking at any more, presented as the current
-          # result. Reading it here narrows the window to the write itself, which no API closes -
-          # there is no conditional comment update - and the comment's footer names the base...head
-          # it was computed from, so a result that still slips through is readable rather than
-          # silently current.
-          moved=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" --jq .head.sha)
-          if [ "$moved" != "$HEAD_SHA" ]; then
-            echo "::notice::PR head moved to ${moved} while this comment was being posted; not updating the comment for ${HEAD_SHA}."
-            exit 0
-          fi
-          # A quota skip must not overwrite a real verdict for this same head:
-          # a manual re-run of an unchanged head after the cap resets is exactly
-          # the case where the "not run: quota" body would replace a verdict
-          # that is still current. A quota body over an older quota comment, or
-          # any real verdict, still writes.
-          if [ "$QUOTA_SKIP" = "true" ] && [ -n "$existing" ]; then
-            for id in $existing; do
-              prior=$(gh api "repos/${GITHUB_REPOSITORY}/issues/comments/${id}" --jq .body)
-              if printf '%s\n' "$prior" | grep -q 'Verdict:' \
-                && printf '%s\n' "$prior" | grep -q "${HEAD_SHA:0:8}"; then
-                echo "::notice::The existing pre-mortem comment is a real verdict for ${HEAD_SHA}; the quota skip did not overwrite it."
-                exit 0
-              fi
-            done
-          fi
-          if [ -n "$existing" ]; then
-            # More than one comment can carry the marker (a duplicate from an
-            # interrupted run, or one created outside the workflow). Patching
-            # only the newest would leave the stale one readable forever, so say
-            # it and update every match with the same current result.
-            count=$(printf '%s\n' "$existing" | grep -c '[0-9]' || true)
-            if [ "$count" -gt 1 ]; then
-              echo "::warning::${count} pre-mortem comments carry the marker; updating all of them with the current result."
-            fi
-            for id in $existing; do
-              gh api --method PATCH "repos/${GITHUB_REPOSITORY}/issues/comments/${id}" -F body=@body.md > /dev/null
-            done
-          else
-            gh api --method POST "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" -F body=@body.md > /dev/null
-          fi
+        run: python3 scripts/agents/post_comment.py --stage premortem --marker '<!-- actions-pre-mortem -->'
 
       - name: Set status
         if: needs.premortem.result == 'success' && needs.premortem.outputs.quota != 'true'
