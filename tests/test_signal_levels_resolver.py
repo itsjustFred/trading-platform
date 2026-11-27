@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import ast
 import math
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -488,32 +489,50 @@ def test_the_error_names_the_alias_that_could_not_be_read(alias, parsing) -> Non
 
 ALIAS_UNIVERSE = frozenset((*SL_METADATA_KEYS, *TP_METADATA_KEYS))
 
-#: Alias vocabularies that stay outside the shared module, each with the reason
-#: it is a different domain: a scrub list names keys to REMOVE and a leg plan
-#: names broker order fields - neither resolves a level from signal metadata.
-#: A new site fails the scan below until it is declared here.
+#: Alias vocabularies that stay outside the shared module, each with the number
+#: of vocabularies it may keep and the reason it is a different domain: a scrub
+#: list names keys to REMOVE and a leg plan names broker order fields - neither
+#: resolves a level from signal metadata.
+#:
+#: The COUNT is the guard that the pre-mortem asked for: an exempt file may keep
+#: exactly this many vocabularies, so a second copy added inside one of them
+#: fails here instead of drifting silently. A file whose count drops to zero
+#: fails too, so the declaration cannot rot.
+@dataclass(frozen=True)
+class _AliasVocabulary:
+    allowed_sites: int
+    reason: str
+
+
 EXEMPT_ALIAS_VOCABULARIES = {
-    "live_runner/daemon.py": "the exit-path scrub list (keys an exit must not carry)",
-    "live_runner/alpaca_adapter.py": (
+    "live_runner/daemon.py": _AliasVocabulary(
+        2,
+        "the exit-path scrub lists: the SL/TP keys an exit must not carry and "
+        "the canonical pair a parsed exit pops before sizing; neither resolves "
+        "a level, both only remove or overwrite keys",
+    ),
+    "live_runner/alpaca_adapter.py": _AliasVocabulary(
+        1,
         "the partial-exit re-protection plan: canonical level names against "
-        "broker order leg fields, not signal metadata aliases"
+        "broker order leg fields, not signal metadata aliases",
     ),
 }
 
 
-def _alias_vocabulary_sites() -> set[str]:
-    """``package/file.py:line`` for every literal spelling out two or more aliases.
+def _alias_vocabulary_counts() -> dict[str, int]:
+    """``package/file.py`` -> number of literals spelling out two or more aliases.
 
     Matched on the AST, not on the text: a renamed or reformatted copy of the
     list still carries its aliases, while a single use of one alias (a field
     name, one key read, one popped key) is not a vocabulary and never matches.
     """
-    found: set[str] = set()
+    counts: dict[str, int] = {}
     for package in ("risk", "live_runner"):
         for path in sorted((REPO_ROOT / package).rglob("*.py")):
             if path.name in {"signal_levels.py", "test_signal_levels_resolver.py"}:
                 continue
             tree = ast.parse(path.read_text(encoding="utf-8"))
+            found = 0
             for node in ast.walk(tree):
                 if not isinstance(node, (ast.Tuple, ast.List, ast.Set)):
                     continue
@@ -523,10 +542,11 @@ def _alias_vocabulary_sites() -> set[str]:
                     if isinstance(element, ast.Constant) and isinstance(element.value, str)
                 }
                 if len(aliases & ALIAS_UNIVERSE) >= 2:
-                    relative = path.relative_to(REPO_ROOT / package)
-                    found.add(f"{package}/{relative}:{node.lineno}")
-                    break
-    return found
+                    found += 1
+            if found:
+                relative = path.relative_to(REPO_ROOT / package)
+                counts[f"{package}/{relative}"] = found
+    return counts
 
 
 def test_no_module_spells_out_the_allowlist_outside_the_shared_module() -> None:
@@ -536,24 +556,27 @@ def test_no_module_spells_out_the_allowlist_outside_the_shared_module() -> None:
     second copy of it: a resolver written per caller drifts in strictness, and
     a key one caller accepts is silently ignored by another.
     """
-    observed = _alias_vocabulary_sites()
-    observed_files = {site.split(":")[0] for site in observed}
-    missing = sorted(
-        site
-        for site in observed
-        if site.split(":")[0] not in EXEMPT_ALIAS_VOCABULARIES
-    )
-    stale = sorted(set(EXEMPT_ALIAS_VOCABULARIES) - observed_files)
-    assert not missing, (
+    observed = _alias_vocabulary_counts()
+    undeclared = {
+        path: count
+        for path, count in observed.items()
+        if path not in EXEMPT_ALIAS_VOCABULARIES
+    }
+    assert not undeclared, (
         "These spell out an SL/TP alias vocabulary outside risk.signal_levels: "
-        f"{missing}. Move the list there and call resolve_signal_level, or add "
-        "the file to EXEMPT_ALIAS_VOCABULARIES with the reason it is a "
-        "different domain."
+        f"{sorted(undeclared)}. Move the list there and call resolve_signal_level, "
+        "or add the file to EXEMPT_ALIAS_VOCABULARIES with the number of "
+        "vocabularies it may keep and the reason it is a different domain."
     )
-    assert not stale, (
-        f"Sites removed: {stale}. Drop them from EXEMPT_ALIAS_VOCABULARIES, or "
-        "restore the vocabulary they guarded."
-    )
+    for path, allowed in sorted(EXEMPT_ALIAS_VOCABULARIES.items()):
+        count = observed.get(path, 0)
+        assert count == allowed.allowed_sites, (
+            f"{path} holds {count} alias vocabularies, not the declared "
+            f"{allowed.allowed_sites} ({allowed.reason}). A NEW vocabulary in an "
+            "exempt file fails here: extract it into risk.signal_levels first, "
+            "or raise the declared count in EXEMPT_ALIAS_VOCABULARIES and say "
+            "why the new one is a different domain."
+        )
 
 
 def test_alpaca_rewrites_every_alias_from_the_shared_resolution() -> None:
@@ -597,4 +620,96 @@ def test_alpaca_rewrites_every_alias_from_the_shared_resolution() -> None:
     with pytest.raises(ValueError, match="Invalid stop_loss"):
         module._round_bracket_levels_in_place(  # noqa: SLF001 - the caller under test
             broken, entry_price=354.85, signal=signal
+        )
+
+
+# ── zero-distance and empty-payload edges the mutation bot flagged ────────────
+
+
+@pytest.mark.parametrize("parsing", list(LevelParsing), ids=lambda parsing: parsing.value)
+def test_an_empty_string_is_unreadable_not_absent(parsing) -> None:
+    """An empty payload value is a value, not an absent level (G19 / mutation gap).
+
+    A publisher that sends ``{"stop_loss": ""}`` has answered the question
+    badly; treating it as "no stop" would let a later alias (or nothing at all)
+    stand in for the refused one and disarm the bracket.
+    """
+    with pytest.raises(ValueError, match="stop_loss"):
+        resolve_signal_level(
+            {"stop_loss": "", "sl_price": 95.0}, SL_METADATA_KEYS, parsing=parsing
+        )
+
+
+#: (leg, stop, take, the message fragment the refusal must name) for a level
+#: that sits exactly AT the reference price: a zero distance is not a level, so
+#: the guard must reject it with its own (named) message. The fragment pins
+#: WHICH message: the wrong-side guard's "is on the wrong side of the reference
+#: price", not ``_relative_distance``'s generic "equals the reference price",
+#: which does not say the distance was zero in the first place.
+_AT_REFERENCE_CASES = [
+    ("stop", 100.0, 105.0, "SL price is on the wrong side"),
+    ("take", 95.0, 100.0, "TP price is on the wrong side"),
+]
+
+
+@pytest.mark.parametrize("leg,stop,take,expected_fragment", _AT_REFERENCE_CASES)
+def test_ctrader_refuses_a_level_exactly_at_the_reference_price(leg, stop, take, expected_fragment):
+    """A zero-distance SL/TP is refused by its own guard, naming the leg.
+
+    ``<= 0`` vs ``< 0`` mattered here: with ``<`` a level equal to the reference
+    falls through to the generic "equals the reference price" error, which does
+    not say which leg was equal to it (the mutation bot's gap 11/17).
+    """
+    metadata = {"stop_loss": stop, "take_profit": take}
+
+    with pytest.raises(ValueError, match=expected_fragment):
+        _ctrader(metadata)
+
+
+def test_ctrader_wrong_side_stop_names_the_stop():
+    """A stop on the wrong side must be refused as the STOP, not by the TP guard.
+
+    The existing ``test_ctrader_relative_sl_tp_direction_and_rejections`` pairs
+    a wrong-side stop with a wrong-side take profit, so its
+    ``match="wrong side of the reference price"`` also passes when only the TP
+    guard fired - which is how the SL guard could be deleted unnoticed.
+    """
+    metadata = {"stop_loss": 110.0, "take_profit": 105.0}
+
+    with pytest.raises(ValueError, match="SL price is on the wrong side"):
+        _ctrader(metadata)
+
+
+@pytest.mark.parametrize(
+    ("alias", "level"),
+    [
+        ("stop_loss", 354.85),  # a buy's stop exactly at the entry
+        ("take_profit", 354.85),  # a buy's take profit exactly at the entry
+    ],
+)
+def test_alpaca_refuses_a_bracket_level_exactly_at_the_entry(alias, level):
+    """A zero-distance leg is refused as wrong-side, before any rounding.
+
+    ``outward <= 0`` vs ``< 0`` decides it: with ``<`` the level reaches the
+    rounding step and the refusal becomes "within one tick", which does not say
+    the level was AT the entry. Both legs are pinned so neither ``<=`` can be
+    loosened on its own (the pre-existing suite pins only the take profit at
+    the entry).
+    """
+    from live_runner import alpaca_adapter as module
+
+    signal = LiveSignal(
+        deployment_id="dep-1",
+        symbol="AAPL",
+        action="buy",
+        theoretical_price=354.85,
+        timestamp=datetime.now(timezone.utc),
+        metadata={"stop_loss": 354.0, "take_profit": 369.0},
+    )
+    metadata = dict(signal.metadata or {})
+    metadata[alias] = level
+
+    with pytest.raises(ValueError, match="is on the wrong side of the entry"):
+        module._round_bracket_levels_in_place(  # noqa: SLF001 - the caller under test
+            metadata, entry_price=354.85, signal=signal
         )

@@ -59,9 +59,12 @@ def resolve_live_levels(signal: LiveSignal) -> tuple[float, float | None, float 
         raise ValueError(f"entry_price: {exc}") from exc
     if entry <= 0:
         raise ValueError("entry_price must be > 0")
-    # Money parsing (LevelParsing.MONEY): a boolean, a non-numeric value and a
-    # non-finite number are refusals, never "the level is absent" - the
-    # alias allowlist and its strictness live in risk.signal_levels (G19).
+    # Money parsing (LevelParsing.MONEY) is LOAD-BEARING here and must stay
+    # strict: the risk engine divides the risk budget by |entry - stop|, so a
+    # boolean, a non-finite or a non-numeric stop must be a refusal, never a
+    # level the sizing arithmetic walks past. The alias allowlist and its
+    # strictness live in risk.signal_levels (G19), which is also why this site
+    # names the mode explicitly instead of taking a default.
     stop = resolve_signal_level(
         metadata, SL_METADATA_KEYS, parsing=LevelParsing.MONEY
     ).price
