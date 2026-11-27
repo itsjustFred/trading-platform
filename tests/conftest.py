@@ -291,7 +291,10 @@ def sandboxed_env(*, shares_sandbox: bool = True, **overrides: str) -> dict[str,
     Lifetime: a child that shares the sandbox is owned by this pytest process.
     The session directory is removed when that process exits, so such a child must
     be finished before then - started, driven and joined (or killed) inside the
-    test that started it.
+    test that started it; ``_shared_sandbox_children_are_finished`` fails the test
+    that leaves one running. ``TP_TEST_CHILD_SANDBOX`` is spelled exactly ``"1"``:
+    it is this module's own marker, and any other truthy spelling would read as a
+    parent and send the child down the wrong branch.
     """
     env = {name: value for name, value in os.environ.items() if _is_allowlisted_env(name)}
     env["DATA_DIR"] = os.environ["DATA_DIR"]
@@ -1381,6 +1384,66 @@ def pytest_runtest_setup(item: pytest.Item) -> None:
         pytest.skip(
             "Playwright browser binaries not installed. "
             "Run: python -m playwright install firefox"
+        )
+
+
+#: The ``Popen`` children a test started that share this session's sandbox, so they own no
+#: lifetime of their own: the session directory is removed when the pytest process exits, and a
+#: child still writing through it would lose its data. Recorded per test, checked at teardown.
+_SHARED_CHILDREN: list[object] = []
+
+
+@pytest.fixture(autouse=True)
+def _track_shared_sandbox_children(monkeypatch: pytest.MonkeyPatch):
+    """Fail the test that leaves a sandbox-sharing child running.
+
+    ``subprocess.run`` builds on ``Popen``, so wrapping the constructor records both shapes,
+    and only the children whose environment carries the child marker - the ones that share
+    the session directory the pytest process owns. A child still alive at teardown is killed
+    and reported: left running it would write into a directory its parent is about to remove.
+    """
+    import subprocess
+
+    real_popen = subprocess.Popen
+
+    class _RecordingPopen(real_popen):  # type: ignore[misc,valid-type]
+        """The real ``Popen`` that remembers the children that share the sandbox.
+
+        A subclass rather than a wrapper: ``subprocess.run`` drives the returned object
+        through the context-manager protocol, which a proxying wrapper would have to
+        re-implement to be indistinguishable - and a wrapper that is not invisible breaks
+        the very call it records.
+        """
+
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            super().__init__(*args, **kwargs)  # type: ignore[call-arg]
+            env = kwargs.get("env")
+            if isinstance(env, dict) and env.get("TP_TEST_CHILD_SANDBOX") == "1":
+                _SHARED_CHILDREN.append(self)
+
+    monkeypatch.setattr(subprocess, "Popen", _RecordingPopen)
+    yield
+    finish_shared_sandbox_children()
+
+
+def finish_shared_sandbox_children() -> None:
+    """Kill every recorded child still running and fail the test that left one.
+
+    Every leftover is killed before the failure is raised, so a test that fails this way does
+    not also poison the next test's teardown with the same child. Exposed for a test to call
+    directly: the teardown above is where the contract is enforced, and this is the same
+    enforcement, called by a test that pins it.
+    """
+    leftover = [child for child in _SHARED_CHILDREN if child.poll() is None]
+    for child in leftover:
+        child.kill()
+        child.wait(timeout=10)
+    _SHARED_CHILDREN.clear()
+    if leftover:
+        pids = ", ".join(str(child.pid) for child in leftover)
+        pytest.fail(
+            f"the test left sandbox-sharing child process(es) running (pid {pids}); the "
+            "session directory they write through is removed when this process exits"
         )
 
 

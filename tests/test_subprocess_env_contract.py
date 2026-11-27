@@ -70,7 +70,14 @@ _ASYNCIO_SPAWN_TAILS = frozenset({"create_subprocess_exec", "create_subprocess_s
 #: spelled with or without its module. Matching the trailing name catches those
 #: shapes - and the pairs below are matched on both names, so ``os.fork`` and
 #: ``multiprocessing.Process(...)`` are covered by the pair list.
-_LAUNCHER_ATTR_NAMES = frozenset({"Process", "ProcessPoolExecutor", "fork", "forkpty"})
+#: ``Parallel`` is joblib's worker launcher, matched the same way for the same
+#: reason. Client-dispatched frameworks (a dask or ray client) have no single call
+#: shape to name - they submit through a connection object - so a test reaching for
+#: one has to say so through the documented marker, which is the escape hatch for
+#: every launcher the list cannot express.
+_LAUNCHER_ATTR_NAMES = frozenset(
+    {"Process", "ProcessPoolExecutor", "Parallel", "fork", "forkpty"}
+)
 
 #: The marker that documents a deliberate exception on the ``env=`` line.
 _ENV_EXCEPTION_MARKER = "sandbox-env:"
@@ -329,6 +336,7 @@ def test_the_scan_covers_the_other_process_launchers(tmp_path: Path) -> None:
         "    multiprocessing.get_context('spawn').Process(target=print)\n"
         "    multiprocessing.Pool(2)\n"
         "    ProcessPoolExecutor(2)\n"
+        "    joblib.Parallel(n_jobs=2)\n"
         "    os.fork()\n"
         "def test_os_forkpty():\n"
         "    os.forkpty()\n"
@@ -337,7 +345,7 @@ def test_the_scan_covers_the_other_process_launchers(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     offenders = _unsandboxed_spawn_calls(sample)
-    assert len(offenders) == 6, offenders
+    assert len(offenders) == 7, offenders
     assert all("test_sample.py:" in offender for offender in offenders)
 
 
@@ -353,6 +361,7 @@ def test_the_scan_accepts_the_other_launchers_with_the_sandboxed_env(tmp_path: P
         "    multiprocessing.Process(target=print, env=sandboxed_env())\n"
         "    multiprocessing.Pool(2, env=sandboxed_env())\n"
         "    ProcessPoolExecutor(2, env=sandboxed_env())\n"
+        "    joblib.Parallel(n_jobs=2, env=sandboxed_env())\n"
         "    os.fork()  # sandbox-env: fork has no env=; the child inherits the swept one\n",
         encoding="utf-8",
     )

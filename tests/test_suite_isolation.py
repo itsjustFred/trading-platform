@@ -21,6 +21,7 @@ import socket
 import subprocess
 import sys
 import threading
+import time
 import types
 from pathlib import Path
 
@@ -1215,6 +1216,42 @@ def test_a_child_guard_covers_the_checkout_through_any_spelling(tmp_path: Path) 
         f"a child importing through a symlinked checkout root was not guarded: "
         f"{result.stdout}{result.stderr}"
     )
+
+
+def test_a_sandbox_sharing_child_must_be_finished_by_its_test(tmp_path: Path) -> None:
+    """The lifetime contract, enforced: a sharing child still alive at teardown fails.
+
+    A child that shares the session sandbox owns no lifetime of its own - the session
+    directory is removed when the pytest process exits - so a test that leaves one running
+    is reported rather than allowed to write into a directory about to disappear. The probe
+    child sleeps far longer than this test does.
+    """
+    from tests.conftest import sandboxed_env
+
+    marker = tmp_path / "child-started"
+    leak = (
+        "import time\n"
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text('started')\n"
+        "time.sleep(60)\n"
+    )
+    child = subprocess.Popen(
+        [sys.executable, "-c", leak],
+        cwd=str(_PROJECT_ROOT),
+        env=sandboxed_env(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    for _ in range(200):
+        if marker.exists():
+            break
+        time.sleep(0.05)
+    assert marker.exists(), "the probe child never started; this pin proves nothing"
+    with pytest.raises(pytest.fail.Exception, match="left sandbox-sharing child"):
+        suite_conftest.finish_shared_sandbox_children()
+    # The enforcement killed it, so this test's own teardown finds nothing left to report.
+    assert child.poll() is not None, "the enforcement did not finish the child it reported"
 
 
 def test_a_child_keeps_a_home_its_parent_named(tmp_path: Path) -> None:
