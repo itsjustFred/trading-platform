@@ -1233,6 +1233,44 @@ def test_sandboxed_env_marks_and_names_a_sharing_child_together() -> None:
     assert "TP_TEST_SESSION_ROOT" not in own
 
 
+def test_no_allowlist_entry_is_credential_shaped() -> None:
+    """The allowlist must not become a way past the credential sweep.
+
+    An entry added to make a test pass that spells like a credential - a token, a key, a
+    DSN, a broker's prefix - would hand every test and every child the variable the sweep
+    exists to remove, and a test could then pass against a real account. The documented
+    entries are paths and flags; this fails the day one of them stops being one.
+    """
+    entries = (
+        *suite_conftest._SANDBOX_ENV_ALLOWLIST,
+        *suite_conftest._SANDBOX_ENV_ALLOWLIST_PREFIXES,
+    )
+    credential_shaped = [
+        name for name in entries if suite_conftest._is_external_credential_env(name)
+    ]
+    assert credential_shaped == [], (
+        "these allowlist entries spell like credentials and would defeat the sweep: "
+        + ", ".join(sorted(credential_shaped))
+    )
+
+
+def test_the_child_marker_is_one_spelling_everywhere() -> None:
+    """Builder, generated shim and teardown guard read one constant.
+
+    A single-site rename of the marker would leave a sharing child unrecorded - or, worse,
+    treated as a parent that removes a session directory still in use. The constant is shared,
+    and the shim's generated text is checked against it here.
+    """
+    marker = suite_conftest.CHILD_SANDBOX_ENV_VAR
+    value = suite_conftest.CHILD_SANDBOX_FLAG_VALUE
+    shim = (suite_conftest.CHILD_SANDBOX_SHIM_DIR / "sitecustomize.py").read_text(encoding="utf-8")
+    assert f'os.environ.get("{marker}") == "{value}"' in shim, (
+        "the generated shim reads a different marker than the constant that builds it"
+    )
+    assert suite_conftest.sandboxed_env()[marker] == value
+    assert marker not in suite_conftest.sandboxed_env(shares_sandbox=False)
+
+
 def test_the_documented_test_opt_ins_are_on_the_allowlist() -> None:
     """Every variable the docs name as a test opt-in survives the sweep.
 
