@@ -55,18 +55,26 @@ jobs:
       MODEL: ${{ inputs.model }}
       VARIANT: ${{ inputs.variant }}
     steps:
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        with:
-          node-version: 22
-
-      # --ignore-scripts keeps every dependency's lifecycle scripts from running;
-      # only @opencode/cli's own postinstall (it links the platform binary from
-      # the optional dependency) is then run explicitly.
+      # The GitHub release binary, verified against the release's own
+      # SHA256SUMS - the same pinned-binary pattern as gitleaks and
+      # actionlint. npm's global install is not used: it resolves transitive
+      # dependencies with no lockfile. This is the inline copy of
+      # scripts/agents/install_opencode.sh - the probe runs without a
+      # checkout, so it cannot call it.
       - name: Install opencode CLI
         run: |
-          npm install -g --ignore-scripts "@opencode/cli@${OPENCODE_VERSION}"
-          (cd "$(npm root -g)/@opencode/cli" && node ./postinstall.mjs)
-          opencode --version
+          set -euo pipefail
+          asset="opencode-linux-x64.tar.gz"
+          base="https://github.com/anomalyco/opencode/releases/download/v${OPENCODE_VERSION}"
+          dest="${RUNNER_TEMP}/opencode"
+          mkdir -p "$dest"
+          curl -fsSL --proto '=https' --proto-redir '=https' -o "$dest/$asset" "$base/$asset"
+          curl -fsSL --proto '=https' --proto-redir '=https' "$base/SHA256SUMS" |
+            grep "  ${asset}\$" | (cd "$dest" && sha256sum -c -)
+          tar -xzf "$dest/$asset" -C "$dest" opencode
+          chmod +x "$dest/opencode"
+          echo "$dest" >> "$GITHUB_PATH"
+          "$dest/opencode" --version
 
       # The probe agent lives in the global config, like the real one, so the
       # ping exercises the same model resolution the agent run will.

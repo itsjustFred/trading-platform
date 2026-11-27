@@ -2908,19 +2908,34 @@ def test_the_agent_jobs_hold_no_token_and_verify_the_tree() -> None:
         assert "git status --porcelain" in bodies, f"{name}: no tree-clean guard"
 
 
-def test_opencode_is_installed_without_dependency_lifecycle_scripts() -> None:
-    """Every `npm install` in the agent jobs passes `--ignore-scripts`, so no dependency's
-    install hook runs on the runner; @opencode/cli's own postinstall (it links the platform
-    binary) is then run by name. SonarCloud rates a plain `npm install` a security issue, and
-    that one rule was what kept the quality gate red on every agent workflow PR."""
+def test_opencode_is_installed_as_a_checksum_verified_binary() -> None:
+    """opencode comes from the pinned GitHub release binary, verified against
+    the release's SHA256SUMS - the same pattern as gitleaks and actionlint.
+    `npm install -g` is gone on purpose: it resolves transitive dependencies
+    with no lockfile, which SonarCloud rates a security issue."""
     for name in AGENT_WORKFLOWS:
         _job_name, job = _agent_job(_load(name))
         body = _run_source(_find_step(job, r"^Install opencode$"))
-        installs = [line for line in body.splitlines() if "npm install" in line]
-        assert installs, f"{name}: the install step runs no npm install"
-        for line in installs:
-            assert "--ignore-scripts" in line, f"{name}: npm install without --ignore-scripts"
-        assert "node ./postinstall.mjs" in body, f"{name}: opencode's postinstall is not run"
+        assert not any(
+            line.lstrip().startswith("npm install") for line in body.splitlines()
+        ), f"{name}: the install step still uses npm"
+        assert "releases/download/v${OPENCODE_VERSION}" in body, (
+            f"{name}: the binary is not fetched for the pinned OPENCODE_VERSION"
+        )
+        assert "SHA256SUMS" in body and "sha256sum -c" in body, (
+            f"{name}: the downloaded binary is not checksum-verified"
+        )
+        assert '"$dest/opencode" --version' in body or "opencode --version" in body, (
+            f"{name}: the installed binary's version is not printed"
+        )
+    # The probe cannot call the script (no checkout), so its inline copy is
+    # held to the same standard.
+    probe_body = _run_source(_find_step(_load(PROBE)["jobs"]["probe"], r"^Install opencode"))
+    assert not any(
+        line.lstrip().startswith("npm install") for line in probe_body.splitlines()
+    )
+    assert "releases/download/v${OPENCODE_VERSION}" in probe_body
+    assert "SHA256SUMS" in probe_body and "sha256sum -c" in probe_body
 
 
 def _premortem_verdict(output: str, tmp_path) -> str:

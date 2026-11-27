@@ -216,11 +216,6 @@ jobs:
           python -m pip install --only-binary=:all: uv==0.10.4
           uv sync --frozen --all-extras --no-install-project --no-build
 
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        if: steps.scope.outputs.empty == 'false'
-        with:
-          node-version: 22
-
       - name: Install opencode
         if: steps.scope.outputs.empty == 'false'
         run: bash scripts/agents/install_opencode.sh

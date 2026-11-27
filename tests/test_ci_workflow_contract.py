@@ -228,6 +228,25 @@ def test_agent_workflow_actions_are_sha_pinned() -> None:
             )
 
 
+def test_quota_probe_output_is_declared_and_consumed() -> None:
+    """`needs.quota-probe.outputs.available` is the quota gate: the reusable
+    workflow must map it out through `on.workflow_call.outputs` (a job-level
+    output alone never reaches the caller - every read would be an empty
+    string, which is not 'false', and the agent job would run even on a
+    confirmed cap), and every agent workflow must actually read it."""
+    probe = _workflow("agent-quota-probe.yml")
+    on = _on_block(probe)
+    outputs = on["workflow_call"].get("outputs") or {}
+    assert "jobs.probe.outputs.available" in str(outputs.get("available", {})), (
+        "the probe's `available` is not mapped through workflow_call.outputs"
+    )
+    for name in AGENT_WORKFLOWS:
+        text = (WORKFLOWS / name).read_text(encoding="utf-8")
+        assert "needs.quota-probe.outputs.available" in text, (
+            f"{name} never reads the probe's available output"
+        )
+
+
 def test_secret_scan_covers_only_the_change_range() -> None:
     workflow = _workflow("secret-scan.yml")
     on = _on_block(workflow)

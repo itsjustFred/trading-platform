@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -76,7 +77,13 @@ def _comment_ids(repo: str, pr: str, marker: str) -> list[str]:
         f'and (.body | startswith("{marker}"))) | .id'
     )
     out = _gh("--paginate", f"repos/{repo}/issues/{pr}/comments", "--jq", jq).stdout
-    return [line.strip() for line in out.splitlines() if line.strip()]
+    # The ids become path segments of later `gh api` calls: only digits are
+    # accepted, so a malformed API answer cannot smuggle arguments.
+    return [
+        line.strip()
+        for line in out.splitlines()
+        if line.strip().isdigit()
+    ]
 
 
 def _comment_body(repo: str, comment_id: str) -> str:
@@ -95,11 +102,28 @@ def main(argv: list[str] | None = None) -> int:
     pr = os.environ.get("PR_NUMBER", "")
     head = os.environ.get("HEAD_SHA", "")
     quota_skip = os.environ.get("QUOTA_SKIP", "") == "true"
-    if not (repo and pr and head):
-        print("::error::GITHUB_REPOSITORY, PR_NUMBER and HEAD_SHA are required.", file=sys.stderr)
+    # Every value below becomes an argument or a path segment of a `gh api`
+    # call or a file read: anything that is not the exact shape the workflow
+    # produces is refused before it can steer the command line.
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo):
+        print("::error::GITHUB_REPOSITORY is not owner/name.", file=sys.stderr)
         return 1
-
+    if not pr.isdigit():
+        print("::error::PR_NUMBER is not a number.", file=sys.stderr)
+        return 1
+    if not head:
+        print("::error::HEAD_SHA is required.", file=sys.stderr)
+        return 1
+    if '"' in args.marker or "\n" in args.marker:
+        print("::error::the marker must be a single-line HTML comment.", file=sys.stderr)
+        return 1
     body_path = Path(args.body_file)
+    if body_path.is_absolute() or ".." in body_path.parts:
+        print(
+            "::error::--body-file must name a file inside the working directory.",
+            file=sys.stderr,
+        )
+        return 1
     body_text = body_path.read_text(encoding="utf-8") if body_path.exists() else ""
 
     current = _head_sha(repo, pr)
