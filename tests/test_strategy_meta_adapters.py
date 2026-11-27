@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import importlib.util
-import sys
 from pathlib import Path
 
 import pandas as pd
@@ -17,9 +16,6 @@ from runner.engines.vectorbt_adapter import VectorbtAdapter, resolve_max_leverag
 from shared.models import Trade, TradeExit
 from shared.strategy_registry import DEFAULT_STRATEGIES_DIR, iter_strategy_files
 from tests.builders import make_backtest_config
-
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 STRATEGIES_DIR = DEFAULT_STRATEGIES_DIR

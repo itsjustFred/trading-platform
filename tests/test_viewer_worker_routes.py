@@ -8,10 +8,7 @@ routes must delegate its blocking body to a worker thread.
 from __future__ import annotations
 
 import ast
-import sys
 from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).parent.parent))
 
 _BLOCKING_ROUTES = [
     "data_overview",

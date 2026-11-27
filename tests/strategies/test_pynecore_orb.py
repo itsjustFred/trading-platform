@@ -11,13 +11,10 @@ EURUSD 1h ist die falsche Zeiteinheit fuer OR-30m-Logik)
 """
 
 import math
-import sys
 from pathlib import Path
 
 import pandas as pd
 import pytest
-
-sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from runner.engines.pynecore_adapter import PyneCoreAdapter
 from tests.builders import make_backtest_config

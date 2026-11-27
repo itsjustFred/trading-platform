@@ -13,12 +13,9 @@ ATR20, 2.5x-Stop mit Trailing erst nach 2.0 ATR Profit).
 """
 
 import math
-import sys
 from pathlib import Path
 
 import pytest
-
-sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from runner.engines.vectorbt_adapter import VectorbtAdapter
 from tests.builders import make_backtest_config

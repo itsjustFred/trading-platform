@@ -14,12 +14,9 @@ sowie falschen Gewichten [0.4,0.3,0.2,0.1] erzeugt; Quelle: [0.35,0.30,
 """
 
 import math
-import sys
 from pathlib import Path
 
 import pytest
-
-sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from runner.engines.vectorbt_adapter import VectorbtAdapter
 from tests.builders import make_backtest_config
@@ -134,7 +131,6 @@ class TestSourceFidelity:
         import importlib.util
         from pathlib import Path
 
-        import pandas as pd
 
         spec = importlib.util.spec_from_file_location(
             "xam", str(Path(STRATEGY_PATH))
