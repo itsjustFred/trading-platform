@@ -395,12 +395,14 @@ def _child_environment(tmp_path: Path, data_dir: Path) -> dict[str, str]:
 
 
 def _run_child_probe(environment: dict[str, str], source: str) -> subprocess.CompletedProcess[str]:
-    # The caller passes the environment _child_environment() built from sandboxed_env();
-    # this helper is the name it travels under.
+    """Run *source* in a child with the mapping the caller built from ``sandboxed_env()``.
+
+    A parameter is not visible to the static scan, so the call documents its exception.
+    """
     return subprocess.run(
         [sys.executable, "-c", source],
         cwd=ROOT,
-        env=environment,  # sandbox-env: built from sandboxed_env() by the caller
+        env=environment,  # sandbox-env: built from sandboxed_env() by the caller (a parameter)
         capture_output=True,
         encoding="utf-8",
         timeout=30,

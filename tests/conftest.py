@@ -9,6 +9,7 @@ import shutil
 import sys
 import tempfile
 import threading
+from collections.abc import Mapping
 from functools import lru_cache
 from pathlib import Path
 
@@ -93,6 +94,17 @@ ACCOUNTS_ENV_ENV_VAR = "TP_ACCOUNTS_ENV"
 # Without the handoff a ``JFOREX_JARS`` or ``TP_REPO_ROOT`` a test passed to its child would
 # be deleted by the very guard meant to protect that child.
 CHILD_ENV_OVERRIDES_ENV_VAR = "TP_TEST_CHILD_ENV"
+
+
+def _child_override_names(environ: Mapping[str, str]) -> frozenset[str]:
+    """The variable names a parent recorded as chosen for the child that inherited *environ*.
+
+    One reader for the list, shared by the allowlist sweep, the credential sweep and
+    ``sandboxed_env`` itself (which extends it): the format is the contract, and two readers
+    of one format are two places for it to drift.
+    """
+    recorded = environ.get(CHILD_ENV_OVERRIDES_ENV_VAR, "")
+    return frozenset(name for name in recorded.split(",") if name)
 # Exported broker, Discord, Sentry and database configuration is as much a leak as the files
 # above: ``load_accounts_env_values`` overlays ``os.environ`` under the accounts file, so a real
 # ``ALPACA_API_KEY`` in the shell would make a test pass for a reason CI cannot reproduce.
@@ -125,7 +137,7 @@ def _clear_external_credential_env() -> None:
     ``SENTRY_RELEASE``, a ``NVIDIA_API_KEY`` the redaction test plants or a ``JFOREX_JARS``
     fixture path is exactly what that child is meant to see.
     """
-    inherited = os.environ.get(CHILD_ENV_OVERRIDES_ENV_VAR, "").split(",")
+    inherited = _child_override_names(os.environ)
     for name in [name for name in os.environ if _is_external_credential_env(name)]:
         if name in inherited:
             continue
@@ -188,10 +200,10 @@ os.environ.pop(ACCOUNTS_ENV_ENV_VAR, None)
 #   * PYTHON*: the interpreter's own switches, plus the PYTHONPATH sandboxed_env() rebuilds.
 #   * PYTEST_XDIST*: an xdist worker's own identity, set by the controller before this import.
 #   * CI, GITHUB_*, RUNNER_TEMP: the CI job's context, which the workflows and the
-#     workflow-simulation tests read. The GITHUB_ prefix carries GITHUB_TOKEN with it, which
-#     is repo-scoped in CI: accepted deliberately, because the workflow-simulation tests
-#     read the job's context and a test in this repo is trusted to run in it. Drop the
-#     prefix rather than widen it if that trade is ever in question.
+#     workflow-simulation tests read (``GITHUB_REPOSITORY``, ``GITHUB_SHA``, the runner's own
+#     paths). A credential-shaped name in that context - ``GITHUB_TOKEN`` - cannot come back
+#     through the prefix: the builder drops it, the child's sweep drops it, and
+#     ``test_a_child_never_sees_a_credential_variable_the_sweep_removed`` pins both.
 #   * the documented opt-ins (TP_TEST_OHLCV_DIR, TP_INTEGRATION_BASE_URL, TRADING_PRODUCTION_DB,
 #     DIFFERENTIAL_REAL_SLICE_CSV, REQUIRE_REAL_DATA_SLICE, PLAYWRIGHT_BROWSERS_PATH): each names
 #     a path or flag a maintainer chose deliberately, and each test that reads one skips cleanly
@@ -238,7 +250,21 @@ _SANDBOX_ENV_ALLOWLIST = frozenset(
         "windir",
     }
 )
-_SANDBOX_ENV_ALLOWLIST_PREFIXES = ("PYTHON", "LC_", "GITHUB_", "PYTEST_XDIST")
+#: ``PYTHONHOME``/``PYTHONEXECUTABLE`` change which interpreter a child runs, so the broad
+#: ``PYTHON`` prefix is not used: the suite's own switches are named instead (the golden run
+#: sets each of them per child, and a child that needs another one names it as an override).
+_SANDBOX_ENV_ALLOWLIST_PREFIXES = (
+    "PYTHONPATH",
+    "PYTHONDONTWRITEBYTECODE",
+    "PYTHONHASHSEED",
+    "PYTHONIOENCODING",
+    "PYTHONNOUSERSITE",
+    "PYTHONPYCACHEPREFIX",
+    "PYTHONUTF8",
+    "LC_",
+    "GITHUB_",
+    "PYTEST_XDIST",
+)
 # Where a sandboxed HOME points: inside the session sandbox, never the caller's home.
 SANDBOX_HOME = _SESSION_ROOT / "home"
 
@@ -250,8 +276,7 @@ def _is_allowlisted_env(name: str) -> bool:
         return True
     if name == CHILD_ENV_OVERRIDES_ENV_VAR:
         return True
-    inherited = os.environ.get(CHILD_ENV_OVERRIDES_ENV_VAR, "")
-    return bool(inherited) and name in inherited.split(",")
+    return name in _child_override_names(os.environ)
 
 
 def _enforce_env_allowlist() -> None:
@@ -271,7 +296,7 @@ def _enforce_env_allowlist() -> None:
     # HOME points into the session sandbox, unless the parent named one for this child: a
     # test that hands its child a HOME of its own - a config-step probe, a fixture tree -
     # means it, and a sweep that clobbered it would fail that test for the wrong reason.
-    inherited = os.environ.get(CHILD_ENV_OVERRIDES_ENV_VAR, "").split(",")
+    inherited = _child_override_names(os.environ)
     if "HOME" not in inherited:
         os.environ["HOME"] = str(SANDBOX_HOME)
     if "USERPROFILE" not in inherited:
@@ -321,7 +346,15 @@ def sandboxed_env(*, shares_sandbox: bool = True, **overrides: str) -> dict[str,
     it is this module's own marker, and any other truthy spelling would read as a
     parent and send the child down the wrong branch.
     """
-    env = {name: value for name, value in os.environ.items() if _is_allowlisted_env(name)}
+    # A credential-shaped name is dropped here as well as swept in the child: an allowlist
+    # prefix (``GITHUB_``) would otherwise re-admit one set after the import-time sweep - a
+    # test's own ``monkeypatch.setenv``, or a tool that exported it later. An override the
+    # parent named deliberately (the redaction tests plant a dummy key) is applied below.
+    env = {
+        name: value
+        for name, value in os.environ.items()
+        if _is_allowlisted_env(name) and not _is_external_credential_env(name)
+    }
     env["DATA_DIR"] = os.environ["DATA_DIR"]
     env["TRADING_DATA_DIR"] = os.environ["TRADING_DATA_DIR"]
     env["LOG_DIR"] = os.environ["LOG_DIR"]
@@ -354,8 +387,8 @@ def sandboxed_env(*, shares_sandbox: bool = True, **overrides: str) -> dict[str,
     # naming test meant the child to see. A child that starts its own child adds to the
     # list rather than replacing it.
     if overrides:
-        inherited = [name for name in env.get(CHILD_ENV_OVERRIDES_ENV_VAR, "").split(",") if name]
-        env[CHILD_ENV_OVERRIDES_ENV_VAR] = ",".join(dict.fromkeys([*inherited, *overrides]))
+        inherited = _child_override_names(env)
+        env[CHILD_ENV_OVERRIDES_ENV_VAR] = ",".join(sorted(dict.fromkeys([*inherited, *overrides])))
     if not shares_sandbox:
         return env
     # The xdist identity belongs to the worker xdist started, never to a child of it: a
@@ -725,12 +758,10 @@ class _ChildAccountsEnvFinder:
     checkout are wrapped, so stdlib and site-packages imports keep their own loaders.
     """
 
-    #: The checkout root, spelled the way the path entries a child imports through are. The
-    #: resolved spelling is what the sandbox builds its PYTHONPATH from, so it hits on the
-    #: fast path in every ordinary child.
-    _REPO_PREFIXES = tuple(
-        str(root) + os.sep for root in (PROJECT_ROOT, Path(__file__).parent.parent)
-    )
+    #: The checkout root, resolved. ``sandboxed_env()`` builds its PYTHONPATH from this
+    #: spelling, so an ordinary child hits the fast path below; any other spelling a child
+    #: imports through (a symlink, an editable install) is resolved by ``_is_repo_file``.
+    _REPO_PREFIXES = (str(PROJECT_ROOT) + os.sep,)
 
     def _is_repo_file(self, origin: str) -> bool:
         """Whether *origin* is a file inside this checkout, by any spelling of the root.

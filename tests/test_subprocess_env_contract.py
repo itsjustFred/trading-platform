@@ -87,17 +87,15 @@ _LAUNCHER_ATTR_NAMES = frozenset(
 _ENV_EXCEPTION_MARKER = "sandbox-env:"
 
 
-#: Deliberately unparseable inputs and Pine Script: not Python, and excluded from
-#: the repo's own lint for the same reason (see ``[tool.ruff] extend-exclude``).
-_NON_PYTHON_DIRS = frozenset({"fixtures"})
-
-
 def _test_files() -> list[Path]:
-    return sorted(
-        path
-        for path in TESTS_ROOT.rglob("*.py")
-        if not _NON_PYTHON_DIRS.intersection(path.relative_to(TESTS_ROOT).parts)
-    )
+    """Every Python file under the suite, parseable ones included.
+
+    Nothing is excluded by directory: the fixtures tree holds Pine Script and deliberately
+    unparseable inputs (excluded from the repo's lint for that reason), and those are
+    skipped per file by the parse below - but a Python test file under ``fixtures/`` that
+    started a process would be exactly the escape this contract exists to close.
+    """
+    return sorted(path for path in TESTS_ROOT.rglob("*.py") if path.is_file())
 
 
 def _dotted_call_name(node: ast.Call) -> str:
@@ -166,6 +164,13 @@ def _names_defined_in_scope(scope: ast.AST) -> dict[str, ast.AST]:
             for alias in node.names:
                 if isinstance(alias.name, str):
                     definitions.setdefault(alias.asname or alias.name, node)
+        elif isinstance(node, ast.Import):
+            # ``import tests.conftest as tc`` binds tc; the dotted call through it is what the
+            # scan follows (``tc.sandboxed_env()``), and the binding is recorded so a name the
+            # import produced is resolved rather than treated as unknown.
+            for alias in node.names:
+                bound = alias.asname or alias.name.split(".")[0]
+                definitions.setdefault(bound, node)
         if isinstance(node, ast.Assign):
             for target in node.targets:
                 if isinstance(target, ast.Name):
@@ -339,8 +344,10 @@ def _unsandboxed_spawn_calls(path: Path) -> list[str]:
         return [f"{path}: unreadable"]
     try:
         tree = ast.parse(source)
-    except SyntaxError as exc:  # pragma: no cover - a broken test file fails on its own
-        return [f"{path}: {exc}"]
+    except SyntaxError:
+        # Not Python - a Pine Script fixture, a deliberately unparseable input. A syntax
+        # error in a real test file fails at collection, before the scan's verdict matters.
+        return []
     source_lines = source.splitlines()
     return [
         f"{_display_path(path)}:{node.lineno}: {_dotted_call_name(node)}"
@@ -451,8 +458,7 @@ def test_the_scan_accepts_the_other_launchers_with_the_sandboxed_env(tmp_path: P
         "def test_launchers():\n"
         "    subprocess.run(['git', 'status'], env=sandboxed_env())\n"
         "    subprocess.Popen(['git', 'status'], env=sandboxed_env())\n"
-        "    multiprocessing.Process(target=print)  # sandbox-env: no env parameter;\n"
-        # inherits the calling process's swept environment\n"
+        "    multiprocessing.Process(target=print)  # sandbox-env: no env parameter\n"
         "    multiprocessing.Pool(2)  # sandbox-env: no env parameter; inherits the swept one\n"
         "    ProcessPoolExecutor(2)  # sandbox-env: no env parameter; inherits the swept one\n"
         "    joblib.Parallel(n_jobs=2)  # sandbox-env: no env parameter; inherits the swept one\n"
@@ -477,6 +483,37 @@ def test_the_scan_follows_a_helper_imported_from_the_repo(tmp_path: Path) -> Non
         encoding="utf-8",
     )
     assert _unsandboxed_spawn_calls(sample) == []
+
+
+def test_the_scan_follows_a_helper_reached_through_a_module_import(tmp_path: Path) -> None:
+    """``import tests.conftest as tc`` binds a name the scan resolves too.
+
+    The environment then reads ``tc.sandboxed_env()``: the dotted call carries the callee, so
+    the contract is followed whether the binding arrived through ``from x import y`` or
+    ``import x as y``.
+    """
+    sample = tmp_path / "test_sample.py"
+    sample.write_text(
+        "import subprocess\n"
+        "import tests.conftest as tc\n"
+        "def test_spawns():\n"
+        "    subprocess.run(['git', 'status'], env=tc.sandboxed_env())\n"
+        "def test_through_a_helper():\n"
+        "    subprocess.run(['git', 'status'], env={**os.environ, 'X': '1'})\n",
+        encoding="utf-8",
+    )
+    sample.write_text(
+        "import os\n"
+        "import subprocess\n"
+        "import tests.conftest as tc\n"
+        "def test_spawns():\n"
+        "    subprocess.run(['git', 'status'], env=tc.sandboxed_env())\n"
+        "def test_hand_rolled():\n"
+        "    subprocess.run(['git', 'status'], env={**os.environ, 'X': '1'})\n",
+        encoding="utf-8",
+    )
+    (offender,) = _unsandboxed_spawn_calls(sample)
+    assert offender.endswith(":7: subprocess.run")
 
 
 def test_the_scan_fails_closed_on_a_launcher_it_does_not_know(tmp_path: Path) -> None:

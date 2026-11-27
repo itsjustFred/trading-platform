@@ -1292,6 +1292,39 @@ def test_the_documented_test_opt_ins_are_on_the_allowlist() -> None:
         )
 
 
+def test_a_child_never_sees_a_credential_variable_the_sweep_removed() -> None:
+    """An allowlist prefix cannot re-admit what the credential sweep removed.
+
+    The CI job's context is allowed through by prefix (``GITHUB_*``), and a token in that
+    context - ``GITHUB_TOKEN`` - spells like the credentials the sweep exists to remove. The
+    credential sweep runs first, so the name is gone before any allowlist could carry it,
+    and this pins the interaction rather than trusting the order.
+    """
+    from tests.conftest import sandboxed_env
+
+    os.environ["GITHUB_TOKEN"] = "ghp_secret_probe"
+    try:
+        child_env = sandboxed_env(GITHUB_REPOSITORY="itsjustFred/trading-platform")
+    finally:
+        os.environ.pop("GITHUB_TOKEN", None)
+    # The allowed one the child needs, the credential-shaped one gone.
+    assert child_env["GITHUB_REPOSITORY"] == "itsjustFred/trading-platform"
+    assert "GITHUB_TOKEN" not in child_env
+    assert "GITHUB_TOKEN" not in os.environ
+
+    body = "import os\nprint('TOKEN', os.environ.get('GITHUB_TOKEN'))\n"
+    result = subprocess.run(
+        [sys.executable, "-c", body],
+        cwd=str(_PROJECT_ROOT),
+        env=child_env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert "TOKEN None" in result.stdout, result.stdout + result.stderr
+
+
 def test_a_sandbox_sharing_child_must_be_finished_by_its_test(tmp_path: Path) -> None:
     """The lifetime contract, enforced: a sharing child still alive at teardown fails.
 
