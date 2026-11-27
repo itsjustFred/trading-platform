@@ -53,6 +53,27 @@ _CASE_INSENSITIVE_FS = os.name == "nt" or sys.platform == "darwin"
 CHILD_SANDBOX_ENV_VAR = "TP_TEST_CHILD_SANDBOX"
 CHILD_SANDBOX_FLAG_VALUE = "1"
 
+def _register_parent_only_session_cleanup() -> None:
+    """Register the session directory's removal - in the parent branch only.
+
+    A child that shares this sandbox (``sandboxed_env()``'s default) owns no lifetime of its
+    own: the session directory is removed here, so such a child must be finished before the
+    pytest process exits. A child that has to outlive the session is the sandbox's one case
+    that has no owner, and the tests that leave one running must not exist - the watchdog and
+    lock holders are all waited on or killed (and the tracking fixture fails one that is not).
+
+    The parent branch is what makes that true: a child that reached the registration would
+    delete the directory the parent still owns, silently, because the removal ignores errors.
+    The assertion lives inside the function, so moving the call out of the parent branch fails
+    here rather than in a leak.
+    """
+    assert not _CHILD_PROCESS, (
+        "only the parent registers the session directory's removal; a child that removes a "
+        "directory it shares deletes the parent's sandbox out from under it"
+    )
+    atexit.register(shutil.rmtree, _SESSION_ROOT, ignore_errors=True)
+
+
 _CHILD_PROCESS = os.environ.get(CHILD_SANDBOX_ENV_VAR) == CHILD_SANDBOX_FLAG_VALUE
 if _CHILD_PROCESS:
     # The marker and the session directory are written in one act by sandboxed_env(), so a
@@ -75,15 +96,7 @@ else:
     # no owner, and the tests that leave one running must not exist - the watchdog and lock
     # holders are all waited on or killed.
     #
-    # The parent branch is what makes that true: a child that reached this line would delete the
-    # directory the parent still owns, silently, because the removal ignores errors. The marker
-    # check above is the branch, and this assertion fails the day an edit moves the registration
-    # out of it.
-    assert not _CHILD_PROCESS, (
-        "only the parent registers the session directory's removal; a child that removes a "
-        "directory it shares deletes the parent's sandbox out from under it"
-    )
-    atexit.register(shutil.rmtree, _SESSION_ROOT, ignore_errors=True)
+    _register_parent_only_session_cleanup()
 TEST_DATA_DIR = _SESSION_ROOT / "data"
 TEST_LOG_DIR = _SESSION_ROOT / "logs"
 # Where a caller that names no accounts-env file resolves to. It deliberately does not exist: a
@@ -470,6 +483,13 @@ def _write_child_sandbox_shim() -> None:
     starts without this environment (one a test forgot to hand it to) is exactly
     the leak ``tests/test_subprocess_env_contract.py`` fails on.
     """
+    # Only the parent writes it (see the call site): every child starts from the same bytes,
+    # and a child rewriting the file another child is about to import is a race for no gain -
+    # a half-written guard is a child with no guard.
+    assert not _CHILD_PROCESS, (
+        "only the parent writes the child shim: a child rewriting it would race another "
+        "child importing it, and a half-written shim is an unguarded child"
+    )
     CHILD_SANDBOX_SHIM_DIR.mkdir(parents=True, exist_ok=True)
     # The files this shim loads into a child, by repo-relative path: a guard that sweeps the
     # repo for hooks or credentials excludes the suite's own modules when - and only when -
