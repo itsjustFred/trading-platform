@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 import math
 import os
@@ -936,7 +937,7 @@ async def _alpaca_roundtrip_check(
         )
     except Exception as exc:
         if order_id:
-            with contextlib_suppress():
+            with contextlib.suppress(Exception):
                 client.cancel_order_by_id(order_id)
         return SmokeCheck(check_name, False, {"order_id": order_id}, _public_error(exc))
 
@@ -1095,8 +1096,8 @@ class _DiscordSmokeAdapter:
 async def _discord_replay_smoke() -> list[SmokeCheck]:
     from types import SimpleNamespace
 
-    from live_runner.daemon import _trade_signal_to_live_signal, submit_order_with_risk
-    from live_runner.signal_sources.discord_source import _parse_trade_signal_from_message
+    from live_runner.daemon import submit_order_with_risk, trade_signal_to_live_signal
+    from live_runner.signal_sources.discord_source import parse_trade_signal_from_message
     from shared.models import LiveDeploymentConfig
 
     channel_id = "discord-smoke-channel"
@@ -1120,7 +1121,7 @@ async def _discord_replay_smoke() -> list[SmokeCheck]:
     adapter = _DiscordSmokeAdapter()
 
     try:
-        trade_signal = _parse_trade_signal_from_message(message, default_timeframe="1h")
+        trade_signal = parse_trade_signal_from_message(message, default_timeframe="1h")
         if trade_signal is None:
             raise RuntimeError("Discord parser returned no signal.")
         if str(trade_signal.metadata.get("discord_channel_id")) != channel_id:
@@ -1128,7 +1129,7 @@ async def _discord_replay_smoke() -> list[SmokeCheck]:
         if trade_signal.symbol.upper() not in {symbol.upper() for symbol in deployment.symbols}:
             raise RuntimeError("Parsed signal did not match deployment symbols.")
 
-        live_signal = _trade_signal_to_live_signal(trade_signal, deployment)
+        live_signal = trade_signal_to_live_signal(trade_signal, deployment)
         # C1: the routing smoke carries an explicit bounded bracket (the
         # parser emits price-only signals; unbounded ones are refused).
         live_signal = live_signal.model_copy(
@@ -1374,8 +1375,8 @@ def _stockkit_deployment_and_signal(
     from types import SimpleNamespace
 
     from live_runner.credential_env import discord_bot_env_key, load_accounts_env_values
-    from live_runner.daemon import _trade_signal_to_live_signal
-    from live_runner.signal_sources.discord_source import _parse_trade_signal_from_message
+    from live_runner.daemon import trade_signal_to_live_signal
+    from live_runner.signal_sources.discord_source import parse_trade_signal_from_message
     from live_runner.stockkit_routing import validate_stockkit_deployment_route
     from shared.models import LiveDeploymentConfig
 
@@ -1386,7 +1387,7 @@ def _stockkit_deployment_and_signal(
         author=SimpleNamespace(id=f"stockkit-{route}", bot=True),
         created_at=datetime.now(timezone.utc),
     )
-    trade_signal = _parse_trade_signal_from_message(message, default_timeframe="1h")
+    trade_signal = parse_trade_signal_from_message(message, default_timeframe="1h")
     if trade_signal is None:
         raise RuntimeError("StockKit Discord parser returned no signal.")
 
@@ -1423,7 +1424,7 @@ def _stockkit_deployment_and_signal(
         account_broker_login=broker_login,
         accounts_env_values=smoke_env,
     )
-    live_signal = _trade_signal_to_live_signal(trade_signal, deployment)
+    live_signal = trade_signal_to_live_signal(trade_signal, deployment)
     live_signal.metadata.update({"entry_price": float(trade_signal.entry_price)})
     if extended_hours:
         live_signal.metadata["extended_hours"] = True
@@ -1697,14 +1698,6 @@ async def _live_stockkit_e2e(
         elif isinstance(result, BaseException):
             checks.append(SmokeCheck(name, False, error=_public_error(result)))
     return checks
-
-
-class contextlib_suppress:
-    def __enter__(self) -> None:
-        return None
-
-    def __exit__(self, *_exc: object) -> bool:
-        return True
 
 
 async def run_smoke(

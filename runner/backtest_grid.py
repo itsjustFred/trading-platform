@@ -32,12 +32,12 @@ from runner.engines.base import (
     native_strategy_parameter_errors,
     resolve_legacy_max_position_kwarg,
     resolve_strategy_parameters,
-    warn_if_engine_frozen,
 )
 from runner.engines.contract import (
     default_signal_exit_fill_for_engine,
     resolve_intrabar_timeframe,
 )
+from runner.engines.registry import get_engine
 from runner.grid_identity import (
     GRID_IDENTITY_KEY,
     cell_identity,
@@ -224,28 +224,6 @@ def build_cli_command(
     if result_id:
         cmd.extend(["--result-id", result_id])
     return cmd
-
-
-def get_engine(name: str):
-    """Create an engine adapter without importing runner.cli."""
-    warn_if_engine_frozen(name, stacklevel=2)
-    if name == "native":
-        from runner.engines.native_adapter import NativeAdapter
-
-        return NativeAdapter()
-    if name == "vectorbt":
-        from runner.engines.vectorbt_adapter import VectorbtAdapter
-
-        return VectorbtAdapter()
-    if name == "lean":
-        from runner.engines.lean_adapter import LeanAdapter
-
-        return LeanAdapter()
-    if name == "pynecore":
-        from runner.engines.pynecore_adapter import PyneCoreAdapter
-
-        return PyneCoreAdapter()
-    raise ValueError(f"Unknown engine: {name}")
 
 
 def _detect_date_range(symbol: str, timeframe: str, data_dir: str) -> tuple[str, str]:

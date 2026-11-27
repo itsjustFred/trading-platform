@@ -31,12 +31,8 @@ from runner.engines import contract
 from runner.engines._drawings import _normalize_drawings
 from runner.engines._shared import (
     resolve_bar_spread,
-)
-from runner.engines._shared import (
-    resolve_max_leverage as _resolve_max_leverage,
-)
-from runner.engines._shared import (
-    resolve_max_position_exposure_pct as _resolve_max_position_exposure_pct,
+    resolve_max_leverage,
+    resolve_max_position_exposure_pct,
 )
 from runner.engines._shared import (
     serialize_meta_value as _serialize_meta_value,
@@ -248,7 +244,7 @@ def _pyne_cli_start_bound(start_date: str) -> str:
 def _frozen_signal_exit_fill(config: BacktestConfig) -> BacktestConfig:
     """Refuse the native-only ``next_open`` exit model on this frozen adapter.
 
-    ADR ``docs/adr/0001-native-single-strategy-engine.md``: frozen engines
+    ADR ``docs/adr/0002-native-single-strategy-engine.md``: frozen engines
     keep their existing semantics until removal and get fail-loud guards, not
     silent re-interpretation. ``next_open`` is the native default, so a
     ``BacktestConfig`` that never touched the field would otherwise simulate
@@ -1189,7 +1185,7 @@ def _apply_risk_sizing(
     equity = float(config.initial_capital)
     if not math.isfinite(equity) or equity <= 0:
         raise ValueError("PyneCore initial capital must be finite and > 0")
-    max_leverage = _resolve_max_leverage(config.max_leverage)
+    max_leverage = resolve_max_leverage(config.max_leverage)
     if not math.isfinite(max_leverage) or max_leverage <= 0:
         raise ValueError("PyneCore max_leverage must be finite and > 0")
 
@@ -1238,7 +1234,7 @@ def _apply_risk_sizing(
     for trade, entry_time, _exit_time in ordered:
         _release_through(entry_time)
         symbol_class = class_by_symbol.get(str(trade.symbol).upper(), asset_class)
-        max_position_exposure_pct = _resolve_max_position_exposure_pct(
+        max_position_exposure_pct = resolve_max_position_exposure_pct(
             config.max_position_exposure_pct, symbol_class
         )
         if not 0 < max_position_exposure_pct <= 1:

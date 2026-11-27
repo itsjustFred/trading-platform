@@ -28,7 +28,9 @@ STATE_PATH = MATRIX_DIR / "queue_state.json"
 LOCK_PATH = MATRIX_DIR / "queue.lock"
 MAX_WORKERS = os.environ.get("MATRIX_MAX_WORKERS", "2")
 TIMEOUT_SECONDS = os.environ.get("MATRIX_TIMEOUT_SECONDS", "3600")
-ENGINE = os.environ.get("MATRIX_ENGINE", "vectorbt")
+# #318 / ADR 0001: the native engine is the single strategy engine; the
+# vectorbt adapter is frozen and queued only on explicit MATRIX_ENGINE opt-in.
+ENGINE = os.environ.get("MATRIX_ENGINE", "native").strip().lower()
 
 _LOCK_HANDLE = None
 
@@ -53,6 +55,53 @@ def strategy_slugs() -> list[str]:
             continue
         slugs.append(strategy_slug_for_path(path, REPO / "strategies"))
     return sorted(dict.fromkeys(slugs))
+
+
+def engine_excluded_strategies(
+    strategies_dir: Path | None = None,
+) -> dict[str, str]:
+    """slug -> reason for strategies the configured ENGINE cannot run faithfully.
+
+    Every engine except the frozen vectorbt adapter silently ignores
+    signal-dict keys only vectorbt executes (``entry_stop`` stop-entry fills —
+    dropped per the #318 maintainer decision), and native never reads the
+    ``atr*`` series vectorbt uses as an implicit stop distance when a strategy
+    publishes no ``stop_loss``/``sl_price``. Queueing either kind of strategy
+    would produce results dressed up as faithful, so the runner excludes it
+    loudly instead of falling back.
+    """
+    if ENGINE == "vectorbt":
+        return {}
+    _ensure_repo_on_path()
+    from shared.strategy_registry import (
+        atr_sizing_keys_without_stop,
+        iter_strategy_files,
+        strategy_slug_for_path,
+        vectorbt_only_signal_keys,
+    )
+
+    strategies_dir = strategies_dir or REPO / "strategies"
+    excluded: dict[str, str] = {}
+    for path in iter_strategy_files(strategies_dir):
+        if path.name.endswith("_context.py"):
+            continue
+        slug = strategy_slug_for_path(path, strategies_dir)
+        keys = vectorbt_only_signal_keys(path)
+        if keys:
+            excluded[slug] = (
+                f"emits vectorbt-only signal key(s) {sorted(keys)}; engine "
+                f"{ENGINE!r} cannot execute them (stop-entry fills were dropped "
+                "per #318)"
+            )
+            continue
+        atr_keys = atr_sizing_keys_without_stop(path)
+        if atr_keys:
+            excluded[slug] = (
+                f"emits atr* sizing key(s) {sorted(atr_keys)} with no "
+                "stop_loss/sl_price; vectorbt sizes risk and places a 1xATR "
+                f"stop from them, engine {ENGINE!r} does not (#318)"
+            )
+    return excluded
 
 
 def load_state() -> dict:
@@ -141,8 +190,24 @@ def grid_summary(strategy: str) -> dict | None:
 
 
 def refresh_strategy_states(state: dict) -> None:
+    excluded = engine_excluded_strategies()
     rows = []
     for slug in strategy_slugs():
+        if slug in excluded:
+            rows.append(
+                {
+                    "strategy": slug,
+                    "status": "excluded",
+                    "error": excluded[slug],
+                    "ok": 0,
+                    "failed": 0,
+                    "skipped_existing": 0,
+                    "requested": 0,
+                    "trades": 0,
+                    "updated_at": now_iso(),
+                }
+            )
+            continue
         summary = grid_summary(slug)
         existing = next(
             (row for row in state.get("strategies", []) if row.get("strategy") == slug),
@@ -207,6 +272,16 @@ def next_pending_strategy(state: dict) -> str | None:
 def run_strategy(slug: str) -> dict:
     """Run one strategy matrix cell in a subprocess and return its result payload."""
     _ensure_repo_on_path()
+    excluded_reason = engine_excluded_strategies().get(slug)
+    if excluded_reason is not None:
+        return {
+            "strategy": slug,
+            "status": "failed",
+            "returncode": None,
+            "started_at": now_iso(),
+            "finished_at": now_iso(),
+            "error": excluded_reason,
+        }
     from runner.agent_process import build_backtest_child_env
 
     cmd = [
@@ -274,6 +349,15 @@ def main() -> int:
 
     ran_any = False
     try:
+        excluded = engine_excluded_strategies()
+        if excluded:
+            print(
+                f"Matrix queue: ENGINE={ENGINE}; refusing to queue strategies "
+                "that only the frozen vectorbt engine can run faithfully "
+                "(#318) — every other engine ignores these signal keys:"
+            )
+            for slug, reason in sorted(excluded.items()):
+                print(f"  - {slug}: {reason}")
         while True:
             state = load_state()
             refresh_strategy_states(state)
@@ -311,6 +395,7 @@ def render_state(state: dict) -> str:
     failed = sum(1 for r in rows if r.get("status") == "failed")
     partial = sum(1 for r in rows if r.get("status") == "partial")
     pending = sum(1 for r in rows if r.get("status") == "pending")
+    excluded = sum(1 for r in rows if r.get("status") == "excluded")
     trades = sum(int(r.get("trades", 0)) for r in rows)
     cells_ok = sum(int(r.get("ok", 0)) for r in rows)
     cells_total = sum(int(r.get("requested", 0)) for r in rows)
@@ -324,7 +409,7 @@ def render_state(state: dict) -> str:
         f"Output: `{MATRIX_DIR}`",
         (
             f"Strategy progress: `{done}/{len(rows)}` done · failed `{failed}` · "
-            f"partial `{partial}` · pending `{pending}`"
+            f"partial `{partial}` · pending `{pending}` · excluded `{excluded}`"
         ),
         f"Cells: `{cells_ok}/{cells_total}` ok · Trade JSONs: `{trades}`",
         f"Current/last: `{current}`",
@@ -337,6 +422,8 @@ def render_state(state: dict) -> str:
             emoji = "✅"
         elif status == "failed":
             emoji = "❌"
+        elif status == "excluded":
+            emoji = "🚫"
         elif status == "partial":
             emoji = "⚠️"
         else:
@@ -344,6 +431,8 @@ def render_state(state: dict) -> str:
         suffix = f" · {r.get('trades', 0)} trades"
         if r.get("status") == "done":
             suffix += f" · {r.get('ok', 0)}/{r.get('requested', 0)} ok"
+        elif r.get("status") == "excluded" and r.get("error"):
+            suffix += f" · {r['error']}"
         lines.append(f"- {emoji} `{r.get('strategy')}` — {r.get('status')}{suffix}")
     return "\n".join(lines)
 

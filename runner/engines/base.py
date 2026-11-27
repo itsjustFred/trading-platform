@@ -73,7 +73,7 @@ VALID_RESOLUTIONS = (
 ProgressCallback = Callable[[float, str], None]
 
 #: Engines frozen by the engine-consolidation decision (#318,
-#: ``docs/adr/0001-native-single-strategy-engine.md``): bug fixes only, no new
+#: ``docs/adr/0002-native-single-strategy-engine.md``): bug fixes only, no new
 #: features, while phase M ports the still-needed behaviour into ``native``.
 #: ``lean`` covers the LEAN *run* path only — ``LeanAdapter.import_result``
 #: and the QC/LEAN importers stay supported as oracles.
@@ -100,7 +100,7 @@ def warn_if_engine_frozen(name: str, *, stacklevel: int = 2) -> None:
         return
     warnings.warn(
         f"Backtest engine {name!r} is frozen: {reason}. Bug fixes only, no "
-        "new features (issue #318; docs/adr/0001-native-single-strategy-engine.md).",
+        "new features (issue #318; docs/adr/0002-native-single-strategy-engine.md).",
         DeprecationWarning,
         stacklevel=stacklevel,
     )

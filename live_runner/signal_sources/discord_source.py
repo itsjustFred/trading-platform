@@ -1122,7 +1122,7 @@ def _report_parse_outcome(
         pass
 
 
-def _parse_trade_signal_from_message(
+def parse_trade_signal_from_message(
     message: Any,
     *,
     default_timeframe: str,
@@ -2043,7 +2043,7 @@ class DiscordSignalSource(BaseSignalSource):
         def _outcome_sink(reason: str, detail: str | None = None) -> None:
             refusals.append((reason, detail))
 
-        parsed = _parse_trade_signal_from_message(
+        parsed = parse_trade_signal_from_message(
             wrapped,
             default_timeframe=self.timeframe,
             trusted_author_ids=self.trusted_author_ids,
