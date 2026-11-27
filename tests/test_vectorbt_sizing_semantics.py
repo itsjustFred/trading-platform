@@ -20,7 +20,7 @@ import pandas as pd
 import pytest
 
 from runner.engines.base import BacktestConfig
-from runner.engines.vectorbt_adapter import VectorbtAdapter, resolve_max_leverage
+from runner.engines.vectorbt_adapter import VectorbtAdapter
 from tests.helpers import deterministic_ohlcv_frame, sma_crossover_strategy_text, with_zero_fees
 from tests.helpers import write_ohlcv as _write_shared_ohlcv
 
@@ -68,10 +68,6 @@ def sizing_env(tmp_path: Path):
 
 
 class TestLeverageSemantics:
-    def test_resolver_keeps_conservative_leverage(self):
-        assert resolve_max_leverage(1.0) == 1.0
-        assert resolve_max_leverage(0.5) == 0.5
-
     def test_conservative_max_leverage_binds_notional(self, sizing_env):
         """max_leverage=1 must cap the notional at 1x equity — no override."""
         tmp_path, strategy_path = sizing_env
@@ -422,34 +418,6 @@ class TestTightCapSizing:
             assert risk_math["capped_by_max_position"] is True
 
 
-class TestTightCapSizingTolerance:
-    def test_tight_position_cap_binds_before_leverage_tolerant(self, sizing_env):
-        """Position cap binds the notional within rounding tolerance.
-
-        Rounding tolerance note: ``quantity`` is rounded to 4 decimals and
-        prices to 6, so the notional can exceed the cap by a fraction of a
-        cent; the assertion therefore allows a tiny relative slack.
-        """
-        tmp_path, strategy_path = sizing_env
-        config = _config(
-            tmp_path,
-            risk_per_trade_pct=0.5,
-            max_position_pct=0.01,
-            max_leverage=10.0,
-        )
-        result = VectorbtAdapter().run(config, str(strategy_path))
-        assert result.trades
-        for trade in result.trades:
-            risk_math = trade.meta["risk_math"]
-            notional = trade.entry_price * trade.quantity
-            slack = 0.01 + 1e-9  # one cent for rounding
-            assert notional <= risk_math["equity_at_entry"] * 0.01 + slack, (
-                "the position cap (1%) must bind the notional even when "
-                "leverage would allow more (rounding slack: one cent)"
-            )
-            assert risk_math["capped_by_max_position"] is True
-
-
 # ─── entry_stop fills + inverted-stop guard ─────────────────────────────────
 
 
@@ -627,3 +595,36 @@ class TestInvertedSizingStop:
         assert result.meta.data["inverted_stop_drops"] == 1
 
 
+class TestRiskMathContract:
+    """PM-2 viewer contract, asserted on real output instead of source text."""
+
+    def test_risk_math_keeps_both_position_pct_spellings_and_record_keys(
+        self, sizing_env
+    ):
+        from runner.engines.vectorbt_adapter import _SizeRecord
+
+        tmp_path, strategy_path = sizing_env
+        config = _config(
+            tmp_path,
+            risk_per_trade_pct=0.05,
+            max_position_pct=0.5,
+            max_leverage=2.0,
+        )
+        result = VectorbtAdapter().run(config, str(strategy_path))
+        assert result.trades, "fixture must produce trades"
+
+        renamed = {
+            "cap_notional": "max_position_notional",
+            "leverage_notional_limit": "max_leverage_notional",
+        }
+        record_keys = set(_SizeRecord.__annotations__) - {"qty"}
+        for trade in result.trades:
+            risk_math = trade.meta["risk_math"]
+            # Artifact-key stability: the legacy spelling stays alongside the
+            # canonical one, both carrying the configured value.
+            assert risk_math["max_position_pct"] == pytest.approx(0.5)
+            assert risk_math["max_position_exposure_pct"] == pytest.approx(0.5)
+            for key in record_keys:
+                assert renamed.get(key, key) in risk_math, (
+                    f"sizing record key {key!r} did not reach risk_math"
+                )

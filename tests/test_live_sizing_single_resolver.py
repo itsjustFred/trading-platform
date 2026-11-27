@@ -184,12 +184,6 @@ def _at_entry(entry: float = 100.0):
 # ── single resolver: entry / SL / TP precedence ───────────────────────────────
 
 
-def test_daemon_has_no_own_level_lookup():
-    """Acceptance: daemon.py no longer carries its own SL/TP alias lookup."""
-    assert not hasattr(daemon, "_first_metadata_float")
-    assert daemon.resolve_live_levels is resolve_live_levels
-
-
 def test_daemon_sizes_from_metadata_entry_price_not_theoretical_price():
     """Regression (#125): the daemon sized off theoretical_price and ignored
     the metadata entry_price the shared resolver uses.

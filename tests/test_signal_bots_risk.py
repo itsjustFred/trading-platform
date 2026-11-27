@@ -38,18 +38,6 @@ def _risk_engine() -> RiskEngine:
     )
 
 
-def test_signal_processors_are_importable_with_process_signal() -> None:
-    processors = [
-        RamJetSignalProcessor({"ram_jet": {"candle_timeframe": "5Min"}}),
-        RocketFuelSignalProcessor(
-            {"rocket_fuel": {"candle_timeframe": "5Min", "variant": "longsonly"}}
-        ),
-        NitroSignalProcessor({"ram_jet": {"candle_timeframe": "5Min"}}),
-    ]
-    for processor in processors:
-        assert callable(getattr(processor, "process_signal", None))
-
-
 def test_signal_with_sl_sizes_from_stop_distance() -> None:
     engine = _risk_engine()
     processor = RamJetSignalProcessor({"ram_jet": {"atr_period": 14, "sl_multiplier": 2.0}})

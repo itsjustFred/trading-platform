@@ -192,6 +192,7 @@ def _save_signal_with_fill(database, *, deployment_id, symbol, action, qty):
             broker_order_id=f"order-{uuid.uuid4().hex[:8]}",
         )
     )
+    return signal_id
 
 
 def test_ledger_nets_only_this_deployments_fills(isolated_db) -> None:
@@ -1361,18 +1362,17 @@ def test_usable_qty_tolerance_is_bounded_to_one_whole_unit() -> None:
     assert usable_qty_tolerance(100.0) == DEFAULT_QTY_TOLERANCE
 
 
-def test_exit_metadata_uses_the_shared_exit_only_constant(monkeypatch) -> None:
-    import live_runner.exit_signals as exit_signals
+def test_exit_metadata_marks_the_exit_only_risk_sizing_mode() -> None:
+    """The persisted marker value is the contract the adapters key on.
+
+    ``risk_sizing_mode == "exit_only"`` is what the broker adapters read to
+    treat the order as a close rather than an entry; the constant it is spelled
+    with is an implementation detail."""
     from live_runner.exit_signals import ExitInstruction, exit_intent_metadata
 
     assert exit_intent_metadata(ExitInstruction(fraction=1.0, position_side=None))[
         "risk_sizing_mode"
     ] == "exit_only"
-    # The persisted marker follows the constant, not a second spelling.
-    monkeypatch.setattr(exit_signals, "EXIT_ONLY_RISK_SIZING_MODE", "sentinel_mode")
-    assert exit_intent_metadata(ExitInstruction(fraction=1.0, position_side=None))[
-        "risk_sizing_mode"
-    ] == "sentinel_mode"
 
 
 def test_ledgers_must_match_broker_pure() -> None:
@@ -1545,7 +1545,16 @@ def test_no_unfilled_previous_exit_never_asks_the_broker(monkeypatch) -> None:
     assert len(adapter.submitted) == 1
 
 
-def _save_exit_signal(database, *, deployment_id, symbol, qty, filled, broker_order_id="ord"):
+def _save_exit_signal(
+    database,
+    *,
+    deployment_id,
+    symbol,
+    qty,
+    filled,
+    broker_order_id="ord",
+    metadata_extra: dict | None = None,
+):
     signal = LiveSignal(
         id=uuid.uuid4(),
         deployment_id=deployment_id,
@@ -1560,6 +1569,7 @@ def _save_exit_signal(database, *, deployment_id, symbol, qty, filled, broker_or
             "qty": qty,
             "explicit_qty": qty,
             "broker_order_id": broker_order_id,
+            **(metadata_extra or {}),
         },
     )
     signal_id, created = database.save_live_signal(signal)
@@ -1956,23 +1966,60 @@ def test_once_the_other_deployments_exit_is_done_this_exit_is_capped_to_the_fres
     assert not _records_at(caplog, logging.WARNING, "previous exit")
 
 
-def test_the_guard_asks_for_the_account_but_not_for_this_deployment(monkeypatch) -> None:
-    import live_runner.daemon as daemon
+def test_own_working_exit_of_another_lot_is_not_a_reservation(isolated_db) -> None:
+    """Real DB end to end: this deployment's own working exit of lot A must
+    neither block nor reserve against the exit of lot B (#382).
 
+    Only *other* deployments' working exits are subtracted from the broker
+    position; the deployment's own exits are already inside its own ledger.
+    The account-level pending-exit query runs for real here, so a regression
+    that let this deployment's rows back into the reservation shows up as a
+    smaller close.
+    """
+    from tests.conftest import seed_live_deployments
+
+    database, _engine, _data_dir = isolated_db
     deployment = _deployment(allow_short=False)
-    _patch_ledger(monkeypatch, deployment, 10.0)
-    seen: list[tuple] = []
+    dep_id = str(deployment.id)
+    seed_live_deployments(
+        database, [dep_id], account_id=deployment.account_id
+    )
+    entry_a = _save_signal_with_fill(
+        database, deployment_id=dep_id, symbol="AAPL", action="buy", qty=2.0
+    )
+    entry_b = _save_signal_with_fill(
+        database, deployment_id=dep_id, symbol="AAPL", action="buy", qty=3.0
+    )
+    # This deployment's own exit of lot A: still working at the broker, and
+    # asking for more than the broker position minus lot B's residual - if it
+    # were counted as a reservation the exit of lot B would be cut to 1.
+    _save_exit_signal(
+        database,
+        deployment_id=dep_id,
+        symbol="AAPL",
+        qty=4.0,
+        filled=0.0,
+        broker_order_id="ord-own-lot-a",
+        metadata_extra={"exit_target_signal_id": entry_a},
+    )
 
-    def _account_unfilled(account_id, symbol, **kwargs):
-        seen.append((account_id, symbol, kwargs))
-        return []
+    trade_signal = dataclasses.replace(
+        _exit_trade_signal(),
+        metadata={
+            **_exit_trade_signal().metadata,
+            "exit_target_signal_id": entry_b,
+        },
+    )
+    adapter = _WorkingOrdersAdapter(
+        [{"symbol": "AAPL", "qty": 5.0}], {"ord-own-lot-a"}
+    )
 
-    monkeypatch.setattr(daemon, "list_account_unfilled_exit_orders", _account_unfilled)
-    _run_submit(_Adapter([{"symbol": "AAPL", "qty": 10.0}]), deployment, _exit_trade_signal())
+    _run_submit(adapter, deployment, trade_signal)
 
-    assert seen == [
-        (deployment.account_id, "AAPL", {"exclude_deployment_id": str(deployment.id)})
-    ]
+    assert len(adapter.submitted) == 1
+    signal, qty = adapter.submitted[0]
+    assert signal.metadata["exit_target_signal_id"] == entry_b
+    assert qty == pytest.approx(3.0)
 
 
 def test_concurrent_exits_of_two_deployments_are_sized_one_after_the_other(

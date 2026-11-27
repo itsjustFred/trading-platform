@@ -291,3 +291,87 @@ def test_run_reports_timeout_reason_not_kill_exit_code(
     assert "timed out after 0" in error_text, (
         f"failure reason must name the timeout budget, got: {error_text!r}"
     )
+
+
+def test_signal_replay_worker_marks_task_and_job_failed_on_error(
+    viewer_client, monkeypatch
+):
+    """An unexpected exception in ``_run_signal_replay`` must finalize the
+    task and job as failed, not leave them running forever (Cleanup 18-C)."""
+    import pandas as pd
+
+    import viewer.main as viewer_app_module
+
+    monkeypatch.setattr(
+        viewer_app_module, "_ensure_backtest_data_availability", lambda **_kwargs: []
+    )
+    monkeypatch.setattr(viewer_app_module, "_upsert_backtest_meta_cache", lambda _id: None)
+    monkeypatch.setattr(
+        viewer_app_module.legacy_viewer,
+        "_load_ohlcv_df",
+        lambda symbol, timeframe: pd.DataFrame(
+            {
+                "timestamp": [
+                    "2024-01-01T12:00:00+00:00",
+                    "2024-01-01T13:00:00+00:00",
+                    "2024-01-01T14:00:00+00:00",
+                ],
+                "open": [100.0, 101.0, 102.0],
+                "high": [101.0, 102.0, 103.0],
+                "low": [99.0, 100.0, 101.0],
+                "close": [100.5, 101.5, 102.5],
+                "volume": [1000, 1100, 1200],
+            }
+        ),
+    )
+
+    class _ReplayBoom(Exception):
+        pass
+
+    class _ExplodingSignalReplayAdapter:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def run(self, **kwargs):
+            raise _ReplayBoom("replay exploded")
+
+    monkeypatch.setattr(
+        viewer_app_module, "SignalReplayAdapter", _ExplodingSignalReplayAdapter
+    )
+
+    response = viewer_client.post(
+        "/api/backtests/run-signals",
+        json={
+            "signals": [
+                {
+                    "timestamp": "2024-01-01T12:00:00Z",
+                    "symbol": "AAPL",
+                    "action": "buy",
+                    "entry_price": 100.0,
+                    "stop_loss": 98.0,
+                    "take_profit": 104.0,
+                    "timeframe": "1h",
+                }
+            ],
+            "start_date": "2024-01-01",
+            "end_date": "2024-01-02",
+            "timeframe": "1h",
+            "auto_download": False,
+            "fees_zero": True,
+        },
+    )
+    assert response.status_code == 202
+    task_id = response.json()["task_id"]
+
+    task = viewer_app_module.DATA_TASKS[task_id]
+    thread = task.get("thread")
+    assert isinstance(thread, threading.Thread), f"task {task_id} has no worker thread"
+    thread.join(timeout=30)
+    assert not thread.is_alive(), "signal replay worker did not reach a terminal state"
+
+    task = viewer_app_module.DATA_TASKS[task_id]
+    assert task["status"] == "failed"
+    assert "replay exploded" in str(task.get("error") or "")
+    job = viewer_app_module._running_jobs.get(task_id)
+    assert job is not None, f"job record for {task_id} is gone"
+    assert job.get("status") == "failed"

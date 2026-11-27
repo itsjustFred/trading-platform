@@ -46,12 +46,6 @@ LEAN_FIXTURE = {
 }
 
 
-def test_lean_adapter_imports_cleanly():
-    import runner.engines.lean_adapter as module
-
-    assert hasattr(module, "LeanAdapter")
-
-
 def test_lean_adapter_imports_result_through_explicit_path(tmp_path):
     fixture = tmp_path / "lean_result.json"
     fixture.write_text(json.dumps(LEAN_FIXTURE), encoding="utf-8")

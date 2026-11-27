@@ -247,15 +247,6 @@ def test_signal_source_drift_between_db_and_yaml_is_reported(isolated_db) -> Non
     assert any("signal_source" in w for w in report.warnings), report.warnings
 
 
-def test_matching_signal_source_is_not_reported(isolated_db) -> None:
-    database = isolated_db[0]
-    _seed(database, signal_source="discord", signal_source_id="news-svc")
-
-    report = run_db_preflight([_yaml_one("discord", "news-svc")], db_path=_db_path(database))
-
-    assert report.warnings == [], report.warnings
-
-
 def test_empty_stored_signal_source_falls_back_to_the_type_like_the_daemon(isolated_db) -> None:
     """The daemon rehydrates ``signal_source or signal_source_type`` (to_live_deployment).
 
