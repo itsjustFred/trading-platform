@@ -109,6 +109,10 @@ def _child_override_names(environ: Mapping[str, str]) -> frozenset[str]:
 # above: ``load_accounts_env_values`` overlays ``os.environ`` under the accounts file, so a real
 # ``ALPACA_API_KEY`` in the shell would make a test pass for a reason CI cannot reproduce.
 _EXTERNAL_ENV_NAMES = {ACCOUNTS_ENV_ENV_VAR, "DATABASE_URL"}
+# Every broker, chat and monitoring family the platform integrates with. A new integration
+# adds its prefix here (and a name to the credential test) in the same change that reads it:
+# a var this tuple does not know survives the sweep and reaches tests, where a test could
+# then pass against a real account.
 _EXTERNAL_ENV_NAMESPACES = ("ALPACA_", "CTRADER_", "DISCORD_", "SENTRY_")
 _EXTERNAL_ENV_MARKERS = (
     "API_KEY",
@@ -262,8 +266,19 @@ _SANDBOX_ENV_ALLOWLIST_PREFIXES = (
     "PYTHONPYCACHEPREFIX",
     "PYTHONUTF8",
     "LC_",
-    "GITHUB_",
     "PYTEST_XDIST",
+    # The CI job's context, by name rather than by prefix: a prefix would re-admit a renamed
+    # token with it (a GITHUB_PAT spells like a credential to nobody), and the exact names
+    # are what the workflow-simulation tests and the workflow steps themselves read. A
+    # token-shaped name in that context is dropped by the credential sweep either way.
+    "GITHUB_REPOSITORY",
+    "GITHUB_SHA",
+    "GITHUB_REF",
+    "GITHUB_ENV",
+    "GITHUB_OUTPUT",
+    "GITHUB_STEP_SUMMARY",
+    "GITHUB_EVENT_NAME",
+    "GITHUB_EVENT_PATH",
 )
 # Where a sandboxed HOME points: inside the session sandbox, never the caller's home.
 SANDBOX_HOME = _SESSION_ROOT / "home"
@@ -1481,6 +1496,11 @@ def _track_shared_sandbox_children():
 
     real_popen = subprocess.Popen
 
+    #: ``env``'s position in Popen's signature, for a call that passes it positionally - the
+    #: static scan makes ``env=`` the keyword form at every call site, so this is belt and
+    #: braces rather than a shape the suite produces.
+    _POPEN_ENV_POSITION = 10
+
     class _RecordingPopen(real_popen):  # type: ignore[misc,valid-type]
         """The real ``Popen`` that remembers the children that share the sandbox.
 
@@ -1493,9 +1513,10 @@ def _track_shared_sandbox_children():
         def __init__(self, *args: object, **kwargs: object) -> None:
             super().__init__(*args, **kwargs)  # type: ignore[call-arg]
             env = kwargs.get("env")
-            if isinstance(env, dict) and env.get(CHILD_SANDBOX_ENV_VAR) == (
-                CHILD_SANDBOX_FLAG_VALUE
-            ):
+            if env is None and len(args) > _POPEN_ENV_POSITION:
+                env = args[_POPEN_ENV_POSITION]
+            getter = getattr(env, "get", None)
+            if callable(getter) and getter(CHILD_SANDBOX_ENV_VAR) == CHILD_SANDBOX_FLAG_VALUE:
                 _SHARED_CHILDREN.append(self)
 
     with pytest.MonkeyPatch.context() as patch:

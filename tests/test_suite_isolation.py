@@ -286,6 +286,38 @@ def test_the_suite_drops_an_inherited_accounts_env_override() -> None:
     assert os.environ["DATA_DIR"] == str(TEST_DATA_DIR)
 
 
+def test_the_credential_sweep_knows_every_integration_prefix() -> None:
+    """Every broker, chat and monitoring family the platform integrates with.
+
+    A var under a prefix this tuple does not know survives the sweep and reaches tests,
+    where a test could pass against a real account. The families are pinned here so a
+    removal fails loudly; a new integration adds its own in the same change that reads it.
+    """
+    assert set(suite_conftest._EXTERNAL_ENV_NAMESPACES) == {
+        "ALPACA_",
+        "CTRADER_",
+        "DISCORD_",
+        "SENTRY_",
+    }
+
+
+def test_no_allowlist_prefix_can_carry_a_renamed_token() -> None:
+    """The CI context is allowed by exact name, so a renamed token has no way in.
+
+    ``GITHUB_TOKEN`` is dropped by the credential sweep; a renamed token (``GITHUB_PAT``)
+    would not match its marker, so the prefix that would carry it is not allowed at all -
+    the allowed names are the context variables the tests and the workflow steps read.
+    """
+    for prefix in suite_conftest._SANDBOX_ENV_ALLOWLIST_PREFIXES:
+        assert not prefix.endswith("_") or prefix in ("LC_", "PYTEST_XDIST"), (
+            f"{prefix} is a prefix that could carry a renamed credential; allow by name"
+        )
+    assert "GITHUB_TOKEN" in suite_conftest._EXTERNAL_ENV_NAMES or (
+        suite_conftest._is_external_credential_env("GITHUB_TOKEN")
+    )
+    assert not suite_conftest._is_external_credential_env("GITHUB_REPOSITORY")
+
+
 @pytest.mark.parametrize(
     "name",
     [
