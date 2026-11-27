@@ -57,6 +57,7 @@ _SPAWN_CALLS = frozenset(
         ("os", "posix_spawnp"),
         # A pool is a set of processes, so it inherits the environment like one.
         ("multiprocessing", "Pool"),
+        ("pty", "fork"),
     }
 )
 
@@ -338,14 +339,15 @@ def test_the_scan_covers_the_other_process_launchers(tmp_path: Path) -> None:
         "    ProcessPoolExecutor(2)\n"
         "    joblib.Parallel(n_jobs=2)\n"
         "    os.fork()\n"
-        "def test_os_forkpty():\n"
-        "    os.forkpty()\n"
+        "    pty.fork()\n"
+        "def test_pty_fork():\n"
+        "    pty.fork()\n"
         "def test_ok():\n"
         "    subprocess.run(['git', 'status'], env=sandboxed_env())\n",
         encoding="utf-8",
     )
     offenders = _unsandboxed_spawn_calls(sample)
-    assert len(offenders) == 7, offenders
+    assert len(offenders) == 8, offenders
     assert all("test_sample.py:" in offender for offender in offenders)
 
 

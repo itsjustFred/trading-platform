@@ -46,7 +46,13 @@ _CASE_INSENSITIVE_FS = os.name == "nt" or sys.platform == "darwin"
 # directory (``TP_TEST_SESSION_ROOT``), so the child shares the sandbox instead of building a
 # second one - and never deletes the parent's on its way out, which an ``atexit`` rmtree of a
 # directory the parent is still using would do.
-_CHILD_PROCESS = os.environ.get("TP_TEST_CHILD_SANDBOX") == "1"
+# The marker a sandboxed child carries, and the one value it may hold. One spelling shared by
+# the builder (``sandboxed_env``), the reader (the child branch below), the generated shim and
+# the teardown guard: two spellings would mean a sharing child nobody records or guards.
+CHILD_SANDBOX_ENV_VAR = "TP_TEST_CHILD_SANDBOX"
+CHILD_SANDBOX_FLAG_VALUE = "1"
+
+_CHILD_PROCESS = os.environ.get(CHILD_SANDBOX_ENV_VAR) == CHILD_SANDBOX_FLAG_VALUE
 if _CHILD_PROCESS:
     _SESSION_ROOT = Path(os.environ["TP_TEST_SESSION_ROOT"]).resolve()
 else:
@@ -338,7 +344,7 @@ def sandboxed_env(*, shares_sandbox: bool = True, **overrides: str) -> dict[str,
     # checks, and the marker has no meaning in a process execnet did not start.
     for name in [name for name in env if name.startswith("PYTEST_XDIST")]:
         env.pop(name, None)
-    env["TP_TEST_CHILD_SANDBOX"] = "1"
+    env[CHILD_SANDBOX_ENV_VAR] = CHILD_SANDBOX_FLAG_VALUE
     env["TP_TEST_SESSION_ROOT"] = str(_SESSION_ROOT)
     env["TP_TEST_REPO_ROOT"] = str(PROJECT_ROOT)
     return env
@@ -360,7 +366,11 @@ def _write_child_sandbox_shim() -> None:
         "import os\n"
         "import sys\n"
         "\n"
-        'if os.environ.get("TP_TEST_CHILD_SANDBOX") == "1":\n'
+        'if os.environ.get("'
+        + CHILD_SANDBOX_ENV_VAR
+        + '") == "'
+        + CHILD_SANDBOX_FLAG_VALUE
+        + '":\n'
         "    _repo = os.environ['TP_TEST_REPO_ROOT']\n"
         "    _shim = os.path.dirname(os.path.abspath(__file__))\n"
         "    _path = os.path.join(_repo, 'tests', 'conftest.py')\n"
@@ -663,10 +673,13 @@ class _ChildAccountsEnvLoader:
     def exec_module(self, module: object) -> None:
         self._loader.exec_module(module)  # type: ignore[attr-defined]
         for name, value in list(vars(module).items()):  # type: ignore[arg-type]
-            if "ACCOUNTS_ENV" not in name or isinstance(value, (bool, int, float)):
+            if isinstance(value, (bool, int, float)):
                 continue
-            if _repo_secret_path(value) == REPO_ACCOUNTS_ENV:
+            resolved = _repo_secret_path(value)
+            if resolved == REPO_ACCOUNTS_ENV:
                 setattr(module, name, ISOLATED_ACCOUNTS_ENV)
+            elif resolved == REPO_ENV_FILE:
+                setattr(module, name, ISOLATED_DOTENV_FILE)
 
     def __getattr__(self, name: str) -> object:
         return getattr(self._loader, name)
@@ -1418,7 +1431,9 @@ def _track_shared_sandbox_children(monkeypatch: pytest.MonkeyPatch):
         def __init__(self, *args: object, **kwargs: object) -> None:
             super().__init__(*args, **kwargs)  # type: ignore[call-arg]
             env = kwargs.get("env")
-            if isinstance(env, dict) and env.get("TP_TEST_CHILD_SANDBOX") == "1":
+            if isinstance(env, dict) and env.get(CHILD_SANDBOX_ENV_VAR) == (
+                CHILD_SANDBOX_FLAG_VALUE
+            ):
                 _SHARED_CHILDREN.append(self)
 
     monkeypatch.setattr(subprocess, "Popen", _RecordingPopen)

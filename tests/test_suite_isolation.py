@@ -1312,6 +1312,35 @@ def test_a_self_sandboxing_child_keeps_the_overrides_it_named() -> None:
     )
 
 
+def test_a_child_guard_patches_by_value_not_by_name() -> None:
+    """The child's guard matches the path an attribute holds, not the attribute's name.
+
+    A future rename of the accounts-env constant to a name without ``ACCOUNTS_ENV`` in it
+    would slip past a name filter and leave that child resolving the checkout's real
+    credential path. The loader is exercised directly here, on a module-shaped object: the
+    patch pass is the same one a real import runs.
+    """
+    probe = types.ModuleType("probe")
+    probe.CREDENTIALS_FILE = REPO_ACCOUNTS_ENV
+    probe.REPO_DOTENV = REPO_ENV_FILE
+    probe.UNRELATED_PATH = REPO_ACCOUNTS_ENV.parent / "notes.txt"
+    probe.NOT_A_PATH = "some string"
+
+    class _NoopLoader:
+        def create_module(self, spec: object) -> object:
+            return None
+
+        def exec_module(self, module: object) -> None:
+            return None
+
+    suite_conftest._ChildAccountsEnvLoader(_NoopLoader()).exec_module(probe)
+
+    assert probe.CREDENTIALS_FILE == ISOLATED_ACCOUNTS_ENV
+    assert probe.REPO_DOTENV == ISOLATED_DOTENV_FILE
+    assert probe.UNRELATED_PATH == REPO_ACCOUNTS_ENV.parent / "notes.txt"
+    assert probe.NOT_A_PATH == "some string"
+
+
 def test_a_subprocess_refuses_the_network() -> None:
     """S16: the network guard covers a child too, or a call escapes the audit hook.
 
