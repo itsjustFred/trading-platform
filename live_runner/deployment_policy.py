@@ -40,8 +40,10 @@ RETIRED_DISCORD_SIGNAL_SOURCE = "discord"
 #: Signal sources the daemon has a signal-listener runner for. Empty since the
 #: Discord ingestion removal (maintainer decision 2026-11-26): ``internal`` is
 #: not a listener source - the internal strategy runner trades the deployments
-#: that opted in - and ``discord`` is retired. Every routing gate in the daemon
-#: and both preflights asks this set.
+#: that opted in, gated by ``internal_runner_untradeable_reason`` - and
+#: ``discord`` is retired. Every routing gate in the daemon and both preflights
+#: asks this set. ``internal`` must NEVER be added here: it is runner-gated,
+#: not a listener, and listing it would silence the untradeable-ACTIVE alert.
 TRADEABLE_SIGNAL_SOURCES: frozenset[str] = frozenset()
 
 #: The statuses a live deployment can hold. ``shared.models`` pins them on the

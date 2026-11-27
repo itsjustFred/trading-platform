@@ -16,6 +16,7 @@ from pathlib import Path
 from live_runner.deployment_policy import (
     DEFAULT_SIGNAL_SOURCE,
     KNOWN_SIGNAL_SOURCES,
+    RETIRED_DISCORD_SIGNAL_SOURCE,
     TRADEABLE_SIGNAL_SOURCES,
     normalize_deployment_status,
     normalize_signal_source,
@@ -61,6 +62,12 @@ def test_the_recognised_vocabulary_contains_the_default_and_the_retired_source()
     assert TRADEABLE_SIGNAL_SOURCES <= KNOWN_SIGNAL_SOURCES
     assert DEFAULT_SIGNAL_SOURCE in KNOWN_SIGNAL_SOURCES
     assert DEFAULT_SIGNAL_SOURCE not in TRADEABLE_SIGNAL_SOURCES
+    # The recognised set is derived, not a second literal: a future tradeable
+    # source lands in KNOWN automatically instead of being refused at load.
+    assert KNOWN_SIGNAL_SOURCES == (
+        TRADEABLE_SIGNAL_SOURCES
+        | {DEFAULT_SIGNAL_SOURCE, RETIRED_DISCORD_SIGNAL_SOURCE}
+    )
 
 
 def test_retired_discord_reason_names_the_retirement() -> None:
