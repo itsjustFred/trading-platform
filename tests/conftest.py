@@ -254,31 +254,36 @@ _SANDBOX_ENV_ALLOWLIST = frozenset(
         "windir",
     }
 )
-#: ``PYTHONHOME``/``PYTHONEXECUTABLE`` change which interpreter a child runs, so the broad
-#: ``PYTHON`` prefix is not used: the suite's own switches are named instead (the golden run
-#: sets each of them per child, and a child that needs another one names it as an override).
-_SANDBOX_ENV_ALLOWLIST_PREFIXES = (
-    "PYTHONPATH",
-    "PYTHONDONTWRITEBYTECODE",
-    "PYTHONHASHSEED",
-    "PYTHONIOENCODING",
-    "PYTHONNOUSERSITE",
-    "PYTHONPYCACHEPREFIX",
-    "PYTHONUTF8",
-    "LC_",
-    "PYTEST_XDIST",
-    # The CI job's context, by name rather than by prefix: a prefix would re-admit a renamed
-    # token with it (a GITHUB_PAT spells like a credential to nobody), and the exact names
-    # are what the workflow-simulation tests and the workflow steps themselves read. A
-    # token-shaped name in that context is dropped by the credential sweep either way.
-    "GITHUB_REPOSITORY",
-    "GITHUB_SHA",
-    "GITHUB_REF",
-    "GITHUB_ENV",
-    "GITHUB_OUTPUT",
-    "GITHUB_STEP_SUMMARY",
-    "GITHUB_EVENT_NAME",
-    "GITHUB_EVENT_PATH",
+#: True prefixes - only these may be matched with ``startswith``, because a prefix is what
+#: carries a family of names into the suite.
+_SANDBOX_ENV_ALLOWLIST_PREFIXES = ("LC_", "PYTEST_XDIST")
+#: Exact names the suite keeps. ``PYTHONHOME``/``PYTHONEXECUTABLE`` change which interpreter a
+#: child runs, so the broad ``PYTHON`` prefix is not used: the suite's own switches are named
+#: instead (the golden run sets each of them per child, and a child that needs another one
+#: names it as an override). The CI job's context is named for the same reason a prefix is
+#: not: a prefix would re-admit a renamed token with it (a ``GITHUB_PAT`` spells like a
+#: credential to nobody), and these are exactly the variables the workflow-simulation tests
+#: and the workflow steps read.
+_SANDBOX_ENV_ALLOWLIST_NAMES = frozenset(
+    {
+        "PYTHONPATH",
+        "PYTHONDONTWRITEBYTECODE",
+        "PYTHONHASHSEED",
+        "PYTHONIOENCODING",
+        "PYTHONNOUSERSITE",
+        "PYTHONPYCACHEPREFIX",
+        "PYTHONUTF8",
+        # The CI job's context: a token-shaped name in it is dropped by the sweep and again
+        # by the builder (see the credential-variable child pin in test_suite_isolation).
+        "GITHUB_REPOSITORY",
+        "GITHUB_SHA",
+        "GITHUB_REF",
+        "GITHUB_ENV",
+        "GITHUB_OUTPUT",
+        "GITHUB_STEP_SUMMARY",
+        "GITHUB_EVENT_NAME",
+        "GITHUB_EVENT_PATH",
+    }
 )
 # Where a sandboxed HOME points: inside the session sandbox, never the caller's home.
 SANDBOX_HOME = _SESSION_ROOT / "home"
@@ -287,7 +292,11 @@ SANDBOX_HOME = _SESSION_ROOT / "home"
 
 def _is_allowlisted_env(name: str) -> bool:
     """Whether *name* is part of the environment the suite may observe."""
-    if name in _SANDBOX_ENV_ALLOWLIST or name.startswith(_SANDBOX_ENV_ALLOWLIST_PREFIXES):
+    if (
+        name in _SANDBOX_ENV_ALLOWLIST
+        or name in _SANDBOX_ENV_ALLOWLIST_NAMES
+        or name.startswith(_SANDBOX_ENV_ALLOWLIST_PREFIXES)
+    ):
         return True
     if name == CHILD_ENV_OVERRIDES_ENV_VAR:
         return True

@@ -308,10 +308,11 @@ def test_no_allowlist_prefix_can_carry_a_renamed_token() -> None:
     would not match its marker, so the prefix that would carry it is not allowed at all -
     the allowed names are the context variables the tests and the workflow steps read.
     """
-    for prefix in suite_conftest._SANDBOX_ENV_ALLOWLIST_PREFIXES:
-        assert not prefix.endswith("_") or prefix in ("LC_", "PYTEST_XDIST"), (
-            f"{prefix} is a prefix that could carry a renamed credential; allow by name"
-        )
+    # Only the two true prefixes may be prefix-matched at all: every other allowed name is
+    # matched exactly, so GITHUB_REPOSITORY_EXTRA cannot ride in on GITHUB_REPOSITORY's stem.
+    assert set(suite_conftest._SANDBOX_ENV_ALLOWLIST_PREFIXES) == {"LC_", "PYTEST_XDIST"}
+    assert not suite_conftest._is_allowlisted_env("GITHUB_REPOSITORY_EXTRA")
+    assert suite_conftest._is_allowlisted_env("GITHUB_REPOSITORY")
     assert "GITHUB_TOKEN" in suite_conftest._EXTERNAL_ENV_NAMES or (
         suite_conftest._is_external_credential_env("GITHUB_TOKEN")
     )

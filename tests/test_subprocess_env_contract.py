@@ -111,7 +111,46 @@ def _dotted_call_name(node: ast.Call) -> str:
     return ".".join(parts)
 
 
-def _starts_a_process(node: ast.Call) -> bool:
+def _dotted_target_of(expression: ast.AST, tree: ast.Module) -> str | None:
+    """The dotted name *expression* stands for, or ``None`` when it stands for nothing known.
+
+    ``run = subprocess.run`` binds a name to the function; ``from subprocess import run as r``
+    binds it to the import. Both make the call's target a bare name, and a bare name matches
+    no launcher list - so the name is resolved here instead of being waved through.
+    """
+    for candidate in (expression, _resolve_name_target(expression, tree)):
+        if candidate is None:
+            continue
+        if isinstance(candidate, ast.Attribute):
+            parts: list[str] = []
+            current: ast.AST = candidate
+            while isinstance(current, ast.Attribute):
+                parts.append(current.attr)
+                current = current.value
+            if isinstance(current, ast.Name):
+                parts.append(current.id)
+                parts.reverse()
+                return ".".join(parts)
+        if isinstance(candidate, ast.ImportFrom) and candidate.module:
+            for alias in candidate.names:
+                if alias.asname and alias.asname == getattr(expression, "id", None):
+                    return f"{candidate.module}.{alias.name}"
+        if isinstance(candidate, ast.Import):
+            for alias in candidate.names:
+                bound = alias.asname or alias.name.split(".")[0]
+                if bound == getattr(expression, "id", None):
+                    return alias.name
+    return None
+
+
+def _resolve_name_target(expression: ast.AST, tree: ast.Module) -> ast.AST | None:
+    """The value a bare call target is bound to, in the scope that reads it."""
+    if isinstance(expression, ast.Name):
+        return _resolve_name(expression.id, expression, tree)
+    return None
+
+
+def _starts_a_process(node: ast.Call, tree: ast.Module | None = None) -> bool:
     """Whether one call starts a process, by anything the scan can name.
 
     Fail closed where a name can say so: a launcher whose final call name contains
@@ -129,21 +168,42 @@ def _starts_a_process(node: ast.Call) -> bool:
     name = parts[-1].lower()
     if "fork" in name or "spawn" in name:
         return True
-    return parts[-1] in _LAUNCHER_ATTR_NAMES
+    if parts[-1] in _LAUNCHER_ATTR_NAMES:
+        return True
+    # A bare name is not a launcher on its own - unless the name reads as an alias of one.
+    aliased = _dotted_target_of(node.func, tree) if len(parts) == 1 else None
+    if aliased is None:
+        return False
+    alias_parts = aliased.split(".")
+    if len(alias_parts) >= 2 and (alias_parts[-2], alias_parts[-1]) in _SPAWN_CALLS:
+        return True
+    return alias_parts[-1] in _ASYNCIO_SPAWN_TAILS or alias_parts[-1] in _LAUNCHER_ATTR_NAMES
+
+
+@lru_cache(maxsize=None)
+def _parent_map(tree: ast.Module) -> dict[int, ast.AST]:
+    """Child node -> its parent, for one file's AST."""
+    parents: dict[int, ast.AST] = {}
+    for parent in ast.walk(tree):
+        for child in ast.iter_child_nodes(parent):
+            parents[id(child)] = parent
+    return parents
 
 
 def _scope_of(node: ast.AST, tree: ast.Module) -> ast.AST:
     """The innermost function, class or module whose body *node* is part of."""
     scope = tree
-    for parent in ast.walk(tree):
+    current = node
+    while True:
+        parent = _parent_map(tree).get(id(current))
+        if parent is None:
+            return scope
         if isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            if parent is not node and any(child is node for child in ast.walk(parent)):
-                if parent.lineno >= getattr(scope, "lineno", 0) or scope is tree:
-                    if parent.lineno >= getattr(scope, "lineno", 0):
-                        scope = parent
-    return scope
+            scope = parent
+        current = parent
 
 
+@lru_cache(maxsize=None)
 def _names_defined_in_scope(scope: ast.AST) -> dict[str, ast.AST]:
     """Every name *scope* binds, mapped to the value it binds.
 
@@ -353,7 +413,7 @@ def _unsandboxed_spawn_calls(path: Path) -> list[str]:
         f"{_display_path(path)}:{node.lineno}: {_dotted_call_name(node)}"
         for node in ast.walk(tree)
         if isinstance(node, ast.Call)
-        and _starts_a_process(node)
+        and _starts_a_process(node, tree)
         and not _spawn_call_is_sandboxed(node, tree, source_lines)
     ]
 
@@ -494,15 +554,6 @@ def test_the_scan_follows_a_helper_reached_through_a_module_import(tmp_path: Pat
     """
     sample = tmp_path / "test_sample.py"
     sample.write_text(
-        "import subprocess\n"
-        "import tests.conftest as tc\n"
-        "def test_spawns():\n"
-        "    subprocess.run(['git', 'status'], env=tc.sandboxed_env())\n"
-        "def test_through_a_helper():\n"
-        "    subprocess.run(['git', 'status'], env={**os.environ, 'X': '1'})\n",
-        encoding="utf-8",
-    )
-    sample.write_text(
         "import os\n"
         "import subprocess\n"
         "import tests.conftest as tc\n"
@@ -535,6 +586,38 @@ def test_the_scan_fails_closed_on_a_launcher_it_does_not_know(tmp_path: Path) ->
     offenders = _unsandboxed_spawn_calls(sample)
     assert len(offenders) == 2, offenders
     assert all("test_sample.py:" in offender for offender in offenders)
+
+
+def test_the_scan_follows_a_spawn_call_through_an_alias(tmp_path: Path) -> None:
+    """``run = subprocess.run`` aliases a launcher, and the call target is the bare name.
+
+    The alias hides the launcher from the dotted-name match, so the scan resolves the name
+    through its binding before deciding: an alias of a launcher is a launcher, and it owes
+    the child the sandboxed environment like any other.
+    """
+    sample = tmp_path / "test_sample.py"
+    sample.write_text(
+        "import os\n"
+        "import subprocess\n"
+        "from subprocess import run as r\n"
+        "from tests.conftest import sandboxed_env\n"
+        "def test_aliased_ok():\n"
+        "    run = subprocess.run\n"
+        "    run(['git', 'status'], env=sandboxed_env())\n"
+        "def test_aliased_hand_rolled():\n"
+        "    other = subprocess.run\n"
+        "    other(['git', 'status'], env={**os.environ, 'X': '1'})\n"
+        "def test_import_alias_ok():\n"
+        "    r(['git', 'status'], env=sandboxed_env())\n"
+        "def test_import_alias_flagged():\n"
+        "    r(['git', 'status'])\n",
+        encoding="utf-8",
+    )
+    offenders = _unsandboxed_spawn_calls(sample)
+    assert [line for line in offenders if ":" in line] == [
+        f"{_display_path(sample)}:10: other",
+        f"{_display_path(sample)}:14: r",
+    ]
 
 
 def test_a_bare_marker_is_not_an_exception(tmp_path: Path) -> None:

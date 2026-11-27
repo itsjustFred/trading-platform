@@ -271,8 +271,12 @@ def test_run_reports_timeout_reason_not_kill_exit_code(
                 stderr=subprocess.STDOUT,
                 text=True,
                 bufsize=1,
+                env=sandboxed_env(),
             )
-        return real_popen(cmd, *args, **kwargs)
+        # The pass-through hands the child whatever environment the calling production path
+        # chose (the backtest runner passes sandboxed_env()); the task-evidence git probe is
+        # the other caller, and it inherits this process's already-swept one.
+        return real_popen(cmd, *args, **kwargs)  # sandbox-env: caller's kwargs; see above
 
     monkeypatch.setattr(viewer_app_module.subprocess, "Popen", fake_popen)
 
