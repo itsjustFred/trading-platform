@@ -71,6 +71,11 @@ ISOLATED_DOTENV_FILE = _SESSION_ROOT / ".env"
 # scrubbed anyway: a variable that points at the checkout's secrets has no business being set for
 # a test, and keeping it out means a reintroduced reader cannot be fed by the shell.
 ACCOUNTS_ENV_ENV_VAR = "TP_ACCOUNTS_ENV"
+# The names ``sandboxed_env()`` applied as overrides for one child, so the child's own
+# sweeps - the allowlist one and the credential one - keep what the parent chose for it.
+# Without the handoff a ``JFOREX_JARS`` or ``TP_REPO_ROOT`` a test passed to its child would
+# be deleted by the very guard meant to protect that child.
+CHILD_ENV_OVERRIDES_ENV_VAR = "TP_TEST_CHILD_ENV"
 # Exported broker, Discord, Sentry and database configuration is as much a leak as the files
 # above: ``load_accounts_env_values`` overlays ``os.environ`` under the accounts file, so a real
 # ``ALPACA_API_KEY`` in the shell would make a test pass for a reason CI cannot reproduce.
@@ -96,7 +101,17 @@ def _is_external_credential_env(name: str) -> bool:
 
 
 def _clear_external_credential_env() -> None:
+    """Drop the caller's credential-shaped variables, keeping the ones a parent named.
+
+    A parent that handed a child a variable it chose (``sandboxed_env`` records those names
+    in ``TP_TEST_CHILD_ENV``) is not the developer the sweep exists to keep out: a dummy
+    ``SENTRY_RELEASE``, a ``NVIDIA_API_KEY`` the redaction test plants or a ``JFOREX_JARS``
+    fixture path is exactly what that child is meant to see.
+    """
+    inherited = os.environ.get(CHILD_ENV_OVERRIDES_ENV_VAR, "").split(",")
     for name in [name for name in os.environ if _is_external_credential_env(name)]:
+        if name in inherited:
+            continue
         os.environ.pop(name, None)
 
 
@@ -203,12 +218,6 @@ _SANDBOX_ENV_ALLOWLIST_PREFIXES = ("PYTHON", "LC_", "GITHUB_", "PYTEST_XDIST")
 SANDBOX_HOME = _SESSION_ROOT / "home"
 
 
-#: The names ``sandboxed_env()`` applied as overrides for one child, so the child's own
-#: sweep (which runs when the child imports this file) keeps what the parent chose for it.
-#: Without the handoff a ``JFOREX_JARS`` or ``TP_REPO_ROOT`` a test passed to its child would be
-#: deleted by the very guard meant to protect that child.
-CHILD_ENV_OVERRIDES_ENV_VAR = "TP_TEST_CHILD_ENV"
-
 
 def _is_allowlisted_env(name: str) -> bool:
     """Whether *name* is part of the environment the suite may observe."""
@@ -293,13 +302,17 @@ def sandboxed_env(*, shares_sandbox: bool = True, **overrides: str) -> dict[str,
     else:
         env.pop("USERPROFILE", None)
     caller_pythonpath = overrides.pop("PYTHONPATH", None)
-    pythonpath = [str(PROJECT_ROOT)]
+    pythonpath: list[str] = []
     if shares_sandbox:
-        # The shim first: sitecustomize is the first one found on sys.path, and the caller's
-        # own path (a foreign tree in the import-origin probe) still shadows the repo's.
-        pythonpath.insert(0, str(CHILD_SANDBOX_SHIM_DIR))
+        # The shim goes first, always: ``sitecustomize`` is the first one Python finds on
+        # sys.path, and a caller-provided one (a fixture tree, or a stray file in a tree a
+        # test happens to pass) must not be able to pre-empt the guard this child starts with.
+        pythonpath.append(str(CHILD_SANDBOX_SHIM_DIR))
     if caller_pythonpath:
-        pythonpath.insert(0, caller_pythonpath)
+        # The caller's own path next, so it still shadows the checkout's packages - the
+        # import-origin probe depends on that - but not the shim.
+        pythonpath.extend(part for part in caller_pythonpath.split(os.pathsep) if part)
+    pythonpath.append(str(PROJECT_ROOT))
     env["PYTHONPATH"] = os.pathsep.join(pythonpath)
     env.update(overrides)
     if not shares_sandbox:
@@ -338,12 +351,30 @@ def _write_child_sandbox_shim() -> None:
         "import sys\n"
         "\n"
         'if os.environ.get("TP_TEST_CHILD_SANDBOX") == "1":\n'
-        "    _path = os.path.join(os.environ['TP_TEST_REPO_ROOT'], 'tests', 'conftest.py')\n"
+        "    _repo = os.environ['TP_TEST_REPO_ROOT']\n"
+        "    _shim = os.path.dirname(os.path.abspath(__file__))\n"
+        "    _path = os.path.join(_repo, 'tests', 'conftest.py')\n"
         "    _spec = importlib.util.spec_from_file_location('tp_test_conftest', _path)\n"
         "    _module = importlib.util.module_from_spec(_spec)\n"
         "    sys.modules['tp_test_conftest'] = _module\n"
         "    sys.modules['tests.conftest'] = _module\n"
-        "    _spec.loader.exec_module(_module)\n",
+        "    _spec.loader.exec_module(_module)\n"
+        "    # A caller-provided sitecustomize runs after the guard, never before it: this file\n"
+        "    # is first on the child's PYTHONPATH so a stray one cannot pre-empt the audit\n"
+        "    # hook, the .env redirect or the accounts-env guard. The first caller entry that\n"
+        "    # holds one gets it run here, which is the one Python itself would have imported.\n"
+        "    for _entry in os.environ.get('PYTHONPATH', '').split(os.pathsep):\n"
+        "        if _entry in (_shim, _repo):\n"
+        "            continue\n"
+        "        _candidate = os.path.join(_entry, 'sitecustomize.py')\n"
+        "        if os.path.isfile(_candidate):\n"
+        "            _spec = importlib.util.spec_from_file_location(\n"
+        "                'caller_sitecustomize', _candidate\n"
+        "            )\n"
+        "            _module = importlib.util.module_from_spec(_spec)\n"
+        "            sys.modules['caller_sitecustomize'] = _module\n"
+        "            _spec.loader.exec_module(_module)\n"
+        "            break\n",
         encoding="utf-8",
     )
 
@@ -646,12 +677,28 @@ class _ChildAccountsEnvFinder:
     checkout are wrapped, so stdlib and site-packages imports keep their own loaders.
     """
 
-    #: Both spellings of the checkout root, because a module's origin is spelled the way the
-    #: path entry it was found through was: a symlinked checkout would be rejected by one of
-    #: them, and an unwrapped module is a leak the audit hook only catches on open.
+    #: The checkout root, spelled the way the path entries a child imports through are. The
+    #: resolved spelling is what the sandbox builds its PYTHONPATH from, so it hits on the
+    #: fast path in every ordinary child.
     _REPO_PREFIXES = tuple(
         str(root) + os.sep for root in (PROJECT_ROOT, Path(__file__).parent.parent)
     )
+
+    def _is_repo_file(self, origin: str) -> bool:
+        """Whether *origin* is a file inside this checkout, by any spelling of the root.
+
+        A child can reach the checkout through a path the prefixes do not match - a symlink,
+        an editable install, a path with a redundant component - and an unwrapped module is a
+        leak the audit hook only catches on open. The prefix check is the fast path for the
+        ordinary spelling; anything else is resolved, which is a handful of stat calls per
+        module the ordinary spelling never pays for.
+        """
+        if origin.startswith(self._REPO_PREFIXES):
+            return True
+        try:
+            return Path(origin).resolve().is_relative_to(PROJECT_ROOT)
+        except (OSError, ValueError):
+            return False
 
     def find_spec(self, fullname: str, path: object = None, target: object = None) -> object:
         for finder in sys.meta_path:
@@ -665,7 +712,7 @@ class _ChildAccountsEnvFinder:
                 origin
                 and spec.loader is not None
                 and hasattr(spec.loader, "exec_module")
-                and str(origin).startswith(self._REPO_PREFIXES)
+                and self._is_repo_file(str(origin))
             ):
                 spec.loader = _ChildAccountsEnvLoader(spec.loader)
             return spec

@@ -1107,6 +1107,116 @@ def test_a_subprocess_does_not_load_the_repo_dotenv() -> None:
     )
 
 
+def test_a_caller_sitecustomize_runs_after_the_guard(tmp_path: Path) -> None:
+    """A caller-provided ``sitecustomize`` runs, but never before the child's guard.
+
+    The shim is first on the child's PYTHONPATH so a stray one cannot pre-empt the audit
+    hook, the ``.env`` redirect or the accounts-env guard; a caller that provides one on
+    purpose (the golden run's fixture tree) still gets it, run after the guard is installed.
+    """
+    from tests.conftest import sandboxed_env
+
+    tree = tmp_path / "caller-tree"
+    tree.mkdir()
+    (tree / "sitecustomize.py").write_text(
+        "print('CALLER-SITECUSTOMIZE-RAN')\n",
+        encoding="utf-8",
+    )
+    body = (
+        "import dotenv\n"
+        "print('LOADER', dotenv.load_dotenv.__name__)\n"
+        "import shared.constants\n"
+        "print('IMPORTED', bool(shared.constants.DATA_DIR))\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", body],
+        cwd=str(_PROJECT_ROOT),
+        env=sandboxed_env(PYTHONPATH=str(tree)),
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "CALLER-SITECUSTOMIZE-RAN" in result.stdout, (
+        "a caller sitecustomize did not run in the sandboxed child: "
+        + result.stdout
+        + result.stderr
+    )
+    assert "LOADER _redirected_load_dotenv" in result.stdout, (
+        "a caller sitecustomize ran before the guard: " + result.stdout + result.stderr
+    )
+    assert "IMPORTED True" in result.stdout, result.stdout + result.stderr
+
+
+def test_a_child_keeps_the_overrides_its_parent_named() -> None:
+    """The child's own sweeps keep what the naming parent handed it.
+
+    ``SENTRY_*`` is credential-shaped, so the child's credential sweep drops it - and a
+    ``SENTRY_RELEASE`` a test names for its child (the golden run does) is the test's own
+    fixture value, not a developer's credential. A sweep that dropped it sent the child
+    into git detection to find a release, which is a subprocess the child's own guards
+    then refuse.
+    """
+    from tests.conftest import sandboxed_env
+
+    os.environ["SENTRY_DSN"] = "dummy-not-a-real-dsn"
+    try:
+        child_env = sandboxed_env(SENTRY_RELEASE="golden-fixture-release")
+    finally:
+        os.environ.pop("SENTRY_DSN", None)
+    # The unnamed one never reaches the child at all: the parent-side construction is the
+    # first sweep, and this is the variable the credential guard exists for.
+    assert "SENTRY_DSN" not in child_env
+
+    body = "import os\nprint('RELEASE', os.environ.get('SENTRY_RELEASE'))\n"
+    result = subprocess.run(
+        [sys.executable, "-c", body],
+        cwd=str(_PROJECT_ROOT),
+        env=child_env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "RELEASE golden-fixture-release" in result.stdout, (
+        "a child dropped an override its parent named: " + result.stdout + result.stderr
+    )
+
+
+def test_a_child_guard_covers_the_checkout_through_any_spelling(tmp_path: Path) -> None:
+    """The child's wrap follows the file, not the spelling of the path it was found through.
+
+    A child reaches the checkout through whatever path entry its PYTHONPATH names - a
+    symlink to the repo, an editable install - and a prefix comparison alone would miss
+    those, leaving a module's accounts-env constant resolved against the checkout.
+    """
+    from tests.conftest import sandboxed_env
+
+    link = tmp_path / "checkout-link"
+    link.symlink_to(_PROJECT_ROOT, target_is_directory=True)
+    expected = suite_conftest._ChildAccountsEnvLoader.__name__
+    body = (
+        "import shared.constants\n"
+        "print('LOADER', type(shared.constants.__loader__).__name__)\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", body],
+        cwd=str(_PROJECT_ROOT),
+        env=sandboxed_env(PYTHONPATH=str(link)),
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert f"LOADER {expected}" in result.stdout, (
+        f"a child importing through a symlinked checkout root was not guarded: "
+        f"{result.stdout}{result.stderr}"
+    )
+
+
 def test_a_subprocess_refuses_the_network() -> None:
     """S16: the network guard covers a child too, or a call escapes the audit hook.
 
