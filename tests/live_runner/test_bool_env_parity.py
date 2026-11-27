@@ -378,7 +378,9 @@ def _boolean_vocabulary_sites() -> set[str]:
     """
 
     found: set[str] = set()
-    for path in sorted(LIVE_RUNNER_DIR.glob("*.py")):
+    # rglob, not glob: the signal_sources subpackage carries its own modules,
+    # and a copy hidden there must fail the scan as surely as one at the top.
+    for path in sorted(LIVE_RUNNER_DIR.rglob("*.py")):
         if path.name.startswith("test_"):
             continue
         tree = ast.parse(path.read_text(encoding="utf-8"))
