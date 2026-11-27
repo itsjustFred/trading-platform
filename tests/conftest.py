@@ -142,6 +142,18 @@ def _is_external_credential_env(name: str) -> bool:
     )
 
 
+def _is_secret_shaped_name(name: str) -> bool:
+    """Whether *name* spells a secret itself - a key, a token, a password, a DSN.
+
+    A namespace prefix (``ALPACA_``, ``SENTRY_``) means the credential sweep clears that
+    broker's whole configuration, but not every name in the family is a secret:
+    ``SENTRY_ENABLED`` is a switch and ``ALPACA_INTRADAY_START`` a date. The override gate
+    asks this narrower question, so a deliberate fixture value in such a family does not have
+    to argue its way through.
+    """
+    return name in _EXTERNAL_ENV_NAMES or any(marker in name for marker in _EXTERNAL_ENV_MARKERS)
+
+
 def _clear_external_credential_env() -> None:
     """Drop the caller's credential-shaped variables, keeping the ones a parent named.
 
@@ -346,7 +358,9 @@ SANDBOX_HOME.mkdir(parents=True, exist_ok=True)
 CHILD_SANDBOX_SHIM_DIR = _SESSION_ROOT / "child-sandbox"
 
 
-def sandboxed_env(*, shares_sandbox: bool = True, **overrides: str) -> dict[str, str]:
+def sandboxed_env(
+    *, shares_sandbox: bool = True, credential_override_reason: str = "", **overrides: str
+) -> dict[str, str]:
     """The environment a subprocess a test starts must be handed.
 
     A child inherits this process's environment but none of its guards: the audit
@@ -415,6 +429,17 @@ def sandboxed_env(*, shares_sandbox: bool = True, **overrides: str) -> dict[str,
     pythonpath.append(str(PROJECT_ROOT))
     env["PYTHONPATH"] = os.pathsep.join(pythonpath)
     env.update(overrides)
+    planted = sorted(name for name in overrides if _is_secret_shaped_name(name))
+    if planted and not credential_override_reason.strip():
+        # A credential-shaped value named for a child is the shape a leaked real credential
+        # would take, so it is allowed only with the reason it is a fixture - the same bargain
+        # the documented-exception marker makes in the static scan, and a reviewer reads the
+        # reason against the value.
+        raise AssertionError(
+            f"sandboxed_env() was asked to hand a child a credential-shaped variable "
+            f"({', '.join(planted)}): pass credential_override_reason= saying why that value "
+            "is a fixture and not a real credential"
+        )
     # Named, not just applied: a sharing child imports this file through the shim and a
     # self-sandboxing one through pytest, and both sweeps must keep the variables the
     # naming test meant the child to see. A child that starts its own child adds to the

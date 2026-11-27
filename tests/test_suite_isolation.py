@@ -1325,7 +1325,123 @@ def test_the_documented_test_opt_ins_are_on_the_allowlist() -> None:
         )
 
 
-def test_the_audit_hook_refuses_a_secret_file_opened_through_os_open() -> None:
+def test_a_credential_shaped_override_needs_its_reason() -> None:
+    """A credential-shaped override is the shape a leaked real credential would take.
+
+    The redaction tests plant a dummy key in a child on purpose; anything else handing a
+    child a credential-shaped variable has to say why in the same call, so the exception is
+    a reviewed one and not a convenience.
+    """
+    from tests.conftest import sandboxed_env
+
+    with pytest.raises(AssertionError, match="credential_override_reason"):
+        sandboxed_env(ALPACA_API_KEY="not-a-real-key")
+    named = sandboxed_env(
+        ALPACA_API_KEY="not-a-real-key",
+        credential_override_reason="the leak-guard's own fixture key",
+    )
+    assert named["ALPACA_API_KEY"] == "not-a-real-key"
+
+
+def test_every_environment_variable_production_reads_is_accounted_for() -> None:
+    """Every env var the platform reads is swept, allowed, or named with its reason.
+
+    A variable that reaches production code reaches every test too. The three ways it can be
+    accounted for: the credential sweep clears it, the allowlist keeps it (the documented
+    opt-ins and the platform's own paths), or it is on this accepted list with the reason it
+    is safe to let through. A new reader adds a name here, and that is where the decision is
+    made deliberately rather than by finding out a test silently saw nothing.
+
+    Read from source, not from the environment: the point is the names production *can* read.
+    """
+    import re
+
+    readers: dict[str, str] = {}
+    pattern = re.compile(
+        r"(?:os\.environ\.get\(\s*|os\.getenv\(\s*|os\.environ\[\s*)"
+        r"([\"\'])([A-Za-z_][A-Za-z0-9_]*)\2"
+    )
+    packages = (
+        "data_tools",
+        "live_runner",
+        "risk",
+        "runner",
+        "scheduler",
+        "scripts",
+        "shared",
+        "signal_bots",
+        "validation",
+        "viewer",
+    )
+    for package in packages:
+        for path in sorted((_PROJECT_ROOT / package).rglob("*.py")):
+            if "__pycache__" in path.parts:
+                continue
+            source = path.read_text(encoding="utf-8")
+            for match in pattern.finditer(source):
+                readers.setdefault(match.group(3), f"{package}/{path.name}")
+    unaccounted = sorted(
+        f"{name} ({readers[name]})"
+        for name in readers
+        if not suite_conftest._is_external_credential_env(name)
+        and not suite_conftest._is_allowlisted_env(name)
+        and name not in _ACCEPTED_PRODUCTION_ENV_READS
+    )
+    assert unaccounted == [], (
+        "these production environment variables are neither swept nor allowed nor accepted "
+        "with a reason - add each to _ACCEPTED_PRODUCTION_ENV_READS in this file or to the "
+        "allowlist, or make it credential-shaped so the sweep clears it:\n  "
+        + "\n  ".join(unaccounted)
+    )
+
+
+#: Environment variables production reads that the suite lets through, each with the reason it
+#: is safe to: none of them carries a credential, and each is a path, a timeout, a model or
+#: tool selection, or a job input the tests set deliberately.
+_ACCEPTED_PRODUCTION_ENV_READS = frozenset(
+    {
+        "APP_ENV",  # the deployment's own name; tests set it where they test it
+        "BACKTEST_TIMEOUT_SECONDS",  # the CLI's own timeout
+        "COPILOT_CLI_EXECUTABLE",  # which copilot CLI to run
+        "COPILOT_CLI_PATH",  # ditto
+        "COPILOT_SDK_MODEL",  # model selection
+        "CTRADER_CONNECT_BACKOFF_S",  # retry tuning
+        "CTRADER_CONNECT_MAX_ATTEMPTS",  # retry tuning
+        "CTRADER_VERIFY_ACCOUNT_ID",  # a job's input for the verify script
+        "CTRADER_VERIFY_ORDER_ID",  # a job's input for the verify script
+        "DISCORD_AUTH_SCHEME",  # per-bot auth scheme selection
+        "DISCORD_CHANNEL_ID",  # a channel the tests set themselves
+        "DOLT_TIMEOUT_SECONDS",  # dolthub request timeout
+        "DUKASCOPY_JNLP_URL",  # the JForex bootstrap URL; the download edge is stubbed
+        "DUKASCOPY_LOGIN",  # a Dukascopy demo login; the download edge is stubbed
+        "DUKASCOPY_PASSWORD",  # see DUKASCOPY_LOGIN: same stubbing, never a live path
+        "DUKASCOPY_USERNAME",  # see DUKASCOPY_LOGIN: same stubbing, never a live path
+        "GIT_SHA",  # release detection metadata
+        "HF_INTRADAY_COVERAGE_END",  # a dataset's coverage bound
+        "JAVA_HOME",  # which JDK the JVM starts from
+        "JFOREX_ALLOW_CUSTOM_JVM",  # a 1/0 escape hatch for a custom JVM path
+        "JFOREX_CLASSPATH",  # the SDK's own classpath
+        "JFOREX_HOME",  # the SDK's home
+        "JFOREX_JARS",  # the SDK's jars
+        "JFOREX_JVM_PATH",  # which JVM to start
+        "JFOREX_TRUSTED_JAVA_HOME",  # the JDK roots a JVM may come from
+        "JFOREX_TRUSTED_JAVA_HOMES",  # ditto
+        "LEAN_PROJECT_DIR",  # the Lean engine's project directory
+        "LOG_LEVEL",  # the log level, which tests set per test
+        "MATRIX_ENGINE",  # the matrix runner's engine selection
+        "MATRIX_MAX_WORKERS",  # the matrix runner's worker count
+        "MATRIX_OUTPUT_DIR",  # the matrix runner's output directory
+        "MATRIX_TIMEOUT_SECONDS",  # the matrix runner's timeout
+        "PYTHON_BIN",  # which interpreter the matrix runner spawns
+        "TRADING_PLATFORM_REPO",  # the repo root the matrix runner works in
+        "TRADING_PLATFORM_VERSION",  # release detection metadata
+    }
+)
+
+
+def test_the_audit_hook_refuses_a_secret_file_opened_through_os_open(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """``os.open``/``os.openat`` raise the same ``open`` audit event ``open()`` does.
 
     The guard is on the event, not on the API, so a read that reaches for the lower-level call
@@ -1334,6 +1450,10 @@ def test_the_audit_hook_refuses_a_secret_file_opened_through_os_open() -> None:
     """
     import os as _os
 
+    # An attempt is refused *and* recorded, so the deliberate one here goes into a list this
+    # test throws away - exactly as the symlink test below does. Without that the session-end
+    # guard would fail a green run for the attempt this pin made on purpose.
+    monkeypatch.setattr(suite_conftest, "_REPO_SECRET_OPENS", [])
     with pytest.raises(suite_conftest.SuiteHermeticityViolation, match=r"\.accounts\.env"):
         _os.open(str(REPO_ACCOUNTS_ENV), _os.O_RDONLY)
 

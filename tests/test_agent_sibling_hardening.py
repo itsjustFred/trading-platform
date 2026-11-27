@@ -912,6 +912,9 @@ def test_an_agent_output_carrying_the_nvidia_key_is_never_kept(tmp_path) -> None
                 MODEL="nvidia/stepfun-ai/step-5-preview",
                 VARIANT="high",
                 NVIDIA_API_KEY=key,
+                credential_override_reason=(
+                    "the leak-guard's own fixture key; the guard has to see a key to refuse one"
+                ),
                 OPENCODE_DISABLE_PROJECT_CONFIG="1",
                 SCOPE_EMPTY="false",
             )
@@ -957,7 +960,13 @@ def test_the_leak_guard_still_refuses_when_one_stream_is_missing(tmp_path) -> No
             )
             result = subprocess.run(
                 [shutil.which("bash") or "bash", str(script)],
-                env=sandboxed_env(NVIDIA_API_KEY=key),
+                env=sandboxed_env(
+                    NVIDIA_API_KEY=key,
+                    credential_override_reason=(
+                        "the leak-guard's own fixture key; the guard has to see a key to "
+                        "refuse one"
+                    ),
+                ),
                 capture_output=True,
                 text=True,
             )

@@ -59,6 +59,10 @@ def _child_env(data_dir: Path) -> dict[str, str]:
         TRADING_DATA_DIR=str(data_dir),
         LOG_DIR=str(data_dir / "logs"),
         DATABASE_URL=f"sqlite:///{(data_dir / 'backtests.db').as_posix()}",
+        credential_override_reason=(
+            "the child script's own sandbox database, pointed at this test's tmp_path - "
+            "not a production URL"
+        ),
     )
 
 

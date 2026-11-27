@@ -2138,9 +2138,11 @@ def test_an_nvidia_model_without_the_key_fails_with_its_reason(name, tmp_path) -
         script.write_text(_run(step), encoding="utf-8")
         env = sandboxed_env(
             MODEL="nvidia/stepfun-ai/step-5-preview",
+            # Empty on purpose: the missing secret is the case under test.
             NVIDIA_API_KEY="",
             RUNNER_TEMP=str(case),
             GITHUB_OUTPUT=str(case / "out"),
+            credential_override_reason="an empty key; the missing secret is the case",
         )
         result = subprocess.run(
             [shutil.which("bash") or "bash", str(script)], env=env, capture_output=True,
