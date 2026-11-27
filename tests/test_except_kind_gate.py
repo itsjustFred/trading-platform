@@ -23,7 +23,14 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 GATED_ROOTS = ("live_runner", "runner", "risk")
-VALID_KINDS = {"loop-survival", "money-decision", "best-effort", "propagate"}
+ALL_KINDS = {"loop-survival", "money-decision", "best-effort", "propagate"}
+# The money path only tolerates the two strict kinds; the backtest/risk
+# packages may additionally degrade best-effort or enrich-then-reraise.
+KINDS_BY_ROOT = {
+    "live_runner": {"loop-survival", "money-decision", "propagate"},
+    "runner": set(ALL_KINDS),
+    "risk": set(ALL_KINDS),
+}
 MARKER_RE = re.compile(r"#\s*except-kind:\s*([A-Za-z-]+)")
 
 
@@ -93,8 +100,17 @@ def _handler_propagates(handler: ast.ExceptHandler) -> bool:
     return False
 
 
-def _violations(root: Path) -> tuple[list[str], list[str], list[str]]:
-    """(missing markers, invalid kinds, stray markers) under ``root``."""
+def _violations(root: Path, valid_kinds: set[str] | None = None) -> tuple[
+    list[str], list[str], list[str]
+]:
+    """(missing markers, invalid kinds, stray markers) under ``root``.
+
+    ``valid_kinds`` defaults to every kind so fixture trees under an
+    arbitrary tmp dir are checked against the full vocabulary; the real
+    run passes the per-root set from ``KINDS_BY_ROOT``.
+    """
+    if valid_kinds is None:
+        valid_kinds = ALL_KINDS
     missing: list[str] = []
     invalid: list[str] = []
     stray: list[str] = []
@@ -112,7 +128,7 @@ def _violations(root: Path) -> tuple[list[str], list[str], list[str]]:
                 missing.append(rel)
                 continue
             kind = match.group(1)
-            if kind not in VALID_KINDS:
+            if kind not in valid_kinds:
                 invalid.append(f"{rel} ({kind})")
             elif kind == "propagate" and not _handler_propagates(node):
                 invalid.append(f"{rel} (propagate but body never raises or uses the exception)")
@@ -132,7 +148,7 @@ def test_every_broad_except_is_classified() -> None:
     for name in GATED_ROOTS:
         root = REPO_ROOT / name
         assert root.is_dir(), f"gated root {name} is missing"
-        m, i, s = _violations(root)
+        m, i, s = _violations(root, KINDS_BY_ROOT[name])
         missing.extend(f"{name}/{rel}" for rel in m)
         invalid.extend(f"{name}/{rel}" for rel in i)
         stray.extend(f"{name}/{rel}" for rel in s)
@@ -217,6 +233,24 @@ def test_gate_flags_a_propagate_marker_that_swallows(tmp_path: Path) -> None:
         "runner/bad.py:4 (propagate but body never raises or uses the exception)",
         "runner/bad.py:12 (propagate but body never raises or uses the exception)",
     ]
+
+
+def test_gate_rejects_a_kind_not_allowed_in_that_root(tmp_path: Path) -> None:
+    """`best-effort` is valid in runner/ but not on the live money path."""
+    pkg = tmp_path / "live_runner"
+    pkg.mkdir()
+    (pkg / "bad.py").write_text(
+        "def f():\n"
+        "    try:\n"
+        "        risky()\n"
+        "    except Exception:  # except-kind: best-effort - degrade to default\n"
+        "        pass\n",
+        encoding="utf-8",
+    )
+    missing, invalid, stray = _violations(tmp_path, KINDS_BY_ROOT["live_runner"])
+    assert missing == []
+    assert invalid == ["live_runner/bad.py:4 (best-effort)"]
+    assert stray == []
 
 
 def test_gate_flags_invalid_kind_and_stray_marker(tmp_path: Path) -> None:

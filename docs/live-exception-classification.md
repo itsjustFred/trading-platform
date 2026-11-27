@@ -7,7 +7,9 @@ Every `except Exception`, bare `except`, and `except BaseException` in `live_run
 - `best-effort`: an optional enrichment or persistence whose failure degrades to a documented default (stats fallbacks, SQLite persist, catalog/meta reads).
 - `propagate`: the handler classifies, records or enriches the error and always re-raises; nothing is swallowed.
 
-`tests/test_except_kind_gate.py` fails when a broad handler in a gated package lacks a valid marker.
+`live_runner/` accepts only `loop-survival`, `money-decision`, and `propagate`; `runner/` and `risk/` additionally accept `best-effort`.
+
+`tests/test_except_kind_gate.py` fails when a broad handler in a gated package lacks a valid marker, and a `propagate` marker whose handler never raises or hands the exception to the caller also fails.
 
 Handlers in files owned by open PRs #192, #271, #272, #274, #277, #313, #316, and #323 are classified here but intentionally left unchanged; the `Current behavior` column marks them `no — after PR #N` (#274, #277).
 
