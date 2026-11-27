@@ -116,6 +116,37 @@ class TestSqlBuilders:
         assert "`we``ird`" in query
         assert "'AAPL'" in query
 
+    def test_export_data_stocks_loop_sends_the_escaped_select_to_dolt(
+        self, monkeypatch, tmp_path: Path
+    ) -> None:
+        """The second per-symbol call site inside ``export_data`` must hand
+        dolt the same escaped builder SQL — a raw f-string there is equally
+        invisible to a source scan (DV-B27)."""
+        dolt_dir = tmp_path / "dolthub"
+        stocks_repo = dolt_dir / "stocks"
+        (stocks_repo / dm.DOLT_METADATA_DIR).mkdir(parents=True)
+        captured: dict[str, object] = {}
+
+        def fake_run_dolt(cmd, **kwargs):
+            captured.setdefault("queries", []).append(cmd)
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        monkeypatch.setattr(dm, "DOLT_DIR", dolt_dir)
+        monkeypatch.setattr(dm, "EXPORT_DIR", tmp_path / "export")
+        monkeypatch.setattr(dm, "run_dolt", fake_run_dolt)
+        monkeypatch.setattr(dm, "_list_tables", lambda repo: ["we`ird"])
+        monkeypatch.setattr(dm, "_list_symbols", lambda repo, table: ["AAPL"])
+
+        dm.export_data()
+
+        queries = [
+            cmd[cmd.index("-q") + 1]
+            for cmd in captured["queries"]
+            if "-q" in cmd
+        ]
+        ohlcv_queries = [q for q in queries if "act_symbol" in q]
+        assert ohlcv_queries == [build_ohlcv_select("we`ird", "AAPL")]
+
 
 class TestDolthubDownloaderSql:
     """DV-B27 for the DoltHub API downloader (same injection class)."""
