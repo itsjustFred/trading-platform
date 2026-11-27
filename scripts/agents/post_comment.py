@@ -17,19 +17,24 @@ pre-mortem copy grew, now for all three stages:
   just the newest - a duplicate left by an interrupted run would otherwise
   stay readable forever.
 
-Environment: ``GH_TOKEN`` (passed through to ``gh``), ``GITHUB_REPOSITORY``,
-``PR_NUMBER``, ``HEAD_SHA`` and ``QUOTA_SKIP`` (``true`` when the body being
-posted is a quota report). ``comment.md`` in the working directory is the
-body; ``body.md`` is the marker plus body that actually gets posted.
+The GitHub calls are plain REST over ``urllib`` - no subprocess, so no
+command line exists for untrusted values to reach. ``GITHUB_API_URL``
+overrides the API base (GitHub Enterprise); the tests point it at a local
+stub. Environment: ``GH_TOKEN``, ``GITHUB_REPOSITORY``, ``PR_NUMBER``,
+``HEAD_SHA`` and ``QUOTA_SKIP`` (``true`` when the body being posted is a
+quota report). ``comment.md`` in the working directory is the body;
+``body.md`` is the marker plus body that actually gets posted.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
-import subprocess
 import sys
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 # `parse_verdict` sits next to this file; it is on sys.path both when the
@@ -40,6 +45,9 @@ from parse_verdict import comment_names_head
 # The stage only names the comment kind in notices; the logic is identical.
 _NOUN = {"review": "review", "mutation": "mutation-testing", "premortem": "pre-mortem"}
 
+_REPO_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
+_PAGE = 100
+
 
 def _notice(message: str) -> None:
     print(f"::notice::{message}")
@@ -49,52 +57,68 @@ def _warning(message: str) -> None:
     print(f"::warning::{message}")
 
 
-def _gh(*args: str) -> subprocess.CompletedProcess[str]:
-    env = dict(os.environ)
-    result = subprocess.run(
-        ["gh", "api", *args],
-        capture_output=True,
-        text=True,
-        env=env,
-        check=False,
+def _request(method: str, path: str, payload: dict | None = None):
+    token = os.environ.get("GH_TOKEN", "")
+    if not token:
+        print("::error::GH_TOKEN is required.", file=sys.stderr)
+        raise SystemExit(1)
+    base = os.environ.get("GITHUB_API_URL", "https://api.github.com").rstrip("/")
+    data = json.dumps(payload).encode() if payload is not None else None
+    request = urllib.request.Request(
+        f"{base}/{path}",
+        data=data,
+        method=method,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "trading-platform-agent-comment",
+        },
     )
-    if result.returncode != 0:
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            raw = response.read()
+            return json.loads(raw) if raw else None
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", "replace")[:500]
         print(
-            f"::error::gh api {' '.join(args[:3])} failed: {result.stderr.strip()}",
+            f"::error::GitHub API {method} {path} failed: HTTP {exc.code} {detail}",
             file=sys.stderr,
         )
-        raise SystemExit(1)
-    return result
+        raise SystemExit(1) from exc
+    except urllib.error.URLError as exc:
+        print(f"::error::GitHub API {method} {path} failed: {exc.reason}", file=sys.stderr)
+        raise SystemExit(1) from exc
 
 
 def _head_sha(repo: str, pr: str) -> str:
-    return _gh(f"repos/{repo}/pulls/{pr}", "--jq", ".head.sha").stdout.strip()
+    return str(_request("GET", f"repos/{repo}/pulls/{pr}")["head"]["sha"])
 
 
-def _comment_ids(repo: str, pr: str, marker: str) -> list[str]:
-    jq = (
-        '.[] | select(.user.login == "github-actions[bot]" '
-        f'and (.body | startswith("{marker}"))) | .id'
-    )
-    out = _gh("--paginate", f"repos/{repo}/issues/{pr}/comments", "--jq", jq).stdout
-    # The ids become path segments of later `gh api` calls: only digits are
-    # accepted, so a malformed API answer cannot smuggle arguments.
-    return [
-        line.strip()
-        for line in out.splitlines()
-        if line.strip().isdigit()
-    ]
-
-
-def _comment_body(repo: str, comment_id: str) -> str:
-    return _gh(f"repos/{repo}/issues/comments/{comment_id}", "--jq", ".body").stdout
+def _marker_comments(repo: str, pr: str, marker: str) -> list[dict[str, str]]:
+    """Every comment by the actions bot whose body starts with the marker."""
+    found: list[dict[str, str]] = []
+    page = 1
+    while True:
+        comments = _request(
+            "GET", f"repos/{repo}/issues/{pr}/comments?per_page={_PAGE}&page={page}"
+        )
+        for comment in comments:
+            body = str(comment.get("body") or "")
+            if (
+                comment.get("user", {}).get("login") == "github-actions[bot]"
+                and body.startswith(marker)
+            ):
+                found.append({"id": str(comment["id"]), "body": body})
+        if len(comments) < _PAGE:
+            return found
+        page += 1
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--stage", required=True, choices=sorted(_NOUN))
     parser.add_argument("--marker", required=True)
-    parser.add_argument("--body-file", default="comment.md")
     args = parser.parse_args(argv)
     noun = _NOUN[args.stage]
 
@@ -102,10 +126,9 @@ def main(argv: list[str] | None = None) -> int:
     pr = os.environ.get("PR_NUMBER", "")
     head = os.environ.get("HEAD_SHA", "")
     quota_skip = os.environ.get("QUOTA_SKIP", "") == "true"
-    # Every value below becomes an argument or a path segment of a `gh api`
-    # call or a file read: anything that is not the exact shape the workflow
-    # produces is refused before it can steer the command line.
-    if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo):
+    # Every value below lands in a request path or the posted body: anything
+    # that is not the exact shape the workflow produces is refused first.
+    if not _REPO_RE.fullmatch(repo):
         print("::error::GITHUB_REPOSITORY is not owner/name.", file=sys.stderr)
         return 1
     if not pr.isdigit():
@@ -117,13 +140,8 @@ def main(argv: list[str] | None = None) -> int:
     if '"' in args.marker or "\n" in args.marker:
         print("::error::the marker must be a single-line HTML comment.", file=sys.stderr)
         return 1
-    body_path = Path(args.body_file)
-    if body_path.is_absolute() or ".." in body_path.parts:
-        print(
-            "::error::--body-file must name a file inside the working directory.",
-            file=sys.stderr,
-        )
-        return 1
+
+    body_path = Path("comment.md")
     body_text = body_path.read_text(encoding="utf-8") if body_path.exists() else ""
 
     current = _head_sha(repo, pr)
@@ -134,7 +152,7 @@ def main(argv: list[str] | None = None) -> int:
     full_body = args.marker + "\n" + body_text
     Path("body.md").write_text(full_body, encoding="utf-8")
 
-    existing = _comment_ids(repo, pr, args.marker)
+    existing = _marker_comments(repo, pr, args.marker)
 
     # The head is read again with the body in hand, immediately before the
     # write. The guard above ran before the body was assembled and before the
@@ -158,9 +176,9 @@ def main(argv: list[str] | None = None) -> int:
     # case where the "not run: quota" body would replace a verdict that is
     # still current. A quota body over an older quota comment, or any real
     # verdict for another head, still writes.
-    if quota_skip and existing:
-        for comment_id in existing:
-            prior = _comment_body(repo, comment_id)
+    if quota_skip:
+        for comment in existing:
+            prior = comment["body"]
             if "Verdict:" in prior and comment_names_head(prior, head):
                 _notice(
                     f"The existing {noun} comment is a real verdict for {head}; "
@@ -178,17 +196,17 @@ def main(argv: list[str] | None = None) -> int:
                 f"{len(existing)} {noun} comments carry the marker; "
                 "updating all of them with the current result."
             )
-        for comment_id in existing:
-            _gh(
-                "--method", "PATCH",
-                f"repos/{repo}/issues/comments/{comment_id}",
-                "-F", "body=@body.md",
+        for comment in existing:
+            _request(
+                "PATCH",
+                f"repos/{repo}/issues/comments/{comment['id']}",
+                {"body": full_body},
             )
     else:
-        _gh(
-            "--method", "POST",
+        _request(
+            "POST",
             f"repos/{repo}/issues/{pr}/comments",
-            "-F", "body=@body.md",
+            {"body": full_body},
         )
     return 0
 

@@ -129,7 +129,10 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import urlparse
 
 import pytest
 import yaml
@@ -1446,16 +1449,16 @@ def test_a_superseded_result_does_not_overwrite_a_newer_comment() -> None:
     # describing a diff nobody looks at posted as the current result.
     assert source.count("_head_sha(repo, pr)") >= 2, "the head is read once, before the write"
     reread = source.index("moved = _head_sha(repo, pr)")
-    written = source.index('"-F", "body=@body.md"')
+    written = source.index('{"body": full_body}')
     assert reread < written, "the write does not happen under the re-read head"
-    for prepared in ("Path(\"body.md\").write_text", "_comment_ids(repo, pr"):
+    for prepared in ("Path(\"body.md\").write_text", "_marker_comments(repo, pr"):
         assert source.index(prepared) < reread, (
             f"the re-read does not gate the write: '{prepared}' runs after the head was last read"
         )
     assert "not updating the comment" in source, "a superseded result does not stop the job"
     # Every marker match is updated, and a duplicate is reported rather than
     # silently dropped by taking the last id.
-    assert "for comment_id in existing" in source, "a duplicate marker comment is left stale"
+    assert "for comment in existing" in source, "a duplicate marker comment is left stale"
     assert "::warning::" in source or "_warning(" in source, (
         "a duplicate marker comment is not reported"
     )
@@ -2527,51 +2530,88 @@ def test_the_quota_reporter_rewrites_only_this_runs_pending_mark(tmp_path) -> No
     assert "--method" not in calls, "the quota reporter wrote a status where none exists"
 
 
-# A stand-in for the `gh` the comment-posting step calls: it serves the PR head
-# read, the marker comment list and one comment body, and records every write.
-_STUB_GH_COMMENTS = """#!/usr/bin/env bash
-set -u
-printf '%s\\n' "$*" >> "$STUB_LOG"
-# Any write (POST/PATCH) is recorded by the log line above and acknowledged.
-if [[ "$*" == *"--method"* ]]; then exit 0; fi
-case "$*" in
-  *"/pulls/"*) printf '%s\\n' "$STUB_HEAD_SHA" ;;
-  *"/issues/comments/"*) cat "$STUB_COMMENT_BODY" ;;
-  *"/issues/"*"/comments"*) cat "$STUB_COMMENT_IDS" ;;
-  *) : ;;
-esac
-exit 0
-"""
+class _CommentsAPI:
+    """A local stand-in for the GitHub REST endpoints post_comment.py uses
+    (the poster speaks plain REST over urllib now, so `GITHUB_API_URL`
+    points it here)."""
+
+    def __init__(self, head_sha: str, comments: list[dict]):
+        self.head_sha = head_sha
+        self.comments = comments
+        self.writes: list[str] = []
+        stub = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args) -> None:
+                pass
+
+            def _json(self, code: int, obj) -> None:
+                raw = json.dumps(obj).encode()
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+            def do_GET(self) -> None:
+                path = urlparse(self.path).path
+                if "/pulls/" in path:
+                    self._json(200, {"head": {"sha": stub.head_sha}})
+                elif "/issues/comments/" in path:
+                    cid = path.rsplit("/", 1)[-1]
+                    body = next(
+                        (c["body"] for c in stub.comments if str(c["id"]) == cid), ""
+                    )
+                    self._json(200, {"body": body})
+                elif path.endswith("/comments"):
+                    self._json(200, stub.comments)
+                else:
+                    self._json(404, {"message": "not found"})
+
+            def _write(self, code: int) -> None:
+                stub.writes.append(f"{self.command} {urlparse(self.path).path}")
+                self._json(code, {})
+
+            def do_PATCH(self) -> None:
+                self._write(200)
+
+            def do_POST(self) -> None:
+                self._write(201)
+
+        self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self._server.daemon_threads = True
+        threading.Thread(target=self._server.serve_forever, daemon=True).start()
+
+    @property
+    def url(self) -> str:
+        return f"http://127.0.0.1:{self._server.server_address[1]}"
 
 
 def _run_comment_post(tmp_path, *, quota_skip: bool, prior_body: str | None):
     """Execute 'Post or update pre-mortem comment' against the comments stub.
 
     `prior_body` is the body of the one existing marker comment (None: no
-    comment yet). Returns (result, calls log)."""
+    comment yet). Returns (result, writes log)."""
     step = _find_step(_load(PREMORTEM)["jobs"]["post"], r"^Post or update pre-mortem comment$")
-    bindir = tmp_path / "bin"
-    bindir.mkdir(exist_ok=True)
-    stub = bindir / "gh"
-    stub.write_text(_STUB_GH_COMMENTS, encoding="utf-8")
-    stub.chmod(0o755)
+    comments = (
+        [
+            {
+                "id": 42,
+                "user": {"login": "github-actions[bot]"},
+                "body": prior_body,
+            }
+        ]
+        if prior_body is not None
+        else []
+    )
+    api = _CommentsAPI(REPORTER_ENV["HEAD_SHA"], comments)
     work = tmp_path / "work"
     work.mkdir(exist_ok=True)
     (work / "comment.md").write_text(
         "# Pre-Mortem Action\n\n**Summary:** Not run: quota\n", encoding="utf-8"
     )
-    ids = tmp_path / "ids"
-    ids.write_text("42\n" if prior_body is not None else "", encoding="utf-8")
-    body = tmp_path / "prior-body"
-    body.write_text(prior_body or "", encoding="utf-8")
-    log = tmp_path / "calls.log"
-    log.unlink(missing_ok=True)
     env = {
-        "PATH": os.pathsep.join([str(bindir), os.environ["PATH"]]),
-        "STUB_LOG": str(log),
-        "STUB_HEAD_SHA": REPORTER_ENV["HEAD_SHA"],
-        "STUB_COMMENT_IDS": str(ids),
-        "STUB_COMMENT_BODY": str(body),
+        "GITHUB_API_URL": api.url,
         "GITHUB_REPOSITORY": REPORTER_ENV["GITHUB_REPOSITORY"],
         "PR_NUMBER": REPORTER_ENV["PR_NUMBER"],
         "HEAD_SHA": REPORTER_ENV["HEAD_SHA"],
@@ -2588,8 +2628,7 @@ def _run_comment_post(tmp_path, *, quota_skip: bool, prior_body: str | None):
         capture_output=True,
         text=True,
     )
-    calls = log.read_text(encoding="utf-8") if log.exists() else ""
-    return result, calls
+    return result, "\n".join(api.writes)
 
 
 @needs_bash
@@ -2613,7 +2652,7 @@ def test_a_quota_skip_does_not_overwrite_a_real_verdict_for_the_same_head(tmp_pa
 
     result, calls = _run_comment_post(tmp_path, quota_skip=True, prior_body=verdict_body)
     assert result.returncode == 0, f"comment post failed: {result.stderr}"
-    assert "--method" not in calls, (
+    assert "PATCH" not in calls and "POST" not in calls, (
         "a quota skip overwrote a real verdict for the same head"
     )
     assert "::notice::" in result.stdout, "the skipped overwrite is silent"
@@ -2622,7 +2661,7 @@ def test_a_quota_skip_does_not_overwrite_a_real_verdict_for_the_same_head(tmp_pa
     case.mkdir()
     result, calls = _run_comment_post(case, quota_skip=True, prior_body=quota_body)
     assert result.returncode == 0, f"comment post failed: {result.stderr}"
-    assert "--method PATCH" in calls, (
+    assert "PATCH" in calls, (
         "a quota skip over an older quota comment did not refresh it"
     )
 
@@ -2630,7 +2669,9 @@ def test_a_quota_skip_does_not_overwrite_a_real_verdict_for_the_same_head(tmp_pa
     case.mkdir()
     result, calls = _run_comment_post(case, quota_skip=False, prior_body=verdict_body)
     assert result.returncode == 0, f"comment post failed: {result.stderr}"
-    assert "--method" in calls, "a real verdict did not overwrite the prior comment"
+    assert "PATCH" in calls or "POST" in calls, (
+        "a real verdict did not overwrite the prior comment"
+    )
 
     # The guard is scoped to *this* head: a real verdict for a different commit
     # must not pin the comment forever, so a quota skip over it still writes.
@@ -2639,7 +2680,7 @@ def test_a_quota_skip_does_not_overwrite_a_real_verdict_for_the_same_head(tmp_pa
     other_head_body = verdict_body.replace(head8, "f" * 8)
     result, calls = _run_comment_post(case, quota_skip=True, prior_body=other_head_body)
     assert result.returncode == 0, f"comment post failed: {result.stderr}"
-    assert "--method PATCH" in calls, (
+    assert "PATCH" in calls, (
         "a quota skip refused to refresh a verdict for a different head"
     )
 

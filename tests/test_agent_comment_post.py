@@ -2,8 +2,9 @@
 
 The marker-comment post/patch logic used to be three hand-copied ``gh api``
 shell blocks; only the pre-mortem copy had the guards. The Python version is
-the single implementation for all three stages, and these tests pin the
-guards with a stub ``gh`` on PATH:
+the single implementation for all three stages - plain REST over urllib, no
+subprocess - and these tests pin the guards against a local HTTP stub of the
+GitHub API (``GITHUB_API_URL`` points the script at it):
 
 - a "not run: quota" body never overwrites an earlier real verdict for the
   same head (the bug this task fixes),
@@ -17,11 +18,14 @@ guards with a stub ``gh`` on PATH:
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
-import stat
 import subprocess
 import sys
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import urlparse
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 AGENTS_DIR = REPO_ROOT / "scripts" / "agents"
@@ -44,66 +48,101 @@ post_comment = _load("post_comment", "post_comment.py")
 HEAD = "b" * 40
 OTHER_HEAD = "c" * 40
 MARKER = "<!-- actions-pre-mortem -->"
-
-_STUB_GH = """#!/usr/bin/env bash
-# Stub `gh api`: serves the pulls head (one value per call, in order),
-# comment ids, comment bodies, and records every call.
-echo "$@" >> "$STUB_DIR/calls"
-args="$*"
-if [[ "$args" == *"--method"* ]]; then
-  exit 0
-fi
-if [[ "$args" == *"/pulls/"* ]]; then
-  n=$(cat "$STUB_DIR/pull-count" 2>/dev/null || echo 0)
-  n=$((n + 1))
-  echo "$n" > "$STUB_DIR/pull-count"
-  sed -n "${n}p" "$STUB_DIR/heads"
-  exit 0
-fi
-if [[ "$args" == *"/issues/comments/"* ]]; then
-  id="${args##*/issues/comments/}"
-  id="${id%% *}"
-  cat "$STUB_DIR/body-$id" 2>/dev/null
-  exit 0
-fi
-if [[ "$args" == *"/issues/"*"/comments"* ]]; then
-  cat "$STUB_DIR/ids" 2>/dev/null
-  exit 0
-fi
-exit 0
-"""
+REPO_PATH = "/repos/itsjustFred/trading-platform"
 
 
-def _setup(tmp_path: Path, heads: list[str], ids: list[str] | None = None,
-           bodies: dict[str, str] | None = None) -> tuple[dict, Path]:
-    stub_dir = tmp_path / "stub"
-    bin_dir = tmp_path / "bin"
-    stub_dir.mkdir()
-    bin_dir.mkdir()
-    (stub_dir / "heads").write_text("\n".join(heads) + "\n", encoding="utf-8")
-    if ids is not None:
-        (stub_dir / "ids").write_text("\n".join(ids) + ("\n" if ids else ""), encoding="utf-8")
-    for cid, body in (bodies or {}).items():
-        (stub_dir / f"body-{cid}").write_text(body, encoding="utf-8")
-    gh = bin_dir / "gh"
-    gh.write_text(_STUB_GH, encoding="utf-8")
-    gh.chmod(gh.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+class _StubAPI:
+    """A local stand-in for the GitHub REST endpoints post_comment.py uses."""
+
+    def __init__(self, heads: list[str], comments: list[dict]):
+        self.heads = list(heads)
+        self.comments = comments
+        self.calls: list[tuple[str, str]] = []
+        self._server = self._serve()
+
+    def _serve(self) -> ThreadingHTTPServer:
+        stub = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args) -> None:  # keep the test output clean
+                pass
+
+            def _json(self, code: int, obj) -> None:
+                raw = json.dumps(obj).encode()
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+            def do_GET(self) -> None:
+                path = urlparse(self.path).path
+                stub.calls.append(("GET", path))
+                if path == f"{REPO_PATH}/pulls/409":
+                    sha = stub.heads.pop(0) if stub.heads else HEAD
+                    self._json(200, {"head": {"sha": sha}})
+                elif "/issues/comments/" in path:
+                    cid = path.rsplit("/", 1)[-1]
+                    body = next(
+                        (c["body"] for c in stub.comments if str(c["id"]) == cid), ""
+                    )
+                    self._json(200, {"body": body})
+                elif path == f"{REPO_PATH}/issues/409/comments":
+                    self._json(200, stub.comments)
+                else:
+                    self._json(404, {"message": "not found"})
+
+            def do_PATCH(self) -> None:
+                stub.calls.append(("PATCH", urlparse(self.path).path))
+                self._json(200, {})
+
+            def do_POST(self) -> None:
+                stub.calls.append(("POST", urlparse(self.path).path))
+                self._json(201, {})
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        server.daemon_threads = True
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        return server
+
+    @property
+    def url(self) -> str:
+        return f"http://127.0.0.1:{self._server.server_address[1]}"
+
+    def writes(self) -> list[str]:
+        return [f"{method} {path}" for method, path in self.calls if method != "GET"]
+
+
+def _setup(
+    tmp_path: Path,
+    heads: list[str],
+    ids: list[str] | None = None,
+    bodies: dict[str, str] | None = None,
+) -> tuple[dict, Path, _StubAPI]:
     work = tmp_path / "work"
     work.mkdir()
     (work / "comment.md").write_text(
         "**Summary:** the body\n**Verdict: PASS**\n", encoding="utf-8"
     )
+    comments = [
+        {
+            "id": int(cid),
+            "user": {"login": "github-actions[bot]"},
+            "body": (bodies or {}).get(cid, f"{MARKER}\n**Summary:** prior\n"),
+        }
+        for cid in (ids or [])
+    ]
+    api = _StubAPI(heads, comments)
     env = {
         **os.environ,
-        "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
-        "STUB_DIR": str(stub_dir),
         "GH_TOKEN": "test-token",
+        "GITHUB_API_URL": api.url,
         "GITHUB_REPOSITORY": "itsjustFred/trading-platform",
         "PR_NUMBER": "409",
         "HEAD_SHA": HEAD,
         "QUOTA_SKIP": "false",
     }
-    return env, work
+    return env, work, api
 
 
 def _run(env: dict, work: Path, *extra: str) -> subprocess.CompletedProcess[str]:
@@ -122,19 +161,6 @@ def _run(env: dict, work: Path, *extra: str) -> subprocess.CompletedProcess[str]
     )
 
 
-def _calls(env: dict, work: Path) -> str:
-    stub_dir = Path(env["STUB_DIR"])
-    log = stub_dir / "calls"
-    return log.read_text(encoding="utf-8") if log.exists() else ""
-
-
-def _method_calls(env: dict, work: Path) -> list[str]:
-    return [
-        line for line in _calls(env, work).splitlines()
-        if "--method" in line
-    ]
-
-
 # ---------------------------------------------------------------------------
 # the quota-overwrite guard - the bug this task fixes
 # ---------------------------------------------------------------------------
@@ -145,11 +171,11 @@ def test_a_quota_skip_does_not_overwrite_a_real_verdict_for_the_same_head(tmp_pa
         f"{MARKER}\n**Summary:** real\n**Verdict: BLOCK**\n"
         f"\n_Analysed base `{'a' * 8}` ... head `{HEAD[:8]}`._\n"
     )
-    env, work = _setup(tmp_path, [HEAD, HEAD], ["42"], {"42": prior})
+    env, work, api = _setup(tmp_path, [HEAD, HEAD], ["42"], {"42": prior})
     env["QUOTA_SKIP"] = "true"
     result = _run(env, work)
     assert result.returncode == 0, result.stderr
-    assert _method_calls(env, work) == [], "the quota body overwrote the verdict"
+    assert api.writes() == [], "the quota body overwrote the verdict"
     assert "did not overwrite it" in result.stdout
 
 
@@ -158,12 +184,12 @@ def test_a_quota_skip_still_overwrites_an_older_quota_comment(tmp_path) -> None:
         f"{MARKER}\n**Summary:** Not run: quota - earlier\n\n"
         f"_Analysed base `{'a' * 8}` ... head `{HEAD[:8]}`._\n"
     )
-    env, work = _setup(tmp_path, [HEAD, HEAD], ["42"], {"42": prior})
+    env, work, api = _setup(tmp_path, [HEAD, HEAD], ["42"], {"42": prior})
     env["QUOTA_SKIP"] = "true"
     result = _run(env, work)
     assert result.returncode == 0, result.stderr
-    methods = _method_calls(env, work)
-    assert len(methods) == 1 and "PATCH" in methods[0] and "comments/42" in methods[0]
+    writes = api.writes()
+    assert len(writes) == 1 and "PATCH" in writes[0] and "comments/42" in writes[0]
 
 
 def test_a_quota_skip_still_overwrites_a_verdict_for_another_head(tmp_path) -> None:
@@ -171,11 +197,11 @@ def test_a_quota_skip_still_overwrites_a_verdict_for_another_head(tmp_path) -> N
         f"{MARKER}\n**Summary:** real\n**Verdict: BLOCK**\n"
         f"\n_Analysed base `{'a' * 8}` ... head `{OTHER_HEAD[:8]}`._\n"
     )
-    env, work = _setup(tmp_path, [HEAD, HEAD], ["42"], {"42": prior})
+    env, work, api = _setup(tmp_path, [HEAD, HEAD], ["42"], {"42": prior})
     env["QUOTA_SKIP"] = "true"
     result = _run(env, work)
     assert result.returncode == 0, result.stderr
-    assert len(_method_calls(env, work)) == 1
+    assert len(api.writes()) == 1
 
 
 def test_a_real_result_overwrites_an_earlier_verdict_for_the_same_head(tmp_path) -> None:
@@ -183,11 +209,11 @@ def test_a_real_result_overwrites_an_earlier_verdict_for_the_same_head(tmp_path)
         f"{MARKER}\n**Summary:** old\n**Verdict: PASS**\n"
         f"_Analysed base `{'a' * 8}` ... head `{HEAD[:8]}`._\n"
     )
-    env, work = _setup(tmp_path, [HEAD, HEAD], ["42"], {"42": prior})
+    env, work, api = _setup(tmp_path, [HEAD, HEAD], ["42"], {"42": prior})
     result = _run(env, work)
     assert result.returncode == 0, result.stderr
-    methods = _method_calls(env, work)
-    assert len(methods) == 1 and "PATCH" in methods[0]
+    writes = api.writes()
+    assert len(writes) == 1 and "PATCH" in writes[0]
 
 
 # ---------------------------------------------------------------------------
@@ -196,19 +222,19 @@ def test_a_real_result_overwrites_an_earlier_verdict_for_the_same_head(tmp_path)
 
 
 def test_a_moved_head_before_the_write_posts_nothing(tmp_path) -> None:
-    env, work = _setup(tmp_path, [OTHER_HEAD, OTHER_HEAD], [])
+    env, work, api = _setup(tmp_path, [OTHER_HEAD, OTHER_HEAD], [])
     result = _run(env, work)
     assert result.returncode == 0, result.stderr
-    assert _method_calls(env, work) == []
+    assert api.writes() == []
     assert "head moved" in result.stdout
 
 
 def test_a_head_moving_during_the_post_still_posts_nothing(tmp_path) -> None:
     """First read agrees, second (just before the write) does not."""
-    env, work = _setup(tmp_path, [HEAD, OTHER_HEAD], ["42"], {"42": "old"})
+    env, work, api = _setup(tmp_path, [HEAD, OTHER_HEAD], ["42"], {"42": "old"})
     result = _run(env, work)
     assert result.returncode == 0, result.stderr
-    assert _method_calls(env, work) == []
+    assert api.writes() == []
     assert "while this comment was being posted" in result.stdout
 
 
@@ -218,26 +244,26 @@ def test_a_head_moving_during_the_post_still_posts_nothing(tmp_path) -> None:
 
 
 def test_every_marker_comment_is_updated_not_just_the_newest(tmp_path) -> None:
-    env, work = _setup(tmp_path, [HEAD, HEAD], ["7", "42"])
+    env, work, api = _setup(tmp_path, [HEAD, HEAD], ["7", "42"])
     result = _run(env, work)
     assert result.returncode == 0, result.stderr
-    methods = _method_calls(env, work)
-    assert len(methods) == 2
-    assert any("comments/7" in m for m in methods)
-    assert any("comments/42" in m for m in methods)
+    writes = api.writes()
+    assert len(writes) == 2
+    assert any("comments/7" in w for w in writes)
+    assert any("comments/42" in w for w in writes)
     assert "2 pre-mortem comments carry the marker" in result.stdout
 
 
 def test_a_pr_with_no_marker_comment_gets_a_post(tmp_path) -> None:
-    env, work = _setup(tmp_path, [HEAD, HEAD], [])
+    env, work, api = _setup(tmp_path, [HEAD, HEAD], [])
     result = _run(env, work)
     assert result.returncode == 0, result.stderr
-    methods = _method_calls(env, work)
-    assert len(methods) == 1 and "POST" in methods[0] and "/issues/409/comments" in methods[0]
+    writes = api.writes()
+    assert len(writes) == 1 and "POST" in writes[0] and "/issues/409/comments" in writes[0]
 
 
 def test_the_marker_and_body_make_up_body_md(tmp_path) -> None:
-    env, work = _setup(tmp_path, [HEAD, HEAD], [])
+    env, work, _api = _setup(tmp_path, [HEAD, HEAD], [])
     result = _run(env, work)
     assert result.returncode == 0, result.stderr
     body = (work / "body.md").read_text(encoding="utf-8")
