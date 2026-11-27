@@ -49,23 +49,45 @@ def _broad_handlers(path: Path) -> list[ast.ExceptHandler]:
     ]
 
 
+def _name_is_loaded(node: ast.AST, name: str) -> bool:
+    return any(
+        isinstance(inner, ast.Name) and inner.id == name and isinstance(inner.ctx, ast.Load)
+        for inner in ast.walk(node)
+    )
+
+
 def _handler_propagates(handler: ast.ExceptHandler) -> bool:
     """A ``propagate`` marker must actually propagate.
 
-    Either the body raises, or it hands the caught exception object to the
-    caller (stores it, appends it to an error list, re-raises it later) —
-    i.e. the bound ``as`` name is loaded anywhere in the body. A
-    ``propagate``-marked ``pass`` or a body that drops the exception
-    silently is exactly the mislabel this check exists to catch.
+    The body must either raise, or hand the caught exception object to the
+    caller in a way that surfaces it later: appended/added to a collection
+    (``errors.append(exc)`` — the vectorbt aggregate), stored into a
+    subscript or attribute (``error["value"] = exc`` — the copilot bridge),
+    or returned. Merely *referencing* the exception — e.g. passing it to a
+    logging call — does not count: that is observation, not propagation.
     """
     for node in ast.walk(handler):
         if isinstance(node, ast.Raise):
             return True
+    name = handler.name
+    if not name:
+        return False
+    for node in ast.walk(handler):
+        if isinstance(node, ast.Return) and node.value is not None and _name_is_loaded(
+            node.value, name
+        ):
+            return True
         if (
-            handler.name
-            and isinstance(node, ast.Name)
-            and node.id == handler.name
-            and isinstance(node.ctx, ast.Load)
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in {"append", "add"}
+            and any(_name_is_loaded(arg, name) for arg in node.args)
+        ):
+            return True
+        if isinstance(node, ast.Assign) and any(
+            isinstance(target, (ast.Subscript, ast.Attribute))
+            and _name_is_loaded(node.value, name)
+            for target in node.targets
         ):
             return True
     return False
@@ -161,6 +183,15 @@ def test_gate_accepts_a_classified_fixture(tmp_path: Path) -> None:
     assert (missing, invalid, stray) == ([], [], [])
 
 
+def test_gate_scope_covers_the_money_and_engine_packages() -> None:
+    """Pin the gated roots: dropping `runner` must fail a test, not pass silently."""
+    assert {"live_runner", "runner", "risk"} <= set(GATED_ROOTS)
+    runner_handlers = sum(
+        len(_broad_handlers(path)) for path in (REPO_ROOT / "runner").rglob("*.py")
+    )
+    assert runner_handlers > 0
+
+
 def test_gate_flags_a_propagate_marker_that_swallows(tmp_path: Path) -> None:
     """A `propagate` marker on a handler that drops the exception is a lie."""
     pkg = tmp_path / "runner"
@@ -174,11 +205,18 @@ def test_gate_flags_a_propagate_marker_that_swallows(tmp_path: Path) -> None:
         "    try:\n"
         "        other()\n"
         "    except Exception as exc:  # except-kind: propagate - stored for the caller\n"
-        "        errors.append(exc)\n",
+        "        errors.append(exc)\n"
+        "    try:\n"
+        "        third()\n"
+        "    except Exception as exc:  # except-kind: propagate - logged only\n"
+        "        logger.warning('failed: %s', exc)\n",
         encoding="utf-8",
     )
     _missing, invalid, _stray = _violations(tmp_path)
-    assert invalid == ["runner/bad.py:4 (propagate but body never raises or uses the exception)"]
+    assert invalid == [
+        "runner/bad.py:4 (propagate but body never raises or uses the exception)",
+        "runner/bad.py:12 (propagate but body never raises or uses the exception)",
+    ]
 
 
 def test_gate_flags_invalid_kind_and_stray_marker(tmp_path: Path) -> None:
