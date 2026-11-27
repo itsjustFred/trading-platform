@@ -3134,7 +3134,12 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             )
 
     def _resolve_order_volume(self, signal: LiveSignal) -> int:
-        """Resolve broker volume from the binding risk-engine ``qty``.
+        """Resolve the binding risk-engine ``qty`` into broker volume units.
+
+        Returns a whole number of broker volume units as a builtin ``int`` -
+        the request seams are typed to that and refuse anything else, so a
+        refactor returning a float would fail closed at the builders rather
+        than change a size.
 
         Reads only the sizing metadata (``qty``, the pip value and
         ``risk_sizing_mode``). In particular it reads no position or exit
@@ -4437,6 +4442,11 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         qty, then guards the normalized one) and passes it in: the request must
         carry that volume, not a fresh resolution against a scale that may have
         moved across the submit's awaits.
+
+        ``volume`` is therefore required and must never gain a default that
+        resolves it here - that would reintroduce exactly the divergence the
+        single resolution removed, and the resolver-call-count spy tests are
+        what catch it.
         """
         if signal.action not in {"buy", "sell"}:
             raise ValueError(f"Unsupported signal action: {signal.action}")
