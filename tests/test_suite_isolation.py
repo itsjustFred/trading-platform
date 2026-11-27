@@ -1004,23 +1004,28 @@ def test_a_parent_env_var_outside_the_allowlist_never_reaches_a_test(tmp_path: P
     assert result.returncode == pytest.ExitCode.OK, result.stdout + result.stderr
 
 
-def test_a_subprocess_resolves_the_accounts_env_into_the_session_sandbox() -> None:
+@pytest.mark.parametrize(
+    "module_name",
+    ["live_runner.credential_env", "scripts.live_smoke"],
+    ids=lambda case: str(case),
+)
+def test_a_subprocess_resolves_the_accounts_env_into_the_session_sandbox(module_name: str) -> None:
     """S16: a child resolves the accounts env to the session sandbox, not the checkout.
 
     The sandbox patches the module constant in this process only, so a child
     imported the real value and would read the checkout's real credential file.
     The path is printed, never read, so the pin holds in a checkout with or
-    without that file.
+    without that file. Both packages that define the constant today are pinned,
+    because a child's guard wraps modules by file, not by package name.
     """
     from tests.conftest import sandboxed_env
 
+    body = (
+        f"import {module_name}\n"
+        f"print({module_name}.DEFAULT_ACCOUNTS_ENV)\n"
+    )
     result = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            "import live_runner.credential_env as credential_env\n"
-            "print(credential_env.DEFAULT_ACCOUNTS_ENV)\n",
-        ],
+        [sys.executable, "-c", body],
         cwd=str(_PROJECT_ROOT),
         env=sandboxed_env(),
         capture_output=True,
@@ -1035,6 +1040,38 @@ def test_a_subprocess_resolves_the_accounts_env_into_the_session_sandbox() -> No
         f" {ISOLATED_ACCOUNTS_ENV}"
     )
     assert not resolved.exists(), "the session sandbox file must not exist"
+
+
+def test_a_child_guard_wraps_every_first_party_module() -> None:
+    """The child's accounts-env guard is not a package list.
+
+    The constant lives in ``live_runner`` and ``scripts`` today; a guard that only
+    wraps those two packages would resolve the checkout's real path for a constant
+    added in another package tomorrow. A module from a third package is pinned here:
+    its loader in a sandboxed child is the guard's wrapper, so a future constant in
+    that file is patched the day it appears.
+    """
+    from tests.conftest import sandboxed_env
+
+    expected = suite_conftest._ChildAccountsEnvLoader.__name__
+    body = (
+        "import shared.constants\n"
+        "print('LOADER', type(shared.constants.__loader__).__name__)\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", body],
+        cwd=str(_PROJECT_ROOT),
+        env=sandboxed_env(),
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert f"LOADER {expected}" in result.stdout, (
+        f"a child did not wrap a first-party module outside live_runner/scripts: "
+        f"{result.stdout}{result.stderr}"
+    )
 
 
 def test_a_subprocess_does_not_load_the_repo_dotenv() -> None:

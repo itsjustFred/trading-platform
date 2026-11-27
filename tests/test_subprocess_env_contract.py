@@ -55,12 +55,22 @@ _SPAWN_CALLS = frozenset(
         ("os", "execvpe"),
         ("os", "posix_spawn"),
         ("os", "posix_spawnp"),
+        # A pool is a set of processes, so it inherits the environment like one.
+        ("multiprocessing", "Pool"),
     }
 )
 
 #: ``asyncio.create_subprocess_exec`` / ``..._shell``: reached as attributes, so
 #: the dotted tail is matched instead of a fixed pair.
 _ASYNCIO_SPAWN_TAILS = frozenset({"create_subprocess_exec", "create_subprocess_shell"})
+
+#: Process launchers whose call shape is not a dotted module name: a
+#: ``multiprocessing.get_context("spawn").Process(...)`` reaches the machinery as a
+#: bare attribute on a call result, and ``concurrent.futures``'s executor can be
+#: spelled with or without its module. Matching the trailing name catches those
+#: shapes - and the pairs below are matched on both names, so ``os.fork`` and
+#: ``multiprocessing.Process(...)`` are covered by the pair list.
+_LAUNCHER_ATTR_NAMES = frozenset({"Process", "ProcessPoolExecutor", "fork", "forkpty"})
 
 #: The marker that documents a deliberate exception on the ``env=`` line.
 _ENV_EXCEPTION_MARKER = "sandbox-env:"
@@ -97,7 +107,9 @@ def _is_spawn_call(node: ast.Call) -> bool:
     parts = dotted.split(".")
     if len(parts) >= 2 and (parts[-2], parts[-1]) in _SPAWN_CALLS:
         return True
-    return parts[-1] in _ASYNCIO_SPAWN_TAILS
+    if parts[-1] in _ASYNCIO_SPAWN_TAILS:
+        return True
+    return parts[-1] in _LAUNCHER_ATTR_NAMES
 
 
 def _scope_of(node: ast.AST, tree: ast.Module) -> ast.AST:
@@ -204,24 +216,23 @@ def _env_keyword(node: ast.Call) -> ast.AST | None:
 
 
 def _spawn_call_is_sandboxed(node: ast.Call, tree: ast.Module, source_lines: list[str]) -> bool:
-    """Whether the ``env=`` of one spawn call is the sandboxed environment.
+    """Whether one spawn call hands its child the sandboxed environment.
 
     Three shapes are the contract: ``env=sandboxed_env(...)``, an ``env=`` bound to
-    a same-file name that resolves to it, and an ``env=`` carrying the
-    ``# sandbox-env:`` marker that documents why this call is the exception.
+    a same-file name that resolves to it, and a call carrying the ``# sandbox-env:``
+    marker that documents why this call is the exception. The marker is checked
+    first and for every launcher, because some shapes take no ``env=`` at all -
+    ``os.fork`` inherits the parent's environment and cannot be told otherwise.
     """
-    env_expression = _env_keyword(node)
-    if env_expression is None:
-        return False
-    if _expr_uses_sandboxed_env(env_expression, tree):
-        return True
-    # The call may span several lines; the marker is looked for on the whole call.
     start = node.lineno - 1
     end = getattr(node, "end_lineno", node.lineno)
     for line in source_lines[start:end]:
         if _ENV_EXCEPTION_MARKER in line:
             return True
-    return False
+    env_expression = _env_keyword(node)
+    if env_expression is None:
+        return False
+    return _expr_uses_sandboxed_env(env_expression, tree)
 
 
 def _display_path(path: Path) -> str:
@@ -295,6 +306,54 @@ def test_the_scan_accepts_sandboxed_env_and_its_helpers(tmp_path: Path) -> None:
         "def test_marked():\n"
         "    subprocess.run(['git', 'status'], env={'PATH': os.environ['PATH']}) "
         "# sandbox-env: PATH-only probe\n",
+        encoding="utf-8",
+    )
+    assert _unsandboxed_spawn_calls(sample) == []
+
+
+def test_the_scan_covers_the_other_process_launchers(tmp_path: Path) -> None:
+    """``multiprocessing``, a pool executor and ``os.fork`` inherit the environment too.
+
+    A spawn call through any of them hands the child the caller's environment exactly like
+    ``subprocess`` does, so the scan has to name them - including the shapes whose target is an
+    attribute on a call result, such as ``get_context("spawn").Process(...)``.
+    """
+    sample = tmp_path / "test_sample.py"
+    sample.write_text(
+        "import multiprocessing\n"
+        "import os\n"
+        "import subprocess\n"
+        "from concurrent.futures import ProcessPoolExecutor\n"
+        "def test_forks():\n"
+        "    multiprocessing.Process(target=print)\n"
+        "    multiprocessing.get_context('spawn').Process(target=print)\n"
+        "    multiprocessing.Pool(2)\n"
+        "    ProcessPoolExecutor(2)\n"
+        "    os.fork()\n"
+        "def test_os_forkpty():\n"
+        "    os.forkpty()\n"
+        "def test_ok():\n"
+        "    subprocess.run(['git', 'status'], env=sandboxed_env())\n",
+        encoding="utf-8",
+    )
+    offenders = _unsandboxed_spawn_calls(sample)
+    assert len(offenders) == 6, offenders
+    assert all("test_sample.py:" in offender for offender in offenders)
+
+
+def test_the_scan_accepts_the_other_launchers_with_the_sandboxed_env(tmp_path: Path) -> None:
+    """``env=sandboxed_env()`` is the contract whichever launcher starts the child."""
+    sample = tmp_path / "test_sample.py"
+    sample.write_text(
+        "import multiprocessing\n"
+        "import os\n"
+        "from concurrent.futures import ProcessPoolExecutor\n"
+        "from tests.conftest import sandboxed_env\n"
+        "def test_launchers():\n"
+        "    multiprocessing.Process(target=print, env=sandboxed_env())\n"
+        "    multiprocessing.Pool(2, env=sandboxed_env())\n"
+        "    ProcessPoolExecutor(2, env=sandboxed_env())\n"
+        "    os.fork()  # sandbox-env: fork has no env=; the child inherits the swept one\n",
         encoding="utf-8",
     )
     assert _unsandboxed_spawn_calls(sample) == []

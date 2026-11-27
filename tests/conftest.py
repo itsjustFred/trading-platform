@@ -51,6 +51,11 @@ if _CHILD_PROCESS:
     _SESSION_ROOT = Path(os.environ["TP_TEST_SESSION_ROOT"]).resolve()
 else:
     _SESSION_ROOT = Path(tempfile.mkdtemp(prefix="tp-pytest-session-")).resolve()
+    # A child that shares this sandbox (sandboxed_env()'s default) owns no lifetime of its own:
+    # the session directory is removed here, so such a child must be finished before the pytest
+    # process exits. A child that has to outlive the session is the sandbox's one case that has
+    # no owner, and the tests that leave one running must not exist - the watchdog and lock
+    # holders are all waited on or killed.
     atexit.register(shutil.rmtree, _SESSION_ROOT, ignore_errors=True)
 TEST_DATA_DIR = _SESSION_ROOT / "data"
 TEST_LOG_DIR = _SESSION_ROOT / "logs"
@@ -267,6 +272,11 @@ def sandboxed_env(*, shares_sandbox: bool = True, **overrides: str) -> dict[str,
     the parent's session directory would give it the parent's session instead of
     its own - so it gets the swept environment and sets up its own sandbox, the
     way a standalone run does.
+
+    Lifetime: a child that shares the sandbox is owned by this pytest process.
+    The session directory is removed when that process exits, so such a child must
+    be finished before then - started, driven and joined (or killed) inside the
+    test that started it.
     """
     env = {name: value for name, value in os.environ.items() if _is_allowlisted_env(name)}
     env["DATA_DIR"] = os.environ["DATA_DIR"]
@@ -622,27 +632,41 @@ class _ChildAccountsEnvLoader:
 
 
 class _ChildAccountsEnvFinder:
-    """Patch the accounts-env constants of the packages that define them, lazily.
+    """Patch the accounts-env constants of every first-party module, lazily.
 
     A child cannot run the suite's eager isolation: importing the roster's eleven modules before
     the child's own code starts would make a ``--help`` probe as heavy as the daemon it is meant
     to avoid importing. Wrapping the loader instead patches each module as it finishes importing,
     in dependency order, so a module that binds the name from another one binds the patched value
     exactly like the suite's own sweep.
+
+    The wrap is by file, not by package name: the accounts-env constant lives in ``live_runner``
+    and ``scripts`` today, and a constant that appears in another first-party package tomorrow
+    (``shared``, ``viewer``) must be patched the same way. Only modules whose file is inside this
+    checkout are wrapped, so stdlib and site-packages imports keep their own loaders.
     """
 
-    _PACKAGES = ("live_runner", "scripts")
+    #: Both spellings of the checkout root, because a module's origin is spelled the way the
+    #: path entry it was found through was: a symlinked checkout would be rejected by one of
+    #: them, and an unwrapped module is a leak the audit hook only catches on open.
+    _REPO_PREFIXES = tuple(
+        str(root) + os.sep for root in (PROJECT_ROOT, Path(__file__).parent.parent)
+    )
 
     def find_spec(self, fullname: str, path: object = None, target: object = None) -> object:
-        if fullname.split(".")[0] not in self._PACKAGES:
-            return None
         for finder in sys.meta_path:
             if finder is self or not hasattr(finder, "find_spec"):
                 continue
             spec = finder.find_spec(fullname, path, target)  # type: ignore[attr-defined]
             if spec is None:
                 continue
-            if spec.loader is not None and hasattr(spec.loader, "exec_module"):
+            origin = getattr(spec, "origin", None)
+            if (
+                origin
+                and spec.loader is not None
+                and hasattr(spec.loader, "exec_module")
+                and str(origin).startswith(self._REPO_PREFIXES)
+            ):
                 spec.loader = _ChildAccountsEnvLoader(spec.loader)
             return spec
         return None
