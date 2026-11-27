@@ -91,6 +91,9 @@ class RiskEngine:
         estimate: that is an estimate from the order's own trigger level, not
         a protective stop (see ``TradeEngine._current_risk_exposure``).
         """
+        normalized_action = str(action).strip().lower()
+        if normalized_action not in {"buy", "long", "sell", "short"}:
+            raise ValueError(f"Unsupported action {action!r} for fallback stop")
         distance = self._fallback_stop_distance(
             entry_price=entry_price, atr=atr, stop_distance=stop_distance
         )

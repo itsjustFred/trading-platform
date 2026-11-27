@@ -630,6 +630,15 @@ def test_risk_engine_fallback_stop_rejects_unusable_atr(atr) -> None:
         engine.fallback_stop(action="buy", entry_price=100.0, atr=atr)
 
 
+@pytest.mark.parametrize("action", ["hold", "exit", "", None, 1])
+def test_risk_engine_fallback_stop_rejects_unknown_action(action) -> None:
+    """``fallback_stop`` is public: an unrecognised action must raise, not
+    silently take the short side like ``_place_stop``'s ``else`` branch."""
+    engine = RiskEngine()
+    with pytest.raises(ValueError, match="Unsupported action"):
+        engine.fallback_stop(action=action, entry_price=100.0)
+
+
 def test_backtest_notional_ceiling_deliberately_differs_from_live() -> None:
     """The named backtest constant is not silently aligned with live.
 
