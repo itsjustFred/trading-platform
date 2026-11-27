@@ -30,6 +30,14 @@ on:
       ACTIONS_NVIDIA_API_KEY:
         description: "NVIDIA API key, only read when model is nvidia/..."
         required: false
+    # What the callers gate on: `needs.quota-probe.outputs.available`. Without
+    # this mapping the job output stays inside this workflow and every caller
+    # reads an empty string - which is not 'false', so the agent job would run
+    # even on a confirmed cap.
+    outputs:
+      available:
+        description: "'false' only on a positive quota signature; 'true' otherwise"
+        value: ${{ jobs.probe.outputs.available }}
 
 permissions: {}
 

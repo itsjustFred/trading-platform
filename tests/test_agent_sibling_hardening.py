@@ -507,8 +507,14 @@ def test_the_quota_probe_gates_the_agent_job() -> None:
         assert probe_job.get("permissions") == {}, (
             f"{name}: the probe holds a token scope it does not need"
         )
-        assert "steps.probe.outputs.available" in str(probe_job.get("outputs", {})), (
-            f"{name}: the probe reports no `available` output"
+        # The `available` the callers read is the workflow_call output, which
+        # must map the probe job's own output outward - without the mapping the
+        # callers see an empty string and the quota gate never fires.
+        probe_data = _load(PROBE)
+        on_block = probe_data.get("on", probe_data.get(True))
+        call_outputs = on_block["workflow_call"].get("outputs", {})
+        assert "jobs.probe.outputs.available" in str(call_outputs.get("available", {})), (
+            f"{name}: the probe reports no `available` output to its callers"
         )
         assert not any(
             str(s.get("uses", "")).startswith("actions/checkout")
