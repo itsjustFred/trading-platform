@@ -188,13 +188,21 @@ os.environ.pop(ACCOUNTS_ENV_ENV_VAR, None)
 #   * PYTHON*: the interpreter's own switches, plus the PYTHONPATH sandboxed_env() rebuilds.
 #   * PYTEST_XDIST*: an xdist worker's own identity, set by the controller before this import.
 #   * CI, GITHUB_*, RUNNER_TEMP: the CI job's context, which the workflows and the
-#     workflow-simulation tests read.
+#     workflow-simulation tests read. The GITHUB_ prefix carries GITHUB_TOKEN with it, which
+#     is repo-scoped in CI: accepted deliberately, because the workflow-simulation tests
+#     read the job's context and a test in this repo is trusted to run in it. Drop the
+#     prefix rather than widen it if that trade is ever in question.
 #   * the documented opt-ins (TP_TEST_OHLCV_DIR, TP_INTEGRATION_BASE_URL, TRADING_PRODUCTION_DB,
 #     DIFFERENTIAL_REAL_SLICE_CSV, REQUIRE_REAL_DATA_SLICE, PLAYWRIGHT_BROWSERS_PATH): each names
 #     a path or flag a maintainer chose deliberately, and each test that reads one skips cleanly
 #     when it is unset.
 # HOME is not on the list: it is pointed at the session sandbox instead, so a test (or a child)
-# never reads the caller's home directory. The sandbox's own variables (DATA_DIR, LOG_DIR, the
+# never reads the caller's home directory. Anything else a feature reads from the environment
+# arrives here for the first time as a silent skip - so a new variable is added to this list
+# (with its reason) or pinned by a named test that fails without it, never left to be
+# discovered by a reader that quietly saw nothing.
+#
+# The sandbox's own variables (DATA_DIR, LOG_DIR, the
 # OPS_ALERT_* filters) are, because the sweep runs after they were forced: they hold this
 # process's values by then, and a child that inherited them from sandboxed_env() must keep them
 # - together with the names sandboxed_env() itself lists in TP_TEST_CHILD_ENV (see
@@ -390,7 +398,7 @@ def _write_child_sandbox_shim() -> None:
         + '":\n'
         "    _repo = os.environ['TP_TEST_REPO_ROOT']\n"
         "    _shim = os.path.dirname(os.path.abspath(__file__))\n"
-        "    _path = os.path.join(_repo, 'tests', 'conftest.py')\n"
+        "    _path = os.path.join(_repo, 'tests/conftest.py')\n"
         "    _spec = importlib.util.spec_from_file_location('tp_test_conftest', _path)\n"
         "    _module = importlib.util.module_from_spec(_spec)\n"
         "    sys.modules['tp_test_conftest'] = _module\n"

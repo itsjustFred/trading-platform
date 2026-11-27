@@ -432,18 +432,30 @@ def test_the_scan_covers_the_other_process_launchers(tmp_path: Path) -> None:
 
 
 def test_the_scan_accepts_the_other_launchers_with_the_sandboxed_env(tmp_path: Path) -> None:
-    """``env=sandboxed_env()`` is the contract whichever launcher starts the child."""
+    """`env=sandboxed_env()` for a launcher that takes one, a marker for one that does not.
+
+    ``multiprocessing.Process``/``Pool``, ``concurrent.futures``' executor and ``joblib.Parallel``
+    accept no ``env=`` at all: handing them one is a ``TypeError``, not a sandboxed child. They
+    inherit the calling process's environment, which inside the suite is the swept one, so the
+    documented marker is what they carry; a launcher that does take an environment is handed
+    ``sandboxed_env()``. Both shapes are accepted by the scan.
+    """
     sample = tmp_path / "test_sample.py"
     sample.write_text(
         "import multiprocessing\n"
         "import os\n"
+        "import subprocess\n"
         "from concurrent.futures import ProcessPoolExecutor\n"
+        "import joblib\n"
         "from tests.conftest import sandboxed_env\n"
         "def test_launchers():\n"
-        "    multiprocessing.Process(target=print, env=sandboxed_env())\n"
-        "    multiprocessing.Pool(2, env=sandboxed_env())\n"
-        "    ProcessPoolExecutor(2, env=sandboxed_env())\n"
-        "    joblib.Parallel(n_jobs=2, env=sandboxed_env())\n"
+        "    subprocess.run(['git', 'status'], env=sandboxed_env())\n"
+        "    subprocess.Popen(['git', 'status'], env=sandboxed_env())\n"
+        "    multiprocessing.Process(target=print)  # sandbox-env: no env parameter;\n"
+        # inherits the calling process's swept environment\n"
+        "    multiprocessing.Pool(2)  # sandbox-env: no env parameter; inherits the swept one\n"
+        "    ProcessPoolExecutor(2)  # sandbox-env: no env parameter; inherits the swept one\n"
+        "    joblib.Parallel(n_jobs=2)  # sandbox-env: no env parameter; inherits the swept one\n"
         "    os.fork()  # sandbox-env: fork has no env=; the child inherits the swept one\n",
         encoding="utf-8",
     )

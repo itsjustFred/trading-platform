@@ -438,6 +438,26 @@ def test_the_probe_scans_only_first_party_modules() -> None:
         assert _is_first_party(rel), rel
 
 
+def test_the_shim_exclusion_is_the_exact_set_the_shim_loads() -> None:
+    """The guard's one exclusion is the shim's own file, asserted as an exact set.
+
+    A widened exclusion - a package, a directory, any file under ``tests/`` - would blind the
+    daemon's teardown-hook scan to a module the daemon really imports, and the daemon leaves
+    through ``os._exit``, so the missed hook never runs. Pinned against both the recorded file
+    and the generated shim text, so a widening edit fails here rather than in a leak.
+    """
+    assert _SANDBOX_CHILD_SHIM_FILES == {"tests/conftest.py"}
+    marker = suite_conftest._SESSION_ROOT / "sandbox-shim-loaded-files"
+    assert marker.is_file(), "the shim no longer records the files it loads into a child"
+    assert set(marker.read_text(encoding="utf-8").split()) == _SANDBOX_CHILD_SHIM_FILES
+    shim = (suite_conftest.CHILD_SANDBOX_SHIM_DIR / "sitecustomize.py").read_text(encoding="utf-8")
+    for rel in _SANDBOX_CHILD_SHIM_FILES:
+        # The shim joins the repo root it is handed at runtime, so the text names the parts.
+        assert f"os.path.join(_repo, {rel!r})" in shim, (
+            f"the shim no longer loads {rel}, so the guard's exclusion of it is stale"
+        )
+
+
 def test_the_guard_catches_a_planted_exit_hook() -> None:
     """The detector itself is pinned: a planted hook must be reported."""
     planted = """
