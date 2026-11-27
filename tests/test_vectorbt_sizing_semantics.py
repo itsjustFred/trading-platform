@@ -595,8 +595,6 @@ class TestInvertedSizingStop:
         assert result.meta.data["inverted_stop_drops"] == 1
 
 
-
-
 class TestRiskMathContract:
     """PM-2 viewer contract, asserted on real output instead of source text."""
 
