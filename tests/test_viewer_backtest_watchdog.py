@@ -325,12 +325,15 @@ def test_signal_replay_worker_marks_task_and_job_failed_on_error(
         ),
     )
 
+    class _ReplayBoom(Exception):
+        pass
+
     class _ExplodingSignalReplayAdapter:
         def __init__(self, *args, **kwargs):
             pass
 
         def run(self, **kwargs):
-            raise RuntimeError("replay exploded")
+            raise _ReplayBoom("replay exploded")
 
     monkeypatch.setattr(
         viewer_app_module, "SignalReplayAdapter", _ExplodingSignalReplayAdapter
