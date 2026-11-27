@@ -18,6 +18,7 @@ pinned in ``tests/test_suite_isolation.py``.
 from __future__ import annotations
 
 import ast
+from functools import lru_cache
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -110,12 +111,23 @@ def _dotted_call_name(node: ast.Call) -> str:
     return ".".join(parts)
 
 
-def _is_spawn_call(node: ast.Call) -> bool:
+def _starts_a_process(node: ast.Call) -> bool:
+    """Whether one call starts a process, by anything the scan can name.
+
+    Fail closed where a name can say so: a launcher whose final call name contains
+    ``fork`` or ``spawn`` is a launcher the list has never heard of, and the cost of
+    being wrong about it is a scan entry a test author explains away with the marker -
+    lower than the cost of a child inheriting an unswept environment. The exact lists
+    above keep the shapes that carry no such substring.
+    """
     dotted = _dotted_call_name(node)
     parts = dotted.split(".")
     if len(parts) >= 2 and (parts[-2], parts[-1]) in _SPAWN_CALLS:
         return True
     if parts[-1] in _ASYNCIO_SPAWN_TAILS:
+        return True
+    name = parts[-1].lower()
+    if "fork" in name or "spawn" in name:
         return True
     return parts[-1] in _LAUNCHER_ATTR_NAMES
 
@@ -148,6 +160,10 @@ def _names_defined_in_scope(scope: ast.AST) -> dict[str, ast.AST]:
     body = [scope]
     while body:
         node = body.pop()
+        if isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                if isinstance(alias.name, str):
+                    definitions.setdefault(alias.asname or alias.name, node)
         if isinstance(node, ast.Assign):
             for target in node.targets:
                 if isinstance(target, ast.Name):
@@ -161,6 +177,38 @@ def _names_defined_in_scope(scope: ast.AST) -> dict[str, ast.AST]:
                 continue  # a nested scope: its own bindings stay its own
         body.extend(ast.iter_child_nodes(node))
     return definitions
+
+
+@lru_cache(maxsize=None)
+def _repo_module_ast(module_name: str) -> ast.Module | None:
+    """The parsed AST of a module inside this repo, or ``None`` when it is not one.
+
+    Only repo-internal modules are followed: a name imported from a third-party package has
+    no definition here to read, and the scan must not pretend to know what it does.
+    """
+    relative = Path(*module_name.split("."))
+    for candidate in (relative.with_suffix(".py"), relative / "__init__.py"):
+        path = PROJECT_ROOT / candidate
+        if path.is_file():
+            try:
+                return ast.parse(path.read_text(encoding="utf-8"))
+            except (OSError, SyntaxError, ValueError):
+                return None
+    return None
+
+
+def _imported_definition(
+    module_name: str, original_name: str, seen: set[tuple[str, str]]
+) -> ast.AST | None:
+    """What *original_name* is bound to in a repo module this file imported it from."""
+    key = (module_name, original_name)
+    if key in seen:
+        return None
+    seen.add(key)
+    module_ast = _repo_module_ast(module_name)
+    if module_ast is None:
+        return None
+    return _names_defined_in_scope(module_ast).get(original_name)
 
 
 def _resolve_name(name: str, node: ast.AST, tree: ast.Module) -> ast.AST | None:
@@ -190,6 +238,7 @@ def _expr_uses_sandboxed_env(expression: ast.AST, tree: ast.Module) -> bool:
     confuse the scan.
     """
     seen: set[tuple[str, int, int]] = set()
+    seen_imports: set[tuple[str, str]] = set()
     pending: list[tuple[ast.AST, ast.AST]] = [(expression, tree)]
     while pending:
         node, scope = pending.pop()
@@ -210,6 +259,27 @@ def _expr_uses_sandboxed_env(expression: ast.AST, tree: ast.Module) -> bool:
                 # The helper's whole body: it may reach the sandboxed environment
                 # through another local name, which this loop then follows.
                 pending.extend((child, definition) for child in ast.walk(definition))
+                continue
+            if isinstance(definition, ast.ImportFrom) and definition.module:
+                # A helper imported from a repo module: the definition lives there, so the
+                # same walk runs on its body.
+                alias = next(
+                    (
+                        alias
+                        for alias in definition.names
+                        if (alias.asname or alias.name) == node.id
+                    ),
+                    None,
+                )
+                if alias is not None:
+                    target = _imported_definition(
+                        definition.module, alias.name, seen_imports
+                    )
+                    if isinstance(target, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        # The imported helper's body, walked the same way a local one is.
+                        pending.extend((child, definition) for child in ast.walk(target))
+                    elif target is not None:
+                        pending.append((target, definition))
                 continue
             pending.append((definition, _scope_of(definition, tree)))
             continue
@@ -239,7 +309,11 @@ def _spawn_call_is_sandboxed(node: ast.Call, tree: ast.Module, source_lines: lis
             return True
     env_expression = _env_keyword(node)
     if env_expression is None:
-        return False
+        # The call names no environment, so the contract has to be inside what it reaches: a
+        # same-file helper that builds the child's environment itself (``spawn_holder`` is
+        # the shape in this suite) is compliant, and anything else - an imported helper, a
+        # bare fork - is reported rather than waved through.
+        return _expr_uses_sandboxed_env(node.func, tree)
     return _expr_uses_sandboxed_env(env_expression, tree)
 
 
@@ -266,7 +340,7 @@ def _unsandboxed_spawn_calls(path: Path) -> list[str]:
         f"{_display_path(path)}:{node.lineno}: {_dotted_call_name(node)}"
         for node in ast.walk(tree)
         if isinstance(node, ast.Call)
-        and _is_spawn_call(node)
+        and _starts_a_process(node)
         and not _spawn_call_is_sandboxed(node, tree, source_lines)
     ]
 
@@ -368,6 +442,44 @@ def test_the_scan_accepts_the_other_launchers_with_the_sandboxed_env(tmp_path: P
         encoding="utf-8",
     )
     assert _unsandboxed_spawn_calls(sample) == []
+
+
+def test_the_scan_follows_a_helper_imported_from_the_repo(tmp_path: Path) -> None:
+    """A repo helper that builds the sandbox with it is the contract, called or imported.
+
+    ``spawn_holder`` lives in ``tests/helpers`` and carries ``sandboxed_env()`` inside it, so
+    a test that calls it hands its child the sandbox even though the call names no ``env=``.
+    The scan reads the imported module for that.
+    """
+    sample = tmp_path / "test_sample.py"
+    sample.write_text(
+        "from tests.helpers.lock_holder import spawn_holder\n"
+        "def test_spawns():\n"
+        "    spawn_holder('/tmp/lock', 1.0)\n",
+        encoding="utf-8",
+    )
+    assert _unsandboxed_spawn_calls(sample) == []
+
+
+def test_the_scan_fails_closed_on_a_launcher_it_does_not_know(tmp_path: Path) -> None:
+    """An unknown launcher is reported rather than waved through.
+
+    A call whose name says it starts a process - ``fork``, ``spawn`` - and that cannot be
+    resolved to the sandboxed environment is an offender: the cost of the entry is a marker
+    comment, the cost of the miss is a child inheriting an unswept environment.
+    """
+    sample = tmp_path / "test_sample.py"
+    sample.write_text(
+        "from some_client_library import spawn_worker_process\n"
+        "def test_starts_a_worker():\n"
+        "    spawn_worker_process()\n"
+        "def test_forks_through_a_helper():\n"
+        "    fork_and_join()\n",
+        encoding="utf-8",
+    )
+    offenders = _unsandboxed_spawn_calls(sample)
+    assert len(offenders) == 2, offenders
+    assert all("test_sample.py:" in offender for offender in offenders)
 
 
 def test_the_scan_rejects_a_hand_rolled_environment(tmp_path: Path) -> None:

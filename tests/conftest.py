@@ -361,6 +361,12 @@ def _write_child_sandbox_shim() -> None:
     the leak ``tests/test_subprocess_env_contract.py`` fails on.
     """
     CHILD_SANDBOX_SHIM_DIR.mkdir(parents=True, exist_ok=True)
+    # The files this shim loads into a child, by repo-relative path: a guard that sweeps the
+    # repo for hooks or credentials excludes the suite's own modules when - and only when -
+    # this child of the sandbox loaded them, which is what the daemon exit-hook guard does.
+    (_SESSION_ROOT / "sandbox-shim-loaded-files").write_text(
+        "tests/conftest.py\n", encoding="utf-8"
+    )
     (CHILD_SANDBOX_SHIM_DIR / "sitecustomize.py").write_text(
         "import importlib.util\n"
         "import os\n"
@@ -1449,10 +1455,15 @@ def finish_shared_sandbox_children() -> None:
     directly: the teardown above is where the contract is enforced, and this is the same
     enforcement, called by a test that pins it.
     """
+    import subprocess
+
     leftover = [child for child in _SHARED_CHILDREN if child.poll() is None]
     for child in leftover:
         child.kill()
-        child.wait(timeout=10)
+        try:
+            child.wait(timeout=10)
+        except subprocess.TimeoutExpired:  # pragma: no cover - an unkillable child
+            pass  # SIGKILL was already sent; a process that survives it is the kernel's problem
     _SHARED_CHILDREN.clear()
     if leftover:
         pids = ", ".join(str(child.pid) for child in leftover)

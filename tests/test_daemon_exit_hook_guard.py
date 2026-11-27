@@ -52,6 +52,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+import tests.conftest as suite_conftest
 from tests.conftest import sandboxed_env
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -300,11 +301,17 @@ def _scan_source(rel_path: str, source: str) -> list[str]:
     return violations
 
 
-#: The one file under ``tests/`` the sandbox's child shim loads: the probe below runs
-#: inside that sandbox, so its own conftest is in the closure of every *test* child before
-#: the daemon is. Excluded by name rather than by package: a daemon module that reaches for
-#: any other ``tests/`` helper is a real finding and must still be scanned.
-_SANDBOX_CHILD_SHIM_FILE = "tests/conftest.py"
+#: The files the sandbox's child shim loads into the probe's child, by repo-relative path. The
+#: probe runs with ``sandboxed_env()``, so the shim's own conftest is in the closure of every
+#: *test* child before the daemon is - and in nothing else: a production module that reached
+#: for ``tests/conftest.py`` itself is a finding, so the exclusion is narrow by file rather
+#: than by package, and it exists only for a child the sandbox actually loaded the file into.
+_SANDBOX_CHILD_SHIM_FILES = frozenset(
+    name
+    for path in [suite_conftest._SESSION_ROOT / "sandbox-shim-loaded-files"]
+    if path.is_file()
+    for name in path.read_text(encoding="utf-8").split()
+)
 
 
 def _is_first_party(rel: str) -> bool:
@@ -317,15 +324,15 @@ def _is_first_party(rel: str) -> bool:
     so third-party teardown hooks (Sentry's flush, certifi's temp files) are
     not policed here.
 
-    ``tests/conftest.py`` is excluded as well, for the one reason above: the
-    suite's sandbox shim loads it into the probe's own child. The rest of
-    ``tests/`` is scanned like any other package, so a production module that
-    reached into the suite would be reported.
+    The sandbox shim's own files are excluded as well, for the one reason above
+    (see ``_SANDBOX_CHILD_SHIM_FILES``); the rest of ``tests/`` is scanned like
+    any other package, so a production module that reached into the suite would
+    be reported.
     """
     parts = rel.split("/")
     return (
         parts[0] in _FIRST_PARTY_PACKAGES
-        and rel != _SANDBOX_CHILD_SHIM_FILE
+        and rel not in _SANDBOX_CHILD_SHIM_FILES
         and "site-packages" not in parts
         and "__pycache__" not in parts
     )
