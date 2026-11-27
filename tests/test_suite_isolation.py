@@ -1218,6 +1218,42 @@ def test_a_child_guard_covers_the_checkout_through_any_spelling(tmp_path: Path) 
     )
 
 
+def test_sandboxed_env_marks_and_names_a_sharing_child_together() -> None:
+    """The marker and the session directory are one act of ``sandboxed_env()``.
+
+    A child that was marked but not named - or the reverse - would take the wrong branch
+    of the sandbox for a reason nobody can see, so the pair is pinned here as well as
+    asserted at child startup.
+    """
+    sharing = suite_conftest.sandboxed_env()
+    assert sharing[suite_conftest.CHILD_SANDBOX_ENV_VAR] == suite_conftest.CHILD_SANDBOX_FLAG_VALUE
+    assert sharing["TP_TEST_SESSION_ROOT"] == str(suite_conftest._SESSION_ROOT)
+    own = suite_conftest.sandboxed_env(shares_sandbox=False)
+    assert suite_conftest.CHILD_SANDBOX_ENV_VAR not in own
+    assert "TP_TEST_SESSION_ROOT" not in own
+
+
+def test_the_documented_test_opt_ins_are_on_the_allowlist() -> None:
+    """Every variable the docs name as a test opt-in survives the sweep.
+
+    DATABASE_URL and the accounts env are cleared from the environment on purpose; these are
+    the opposite - paths and flags a maintainer chose, which the tests read and skip without.
+    Dropping one from the allowlist would turn a deliberate opt-in into a silent skip.
+    """
+    opt_ins = (
+        "TP_TEST_OHLCV_DIR",  # AGENTS.md: the dataset-backed strategy runs
+        "TP_INTEGRATION_BASE_URL",  # tests/integration: the live-pipeline opt-in
+        "TRADING_PRODUCTION_DB",  # the corpus checks against a production copy
+        "DIFFERENTIAL_REAL_SLICE_CSV",  # CI's differential slice cache
+        "REQUIRE_REAL_DATA_SLICE",  # CI turns a missing slice into a failure
+        "PLAYWRIGHT_BROWSERS_PATH",  # a browser install outside the sandbox HOME
+    )
+    for name in opt_ins:
+        assert suite_conftest._is_allowlisted_env(name), (
+            f"{name} is documented as a test opt-in but is no longer on the allowlist"
+        )
+
+
 def test_a_sandbox_sharing_child_must_be_finished_by_its_test(tmp_path: Path) -> None:
     """The lifetime contract, enforced: a sharing child still alive at teardown fails.
 

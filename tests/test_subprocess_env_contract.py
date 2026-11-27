@@ -81,7 +81,9 @@ _LAUNCHER_ATTR_NAMES = frozenset(
     {"Process", "ProcessPoolExecutor", "Parallel", "fork", "forkpty"}
 )
 
-#: The marker that documents a deliberate exception on the ``env=`` line.
+#: The marker that documents a deliberate exception on the spawn call, and the shape it must
+#: take: ``# sandbox-env:`` followed by the reason. A bare marker would silence the scan with
+#: nothing to review, which is the one way the contract could be talked out of.
 _ENV_EXCEPTION_MARKER = "sandbox-env:"
 
 
@@ -305,8 +307,12 @@ def _spawn_call_is_sandboxed(node: ast.Call, tree: ast.Module, source_lines: lis
     start = node.lineno - 1
     end = getattr(node, "end_lineno", node.lineno)
     for line in source_lines[start:end]:
-        if _ENV_EXCEPTION_MARKER in line:
-            return True
+        marker = line.find(_ENV_EXCEPTION_MARKER)
+        if marker == -1:
+            continue
+        if not line[marker + len(_ENV_EXCEPTION_MARKER) :].strip():
+            return False  # a bare marker documents nothing; it is not an exception
+        return True
     env_expression = _env_keyword(node)
     if env_expression is None:
         # The call names no environment, so the contract has to be inside what it reaches: a
@@ -482,7 +488,25 @@ def test_the_scan_fails_closed_on_a_launcher_it_does_not_know(tmp_path: Path) ->
     assert all("test_sample.py:" in offender for offender in offenders)
 
 
+def test_a_bare_marker_is_not_an_exception(tmp_path: Path) -> None:
+    """``# sandbox-env:`` with no reason documents nothing, so it silences nothing.
+
+    The marker is the one way this contract can be talked out of, so it has to carry the
+    reason a reviewer reads: an empty one is treated as no marker at all.
+    """
+    sample = tmp_path / "test_sample.py"
+    sample.write_text(
+        "import subprocess\n"
+        "def test_spawns():\n"
+        "    subprocess.run(['git', 'status'], env={'PATH': '/usr/bin'})  # sandbox-env:\n",
+        encoding="utf-8",
+    )
+    (offender,) = _unsandboxed_spawn_calls(sample)
+    assert offender.endswith(":3: subprocess.run")
+
+
 def test_the_scan_rejects_a_hand_rolled_environment(tmp_path: Path) -> None:
+
     """``dict(os.environ)`` is the shape the contract exists to remove."""
     sample = tmp_path / "test_sample.py"
     sample.write_text(

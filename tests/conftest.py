@@ -54,6 +54,17 @@ CHILD_SANDBOX_FLAG_VALUE = "1"
 
 _CHILD_PROCESS = os.environ.get(CHILD_SANDBOX_ENV_VAR) == CHILD_SANDBOX_FLAG_VALUE
 if _CHILD_PROCESS:
+    # The marker and the session directory are written in one act by sandboxed_env(), so a
+    # child that carries one without the other is a desync inside this module - and taking
+    # the wrong branch for it means the session directory a parent still owns gets removed,
+    # or a sharing child builds a second sandbox nobody cleans. Fail loudly instead.
+    if not os.environ.get("TP_TEST_SESSION_ROOT"):
+        raise AssertionError(
+            "a child was marked as sandbox-sharing ("
+            + CHILD_SANDBOX_ENV_VAR
+            + ") without being named a session directory (TP_TEST_SESSION_ROOT): both are "
+            "written together by sandboxed_env() in tests/conftest.py"
+        )
     _SESSION_ROOT = Path(os.environ["TP_TEST_SESSION_ROOT"]).resolve()
 else:
     _SESSION_ROOT = Path(tempfile.mkdtemp(prefix="tp-pytest-session-")).resolve()
