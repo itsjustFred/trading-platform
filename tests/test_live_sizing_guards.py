@@ -18,10 +18,11 @@ import live_runner.daemon as daemon
 from live_runner.base_adapter import LiveQuote
 from risk.live import entry_deviation_sl_fraction
 from shared.models import LiveDeploymentConfig, LiveSignal
+from tests.builders import make_live_deployment, make_live_signal
 
 
 def _deployment() -> LiveDeploymentConfig:
-    return LiveDeploymentConfig(
+    return make_live_deployment(
         id=str(uuid4()),
         strategy_name="demo",
         account_id="acc-1",
@@ -35,7 +36,7 @@ def _deployment() -> LiveDeploymentConfig:
 
 
 def _signal(deployment: LiveDeploymentConfig, metadata: dict) -> LiveSignal:
-    return LiveSignal(
+    return make_live_signal(
         deployment_id=str(deployment.id),
         symbol="AAPL",
         action="buy",
