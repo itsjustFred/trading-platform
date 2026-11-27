@@ -16,8 +16,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from runner.engines.base import BacktestConfig
 from runner.engines.vectorbt_adapter import VectorbtAdapter
+from tests.builders import make_backtest_config
 
 STRATEGY_PATH = str(Path(__file__).parent.parent.parent / "strategies" / "pine_supertrend_dema" / "pine_supertrend_dema.py")
 TEST_START = "2025-04-01"
@@ -31,7 +31,7 @@ EXPECTED_NET_PROFIT = 589.93
 @pytest.fixture(scope="module")
 def backtest_result():
     engine = VectorbtAdapter()
-    config = BacktestConfig(signal_exit_fill="close", parameters={"fees": "zero"},
+    config = make_backtest_config(signal_exit_fill="close", parameters={"fees": "zero"},
         strategy_name="pine_supertrend_dema",
         symbols=[TEST_SYMBOL],
         timeframe=TEST_TIMEFRAME,
