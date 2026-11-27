@@ -28,7 +28,6 @@ from shared.models import (
     TradeExit,
 )
 
-# Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 
@@ -356,6 +355,15 @@ def test_viewer_app_enables_gzip_middleware(viewer_client):
 def test_static_spa_middleware_returns_404_for_missing_js_asset(viewer_client):
     resp = viewer_client.get("/assets/missing-liveviewer-chunk.js")
     assert resp.status_code == 404
+
+
+def test_static_spa_middleware_reports_missing_frontend_build(viewer_client, monkeypatch, tmp_path):
+    import viewer.main as viewer_app_module
+
+    monkeypatch.setattr(viewer_app_module, "STATIC_DIR", tmp_path)
+    resp = viewer_client.get("/strategies")
+    assert resp.status_code == 503
+    assert "frontend not built" in resp.text.lower()
 
 
 def test_data_download_rejects_dates_before_genesis(viewer_client, tmp_path):

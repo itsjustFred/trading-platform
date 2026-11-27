@@ -465,8 +465,7 @@ def test_mt5_row_keeps_platform_mtm_sharpe_as_a_separate_field(tmp_path):
     platform_path = tmp_path / "intraday_volatility_breakout_sp500_m1.json"
     platform_result.save(platform_path)
 
-    from validation.statistics.cross_platform import _build_mt5_row
-    from validation.statistics.cross_platform import MT5ComparisonCase
+    from validation.statistics.cross_platform import MT5ComparisonCase, _build_mt5_row
 
     row = _build_mt5_row(
         MT5ComparisonCase(

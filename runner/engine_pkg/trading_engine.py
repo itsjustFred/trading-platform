@@ -260,12 +260,12 @@ class TradeEngine:
         # bar) and before pending entry orders fill (so a reversal's exit leg
         # closes the OLD position, never the position the same open creates).
         self._pending_signal_exit = False
-        # Test/diagnostic hook (#210): when True the run loop reproduces the
-        # pre-optimization eager path on EVERY bar — the merged signal row is
-        # built unconditionally, ``next_time`` comes from ``frame.iloc[i + 1]``,
-        # and entries/exits are read with ``.iloc`` — so equivalence tests can
-        # diff lazy vs eager dumps and isolate each optimisation. Never set
-        # outside tests — it only costs performance, never changes results.
+        # Test/diagnostic hook (#210): when True the run loop takes the eager
+        # path on EVERY bar — the merged signal row is built unconditionally,
+        # ``next_time`` comes from ``frame.iloc[i + 1]``, and entries/exits are
+        # read with ``.iloc`` — so equivalence tests can diff lazy vs eager
+        # dumps and isolate each optimisation. Never set outside tests — it
+        # only costs performance, never changes results.
         self._eager_signal_rows = False
         # Fail loudly even if the config bypassed pydantic validation (#153).
         self._signal_exit_next_open = (

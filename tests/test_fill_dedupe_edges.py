@@ -396,7 +396,7 @@ def _live_signal(
     entry: float = 1.1,
     stamp: Any = "2026-07-15T10:00:00+00:00",
 ) -> LiveSignal:
-    from live_runner.daemon import _trade_signal_to_live_signal
+    from live_runner.daemon import trade_signal_to_live_signal
 
     trade = TradeSignal(
         action=action,
@@ -407,7 +407,7 @@ def _live_signal(
         timeframe="1h",
         metadata={"signal_timestamp": stamp},
     )
-    return _trade_signal_to_live_signal(trade, _deployment(deployment_id))
+    return trade_signal_to_live_signal(trade, _deployment(deployment_id))
 
 
 def test_c18_safe_entry_exit_reentry_with_new_producer_stamps_are_three_signals(database) -> None:
@@ -433,7 +433,7 @@ def test_c18_safe_same_event_in_two_deployments_is_two_signals(database) -> None
 
 def test_c18_safe_every_keyed_field_separates_signals() -> None:
     """SAFE: price, action, SL/TP, timeframe and stamp each change the key."""
-    from live_runner.daemon import _trade_signal_to_live_signal
+    from live_runner.daemon import trade_signal_to_live_signal
 
     def _key(**override: Any) -> str:
         fields: dict[str, Any] = dict(
@@ -446,7 +446,7 @@ def test_c18_safe_every_keyed_field_separates_signals() -> None:
             metadata={"signal_timestamp": "2026-07-15T10:00:00+00:00"},
         )
         fields.update(override)
-        live = _trade_signal_to_live_signal(TradeSignal(**fields), _deployment())
+        live = trade_signal_to_live_signal(TradeSignal(**fields), _deployment())
         return str(live.metadata["idempotency_key"])
 
     keys = {
@@ -496,7 +496,7 @@ def test_c18_distinct_instants_are_not_merged_by_stamp_normalisation() -> None:
 
 def test_c18_symbol_case_variant_is_one_key() -> None:
     """A redelivery spelling the symbol in another case is the same producer event."""
-    from live_runner.daemon import _trade_signal_to_live_signal
+    from live_runner.daemon import trade_signal_to_live_signal
 
     keys = set()
     for symbol in ("EURUSD", "Eurusd", "eurusd"):
@@ -509,7 +509,7 @@ def test_c18_symbol_case_variant_is_one_key() -> None:
             timeframe="1h",
             metadata={"signal_timestamp": "2026-07-15T10:00:00+00:00"},
         )
-        keys.add(_trade_signal_to_live_signal(trade, _deployment()).metadata["idempotency_key"])
+        keys.add(trade_signal_to_live_signal(trade, _deployment()).metadata["idempotency_key"])
     assert len(keys) == 1, keys
 
 
