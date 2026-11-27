@@ -184,6 +184,8 @@ from risk import (
     RiskConfig,
     RiskEngine,
     TradeSignal,
+    coerce_setting_float,
+    coerce_setting_int,
     effective_max_notional_per_trade,
 )
 from risk.live import (
@@ -620,51 +622,6 @@ def _block_ctrader_account(account_id: str, exc: BaseException | str) -> None:
     _CTRADER_AUTH_BLOCKED_REASONS[account_id] = reason
 
 
-def _coerce_live_float(
-    value: Any,
-    *,
-    field_name: str,
-    minimum: float | None = None,
-) -> float:
-    """Coerce a live setting that is not part of ``RiskConfig``.
-
-    Deployment risk settings go through ``RiskConfig.from_settings`` (one
-    mapping, improvement-run G03); this helper is for the remaining live
-    values such as broker pip data.
-    """
-    if isinstance(value, bool):
-        raise ValueError(f"Invalid {field_name}: {value!r}")
-    try:
-        parsed = float(value)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError(f"Invalid {field_name}: {value!r}") from exc
-    if not math.isfinite(parsed):
-        raise ValueError(f"{field_name} must be finite")
-    if minimum is not None and parsed < minimum:
-        raise ValueError(f"{field_name} must be >= {minimum}")
-    return parsed
-
-
-def _coerce_live_int(
-    value: Any,
-    *,
-    field_name: str,
-    minimum: int | None = None,
-) -> int:
-    if isinstance(value, bool):
-        raise ValueError(f"Invalid {field_name}: {value!r}")
-    try:
-        numeric = float(value)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError(f"Invalid {field_name}: {value!r}") from exc
-    if not math.isfinite(numeric) or not numeric.is_integer():
-        raise ValueError(f"{field_name} must be an integer")
-    parsed = int(numeric)
-    if minimum is not None and parsed < minimum:
-        raise ValueError(f"{field_name} must be >= {minimum}")
-    return parsed
-
-
 def _risk_config_for_deployment(deployment: LiveDeploymentConfig) -> RiskConfig:
     # Improvement-run G03: the settings -> RiskConfig mapping lives in
     # ``RiskConfig.from_settings``, so the live defaults are the dataclass
@@ -894,7 +851,7 @@ def _validate_signal_age_before_wait(
     else:
         # Through the shared coercer: a boolean or a non-finite value is a config
         # error, not a budget. `float(True)` silently means one second.
-        max_age = _coerce_live_float(configured, field_name="max_signal_age_seconds")
+        max_age = coerce_setting_float(configured, field_name="max_signal_age_seconds")
     if max_age <= 0:
         raise ValueError("max_signal_age_seconds must be positive")
     age_seconds = (datetime.now(timezone.utc) - received_at).total_seconds()
@@ -1068,7 +1025,7 @@ def size_live_signal_for_submission(
     metadata.pop("current_positions", None)
     trusted_positions = 0
     if current_positions is not None:
-        trusted_positions = _coerce_live_int(
+        trusted_positions = coerce_setting_int(
             current_positions, field_name="current_positions", minimum=0
         )
         metadata["current_positions"] = trusted_positions
@@ -1078,7 +1035,7 @@ def size_live_signal_for_submission(
     resolved_pip = (
         1.0
         if pip_value is None
-        else _coerce_live_float(pip_value, field_name="pip_value", minimum=0.0)
+        else coerce_setting_float(pip_value, field_name="pip_value", minimum=0.0)
     )
 
     trade_signal = TradeSignal(
@@ -1461,9 +1418,9 @@ async def _resolve_live_pip_value(
     if not isinstance(resolved, LivePipValue):
         raise _refuse(f"adapter returned {type(resolved).__name__}, not LivePipValue")
     try:
-        value = _coerce_live_float(resolved.value, field_name="pip value")
-        units_per_qty = _coerce_live_float(resolved.units_per_qty, field_name="units per qty")
-        rate = _coerce_live_float(resolved.conversion_rate, field_name="conversion rate")
+        value = coerce_setting_float(resolved.value, field_name="pip value")
+        units_per_qty = coerce_setting_float(resolved.units_per_qty, field_name="units per qty")
+        rate = coerce_setting_float(resolved.conversion_rate, field_name="conversion rate")
     except ValueError as exc:
         raise _refuse(str(exc)) from exc
     if value <= 0 or units_per_qty <= 0 or rate <= 0:
@@ -2574,7 +2531,7 @@ async def prepare_order_with_risk(
     if pip_value is None:
         resolved_pip, pip_metadata = await _resolve_live_pip_value(adapter, deployment, signal)
     else:
-        resolved_pip = _coerce_live_float(pip_value, field_name="pip_value", minimum=0.0)
+        resolved_pip = coerce_setting_float(pip_value, field_name="pip_value", minimum=0.0)
         pip_metadata = _pip_value_record(resolved_pip, source="caller")
         # The override is a trusted channel that bypasses the broker lookup and
         # its freshness checks (#146); make every use visible in the logs.
@@ -2641,7 +2598,7 @@ async def prepare_order_with_risk(
     sized_stop = (
         None
         if sized_stop_raw is None
-        else _coerce_live_float(sized_stop_raw, field_name="resolved_stop_loss")
+        else coerce_setting_float(sized_stop_raw, field_name="resolved_stop_loss")
     )
     if stop_loss is None:
         stop_loss = sized_stop

@@ -22,15 +22,17 @@ UNIT_FRACTION = "fraction_of_balance"
 UNIT_QUANTITY = "account_currency_units_of_symbol"
 
 
-def _settings_float(
+def coerce_setting_float(
     value: Any, *, field_name: str, minimum: float | None = None
 ) -> float:
-    """Coerce one deployment setting to a finite float.
+    """Coerce one operator setting to a finite float.
 
-    Kept separate from ``RiskConfig._finite_float``: the deployment-settings
-    messages ("Invalid <field>: <value>") name the offending value for an
-    operator fixing a live deployment row, and the numeric minimum is checked
-    before the field's own range rule runs in ``__post_init__``.
+    Shared by ``RiskConfig.from_settings`` (deployment risk settings) and the
+    live daemon's non-``RiskConfig`` values (broker pip data etc.). Kept
+    separate from ``RiskConfig._finite_float``: the setting messages
+    ("Invalid <field>: <value>") name the offending value for an operator
+    fixing a live deployment row, and the numeric minimum is checked before
+    the field's own range rule runs in ``__post_init__``.
     """
     if isinstance(value, bool):
         raise ValueError(f"Invalid {field_name}: {value!r}")
@@ -45,8 +47,8 @@ def _settings_float(
     return parsed
 
 
-def _settings_int(value: Any, *, field_name: str, minimum: int | None = None) -> int:
-    """Coerce one deployment setting to an integer (see ``_settings_float``)."""
+def coerce_setting_int(value: Any, *, field_name: str, minimum: int | None = None) -> int:
+    """Coerce one operator setting to an integer (see ``coerce_setting_float``)."""
     if isinstance(value, bool):
         raise ValueError(f"Invalid {field_name}: {value!r}")
     try:
@@ -124,7 +126,7 @@ class RiskConfig:
         values = settings or {}
         defaults = cls()
         return cls(
-            max_risk_per_trade=_settings_float(
+            max_risk_per_trade=coerce_setting_float(
                 values.get(
                     "max_risk_per_trade",
                     values.get("risk_per_trade_pct", defaults.max_risk_per_trade),
@@ -132,17 +134,17 @@ class RiskConfig:
                 field_name="max_risk_per_trade",
                 minimum=0.0,
             ),
-            max_total_exposure=_settings_float(
+            max_total_exposure=coerce_setting_float(
                 values.get("max_total_exposure", defaults.max_total_exposure),
                 field_name="max_total_exposure",
                 minimum=0.0,
             ),
-            max_positions=_settings_int(
+            max_positions=coerce_setting_int(
                 values.get("max_positions", defaults.max_positions),
                 field_name="max_positions",
                 minimum=1,
             ),
-            default_sl_atr_multiplier=_settings_float(
+            default_sl_atr_multiplier=coerce_setting_float(
                 values.get(
                     "default_sl_atr_multiplier",
                     defaults.default_sl_atr_multiplier,
@@ -150,12 +152,12 @@ class RiskConfig:
                 field_name="default_sl_atr_multiplier",
                 minimum=0.0,
             ),
-            fallback_stop_pct=_settings_float(
+            fallback_stop_pct=coerce_setting_float(
                 values.get("fallback_stop_pct", defaults.fallback_stop_pct),
                 field_name="fallback_stop_pct",
                 minimum=0.0,
             ),
-            max_notional_per_trade=_settings_float(
+            max_notional_per_trade=coerce_setting_float(
                 values.get(
                     "max_notional_per_trade", defaults.max_notional_per_trade
                 ),
