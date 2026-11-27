@@ -300,6 +300,13 @@ def _scan_source(rel_path: str, source: str) -> list[str]:
     return violations
 
 
+#: The one file under ``tests/`` the sandbox's child shim loads: the probe below runs
+#: inside that sandbox, so its own conftest is in the closure of every *test* child before
+#: the daemon is. Excluded by name rather than by package: a daemon module that reaches for
+#: any other ``tests/`` helper is a real finding and must still be scanned.
+_SANDBOX_CHILD_SHIM_FILE = "tests/conftest.py"
+
+
 def _is_first_party(rel: str) -> bool:
     """Whether a repo-root-relative path is a first-party daemon module.
 
@@ -310,16 +317,15 @@ def _is_first_party(rel: str) -> bool:
     so third-party teardown hooks (Sentry's flush, certifi's temp files) are
     not policed here.
 
-    ``tests/`` is excluded as well: the probe below runs inside the suite's
-    sandbox, whose child shim imports ``tests/conftest.py`` before the daemon,
-    so the suite's own modules show up in the closure of a *test* child and
-    only there - a production daemon never imports them. Their teardown hooks
-    cannot break a process that does not load them.
+    ``tests/conftest.py`` is excluded as well, for the one reason above: the
+    suite's sandbox shim loads it into the probe's own child. The rest of
+    ``tests/`` is scanned like any other package, so a production module that
+    reached into the suite would be reported.
     """
     parts = rel.split("/")
     return (
         parts[0] in _FIRST_PARTY_PACKAGES
-        and parts[0] != "tests"
+        and rel != _SANDBOX_CHILD_SHIM_FILE
         and "site-packages" not in parts
         and "__pycache__" not in parts
     )

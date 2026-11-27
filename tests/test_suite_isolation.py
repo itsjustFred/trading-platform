@@ -1217,6 +1217,64 @@ def test_a_child_guard_covers_the_checkout_through_any_spelling(tmp_path: Path) 
     )
 
 
+def test_a_child_keeps_a_home_its_parent_named(tmp_path: Path) -> None:
+    """A sweep that clobbered a named HOME would fail the test that named it.
+
+    A config-step probe hands its child the HOME its fixture tree lives in; the child's
+    own sweep points HOME at the session sandbox by default, and has to step aside for
+    the name the parent recorded.
+    """
+    from tests.conftest import sandboxed_env
+
+    home = tmp_path / "child-home"
+    home.mkdir()
+    body = "import os\nprint('HOME', os.environ.get('HOME'))\n"
+    result = subprocess.run(
+        [sys.executable, "-c", body],
+        cwd=str(_PROJECT_ROOT),
+        env=sandboxed_env(HOME=str(home)),
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert f"HOME {home}" in result.stdout, (
+        "a child clobbered the HOME its parent named: " + result.stdout + result.stderr
+    )
+
+
+def test_a_self_sandboxing_child_keeps_the_overrides_it_named() -> None:
+    """``shares_sandbox=False`` records its overrides too - the child sweeps them itself.
+
+    Such a child runs the repo's suite (or imports this conftest) without the shim, and
+    its own sweep still runs: a variable the naming test meant it to see must survive that
+    sweep, not only survive the parent's environment construction.
+    """
+    from tests.conftest import sandboxed_env
+
+    body = (
+        "import tests.conftest  # noqa: F401 - importing it runs the sweep this pins\n"
+        "import os\n"
+        "print('PROBE', os.environ.get('TP_CHILD_PROBE_VAR'))\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", body],
+        cwd=str(_PROJECT_ROOT),
+        env=sandboxed_env(shares_sandbox=False, TP_CHILD_PROBE_VAR="named-for-this-child"),
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "PROBE named-for-this-child" in result.stdout, (
+        "a self-sandboxing child dropped an override its parent named: "
+        + result.stdout
+        + result.stderr
+    )
+
+
 def test_a_subprocess_refuses_the_network() -> None:
     """S16: the network guard covers a child too, or a call escapes the audit hook.
 

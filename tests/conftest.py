@@ -243,11 +243,17 @@ def _enforce_env_allowlist() -> None:
     """
     for name in [name for name in os.environ if not _is_allowlisted_env(name)]:
         os.environ.pop(name, None)
-    os.environ["HOME"] = str(SANDBOX_HOME)
-    if os.name == "nt":
-        os.environ["USERPROFILE"] = str(SANDBOX_HOME)
-    else:
-        os.environ.pop("USERPROFILE", None)
+    # HOME points into the session sandbox, unless the parent named one for this child: a
+    # test that hands its child a HOME of its own - a config-step probe, a fixture tree -
+    # means it, and a sweep that clobbered it would fail that test for the wrong reason.
+    inherited = os.environ.get(CHILD_ENV_OVERRIDES_ENV_VAR, "").split(",")
+    if "HOME" not in inherited:
+        os.environ["HOME"] = str(SANDBOX_HOME)
+    if "USERPROFILE" not in inherited:
+        if os.name == "nt":
+            os.environ["USERPROFILE"] = str(SANDBOX_HOME)
+        else:
+            os.environ.pop("USERPROFILE", None)
 
 
 _enforce_env_allowlist()
@@ -315,14 +321,15 @@ def sandboxed_env(*, shares_sandbox: bool = True, **overrides: str) -> dict[str,
     pythonpath.append(str(PROJECT_ROOT))
     env["PYTHONPATH"] = os.pathsep.join(pythonpath)
     env.update(overrides)
-    if not shares_sandbox:
-        return env
+    # Named, not just applied: a sharing child imports this file through the shim and a
+    # self-sandboxing one through pytest, and both sweeps must keep the variables the
+    # naming test meant the child to see. A child that starts its own child adds to the
+    # list rather than replacing it.
     if overrides:
-        # Named, not just applied: the child imports this file through the shim, and its sweep
-        # must keep the variables the naming test meant it to see. A child that starts its own
-        # child adds to the list rather than replacing it.
         inherited = [name for name in env.get(CHILD_ENV_OVERRIDES_ENV_VAR, "").split(",") if name]
         env[CHILD_ENV_OVERRIDES_ENV_VAR] = ",".join(dict.fromkeys([*inherited, *overrides]))
+    if not shares_sandbox:
+        return env
     # The xdist identity belongs to the worker xdist started, never to a child of it: a
     # plain child that carries the marker would look like a worker to anything that
     # checks, and the marker has no meaning in a process execnet did not start.
