@@ -129,13 +129,12 @@ import re
 import shutil
 import subprocess
 import sys
-import threading
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
 
 import pytest
 import yaml
+
+from tests.helpers.github_api_stub import GitHubAPIStub
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 WORKFLOWS = REPO_ROOT / ".github" / "workflows"
@@ -2530,65 +2529,10 @@ def test_the_quota_reporter_rewrites_only_this_runs_pending_mark(tmp_path) -> No
     assert "--method" not in calls, "the quota reporter wrote a status where none exists"
 
 
-class _CommentsAPI:
-    """A local stand-in for the GitHub REST endpoints post_comment.py uses
-    (the poster speaks plain REST over urllib now, so `GITHUB_API_URL`
-    points it here)."""
-
-    def __init__(self, head_sha: str, comments: list[dict]):
-        self.head_sha = head_sha
-        self.comments = comments
-        self.writes: list[str] = []
-        stub = self
-
-        class Handler(BaseHTTPRequestHandler):
-            def log_message(self, *args) -> None:
-                pass
-
-            def _json(self, code: int, obj) -> None:
-                raw = json.dumps(obj).encode()
-                self.send_response(code)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(raw)))
-                self.end_headers()
-                self.wfile.write(raw)
-
-            def do_GET(self) -> None:
-                path = urlparse(self.path).path
-                if "/pulls/" in path:
-                    self._json(200, {"head": {"sha": stub.head_sha}})
-                elif "/issues/comments/" in path:
-                    cid = path.rsplit("/", 1)[-1]
-                    body = next(
-                        (c["body"] for c in stub.comments if str(c["id"]) == cid), ""
-                    )
-                    self._json(200, {"body": body})
-                elif path.endswith("/comments"):
-                    self._json(200, stub.comments)
-                else:
-                    self._json(404, {"message": "not found"})
-
-            def _write(self, code: int) -> None:
-                stub.writes.append(f"{self.command} {urlparse(self.path).path}")
-                self._json(code, {})
-
-            def do_PATCH(self) -> None:
-                self._write(200)
-
-            def do_POST(self) -> None:
-                self._write(201)
-
-        self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        self._server.daemon_threads = True
-        threading.Thread(target=self._server.serve_forever, daemon=True).start()
-
-    @property
-    def url(self) -> str:
-        return f"http://127.0.0.1:{self._server.server_address[1]}"
-
-
 def _run_comment_post(tmp_path, *, quota_skip: bool, prior_body: str | None):
-    """Execute 'Post or update pre-mortem comment' against the comments stub.
+    """Execute 'Post or update pre-mortem comment' against the comments stub
+    (the poster speaks plain REST over urllib now, so `GITHUB_API_URL` points
+    it at a local server - tests/helpers/github_api_stub.py).
 
     `prior_body` is the body of the one existing marker comment (None: no
     comment yet). Returns (result, writes log)."""
@@ -2604,7 +2548,7 @@ def _run_comment_post(tmp_path, *, quota_skip: bool, prior_body: str | None):
         if prior_body is not None
         else []
     )
-    api = _CommentsAPI(REPORTER_ENV["HEAD_SHA"], comments)
+    api = GitHubAPIStub(heads=[REPORTER_ENV["HEAD_SHA"]], comments=comments)
     work = tmp_path / "work"
     work.mkdir(exist_ok=True)
     (work / "comment.md").write_text(

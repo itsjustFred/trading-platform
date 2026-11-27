@@ -18,14 +18,12 @@ GitHub API (``GITHUB_API_URL`` points the script at it):
 from __future__ import annotations
 
 import importlib.util
-import json
 import os
 import subprocess
 import sys
-import threading
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+
+from tests.helpers.github_api_stub import GitHubAPIStub
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 AGENTS_DIR = REPO_ROOT / "scripts" / "agents"
@@ -48,69 +46,6 @@ post_comment = _load("post_comment", "post_comment.py")
 HEAD = "b" * 40
 OTHER_HEAD = "c" * 40
 MARKER = "<!-- actions-pre-mortem -->"
-REPO_PATH = "/repos/itsjustFred/trading-platform"
-
-
-class _StubAPI:
-    """A local stand-in for the GitHub REST endpoints post_comment.py uses."""
-
-    def __init__(self, heads: list[str], comments: list[dict]):
-        self.heads = list(heads)
-        self.comments = comments
-        self.calls: list[tuple[str, str]] = []
-        self._server = self._serve()
-
-    def _serve(self) -> ThreadingHTTPServer:
-        stub = self
-
-        class Handler(BaseHTTPRequestHandler):
-            def log_message(self, *args) -> None:  # keep the test output clean
-                pass
-
-            def _json(self, code: int, obj) -> None:
-                raw = json.dumps(obj).encode()
-                self.send_response(code)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(raw)))
-                self.end_headers()
-                self.wfile.write(raw)
-
-            def do_GET(self) -> None:
-                path = urlparse(self.path).path
-                stub.calls.append(("GET", path))
-                if path == f"{REPO_PATH}/pulls/409":
-                    sha = stub.heads.pop(0) if stub.heads else HEAD
-                    self._json(200, {"head": {"sha": sha}})
-                elif "/issues/comments/" in path:
-                    cid = path.rsplit("/", 1)[-1]
-                    body = next(
-                        (c["body"] for c in stub.comments if str(c["id"]) == cid), ""
-                    )
-                    self._json(200, {"body": body})
-                elif path == f"{REPO_PATH}/issues/409/comments":
-                    self._json(200, stub.comments)
-                else:
-                    self._json(404, {"message": "not found"})
-
-            def do_PATCH(self) -> None:
-                stub.calls.append(("PATCH", urlparse(self.path).path))
-                self._json(200, {})
-
-            def do_POST(self) -> None:
-                stub.calls.append(("POST", urlparse(self.path).path))
-                self._json(201, {})
-
-        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        server.daemon_threads = True
-        threading.Thread(target=server.serve_forever, daemon=True).start()
-        return server
-
-    @property
-    def url(self) -> str:
-        return f"http://127.0.0.1:{self._server.server_address[1]}"
-
-    def writes(self) -> list[str]:
-        return [f"{method} {path}" for method, path in self.calls if method != "GET"]
 
 
 def _setup(
@@ -118,7 +53,7 @@ def _setup(
     heads: list[str],
     ids: list[str] | None = None,
     bodies: dict[str, str] | None = None,
-) -> tuple[dict, Path, _StubAPI]:
+) -> tuple[dict, Path, GitHubAPIStub]:
     work = tmp_path / "work"
     work.mkdir()
     (work / "comment.md").write_text(
@@ -132,7 +67,7 @@ def _setup(
         }
         for cid in (ids or [])
     ]
-    api = _StubAPI(heads, comments)
+    api = GitHubAPIStub(heads=heads, comments=comments)
     env = {
         **os.environ,
         "GH_TOKEN": "test-token",
@@ -175,7 +110,7 @@ def test_a_quota_skip_does_not_overwrite_a_real_verdict_for_the_same_head(tmp_pa
     env["QUOTA_SKIP"] = "true"
     result = _run(env, work)
     assert result.returncode == 0, result.stderr
-    assert api.writes() == [], "the quota body overwrote the verdict"
+    assert api.writes == [], "the quota body overwrote the verdict"
     assert "did not overwrite it" in result.stdout
 
 
@@ -188,7 +123,7 @@ def test_a_quota_skip_still_overwrites_an_older_quota_comment(tmp_path) -> None:
     env["QUOTA_SKIP"] = "true"
     result = _run(env, work)
     assert result.returncode == 0, result.stderr
-    writes = api.writes()
+    writes = api.writes
     assert len(writes) == 1 and "PATCH" in writes[0] and "comments/42" in writes[0]
 
 
@@ -201,7 +136,7 @@ def test_a_quota_skip_still_overwrites_a_verdict_for_another_head(tmp_path) -> N
     env["QUOTA_SKIP"] = "true"
     result = _run(env, work)
     assert result.returncode == 0, result.stderr
-    assert len(api.writes()) == 1
+    assert len(api.writes) == 1
 
 
 def test_a_real_result_overwrites_an_earlier_verdict_for_the_same_head(tmp_path) -> None:
@@ -212,7 +147,7 @@ def test_a_real_result_overwrites_an_earlier_verdict_for_the_same_head(tmp_path)
     env, work, api = _setup(tmp_path, [HEAD, HEAD], ["42"], {"42": prior})
     result = _run(env, work)
     assert result.returncode == 0, result.stderr
-    writes = api.writes()
+    writes = api.writes
     assert len(writes) == 1 and "PATCH" in writes[0]
 
 
@@ -225,7 +160,7 @@ def test_a_moved_head_before_the_write_posts_nothing(tmp_path) -> None:
     env, work, api = _setup(tmp_path, [OTHER_HEAD, OTHER_HEAD], [])
     result = _run(env, work)
     assert result.returncode == 0, result.stderr
-    assert api.writes() == []
+    assert api.writes == []
     assert "head moved" in result.stdout
 
 
@@ -234,7 +169,7 @@ def test_a_head_moving_during_the_post_still_posts_nothing(tmp_path) -> None:
     env, work, api = _setup(tmp_path, [HEAD, OTHER_HEAD], ["42"], {"42": "old"})
     result = _run(env, work)
     assert result.returncode == 0, result.stderr
-    assert api.writes() == []
+    assert api.writes == []
     assert "while this comment was being posted" in result.stdout
 
 
@@ -247,7 +182,7 @@ def test_every_marker_comment_is_updated_not_just_the_newest(tmp_path) -> None:
     env, work, api = _setup(tmp_path, [HEAD, HEAD], ["7", "42"])
     result = _run(env, work)
     assert result.returncode == 0, result.stderr
-    writes = api.writes()
+    writes = api.writes
     assert len(writes) == 2
     assert any("comments/7" in w for w in writes)
     assert any("comments/42" in w for w in writes)
@@ -258,7 +193,7 @@ def test_a_pr_with_no_marker_comment_gets_a_post(tmp_path) -> None:
     env, work, api = _setup(tmp_path, [HEAD, HEAD], [])
     result = _run(env, work)
     assert result.returncode == 0, result.stderr
-    writes = api.writes()
+    writes = api.writes
     assert len(writes) == 1 and "POST" in writes[0] and "/issues/409/comments" in writes[0]
 
 
