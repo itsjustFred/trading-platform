@@ -32,7 +32,14 @@ def _capture_viewer_logs() -> Iterator[_CaptureHandler]:
         logger.setLevel(previous_level)
 
 
-def test_request_middleware_logs_non_api_request(_capture_viewer_logs: _CaptureHandler) -> None:
+def test_request_middleware_logs_non_api_request(
+    _capture_viewer_logs: _CaptureHandler, tmp_path, monkeypatch
+) -> None:
+    # The SPA middleware only serves index.html when a frontend build (or a
+    # static dir) exists; point STATIC_DIR at a deterministic fixture so the
+    # test does not depend on whether frontend/dist happens to be built.
+    (tmp_path / "index.html").write_text("<html></html>", encoding="utf-8")
+    monkeypatch.setattr(viewer_main_module, "STATIC_DIR", tmp_path)
     client = TestClient(viewer_main_module.app)
 
     response = client.get("/strategies")

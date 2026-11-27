@@ -90,8 +90,6 @@ def _log_safe(value: object) -> str:
 
 
 BACKTESTS_DIR = DATA_DIR / "backtests"
-REACT_DIST = Path(__file__).parent.parent / "frontend" / "dist"
-STATIC_DIR = REACT_DIST if REACT_DIST.exists() else Path(__file__).parent / "static"
 
 STRATEGIES_DIR = DEFAULT_STRATEGIES_DIR
 PORTFOLIOS_DIR = DATA_DIR / "portfolios"
@@ -2519,8 +2517,9 @@ _SINGLEFLIGHT_OWNER_CONTEXT = threading.local()
 #
 # - `_clear_singleflight_reservation` in this module POPS every key, releasing the lease
 #   in memory;
-# - `viewer/main.py::_task_snapshot_payload` COPIES every key into the persisted payload,
-#   so a held lease survives a restart and is not re-acquired by a second worker.
+# - `viewer/main.py`'s task-record builders COPY every `_SINGLEFLIGHT_PERSISTED_KEYS`
+#   entry into the persisted payload, so a held lease survives a restart and is
+#   not re-acquired by a second worker.
 #
 # A key present in the persisted set but missing from the cleared set is therefore the
 # bad direction: the field is written to disk and never released, so the reservation is

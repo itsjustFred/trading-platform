@@ -1038,7 +1038,7 @@ def test_extreme_producer_timestamps_degrade_to_null_never_raise(db) -> None:
 def test_conversion_overwrites_payload_received_at_local() -> None:
     """``received_at_local`` is a local receipt stamp: a payload value must
     never reach persistence (``setdefault`` used to let it win)."""
-    from live_runner.daemon import _trade_signal_to_live_signal
+    from live_runner.daemon import trade_signal_to_live_signal
     from risk.models import TradeSignal
     from tests.test_live_execution_safety import _deployment
 
@@ -1056,7 +1056,7 @@ def test_conversion_overwrites_payload_received_at_local() -> None:
                 "signal_timestamp": "0001-01-01T00:00:00+05:00",
             },
         )
-        converted = _trade_signal_to_live_signal(signal, deployment)
+        converted = trade_signal_to_live_signal(signal, deployment)
         stamped = datetime.fromisoformat(converted.metadata["received_at_local"])
         assert stamped.year >= 2026
         # The hostile producer stamp is preserved as raw metadata for audit but
@@ -1145,7 +1145,7 @@ def test_discord_receipt_stamp_survives_candle_close_wait(db, monkeypatch) -> No
     assert prepared.received_at_local == receipt
     assert clock["now"] > datetime.fromisoformat(receipt)
 
-    live_signal = daemon._trade_signal_to_live_signal(prepared, deployment)
+    live_signal = daemon.trade_signal_to_live_signal(prepared, deployment)
     assert live_signal.metadata["received_at_local"] == receipt
     db.save_live_signal(live_signal)
     row = _signal_row(db, live_signal)
@@ -1192,7 +1192,7 @@ def test_prepare_stamps_receipt_at_first_contact_when_source_missing(
     assert prepared.received_at_local is not None
     assert seen["stamp_during_wait"] == prepared.received_at_local
 
-    live_signal = daemon._trade_signal_to_live_signal(prepared, deployment)
+    live_signal = daemon.trade_signal_to_live_signal(prepared, deployment)
     assert live_signal.metadata["received_at_local"] == prepared.received_at_local
 
 
@@ -1238,7 +1238,7 @@ def test_signal_processor_path_preserves_receipt_stamp(db, monkeypatch) -> None:
     assert prepared.received_at_local == receipt
     assert clock["now"] > datetime.fromisoformat(receipt)
 
-    live_signal = daemon._trade_signal_to_live_signal(prepared, deployment)
+    live_signal = daemon.trade_signal_to_live_signal(prepared, deployment)
     assert live_signal.metadata["received_at_local"] == receipt
     db.save_live_signal(live_signal)
     row = _signal_row(db, live_signal)

@@ -48,7 +48,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
-from runner.approval_gate import _sha256_of
+from runner.approval_gate import sha256_of
 from runner.promotion_gate import StrategyNotPromotedError, require_promoted
 from shared.models import LiveDeploymentConfig
 from shared.strategy_registry import DEFAULT_STRATEGIES_DIR, load_strategy_meta
@@ -188,7 +188,7 @@ def repository_import_closure(start: Path, *, repo_root: Path | None = None) -> 
                 resolved = init.resolve()
                 seen.add(resolved)
                 todo.append(resolved)
-                found[_repository_key(resolved, root)] = _sha256_of(resolved)
+                found[_repository_key(resolved, root)] = sha256_of(resolved)
     while todo:
         current = todo.pop()
         try:
@@ -215,7 +215,7 @@ def repository_import_closure(start: Path, *, repo_root: Path | None = None) -> 
                         continue
                     seen.add(resolved_module)
                     todo.append(resolved_module)
-                    found[_repository_key(resolved_module, root)] = _sha256_of(resolved_module)
+                    found[_repository_key(resolved_module, root)] = sha256_of(resolved_module)
     return dict(sorted(found.items()))
 
 
@@ -251,7 +251,7 @@ def signal_bot_target(
     if not module_path.is_file():
         raise PromotionTargetError(f"signal processor module not found for '{name}'")
     try:
-        config_sha256 = _sha256_of(config_path)
+        config_sha256 = sha256_of(config_path)
     except OSError as exc:
         raise PromotionTargetError(
             f"signal processor config is unreadable for '{name}'"

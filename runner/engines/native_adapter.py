@@ -39,7 +39,7 @@ TIMEFRAME_ORDER = contract.TIMEFRAME_ORDER
 ONE_LOWER_SPELLINGS = contract.ONE_LOWER_SPELLINGS
 
 
-def _load_strategy_module(path: str):
+def load_strategy_module(path: str):
     require_generated_strategy_approval(path)
     resolved = Path(path).resolve()
     spec = importlib.util.spec_from_file_location("strategy", str(resolved))
@@ -67,7 +67,7 @@ def _find_ohlcv_path(data_root: Path, symbol: str, timeframe: str) -> Path | Non
     return matches[0] if matches else None
 
 
-def _load_ohlcv(data_root: Path, symbol: str, timeframe: str, start: str, end: str) -> pd.DataFrame | None:
+def load_ohlcv(data_root: Path, symbol: str, timeframe: str, start: str, end: str) -> pd.DataFrame | None:
     match = _find_ohlcv_path(data_root, symbol, timeframe)
     if match is None:
         return None
@@ -108,7 +108,7 @@ def _load_intrabar_data(
     selected = contract.resolve_intrabar_timeframe(base_timeframe, modeling_resolution)
     if not selected:
         return None
-    return _load_ohlcv(data_root, symbol, selected, start, end)
+    return load_ohlcv(data_root, symbol, selected, start, end)
 
 
 class NativeAdapter(EngineAdapter):
@@ -136,7 +136,7 @@ class NativeAdapter(EngineAdapter):
             progress_callback(round(bounded, 2), message)
 
         emit_progress(5.0, "Loading market data...")
-        strategy_module = _load_strategy_module(strategy_path)
+        strategy_module = load_strategy_module(strategy_path)
         if not hasattr(strategy_module, "generate_signals"):
             raise ValueError(f"Strategy {strategy_path} must define generate_signals")
 
@@ -169,7 +169,7 @@ class NativeAdapter(EngineAdapter):
             # trading to start_date..end_date.
             warmup_raw = str(getattr(config, "warmup_start", "") or "").strip()
             load_start = warmup_raw or config.start_date
-            data = _load_ohlcv(data_root, symbol, config.timeframe, load_start, config.end_date)
+            data = load_ohlcv(data_root, symbol, config.timeframe, load_start, config.end_date)
             if data is None or data.empty:
                 raise RuntimeError(
                     f"No OHLCV data for {symbol}/{config.timeframe} in "
