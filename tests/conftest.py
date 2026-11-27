@@ -1424,13 +1424,19 @@ _SHARED_CHILDREN: list[object] = []
 
 
 @pytest.fixture(autouse=True)
-def _track_shared_sandbox_children(monkeypatch: pytest.MonkeyPatch):
+def _track_shared_sandbox_children():
     """Fail the test that leaves a sandbox-sharing child running.
 
     ``subprocess.run`` builds on ``Popen``, so wrapping the constructor records both shapes,
     and only the children whose environment carries the child marker - the ones that share
     the session directory the pytest process owns. A child still alive at teardown is killed
     and reported: left running it would write into a directory its parent is about to remove.
+
+    Its own ``MonkeyPatch.context()`` rather than the ``monkeypatch`` fixture, and for the
+    same reason as the fixtures above: an autouse fixture that requested it would
+    instantiate the shared patch before every test's other fixtures and delay its undo
+    until after them, which breaks fixtures that assert state restored by their own
+    ``monkeypatch`` use.
     """
     import subprocess
 
@@ -1453,8 +1459,12 @@ def _track_shared_sandbox_children(monkeypatch: pytest.MonkeyPatch):
             ):
                 _SHARED_CHILDREN.append(self)
 
-    monkeypatch.setattr(subprocess, "Popen", _RecordingPopen)
-    yield
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(subprocess, "Popen", _RecordingPopen)
+        yield
+        # The recording is undone before the check runs, so a test that replaced Popen with
+        # its own fake is not holding a wrapper the check would then trip over.
+        patch.undo()
     finish_shared_sandbox_children()
 
 
