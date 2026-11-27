@@ -74,6 +74,15 @@ else:
     # process exits. A child that has to outlive the session is the sandbox's one case that has
     # no owner, and the tests that leave one running must not exist - the watchdog and lock
     # holders are all waited on or killed.
+    #
+    # The parent branch is what makes that true: a child that reached this line would delete the
+    # directory the parent still owns, silently, because the removal ignores errors. The marker
+    # check above is the branch, and this assertion fails the day an edit moves the registration
+    # out of it.
+    assert not _CHILD_PROCESS, (
+        "only the parent registers the session directory's removal; a child that removes a "
+        "directory it shares deletes the parent's sandbox out from under it"
+    )
     atexit.register(shutil.rmtree, _SESSION_ROOT, ignore_errors=True)
 TEST_DATA_DIR = _SESSION_ROOT / "data"
 TEST_LOG_DIR = _SESSION_ROOT / "logs"

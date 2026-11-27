@@ -1325,6 +1325,19 @@ def test_the_documented_test_opt_ins_are_on_the_allowlist() -> None:
         )
 
 
+def test_the_audit_hook_refuses_a_secret_file_opened_through_os_open() -> None:
+    """``os.open``/``os.openat`` raise the same ``open`` audit event ``open()`` does.
+
+    The guard is on the event, not on the API, so a read that reaches for the lower-level call
+    is refused the same way - pinned here, because the event's argument shape is the contract
+    and a reader reaching around ``open`` is the obvious next attempt.
+    """
+    import os as _os
+
+    with pytest.raises(suite_conftest.SuiteHermeticityViolation, match=r"\.accounts\.env"):
+        _os.open(str(REPO_ACCOUNTS_ENV), _os.O_RDONLY)
+
+
 def test_a_child_never_sees_a_credential_variable_the_sweep_removed() -> None:
     """An allowlist prefix cannot re-admit what the credential sweep removed.
 
