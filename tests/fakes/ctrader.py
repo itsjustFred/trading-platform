@@ -1368,8 +1368,10 @@ def fake_ctrader_transport(
     # objects we just imported - patched - so ``from ctrader_open_api import
     # Client`` inside ``_load_openapi_types`` resolves them instead of
     # re-executing ``__init__`` against the real ``Client``.
-    sys.modules.setdefault("ctrader_open_api", ctrader_open_api)
-    sys.modules.setdefault("ctrader_open_api.client", client_module)
+    # Assign, not setdefault: ``import`` returns whatever ``sys.modules``
+    # holds, so the names are re-seated to the exact objects just patched.
+    sys.modules["ctrader_open_api"] = ctrader_open_api
+    sys.modules["ctrader_open_api.client"] = client_module
 
     patched: list[tuple[Any, str, Any]] = []
     for module in (ctrader_open_api, client_module):

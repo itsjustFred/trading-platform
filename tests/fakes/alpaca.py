@@ -98,7 +98,9 @@ def _text(raw: Any) -> str:
 def _float(raw: Any) -> float:
     # Non-finite values pass through: alpaca-py returns what the wire carried,
     # and a NaN mark price or qty must reach the adapter's refusal path rather
-    # than being silently zeroed by the fake.
+    # than being silently zeroed by the fake. An unparseable value falling back
+    # to 0.0 is deliberate tolerant parsing (absent proto3/alpaca-py fields);
+    # request validation lives in the handlers, not here.
     try:
         return float(raw)
     except (TypeError, ValueError):
