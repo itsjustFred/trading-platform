@@ -13,7 +13,8 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from shared.models import LiveExecution, LiveSignal
+from shared.models import LiveExecution
+from tests.builders import make_live_signal
 
 BASE_TS = datetime(2026, 1, 5, 14, 30, tzinfo=timezone.utc)
 
@@ -33,7 +34,7 @@ def _save_signal(
     merged = {"idempotency_key": uuid.uuid4().hex, **(metadata or {})}
     if broker_order_id:
         merged["broker_order_id"] = broker_order_id
-    signal = LiveSignal(
+    signal = make_live_signal(
         id=uuid.uuid4(),
         deployment_id=deployment_id,
         symbol=symbol,

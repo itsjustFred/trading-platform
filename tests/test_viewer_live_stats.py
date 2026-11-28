@@ -6,11 +6,7 @@ denominator was `len(execution_rows)`, so every partial fill deflated win_rate.
 
 from __future__ import annotations
 
-import sys
 from datetime import datetime, timezone
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).parent.parent))
 
 
 def _row(symbol: str, action: str, price: float, qty: float, minute: int) -> dict:
