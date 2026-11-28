@@ -8,7 +8,7 @@ independent source.
 
 The identities are checked against the stored JSON; the money fields are
 additionally pinned to a fresh import (``TestGoldensMatchFreshImport``). The source ``.xlsx`` reports are tracked in
-``strategy-comparisons/intraday_volatility_breakout/``, and
+``strategies/intraday_volatility_breakout/reference/``, and
 ``scripts/generate_golden_files.py`` re-imports them to regenerate the goldens,
 so a golden can always be re-derived from its report.
 
@@ -33,8 +33,9 @@ GOLDEN_DIR = Path(__file__).resolve().parents[1] / "fixtures" / "validation" / "
 GOLDEN_FILES = ["eurusd_h1_golden.json", "nas100_m15_golden.json", "sp500_m1_golden.json"]
 REPORT_DIR = (
     Path(__file__).resolve().parents[2]
-    / "strategy-comparisons"
+    / "strategies"
     / "intraday_volatility_breakout"
+    / "reference"
 )
 GOLDEN_REPORTS = {
     "eurusd_h1_golden.json": "EURUSD_H1.xlsx",
@@ -142,7 +143,7 @@ class TestGoldensMatchFreshImport:
     """The goldens must stay re-derivable from their tracked reports.
 
     The source ``.xlsx`` reports are tracked in
-    ``strategy-comparisons/intraday_volatility_breakout/``, so each golden is
+    ``strategies/intraday_volatility_breakout/reference/``, so each golden is
     a derived copy, not an independently maintained file. This pins the
     fields the importer owns about a trade's PnL (``fees``/``net_pnl``, and
     the per-exit ones) to a fresh import, so a hand-edited golden that drifts

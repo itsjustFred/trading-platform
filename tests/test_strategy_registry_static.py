@@ -53,6 +53,140 @@ def test_iter_strategy_entries_does_not_execute_strategy_files(
     assert not no_strategy_imports
 
 
+def test_strategy_folder_auxiliary_dirs_are_not_strategies(tmp_path: Path) -> None:
+    """``mt5/``, ``reference/`` and ``_template/`` never load as strategies."""
+    from shared.strategy_registry import iter_strategy_entries, iter_strategy_files
+
+    strategies_dir = tmp_path / "strategies"
+    strategy_dir = strategies_dir / "foldered_strategy"
+    strategy_dir.mkdir(parents=True)
+    (strategy_dir / "foldered_strategy.py").write_text(
+        "STRATEGY_META = {'name': 'Folded Strategy'}\n",
+        encoding="utf-8",
+    )
+    (strategy_dir / "SOURCE.md").write_text("# source\n", encoding="utf-8")
+    (strategy_dir / "__init__.py").write_text("", encoding="utf-8")
+
+    mt5_dir = strategy_dir / "mt5"
+    mt5_dir.mkdir()
+    (mt5_dir / "mt5.py").write_text(
+        "STRATEGY_META = {'name': 'MT5 Helper'}\n",
+        encoding="utf-8",
+    )
+    reference_dir = strategy_dir / "reference"
+    reference_dir.mkdir()
+    (reference_dir / "reference.py").write_text(
+        "STRATEGY_META = {'name': 'Reference Helper'}\n",
+        encoding="utf-8",
+    )
+    template_dir = strategies_dir / "_template"
+    template_dir.mkdir()
+    (template_dir / "_template.py").write_text(
+        "STRATEGY_META = {'name': 'Template'}\n",
+        encoding="utf-8",
+    )
+
+    assert iter_strategy_files(strategies_dir) == [strategy_dir / "foldered_strategy.py"]
+    entries = iter_strategy_entries(strategies_dir)
+    assert [entry.slug for entry in entries] == ["foldered_strategy"]
+    assert entries[0].display_name == "Folded Strategy"
+
+
+def test_real_strategies_tree_nested_dirs_are_declared_auxiliary() -> None:
+    """Every directory nested inside a strategy folder must be ignored by name.
+
+    ``iter_strategy_files`` enumerates any ``<dir>/<dir>.py`` pair outside
+    ``_STRATEGY_IGNORED_DIRS``; a new auxiliary folder (``data/``,
+    ``fixtures/``, …) added without extending the set would be silently queued
+    as a runnable strategy. This pins the reserved names against the real
+    tree so adding one fails here instead of in a backtest queue.
+    """
+    from shared.strategy_registry import _STRATEGY_IGNORED_DIRS, DEFAULT_STRATEGIES_DIR
+
+    undeclared = sorted(
+        dirpath.name
+        for dirpath in DEFAULT_STRATEGIES_DIR.rglob("*")
+        if dirpath.is_dir()
+        and len(dirpath.relative_to(DEFAULT_STRATEGIES_DIR).parts) >= 2
+        and not dirpath.name.startswith((".", "__"))
+        and dirpath.name not in _STRATEGY_IGNORED_DIRS
+    )
+
+    assert undeclared == []
+
+
+def test_real_strategies_tree_top_level_dirs_are_strategies_or_auxiliary() -> None:
+    """Top-level ``strategies/`` dirs must be strategy folders or declared aux.
+
+    A strategy folder contains ``<name>.py``; a declared auxiliary dir is in
+    ``_STRATEGY_IGNORED_DIRS``; anything else must hold no Python at all
+    (e.g. a docs-only folder). A new auxiliary dir carrying ``.py`` files
+    would otherwise ship in the wheel and be linted as platform code.
+    """
+    from shared.strategy_registry import _STRATEGY_IGNORED_DIRS, DEFAULT_STRATEGIES_DIR
+
+    undeclared = []
+    collisions = []
+    for dirpath in DEFAULT_STRATEGIES_DIR.iterdir():
+        if not dirpath.is_dir():
+            continue
+        if dirpath.name in _STRATEGY_IGNORED_DIRS:
+            # A reserved aux dir holding <name>.py is never discovered — it
+            # would only masquerade as a strategy. Fail so the collision is
+            # renamed or the ignore set is revisited deliberately.
+            if (dirpath / f"{dirpath.name}.py").exists():
+                collisions.append(dirpath.name)
+            continue
+        if (dirpath / f"{dirpath.name}.py").exists():
+            continue
+        if not any(dirpath.rglob("*.py")):
+            continue
+        undeclared.append(dirpath.name)
+
+    assert undeclared == []
+    assert collisions == []
+
+
+def test_iter_strategy_files_skips_symlinked_auxiliary_code(tmp_path: Path) -> None:
+    """A strategy-named symlink into an ignored dir must not be discovered."""
+    from shared.strategy_registry import iter_strategy_files
+
+    strategies_dir = tmp_path / "strategies"
+    aux_dir = strategies_dir / "foo" / "reference"
+    aux_dir.mkdir(parents=True)
+    hidden = aux_dir / "hidden.py"
+    hidden.write_text("STRATEGY_META = {'name': 'Hidden'}\n", encoding="utf-8")
+    (strategies_dir / "foo" / "foo.py").symlink_to(hidden)
+
+    assert iter_strategy_files(strategies_dir) == []
+
+
+def test_auxiliary_dir_exclusions_cover_ignore_set() -> None:
+    """Wheel, ruff and mypy excludes must cover ``_STRATEGY_IGNORED_DIRS``.
+
+    Discovery ignores aux dirs by name; the pyproject excludes keep the same
+    material out of the wheel and the lint/type surface. A name added to only
+    some of the sites ships restricted code or fails CI loudly — pin the
+    contract here instead.
+    """
+    import re
+    import tomllib
+
+    from shared.strategy_registry import _STRATEGY_IGNORED_DIRS
+
+    root = Path(__file__).resolve().parents[1]
+    config = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
+    wheel_exclude = config["tool"]["hatch"]["build"]["targets"]["wheel"]["exclude"]
+    ruff_exclude = config["tool"]["ruff"]["extend-exclude"]
+    mypy_exclude = config["tool"]["mypy"]["exclude"]
+
+    for name in _STRATEGY_IGNORED_DIRS:
+        assert f"strategies/**/{name}" in wheel_exclude, name
+        assert f"strategies/**/{name}" in ruff_exclude, name
+        assert re.search(mypy_exclude, f"strategies/s/nested/{name}/x.py"), name
+        assert re.search(mypy_exclude, f"strategies/{name}/x.py"), name
+
+
 def test_find_strategy_entry_does_not_execute_strategy_files(
     tmp_path: Path, no_strategy_imports
 ) -> None:

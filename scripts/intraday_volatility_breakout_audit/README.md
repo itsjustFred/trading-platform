@@ -1,6 +1,6 @@
 # Strategy-Test-Audit: IntradayVolatilityBreakout (MT5 ↔ Platform)
 
-Branch: `strategy-test-audit`. Ziel: MT5-Code (`../IntradayVolatilityBreakout.mq5`,
+Branch: `strategy-test-audit`. Ziel: MT5-Code (`strategies/intraday_volatility_breakout/mt5/IntradayVolatilityBreakout.mq5`,
 Referenz-Runs im Verzeichnis `$TRADING_PLATFORM_REFERENCES` bzw. `--reference-dir`) gegen die
 Platform-Strategie (`strategies/intraday_volatility_breakout/`, native Engine)
 verifizieren, bis Trade-Listen und Stats (nahezu) identisch sind.
@@ -19,7 +19,7 @@ XLSX = EUR-Account (500 € Risk, Swaps, USD→EUR-Konvertierung), Logs = USD-Ru
 Reproduktion der Referenz-Seite (vom Repo-Root aufrufen):
 
 ```bash
-python strategy-comparisons/intraday_volatility_breakout/audit/parse_mt5_reference.py --reference-dir <Referenz-Verzeichnis> --out data/intraday_volatility_breakout_audit
+python scripts/intraday_volatility_breakout_audit/parse_mt5_reference.py --reference-dir <Referenz-Verzeichnis> --out data/intraday_volatility_breakout_audit
 ```
 
 `--out` ist optional (Default: der Audit-Ordner selbst) und muss innerhalb des
@@ -189,7 +189,7 @@ des neuen Server-Tages statt auf der „letzten Bar des Tages“ (kein Look-ahea
 
 `run_native_window.py` (dieses Verzeichnis) reproduziert die Platform-Läufe oben mit der
 nativen Engine auf den MT5-M1-CSVs (MT5-ATR aus dem EA-Log injiziert, Fixed-Risk-Sizing,
-Spread-Modell; `.venv/bin/python strategy-comparisons/intraday_volatility_breakout/audit/run_native_window.py
+Spread-Modell; `.venv/bin/python scripts/intraday_volatility_breakout_audit/run_native_window.py
 --ref-dir <parse_mt5_reference-Output> [--signal-exit-fill next_open|close] [--strategy-file <alte Version>]`,
 ca. 4 min je Symbol). Gemessen 2026-11-13 – Treffer unter den gematchten Trades (Server-Tag +
 Richtung), Exit-Minute / Exit-Preis (Toleranz 1e-6) gleich wie MT5:

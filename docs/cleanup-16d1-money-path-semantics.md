@@ -81,7 +81,7 @@ cannot distinguish the two bases, because none of them ever sizes while a
 position is open:
 
 - **MT5 (basis-independent fixed cash):** the EA's `CalculateLotSize`
-  (`strategy-comparisons/intraday_volatility_breakout/IntradayVolatilityBreakout.mq5:381-395`)
+  (`strategies/intraday_volatility_breakout/mt5/IntradayVolatilityBreakout.mq5:381-395`)
   sizes from the `Fixed_Risk_Amount` input
   (`IntradayVolatilityBreakout.mq5:46`) — a fixed cash amount — and never reads
   the account value at all (no `AccountInfoDouble`, `ACCOUNT_BALANCE` or

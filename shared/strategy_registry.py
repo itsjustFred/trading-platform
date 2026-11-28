@@ -149,13 +149,32 @@ def atr_sizing_keys_without_stop(path: Path) -> frozenset[str]:
     return frozenset(key for key in published if key.startswith("atr"))
 
 
+#: Directories inside ``strategies/`` that hold source/reference material, not
+#: runnable strategies. They are ignored even when a contained file happens to
+#: match the folder/file naming rule (for example ``mt5/mt5.py``). The names
+#: are reserved: a strategy slug must not collide with them. When adding a
+#: name here, update the matching ``pyproject.toml`` excludes (wheel packages,
+#: ruff ``extend-exclude``, mypy ``exclude``) — pinned by
+#: ``test_auxiliary_dir_exclusions_cover_ignore_set``.
+_STRATEGY_IGNORED_DIRS = frozenset({"mt5", "reference", "_template"})
+
+
 def iter_strategy_files(strategies_dir: Path = DEFAULT_STRATEGIES_DIR) -> list[Path]:
     if not strategies_dir.exists():
         return []
 
+    root = strategies_dir.resolve()
     files: list[Path] = []
     for path in strategies_dir.rglob("*.py"):
         if path.name.startswith("__") or path.stem.endswith("_context"):
+            continue
+        try:
+            # Resolve before the ignore check: a strategy-named symlink into an
+            # auxiliary dir (or outside the tree) must not be discovered.
+            relative_parts = path.resolve().relative_to(root).parts[:-1]
+        except (OSError, ValueError):
+            continue
+        if _STRATEGY_IGNORED_DIRS.intersection(relative_parts):
             continue
         if path.parent != strategies_dir and path.parent.name != path.stem:
             continue

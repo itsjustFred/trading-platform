@@ -30,7 +30,7 @@ property of that broker's history, which only the history itself can tell.
 The profiles below are *empirical*: they are what the broker's tester history
 shows, not what the broker documents. Their evidence is recorded beside each
 profile and in
-``strategy-comparisons/intraday_volatility_breakout/audit/README.md``.
+``scripts/intraday_volatility_breakout_audit/README.md``.
 
 The conversion produces *naive* server wall-clock timestamps. pandas does not
 reliably accept a custom ``tzinfo`` for vectorised conversion, and a broker

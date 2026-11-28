@@ -45,7 +45,7 @@ committed comparison cases, plus the remaining limitations.
   - `tests/strategies/test_risk_parity.py`: new parametrized test
     `test_trade_gate_ignores_the_rebalance_day_close` — a same-day SPY jump
     does not trade, the previous-session jump does.
-  - `strategy-comparisons/risk_parity/risk_parity_reference.json`:
+  - `strategies/risk_parity/reference/risk_parity_reference.json`:
     regenerated on yfinance data (see below); the platform artifact in
     `data/backtests/` is not committed.
 - Why: maintainer decision on #259 (2026-11-18): the rebalance day's close is
@@ -94,7 +94,7 @@ committed comparison cases, plus the remaining limitations.
     `tests/validation/test_cross_platform_metrics.py`, `tests/test_analyze_mt5_parity.py`.
 - Why: MT5 prints `TimeCurrent()`, the broker's server wall clock. That clock has
   three offset epochs; `Europe/Athens` matches only one of them. Evidence and
-  examples: `strategy-comparisons/intraday_volatility_breakout/audit/README.md`.
+  examples: `scripts/intraday_volatility_breakout_audit/README.md`.
   Example: SP500 server 2024-04-01 17:15 is 15:15Z on the broker clock, 14:15Z
   under Athens.
 - Before/after matrix: **not produced in this change**, for the same reason as
@@ -157,7 +157,7 @@ committed comparison cases, plus the remaining limitations.
     script's case selection, EUR-account conversion gate and clock plumbing.
 - Why: the MT5 tester history builds D1 bars and the weekend/holiday rows on the
   broker's server clock; the UTC-day bars put the day boundaries in other places.
-  Evidence: `strategy-comparisons/intraday_volatility_breakout/audit/README.md`.
+  Evidence: `scripts/intraday_volatility_breakout_audit/README.md`.
 - Before/after matrix: **not produced in this change.** The platform artifacts in
   `data/backtests/` are generated locally (multi-GB data run) and are not
   committed, so the `build_comparison_matrix()` deltas cannot be recomputed from
@@ -190,7 +190,7 @@ committed comparison cases, plus the remaining limitations.
 ### Before/after matrix
 
 Method: `build_comparison_matrix()` over the committed references in
-`strategy-comparisons/` and the locally generated platform artifacts in `data/backtests/` (not committed), run
+`strategies/` and the locally generated platform artifacts in `data/backtests/` (not committed), run
 once on the pre-change `cross_platform.py` and once on the change. Every key of
 the payload except `generated_at` and the values below is identical between the
 two runs: reference/platform stats, `absolute_delta`, paths, notes, missing

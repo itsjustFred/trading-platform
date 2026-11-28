@@ -24579,7 +24579,7 @@
       "avg_consecutive_losses": 2
     }
   },
-  "source_path": "/home/ubuntu/Desktop/trading-platform/strategy-comparisons/intraday_volatility_breakout/NAS100_M15.xlsx",
+  "source_path": "/home/ubuntu/Desktop/trading-platform/strategies/intraday_volatility_breakout/reference/NAS100_M15.xlsx",
   "source_hash": null,
   "imported_at": "2026-06-24T13:49:21.827465",
   "validation_status": "pending",

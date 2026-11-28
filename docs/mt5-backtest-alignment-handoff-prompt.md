@@ -2,7 +2,7 @@
 
 You are starting a new coding/planning session in `/home/ubuntu/Desktop/trading-platform` on branch `codex_rewrite`.
 
-Your task is to create an implementation plan for the changes needed so platform backtests can be effectively compared against MT5 strategy reports in `strategy-comparisons/`.
+Your task is to create an implementation plan for the changes needed so platform backtests can be effectively compared against MT5 strategy reports in `strategies/intraday_volatility_breakout/reference/`.
 
 ## Context
 
@@ -13,10 +13,10 @@ Recent commits already did the first round of comparison work:
 
 Read these first:
 
-- `reports/strategy-comparison-platform-check-2026-06-23.md` (historisch, mit `reports/`-Ordner entfernt; Vergleichsbasis heute: `strategy-comparisons/`)
-- `strategy-comparisons/intraday_volatility_breakout/EURUSD_H1.html`
-- `strategy-comparisons/intraday_volatility_breakout/SP500_M1.html`
-- `strategy-comparisons/intraday_volatility_breakout/US100_M15.html`
+- `reports/strategy-comparison-platform-check-2026-06-23.md` (historisch, mit `reports/`-Ordner entfernt; Vergleichsbasis heute: `strategies/`)
+- `strategies/intraday_volatility_breakout/reference/EURUSD_H1.xlsx`
+- `strategies/intraday_volatility_breakout/reference/SP500_M1.xlsx`
+- `strategies/intraday_volatility_breakout/reference/NAS100_M15.xlsx`
 - `strategies/volatility_breakout/volatility_breakout.py`
 - `runner/engine.py`
 - `runner/engines/native_adapter.py`
@@ -151,7 +151,7 @@ Plan a tool, for example:
 
 ```bash
 python -m scripts.compare_mt5_report \
-  --mt5 strategy-comparisons/intraday_volatility_breakout/SP500_M1.html \
+  --mt5 strategies/intraday_volatility_breakout/reference/SP500_M1.xlsx \
   --platform [entfernt] reports/strategy_comparison_backtest_SP500_M1_after_align_20260623.trades.json \
   --output docs/reports/mt5_alignment_SP500_M1_YYYYMMDD.md
 ```

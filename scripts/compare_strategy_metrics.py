@@ -46,10 +46,10 @@ def _safe_output_path(raw: Path) -> Path:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Compare platform metrics with MT5/QC references.")
     parser.add_argument(
-        "--comparisons-dir",
+        "--strategies-dir",
         type=Path,
-        default=Path("strategy-comparisons"),
-        help="Directory containing external reference reports.",
+        default=Path("strategies"),
+        help="Directory containing strategy folders with reference reports.",
     )
     parser.add_argument(
         "--reports-dir",
@@ -72,7 +72,7 @@ def main() -> int:
     args = parser.parse_args()
 
     matrix = build_comparison_matrix(
-        comparisons_dir=args.comparisons_dir,
+        strategies_dir=args.strategies_dir,
         reports_dir=args.reports_dir,
         platform_data_dir=args.platform_data_dir,
     )

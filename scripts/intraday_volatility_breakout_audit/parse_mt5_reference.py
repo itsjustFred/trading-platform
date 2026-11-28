@@ -12,7 +12,7 @@ non-existent directory is an error.
 
 Inputs (read-only):
   <reference-dir>/{mt5-eurusd-h1,mt5-nas100-m15,mt5-sp500-m1}/*.log
-  strategy-comparisons/intraday_volatility_breakout/{EURUSD_H1,NAS100_M15,SP500_M1}.xlsx
+  strategies/intraday_volatility_breakout/reference/{EURUSD_H1,NAS100_M15,SP500_M1}.xlsx
 
 Outputs (beside this script, git-ignored via data/ — pass --out to override):
   mt5_trades_{eurusd,nas100,sp500}.csv   (deal-paired, USD-denominated PnL)
@@ -35,7 +35,10 @@ import re
 import sys
 
 REFERENCE_ENV_VAR = "TRADING_PLATFORM_REFERENCES"
-CMP = pathlib.Path(__file__).resolve().parent.parent
+SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
+REFERENCE_DIR = (
+    SCRIPT_DIR.parents[1] / "strategies" / "intraday_volatility_breakout" / "reference"
+)
 
 JOBS = {
     "eurusd": ("mt5-eurusd-h1/eurusd_h1.log", "EURUSD_H1.xlsx", 100000.0),
@@ -89,7 +92,7 @@ def _resolve_output_dir(raw: str) -> pathlib.Path:
     symlink escape) redirect output writes elsewhere.
     """
     candidate = pathlib.Path(raw).expanduser().resolve()
-    allowed = (pathlib.Path.cwd().resolve(), CMP.resolve())
+    allowed = (pathlib.Path.cwd().resolve(), SCRIPT_DIR.resolve())
     if not any(candidate == base or base in candidate.parents for base in allowed):
         raise ValueError(f"--out {raw!r} escapes the allowed output bases")
     return candidate
@@ -301,7 +304,7 @@ def parse_xlsx_trades(xlsx_path: pathlib.Path) -> list[dict]:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--out", default=str(CMP / "audit"))
+    ap.add_argument("--out", default=str(SCRIPT_DIR))
     ap.add_argument(
         "--reference-dir",
         default=None,
@@ -318,7 +321,7 @@ def main() -> int:
     ok = True
     for name, (log_rel, xlsx_name, contract) in JOBS.items():
         log_trades = parse_log_trades(ref / log_rel, contract)
-        xlsx_trades = parse_xlsx_trades(CMP / xlsx_name)
+        xlsx_trades = parse_xlsx_trades(REFERENCE_DIR / xlsx_name)
 
         import csv as _csv
 
@@ -359,7 +362,7 @@ def main() -> int:
         # Kommission + Swap), so the gross classification uses `net`, not
         # the raw `Gewinn` column.
         pd = __import__("pandas")
-        xlsx_df = pd.read_excel(CMP / xlsx_name, sheet_name="Sheet1", header=None)
+        xlsx_df = pd.read_excel(REFERENCE_DIR / xlsx_name, sheet_name="Sheet1", header=None)
         summary = parse_xlsx_summary(xlsx_df)
         gross_profit = sum(t["net"] for t in xlsx_trades if t["net"] > 0)
         gross_loss = sum(t["net"] for t in xlsx_trades if t["net"] < 0)

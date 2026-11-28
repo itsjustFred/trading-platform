@@ -334,7 +334,7 @@ _ALLOWED: dict[str, dict[str, int]] = {
     },
     # Audit script that monkeypatches a strategy's ATR for MT5 parity
     # scoring — it patches, it does not implement an indicator.
-    "strategy-comparisons/intraday_volatility_breakout/audit/run_native_window.py": {
+    "scripts/intraday_volatility_breakout_audit/run_native_window.py": {
         "def:_inject_atr": 1,
     },
 }

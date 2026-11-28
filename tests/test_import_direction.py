@@ -99,9 +99,8 @@ ALLOWED_UPWARD_EDGES: frozenset[tuple[str, str]] = frozenset(
 )
 
 # Top-level directories that contain .py files but are deliberately not part
-# of the layered package graph: the test suite itself and one-off strategy
-# comparison/audit scripts (not importable packages, not platform code).
-NON_PACKAGE_DIRS = frozenset({"tests", "strategy-comparisons"})
+# of the layered package graph: the test suite itself.
+NON_PACKAGE_DIRS = frozenset({"tests"})
 
 _PRUNE_DIRS = frozenset({"node_modules", "__pycache__", ".venv"})
 

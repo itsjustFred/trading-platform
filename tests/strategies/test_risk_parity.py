@@ -2,7 +2,7 @@
 Unit tests for the Risk Parity Python reimplementation.
 
 The original QuantConnect algorithm lives in
-`strategy-comparisons/risk_parity/risk_parity_strategy.py`.  A native LEAN
+`strategies/risk_parity/reference/risk_parity_strategy.py`.  A native LEAN
 backtest is not practical here (missing credentials / local equity data), so
 the regression surface is the fallback script
 `scripts/run_risk_parity_backtest.py`.
@@ -367,8 +367,9 @@ def test_pdf_gate_bounds_checked_in_reference_stats():
 
     ref_path = (
         Path(__file__).parent.parent.parent
-        / "strategy-comparisons"
+        / "strategies"
         / "risk_parity"
+        / "reference"
         / "risk_parity_reference.json"
     )
     reference = json.loads(ref_path.read_text(encoding="utf-8"))
@@ -721,8 +722,9 @@ def test_checked_in_reference_stays_within_lean_ground_truth():
 
     ref_path = (
         Path(__file__).parent.parent.parent
-        / "strategy-comparisons"
+        / "strategies"
         / "risk_parity"
+        / "reference"
         / "risk_parity_reference.json"
     )
     reference = json.loads(ref_path.read_text(encoding="utf-8"))

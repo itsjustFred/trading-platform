@@ -16,8 +16,9 @@ from validation.reference import ValidationReference
 
 _REPORTS = (
     Path(__file__).resolve().parents[2]
-    / "strategy-comparisons"
+    / "strategies"
     / "intraday_volatility_breakout"
+    / "reference"
 )
 
 

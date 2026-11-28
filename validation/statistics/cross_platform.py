@@ -62,32 +62,33 @@ class MT5ComparisonCase:
 
 def build_comparison_matrix(
     *,
-    comparisons_dir: Path,
+    strategies_dir: Path,
     reports_dir: Path,
     platform_data_dir: Path | None = None,
 ) -> dict[str, Any]:
-    """Compare MT5 and QuantConnect references with available platform artifacts."""
-    comparisons_dir = comparisons_dir.resolve()
+    """Compare strategy reference reports with available platform artifacts."""
+    strategies_dir = strategies_dir.resolve()
     reports_dir = reports_dir.resolve()
     platform_data_dir = (platform_data_dir or reports_dir.parent / "data" / "backtests").resolve()
     rows: list[dict[str, Any]] = []
 
+    ivb_reference_dir = strategies_dir / "intraday_volatility_breakout" / "reference"
     mt5_cases = [
         MT5ComparisonCase(
             case_id="intraday_volatility_breakout_sp500_m1",
-            reference_path=comparisons_dir / "intraday_volatility_breakout" / "SP500_M1.xlsx",
+            reference_path=ivb_reference_dir / "SP500_M1.xlsx",
             platform_path=platform_data_dir / "intraday_volatility_breakout_sp500_m1.json",
             broker_clock="dukascopy_mt5_index",
         ),
         MT5ComparisonCase(
             case_id="intraday_volatility_breakout_eurusd_h1",
-            reference_path=comparisons_dir / "intraday_volatility_breakout" / "EURUSD_H1.xlsx",
+            reference_path=ivb_reference_dir / "EURUSD_H1.xlsx",
             platform_path=platform_data_dir / "intraday_volatility_breakout_eurusd_h1.json",
             broker_clock="dukascopy_mt5_forex",
         ),
         MT5ComparisonCase(
             case_id="intraday_volatility_breakout_nas100_m15",
-            reference_path=comparisons_dir / "intraday_volatility_breakout" / "NAS100_M15.xlsx",
+            reference_path=ivb_reference_dir / "NAS100_M15.xlsx",
             platform_path=platform_data_dir / "intraday_volatility_breakout_nas100_m15.json",
             broker_clock="dukascopy_mt5_index",
         ),
@@ -98,7 +99,7 @@ def build_comparison_matrix(
     rows.append(
         _build_json_reference_row(
             "risk_parity_quantconnect",
-            comparisons_dir / "risk_parity" / "risk_parity_reference.json",
+            strategies_dir / "risk_parity" / "reference" / "risk_parity_reference.json",
             platform_data_dir / "risk_parity_quantconnect_reimplementation.json",
         )
     )
