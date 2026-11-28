@@ -148,6 +148,19 @@ def _float(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def _optional_float(value: Any) -> float | None:
+    """A proto price field: ``None`` when absent, zero or non-finite."""
+    if value is None:
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(parsed) or parsed == 0.0:
+        return None
+    return parsed
+
+
 def _has(msg: Any, name: str) -> bool:
     has_field = getattr(msg, "HasField", None)
     if has_field is None:
@@ -929,12 +942,12 @@ class FakeCTraderBroker:
             symbol_name=spec.name,
             symbol_id=spec.symbol_id,
             accepted_ms=self.now_ms,
-            limit_price=_float(getattr(request, "limitPrice", None)) or None,
-            stop_price=_float(getattr(request, "stopPrice", None)) or None,
+            limit_price=_optional_float(getattr(request, "limitPrice", None)),
+            stop_price=_optional_float(getattr(request, "stopPrice", None)),
             relative_stop=_int(getattr(request, "relativeStopLoss", 0)) or None,
             relative_take=_int(getattr(request, "relativeTakeProfit", 0)) or None,
-            absolute_stop=_float(getattr(request, "stopLoss", None)) or None,
-            absolute_take=_float(getattr(request, "takeProfit", None)) or None,
+            absolute_stop=_optional_float(getattr(request, "stopLoss", None)),
+            absolute_take=_optional_float(getattr(request, "takeProfit", None)),
             target_position_id=_int(getattr(request, "positionId", 0)),
         )
         self.orders[order_id] = record

@@ -162,6 +162,30 @@ def test_the_fill_lands_on_advance_and_opens_a_position_and_a_deal() -> None:
     assert not deal.HasField("closePositionDetail"), "an entry deal has no close detail"
 
 
+def test_a_non_finite_order_price_is_recorded_as_absent() -> None:
+    # NaN is truthy, so ``_float(x) or None`` would record NaN as a real price;
+    # the fake must treat a non-finite wire value like a missing one.
+    m, _mm = _types()
+    broker = _broker()
+    accepted = broker.handle(
+        _new_order(
+            m,
+            orderType=2,  # LIMIT
+            limitPrice=float("nan"),
+            stopPrice=float("inf"),
+            stopLoss=float("nan"),
+            takeProfit=float("-inf"),
+            timeInForce=2,  # GTC so the order rests for inspection
+        )
+    )
+    record = broker.orders[int(accepted.order.orderId)]
+
+    assert record.limit_price is None
+    assert record.stop_price is None
+    assert record.absolute_stop is None
+    assert record.absolute_take is None
+
+
 def test_a_sell_entry_opens_a_short_side_position() -> None:
     m, _mm = _types()
     broker = _broker()
