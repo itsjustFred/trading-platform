@@ -71,31 +71,54 @@ class TestDownloadResultContract:
         assert result.path.is_file()
         assert not result.path.is_dir()
 
-    def test_jforex_merged_download_reports_file_not_directory(self, tmp_path):
-        """JForex bid/ask merges store two parquets; the result path decision
-        must point at the stored bid file, never the symbol directory."""
-        from data_tools.downloaders.jforex_dl import merged_result_path
+    def test_jforex_merged_download_stores_one_two_sided_file(self, tmp_path, monkeypatch):
+        """offer_side='both' stores ONE parquet with bid_*/ask_* columns,
+        declared in the dukascopy manifest — the layout has no _bid/_ask
+        sibling files (#471)."""
+        import data_tools.downloaders.jforex_dl as jforex
+        from shared import ohlcv_store
 
-        symbol_dir = tmp_path / "ohlcv" / "jforex" / "forex" / "EURUSD"
-        symbol_dir.mkdir(parents=True)
-        bid_path = symbol_dir / "1h_bid.parquet"
-        frame = pd.DataFrame(
-            {"timestamp": pd.to_datetime(["2024-01-01T00:00:00Z"], utc=True), "close": [1.0]}
+        monkeypatch.setattr(
+            jforex, "_resolve_java_instrument",
+            lambda symbol: ("EURUSD", "forex", object()),
         )
-        frame.to_parquet(bid_path, index=False)
+        monkeypatch.setattr(jforex, "_read_auth_config", lambda: object())
+        stamps = pd.date_range("2024-01-02 00:00", periods=4, freq="h", tz="UTC")
 
-        resolved = merged_result_path(bid_path)
-        assert resolved.is_file()
-        assert not resolved.is_dir()
-        assert resolved == bid_path
+        def side_frame(side: str) -> pd.DataFrame:
+            return pd.DataFrame(
+                {
+                    "timestamp": stamps,
+                    f"{side}_open": [1.0] * 4,
+                    f"{side}_high": [1.1] * 4,
+                    f"{side}_low": [0.9] * 4,
+                    f"{side}_close": [1.05] * 4,
+                    f"{side}_volume": [10] * 4,
+                }
+            )
 
-    def test_jforex_merged_result_path_fails_closed_when_missing(self, tmp_path):
-        """A partial merge (bid parquet absent) must not report a path."""
-        from data_tools.downloaders.jforex_dl import merged_result_path
+        monkeypatch.setattr(
+            jforex,
+            "_query_bars_for_offer_side",
+            lambda **kwargs: side_frame(kwargs["offer_side"]),
+        )
 
-        with pytest.raises(RuntimeError, match="did not store"):
-            merged_result_path(tmp_path / "ohlcv" / "jforex" / "forex" / "EURUSD"
-                               / "1h_bid.parquet")
+        downloader = jforex.JForexDownloader()
+        result = downloader.download(
+            "EURUSD", "1h", tmp_path,
+            start="2024-01-02", end="2024-01-03", offer_side="both",
+        )
+
+        stored = Path(result.path)
+        assert stored.is_file()
+        assert stored.name == "EURUSD_H1.parquet"
+        df = pd.read_parquet(stored)
+        assert {"bid_open", "bid_close", "ask_open", "ask_close"} <= set(df.columns)
+        datasets = ohlcv_store.list_datasets(
+            tmp_path, source="dukascopy", symbol="EURUSD", timeframe="1h"
+        )
+        assert len(datasets) == 1
+        assert datasets[0].asset_class == "forex"
 
 
 class TestSourceMetaAtomicity:
@@ -147,7 +170,7 @@ class TestCtraderStorageLayout:
         )
 
         stored = Path(result.path)
-        assert stored.name == "tick.parquet", f"tick data stored as {stored.name}"
+        assert stored.name == "EURUSD_TICK.parquet", f"tick data stored as {stored.name}"
         assert stored.is_file()
 
     def test_metals_use_metals_asset_class(self, tmp_path):
@@ -172,7 +195,10 @@ class TestCtraderStorageLayout:
         result = downloader.download("XAUUSD", "tick", tmp_path, csv_file=str(csv_path))
 
         assert result.asset_class == "metals"
-        assert "metals" in str(result.path)
+        from shared import ohlcv_store
+
+        datasets = ohlcv_store.list_datasets(tmp_path, source="ctrader", symbol="XAUUSD")
+        assert datasets and datasets[0].asset_class == "metals"
 
 
 class TestHistdataFailureVisibility:

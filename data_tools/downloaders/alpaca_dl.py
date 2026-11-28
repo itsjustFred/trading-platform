@@ -17,7 +17,7 @@ from typing import Any
 import pandas as pd
 
 from data_tools.downloaders.base import Downloader, DownloadResult, SourceMeta
-from data_tools.path_safety import build_dataset_path
+from shared import ohlcv_store
 from shared import venue_calendar
 from shared.constants import DATA_DIR, normalize_timeframe
 
@@ -199,15 +199,7 @@ class AlpacaDownloader(Downloader):
         ]
 
     def _make_us_equity_output_path(self, output_dir: Path, symbol: str, timeframe: str) -> Path:
-        path = build_dataset_path(
-            output_dir,
-            "ohlcv",
-            self.source_name,
-            "equity",
-            "US",
-            symbol,
-            f"{timeframe}.parquet",
-        )
+        path = ohlcv_store.data_path(output_dir, self.source_name, symbol, timeframe)
         path.parent.mkdir(parents=True, exist_ok=True)
         return path
 
@@ -354,7 +346,7 @@ class AlpacaDownloader(Downloader):
             .drop_duplicates(subset=["timestamp"], keep="last")
             .reset_index(drop=True)
         )
-        stored = self._merge_and_store_single_file(out_path, combined_new)
+        stored = self._merge_and_store_single_file(out_path, combined_new, asset_class="equity", region="US")
         self._cache_exchange_calendar(
             output_dir, normalized_symbol, parsed_start, parsed_end
         )

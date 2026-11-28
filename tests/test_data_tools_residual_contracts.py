@@ -116,13 +116,15 @@ def test_coverage_rejects_glob_symbol_before_scanning(tmp_path: Path) -> None:
 
 
 def test_alias_refresh_uses_file_fingerprint(tmp_path: Path) -> None:
-    canonical = tmp_path / "ohlcv" / "dukascopy" / "forex" / "EURUSD" / "1m.parquet"
+    from shared import ohlcv_store
+
+    canonical = ohlcv_store.data_path(tmp_path, "dukascopy", "EURUSD", "1m")
     canonical.parent.mkdir(parents=True)
     canonical.write_bytes(b"new canonical data")
-    alias = ensure_alias_copy(canonical, "GBPUSD", "forex", tmp_path)
+    alias = ensure_alias_copy(canonical, "GBPUSD", "1m", "forex", tmp_path)
     alias.write_bytes(b"old canonical data")
 
-    refreshed = ensure_alias_copy(canonical, "GBPUSD", "forex", tmp_path)
+    refreshed = ensure_alias_copy(canonical, "GBPUSD", "1m", "forex", tmp_path)
 
     assert refreshed.read_bytes() == canonical.read_bytes()
 

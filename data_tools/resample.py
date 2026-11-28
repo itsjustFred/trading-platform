@@ -21,12 +21,8 @@ from pathlib import Path
 
 import pandas as pd
 
-from data_tools.path_safety import (
-    build_dataset_path,
-    ensure_dataset_path_within,
-    validate_dataset_component,
-)
-from shared.atomic_io import write_parquet_atomically
+from data_tools.path_safety import validate_dataset_component
+from shared import ohlcv_store
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(message)s")
 logger = logging.getLogger(__name__)
@@ -325,19 +321,72 @@ def merge_resampled_history(
     return combined
 
 
+def _store_dataset_root(source_path: Path) -> Path | None:
+    """The ``ohlcv`` directory containing ``source_path``, if any."""
+    return next(
+        (parent for parent in (source_path, *source_path.parents) if parent.name == "ohlcv"),
+        None,
+    )
+
+
+def _dataset_identity(
+    source_path: Path, data_root: Path | None
+) -> tuple[Path, str, str, ohlcv_store.DatasetEntry | None] | None:
+    """``(data_root, source, symbol, manifest entry)`` for a store parquet.
+
+    The manifest entry supplies ``asset_class``/``region``/``source_symbol``
+    when the source dataset is declared; an undeclared file still resamples
+    but writes with empty metadata (``validate_manifest`` will flag it).
+    """
+    ohlcv_dir = _store_dataset_root(source_path)
+    if ohlcv_dir is None:
+        return None
+    root = Path(data_root) if data_root is not None else ohlcv_dir.parent
+    try:
+        relative = source_path.resolve().relative_to((root / "ohlcv").resolve())
+    except (OSError, ValueError):
+        return None
+    parts = relative.parts
+    if len(parts) != 3:
+        return None
+    source, symbol, _filename = parts
+    entry = ohlcv_store.entry_for_path(root, source_path)
+    return root, source, symbol, entry
+
+
 def resample_file(
-    source_path: Path, timeframes: list[str], output_dir: Path | None = None
+    source_path: Path,
+    timeframes: list[str],
+    *,
+    data_root: Path | None = None,
+    symbol: str | None = None,
+    asset_class: str | None = None,
+    region: str | None = None,
+    source_symbol: str | None = None,
 ) -> list[Path]:
-    """Resample a single parquet file to multiple timeframes.
+    """Resample a store parquet to higher timeframes, writing via the manifest.
 
     Args:
-        source_path: Path to source OHLCV parquet file.
+        source_path: Path to a source OHLCV parquet inside the store
+            (``<root>/ohlcv/<source>/<SYMBOL>/<SYMBOL>_<TF>.parquet``).
         timeframes: List of target timeframes (e.g., ['5m', '15m', '1h']).
-        output_dir: Output directory (default: same directory as source).
+        data_root: Data root override; inferred from ``source_path``.
+        symbol: Write targets under this symbol instead of the source's
+            (alias resampling, e.g. requested-name copies of canonical data).
+        asset_class/region/source_symbol: Manifest metadata overrides; the
+            source dataset's manifest entry supplies them otherwise.
 
     Returns:
         List of output file paths.
     """
+    identity = _dataset_identity(Path(source_path), data_root)
+    if identity is None:
+        raise ValueError(
+            f"{source_path} is not an OHLCV store dataset; resample_file writes "
+            "through shared.ohlcv_store and needs a manifest-declared source"
+        )
+    root, source, src_symbol, entry = identity
+
     df = pd.read_parquet(source_path)
 
     # Normalize columns
@@ -347,56 +396,107 @@ def resample_file(
     if missing:
         raise ValueError(f"Missing columns: {missing}")
 
-    out_dir = output_dir or source_path.parent
+    target_symbol = str(symbol or src_symbol)
+    target_asset_class = (
+        str(asset_class)
+        if asset_class is not None
+        else (entry.asset_class if entry is not None else "")
+    )
+    target_region = (
+        str(region)
+        if region is not None
+        else (entry.region if entry is not None else "")
+    )
+    target_source_symbol = (
+        str(source_symbol)
+        if source_symbol is not None
+        else (entry.source_symbol if entry is not None else "")
+    )
+
     results = []
 
     for tf in timeframes:
-        out_path = build_dataset_path(out_dir, f"{tf}.parquet")
+        out_path = ohlcv_store.data_path(root, source, target_symbol, tf)
         resampled = resample_ohlcv(df, tf)
         if out_path.exists():
             resampled = merge_resampled_history(out_path, resampled, tf)
-        write_parquet_atomically(out_path, resampled)
+        ohlcv_store.write_frame(
+            root,
+            source,
+            target_symbol,
+            tf,
+            resampled,
+            asset_class=target_asset_class,
+            region=target_region,
+            source_symbol=target_source_symbol,
+        )
         logger.info("  %s: %d → %d rows → %s", tf, len(df), len(resampled), out_path)
         results.append(out_path)
 
     return results
 
 
-def _path_is_contained(root: Path, path: Path) -> bool:
-    try:
-        ensure_dataset_path_within(root, path)
-    except ValueError:
-        return False
-    return True
+def _resolve_store_root(source_dir: Path) -> tuple[Path, str] | None:
+    """``(data_root, source)`` for a directory argument.
+
+    Accepts a data root (contains ``ohlcv/``), an ``ohlcv`` root, or one
+    source directory inside it. Returns None for anything else.
+    """
+    path = Path(source_dir)
+    if (path / "ohlcv").is_dir():
+        return path, ""
+    if path.name == "ohlcv":
+        return path.parent, ""
+    if path.parent.name == "ohlcv":
+        return path.parent.parent, path.name
+    return None
 
 
 def resample_directory(source_dir: Path, from_tf: str, timeframes: list[str]) -> list[Path]:
-    """Resample all parquet files in a directory tree.
+    """Resample every store dataset at ``from_tf`` under a data/source dir.
 
-    Finds all {from_tf}.parquet files under source_dir and resamples each.
+    ``source_dir`` may be the data root, the ``ohlcv`` root, or a single
+    source directory; datasets come from the manifest, never a filesystem
+    glob.
     """
     validate_dataset_component(from_tf, name="source timeframe")
     for timeframe in timeframes:
         validate_dataset_component(timeframe, name="target timeframe")
-    source_files = sorted(
-        path
-        for path in source_dir.rglob(f"{from_tf}.parquet")
-        if _path_is_contained(source_dir, path)
-    )
+    resolved = _resolve_store_root(Path(source_dir))
+    if resolved is None:
+        logger.warning("%s is not an OHLCV store directory", source_dir)
+        return []
+    data_root, source = resolved
 
-    if not source_files:
-        logger.warning("No %s.parquet files found under %s", from_tf, source_dir)
+    datasets = ohlcv_store.list_datasets(data_root, source=source, timeframe=from_tf)
+    if not datasets:
+        logger.warning("No %s datasets found under %s", from_tf, source_dir)
         return []
 
     all_results = []
-    for src in source_files:
-        symbol = src.parent.name
-        logger.info("Resampling %s (%s)...", symbol, src)
+    for dataset in datasets:
+        logger.info("Resampling %s/%s (%s)...", dataset.source, dataset.symbol, dataset.timeframe)
         try:
-            results = resample_file(src, timeframes)
-            all_results.extend(results)
+            frame = ohlcv_store.read_frame(dataset)
+            for tf in timeframes:
+                out_path = ohlcv_store.data_path(data_root, dataset.source, dataset.symbol, tf)
+                resampled = resample_ohlcv(frame, tf)
+                if out_path.exists():
+                    resampled = merge_resampled_history(out_path, resampled, tf)
+                ohlcv_store.write_frame(
+                    data_root,
+                    dataset.source,
+                    dataset.symbol,
+                    tf,
+                    resampled,
+                    asset_class=dataset.asset_class,
+                    region=dataset.region,
+                    source_symbol=dataset.source_symbol,
+                )
+                logger.info("  %s: %d → %d rows → %s", tf, len(frame), len(resampled), out_path)
+                all_results.append(out_path)
         except Exception:
-            logger.exception("  Resampling %s failed", symbol)
+            logger.exception("  Resampling %s failed", dataset.symbol)
 
     return all_results
 

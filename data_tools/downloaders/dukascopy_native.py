@@ -1382,7 +1382,7 @@ class DukascopyNativeDownloader(Downloader):
 
         await _wait_for_control(pause_event, stop_event)
 
-        df = self._merge_and_store_single_file(out_path, df)
+        df = self._merge_and_store_single_file(out_path, df, asset_class=asset_class)
         warnings.append(f"requested_range:{requested_start}->{requested_end}")
         _report_progress(report_progress, 100.0, f"Saved {out_path.name}")
 

@@ -44,6 +44,7 @@ __all__ = [
     "platform_timeframe",
     "read_frame",
     "read_manifest",
+    "register_file",
     "segment_for_path",
     "source_dir",
     "store_root",
@@ -834,3 +835,59 @@ def write_frame(
             meta[str(key)] = value
     write_manifest(data_root, src, manifest)
     return path
+
+
+def register_file(
+    data_root: str | Path,
+    source: str,
+    symbol: str,
+    timeframe: str,
+    path: str | Path,
+    *,
+    asset_class: str,
+    region: str = "",
+    source_symbol: str = "",
+    segment: str = "",
+    extra_meta: Mapping[str, Any] | None = None,
+) -> Path:
+    """Declare an already-written parquet in the source manifest.
+
+    ``rows``/``first``/``last`` are recomputed from the file's parquet
+    metadata and timestamp statistics — never trusted from the caller. Use
+    this for byte-identical copies (aliases) where re-writing the frame
+    through :func:`write_frame` would be wasted I/O; ``write_frame`` remains
+    the writer for frames held in memory.
+    """
+    src = _source_name(source)
+    sym = _symbol_name(symbol)
+    target = Path(path)
+    expected = data_path(data_root, src, sym, timeframe, segment=segment)
+    if target.resolve() != expected.resolve():
+        raise ValueError(f"register_file path {target} is not {expected}")
+    if not target.is_file():
+        raise ValueError(f"register_file target does not exist: {target}")
+
+    rows = _parquet_row_count(target)
+    bounds = timestamp_bounds(target)
+    manifest = read_manifest(data_root, src)
+    meta = manifest.get(sym)
+    if not isinstance(meta, dict):
+        meta = {}
+        manifest[sym] = meta
+    files = meta.get("files")
+    if not isinstance(files, dict):
+        files = {}
+        meta["files"] = files
+    files[expected.name] = {
+        "rows": rows or 0,
+        "first": bounds[0].isoformat() if bounds else "",
+        "last": bounds[1].isoformat() if bounds else "",
+    }
+    meta["asset_class"] = str(asset_class or "").strip()
+    meta["region"] = str(region or "").strip()
+    meta["source_symbol"] = str(source_symbol or "").strip() or sym
+    if extra_meta:
+        for key, value in extra_meta.items():
+            meta[str(key)] = value
+    write_manifest(data_root, src, manifest)
+    return target

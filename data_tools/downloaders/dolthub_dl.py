@@ -195,7 +195,7 @@ class DolthubDownloader(Downloader):
         ]
         df = df[keep].dropna(subset=["open"]).sort_values("timestamp").reset_index(drop=True)
 
-        combined = self._merge_and_store_single_file(out_path, df)
+        combined = self._merge_and_store_single_file(out_path, df, asset_class="equity")
 
         return DownloadResult(
             symbol=symbol,

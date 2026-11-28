@@ -212,7 +212,7 @@ def test_ensure_alias_copy_refreshes_when_canonical_is_newer(tmp_path):
     canonical.parent.mkdir(parents=True)
     pd.DataFrame({"timestamp": [1], "close": [1.0]}).to_parquet(canonical, index=False)
 
-    first = ensure_alias_copy(canonical, "SP500", "indices", tmp_path)
+    first = ensure_alias_copy(canonical, "SP500", "1m", "indices", tmp_path)
     assert first.exists()
 
     # Touch the alias so it is newer than the canonical file, then update the
@@ -223,7 +223,7 @@ def test_ensure_alias_copy_refreshes_when_canonical_is_newer(tmp_path):
     # Force equal sizes: pad the alias content check by rewriting canonical to
     # match its previous byte size is not needed — mtime alone must trigger.
 
-    refreshed = ensure_alias_copy(canonical, "SP500", "indices", tmp_path)
+    refreshed = ensure_alias_copy(canonical, "SP500", "1m", "indices", tmp_path)
     assert pd.read_parquet(refreshed)["timestamp"].tolist() == [1, 2]
 
 
@@ -234,14 +234,14 @@ def test_ensure_alias_copy_skips_copy_when_alias_up_to_date(tmp_path):
     canonical.parent.mkdir(parents=True)
     pd.DataFrame({"timestamp": [1], "close": [1.0]}).to_parquet(canonical, index=False)
 
-    first = ensure_alias_copy(canonical, "SP500", "indices", tmp_path)
+    first = ensure_alias_copy(canonical, "SP500", "1m", "indices", tmp_path)
     before = first.stat().st_mtime_ns
     time.sleep(0.01)
     # Rewriting canonical with identical content but older mtime must not re-copy.
     import os
     os.utime(canonical, ns=(0, 0))
 
-    second = ensure_alias_copy(canonical, "SP500", "indices", tmp_path)
+    second = ensure_alias_copy(canonical, "SP500", "1m", "indices", tmp_path)
 
     assert second == first
     assert second.stat().st_mtime_ns == before

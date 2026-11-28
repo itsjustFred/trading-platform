@@ -173,7 +173,7 @@ class CTraderDownloader(Downloader):
         if timeframe != "tick" and timeframe != "1m":
             df = self._resample(df, timeframe)
 
-        combined = self._merge_and_store_single_file(out_path, df)
+        combined = self._merge_and_store_single_file(out_path, df, asset_class=asset_class)
 
         return DownloadResult(
             symbol=symbol,
