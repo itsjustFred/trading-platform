@@ -40,10 +40,11 @@ from live_runner.pre_submit_caps import (
 from risk.config import RiskConfig
 from shared.database import list_live_control_audit
 from shared.models import LiveDeploymentConfig, LiveSignal
+from tests.builders import make_live_deployment, make_live_signal
 
 
 def _deployment(**settings: Any) -> LiveDeploymentConfig:
-    return LiveDeploymentConfig(
+    return make_live_deployment(
         id=uuid4(),
         strategy_name="demo",
         account_id="acc-1",
@@ -65,7 +66,7 @@ def _signal(
 ) -> LiveSignal:
     meta = {"entry_price": 100.0, "stop_loss": 95.0, "take_profit": 110.0}
     meta.update(metadata or {})
-    return LiveSignal(
+    return make_live_signal(
         deployment_id=str(deployment.id),
         symbol=symbol,
         action=action,  # type: ignore[arg-type]

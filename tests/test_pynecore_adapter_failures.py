@@ -8,6 +8,7 @@ import pytest
 
 from runner.engines.base import BacktestConfig
 from runner.engines.pynecore_adapter import PyneCoreAdapter
+from tests.builders import make_backtest_config
 
 
 def _write_ohlcv(tmp_path: Path, symbol: str) -> None:
@@ -27,7 +28,7 @@ def _write_ohlcv(tmp_path: Path, symbol: str) -> None:
 
 
 def _config(tmp_path: Path, symbols: list[str]) -> BacktestConfig:
-    return BacktestConfig(risk_per_trade_pct=0.01, parameters={"fees": "zero"},
+    return make_backtest_config(risk_per_trade_pct=0.01, parameters={"fees": "zero"},
         strategy_name="pyne_demo",
         symbols=symbols,
         timeframe="1d",

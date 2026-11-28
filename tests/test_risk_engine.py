@@ -920,6 +920,58 @@ def test_risk_decision_rejects_malformed_wire_values():
         )
 
 
+def _decision_with_accepted(**overrides: object) -> RiskDecision:
+    fields: dict[str, object] = {
+        "signal_id": "risk-1",
+        "accepted": True,
+        "quantity": 0.0,
+        "risk_amount": 0.0,
+        "risk_percent": 0.0,
+        "risk_distance": None,
+        "stop_price_used": None,
+        "take_profit_used": None,
+    }
+    fields.update(overrides)
+    return RiskDecision(**fields)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        (True, True),
+        (False, False),
+        ("true", True),
+        ("TRUE", True),
+        (" true ", True),
+        ("1", True),
+        ("yes", True),
+        ("false", False),
+        ("0", False),
+        ("no", False),
+        (1, True),
+        (0, False),
+    ],
+)
+def test_risk_decision_accepted_parses_its_own_wire_tokens(value, expected) -> None:
+    """``risk.models._parse_bool`` is NOT the env parser (G08).
+
+    It reads a decision payload that may already be a bool or an int, accepts
+    neither ``y``/``n`` nor ``on``/``off``, and answers a different error text.
+    Pinned here so a later merge attempt starts from the current behaviour.
+    """
+
+    assert _decision_with_accepted(accepted=value).accepted is expected
+
+
+@pytest.mark.parametrize(
+    "value",
+    [None, "", "ture", "y", "n", "on", "off", "maybe", 2, 1.5],
+)
+def test_risk_decision_rejects_a_value_its_bool_parser_does_not_know(value) -> None:
+    with pytest.raises(ValueError, match="accepted must be a boolean"):
+        _decision_with_accepted(accepted=value)
+
+
 @dataclass(slots=True)
 class _DummyAdapter(BaseLiveAdapter):
     submitted_signal: LiveSignal | None = None

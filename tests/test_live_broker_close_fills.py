@@ -32,6 +32,7 @@ import pytest
 
 from live_runner.alpaca_adapter import AlpacaLiveAdapter
 from shared.models import LiveDeploymentConfig, LiveExecution, LiveSignal
+from tests.builders import make_live_deployment, make_live_signal
 from tests.conftest import seed_live_deployments
 
 ACCOUNT = "fixture-account"
@@ -66,7 +67,7 @@ def _persist_entry(
     broker_order_id: str = PARENT_ORDER_ID,
 ) -> str:
     """One entry signal of one deployment, already filled at the broker and recorded."""
-    signal = LiveSignal(
+    signal = make_live_signal(
         deployment_id=deployment_id,
         symbol=symbol,
         action=action,
@@ -243,7 +244,7 @@ def _ledger(database, deployment_id: str, symbol: str = "AAPL") -> float:
 
 def _entry_signal() -> LiveSignal:
     """A bracket entry signal of the kind every Alpaca entry carries."""
-    return LiveSignal(
+    return make_live_signal(
         deployment_id=DEP_ENTRY,
         symbol="AAPL",
         action="buy",
@@ -640,7 +641,7 @@ def test_a_still_open_leg_is_not_backfilled(database) -> None:
 
 
 def _deployment(deployment_id: str) -> LiveDeploymentConfig:
-    return LiveDeploymentConfig(
+    return make_live_deployment(
         id=UUID(deployment_id),
         broker="alpaca",
         strategy_name="fixture",
@@ -671,7 +672,7 @@ def _exit_signal() -> LiveSignal:
     from live_runner.exit_signals import ExitInstruction, exit_intent_metadata
 
     instruction = ExitInstruction(fraction=1.0, position_side="long")
-    return LiveSignal(
+    return make_live_signal(
         deployment_id=DEP_OTHER,
         symbol="AAPL",
         action="sell",
@@ -825,7 +826,7 @@ def test_reconcile_falls_back_to_the_client_id_fetch_without_a_stored_order_id(
     database,
 ) -> None:
     """A signal persisted before its broker order id was stored still reconciles."""
-    signal = LiveSignal(
+    signal = make_live_signal(
         deployment_id=DEP_ENTRY,
         symbol="AAPL",
         action="buy",
@@ -1199,7 +1200,7 @@ REPROTECT_LONE_ID = "77777777-7777-4777-8777-777777777777"
 
 def _persist_exit_signal(database, *, deployment_id: str = DEP_ENTRY) -> str:
     """One persisted exit-only signal (the ``{exit}`` half of a reprotect id)."""
-    signal = LiveSignal(
+    signal = make_live_signal(
         deployment_id=deployment_id,
         symbol="AAPL",
         action="sell",

@@ -33,6 +33,7 @@ from runner.engines.pynecore_adapter import (
     _pyne_cli_start_bound,
 )
 from shared.models import Trade, TradeExit
+from tests.builders import make_backtest_config
 from tests.helpers import with_zero_fees
 
 
@@ -191,7 +192,7 @@ def _config(tmp_path: Path, **overrides: Any) -> BacktestConfig:
         "data_dir": str(tmp_path),
     }
     payload.update(overrides)
-    return BacktestConfig(**with_zero_fees(payload))
+    return make_backtest_config(**with_zero_fees(payload))
 
 
 def test_colliding_trade_ids_keep_independent_open_ledger_entries(tmp_path: Path) -> None:
@@ -585,9 +586,7 @@ def test_pyne_cli_receives_full_day_bounds_for_date_only_config(monkeypatch, tmp
         "            pd.Series([False] * n, index=df.index), {})\n",
         encoding="utf-8",
     )
-    from runner.engines.base import BacktestConfig
-
-    config = BacktestConfig(
+    config = make_backtest_config(
         strategy_name="pyne_bound",
         symbols=["PYNE"],
         timeframe="1h",

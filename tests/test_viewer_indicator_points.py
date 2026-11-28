@@ -9,13 +9,9 @@ so on a non-contiguous slice indicator values land on the wrong timestamps.
 from __future__ import annotations
 
 import math
-import sys
-from pathlib import Path
 
 import numpy as np
 import pandas as pd
-
-sys.path.insert(0, str(Path(__file__).parent.parent))
 
 
 def _frame() -> pd.DataFrame:

@@ -415,7 +415,7 @@ class TradeEngine:
         # "take_profit" and "tp_price" are two spellings of the SAME plain
         # take-profit level (#237), so a row carrying both must produce a
         # single "tp" candidate. The canonical spelling wins — the alias order
-        # every other level resolver uses (``risk.live._LIVE_TP_KEYS``, the
+        # every other level resolver uses (``risk.signal_levels.TP_METADATA_KEYS``,
         # comparison/extraction helpers) — and the winner must not depend on
         # the signal frame's column order. Appending one candidate per column
         # made two levels named "tp" for the one intended level, so the row's

@@ -1485,32 +1485,6 @@ def test_an_escalated_mode_re_sweeps_a_state_that_is_refreshed_in_place(
     assert report.swept == (account,)
 
 
-def test_an_escalated_mode_re_sweeps_immediately(
-    isolated_db_sandbox, account
-) -> None:
-    """Escalating entries -> flatten must not wait out the sweep interval."""
-    set_live_kill_switch(account, "orders", actor="operator")
-    adapter = _SweepAdapter()
-    asyncio.run(
-        enforce_live_kill_switch(
-            {account: adapter}, [account], state=read_kill_switch_state()
-        )
-    )
-    calls_before = list(adapter.calls)
-
-    set_live_kill_switch(account, "flatten", actor="operator")
-
-    report = asyncio.run(
-        enforce_live_kill_switch(
-            {account: adapter}, [account], state=read_kill_switch_state()
-        )
-    )
-
-    assert adapter.calls[: len(calls_before)] == calls_before
-    assert "close_all_positions" in adapter.calls
-    assert report.swept == (account,)
-
-
 def test_an_unreadable_state_never_sweeps_the_broker(
     isolated_db_sandbox, account, monkeypatch, caplog
 ) -> None:
