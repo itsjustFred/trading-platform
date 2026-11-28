@@ -50,6 +50,23 @@ def test_live_endpoints_return_expected_payloads(monkeypatch, isolated_db):
         balance=10_000.0,
         equity=10_010.0,
     )
+    execution_row = {
+        "signal_id": signal_id,
+        "execution_id": "22222222-2222-2222-2222-222222222222",
+        "deployment_id": deployment_id,
+        "symbol": "AAPL",
+        "action": "buy",
+        "theoretical_price": 100.0,
+        "actual_price": 100.25,
+        "slippage": 0.25,
+        "slippage_bps": 25.0,
+        "filled_qty": 1.0,
+        "commission": 0.01,
+        "signal_timestamp": datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc),
+        "execution_timestamp": datetime(2026, 1, 1, 12, 0, 2, tzinfo=timezone.utc),
+        "broker_order_id": "broker-123",
+        "signal_metadata": {"qty": 1},
+    }
 
     monkeypatch.setattr(viewer_main_module, "_seed_default_live_accounts", lambda: None)
     # Creating a deployment now requires a KNOWN account: the endpoint refuses an
@@ -83,27 +100,7 @@ def test_live_endpoints_return_expected_payloads(monkeypatch, isolated_db):
         "load_live_account_stats_inputs",
         lambda _account_id: (
             [balance] if _account_id == account_id else [],
-            [
-                {
-                    "signal_id": signal_id,
-                    "execution_id": "22222222-2222-2222-2222-222222222222",
-                    "deployment_id": deployment_id,
-                    "symbol": "AAPL",
-                    "action": "buy",
-                    "theoretical_price": 100.0,
-                    "actual_price": 100.25,
-                    "slippage": 0.25,
-                    "slippage_bps": 25.0,
-                    "filled_qty": 1.0,
-                    "commission": 0.01,
-                    "signal_timestamp": datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc),
-                    "execution_timestamp": datetime(2026, 1, 1, 12, 0, 2, tzinfo=timezone.utc),
-                    "broker_order_id": "broker-123",
-                    "signal_metadata": {"qty": 1},
-                }
-            ]
-            if _account_id == account_id
-            else [],
+            [execution_row] if _account_id == account_id else [],
         ),
     )
     monkeypatch.setattr(
@@ -115,25 +112,7 @@ def test_live_endpoints_return_expected_payloads(monkeypatch, isolated_db):
     monkeypatch.setattr(
         viewer_main_module,
         "list_live_signal_executions_for_deployments",
-        lambda _deployment_ids: [
-            {
-                "signal_id": signal_id,
-                "execution_id": "22222222-2222-2222-2222-222222222222",
-                "deployment_id": deployment_id,
-                "symbol": "AAPL",
-                "action": "buy",
-                "theoretical_price": 100.0,
-                "actual_price": 100.25,
-                "slippage": 0.25,
-                "slippage_bps": 25.0,
-                "filled_qty": 1.0,
-                "commission": 0.01,
-                "signal_timestamp": datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc),
-                "execution_timestamp": datetime(2026, 1, 1, 12, 0, 2, tzinfo=timezone.utc),
-                "broker_order_id": "broker-123",
-                "signal_metadata": {"qty": 1},
-            }
-        ],
+        lambda _deployment_ids: [execution_row],
     )
     monkeypatch.setattr(
         viewer_main_module,
