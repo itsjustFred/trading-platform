@@ -1791,3 +1791,21 @@ class TestProtectiveExitGapHelpers:
             take_profit_price=110.0,
         )
         assert (kind, gapped) == ("stop", False)
+
+
+def test_resolve_strategy_parameters_warns_when_meta_read_fails(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A strategy-meta read that raises must warn, not silently drop defaults."""
+    import logging
+
+    from runner.engines import base as engine_base
+
+    def _boom(*args: object, **kwargs: object) -> dict:
+        raise RuntimeError("meta exploded")
+
+    monkeypatch.setattr(engine_base, "load_strategy_meta", _boom)
+    with caplog.at_level(logging.WARNING):
+        params = engine_base.resolve_strategy_parameters(tmp_path / "strategy.py", {"x": 1})
+    assert params == {"x": 1}
+    assert "Could not load strategy meta" in caplog.text

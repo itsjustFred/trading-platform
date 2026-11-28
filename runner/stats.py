@@ -459,7 +459,8 @@ def _ohlcv_asset_class_for(
         path, _candidates = select_ohlcv_path(
             data_dir, symbol, timeframe, data_source=data_source
         )
-    except Exception:
+    except Exception:  # except-kind: best-effort - failure degrades to None ("try next timeframe")
+        logger.debug("OHLCV asset-class lookup failed for %s", symbol, exc_info=True)
         return None
     if path is None:
         return None
@@ -652,7 +653,7 @@ def _equity_to_returns_series(equity_curve: list[EquityPoint]) -> pd.Series | No
             returns = eq_series.pct_change(fill_method=None)
             returns.loc[previous <= 0] = pd.NA
             return returns.replace([math.inf, -math.inf], pd.NA).dropna()
-        except Exception:
+        except Exception:  # except-kind: best-effort - falls back to the plain returns series below
             logger.debug("Could not build datetime-indexed returns series", exc_info=True)
 
     eq_series = pd.Series(equities, dtype=float)
@@ -729,7 +730,7 @@ def _daily_returns_series_from_equity_curve(
         returns.loc[previous <= 0] = pd.NA
         returns = returns.replace([math.inf, -math.inf], pd.NA).dropna()
         return returns if not returns.empty else None
-    except Exception:
+    except Exception:  # except-kind: best-effort - falls back to the raw equity returns below
         logger.debug("Could not build daily returns series from equity curve", exc_info=True)
 
     raw_returns = _equity_to_returns_series(equity_curve)
@@ -836,7 +837,7 @@ def _resolve_return_convention(
                     data_dir=str(data_dir) if data_dir else "",
                 )
             )
-        except Exception:
+        except Exception:  # except-kind: best-effort - counts as non-crypto daily
             logger.debug(
                 "Venue calendar resolution failed for %s", symbol, exc_info=True
             )
@@ -861,7 +862,8 @@ def _resolve_return_convention(
         last_ts = pd.Timestamp(stamps.max())
         start = first_ts.normalize()
         end = last_ts.normalize()
-    except Exception:
+    except Exception:  # except-kind: best-effort - unparseable stamps yield no annualisation window
+        logger.debug("Equity-curve timestamp parse failed", exc_info=True)
         return periods, None
     if pd.isna(first_ts) or pd.isna(last_ts):
         return periods, None
@@ -981,7 +983,8 @@ def _resolve_backtest_period_bounds(
             )
             if not pd.isna(ts)
         ]
-    except Exception:
+    except Exception:  # except-kind: best-effort - falls back to the configured dates below
+        logger.debug("Equity-curve timestamp parse failed", exc_info=True)
         equity_times = []
 
     if not pd.isna(configured_start) and pd.isna(configured_end):
@@ -1037,8 +1040,8 @@ def _safe_qs(func, returns: pd.Series, **kwargs) -> float:
         ):
             return 0.0
         return float(result)
-    except Exception as e:
-        logger.debug("QuantStats %s failed: %s", func.__name__, e)
+    except Exception as e:  # except-kind: best-effort - QuantStats failure degrades to 0.0
+        logger.debug("QuantStats %s failed: %s", func.__name__, e, exc_info=True)
         return 0.0
 
 
@@ -1217,7 +1220,8 @@ def _one_sided_p_value(returns: list[float]) -> float:
         if math.isnan(p_value_float) or math.isinf(p_value_float):
             return 1.0
         return max(0.0, min(1.0, p_value_float))
-    except Exception:
+    except Exception:  # except-kind: best-effort - failure degrades to the conservative p=1.0
+        logger.debug("One-sided p-value computation failed", exc_info=True)
         return 1.0
 
 
@@ -1319,7 +1323,8 @@ def _probabilistic_sharpe(
         skew = float(returns_series.skew())
         kurt = float(returns_series.kurtosis()) + 3  # pandas excess → raw kurtosis
         return _psr_formula(sr_obs, sr_benchmark, n, skew, kurt)
-    except Exception:
+    except Exception:  # except-kind: best-effort - PSR failure degrades to undefined (None)
+        logger.debug("Probabilistic Sharpe computation failed", exc_info=True)
         return None
 
 

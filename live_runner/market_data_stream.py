@@ -216,7 +216,7 @@ class _StreamWorker:
         if hasattr(self.stream, "unsubscribe_bars"):
             try:
                 self.stream.unsubscribe_bars()
-            except Exception:  # except-kind: loop-survival
+            except Exception:  # except-kind: loop-survival  # noqa: S110
                 pass
         if normalized:
             self._subscribe_symbols(sorted(normalized))
@@ -227,7 +227,7 @@ class _StreamWorker:
         if stream is not None and hasattr(stream, "stop"):
             try:
                 stream.stop()
-            except Exception:  # except-kind: loop-survival
+            except Exception:  # except-kind: loop-survival  # noqa: S110
                 pass
 
 

@@ -108,7 +108,7 @@ def load_state() -> dict:
     if STATE_PATH.exists():
         try:
             return json.loads(STATE_PATH.read_text(encoding="utf-8"))
-        except Exception:
+        except Exception:  # noqa: S110 - corrupt state file falls back to a fresh state
             pass
     return {
         "started_at": now_iso(),
