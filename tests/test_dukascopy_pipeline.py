@@ -975,6 +975,39 @@ def test_drifted_higher_tf_is_fully_resampled_when_new_data_arrives(tmp_path):
     assert pipeline.verify_manifest(root) == []
 
 
+def test_missing_higher_tf_is_rebuilt_from_full_m1_not_the_fetch_tail(tmp_path):
+    """A deleted higher-TF parquet with no manifest entry must not truncate."""
+    root = tmp_path / "dukascopy"
+    raw = tmp_path / "raw"
+    # Three weeks of fixture: the incremental tail slice starts at the W1
+    # week floor, so anything older would be silently dropped from a rebuilt
+    # higher timeframe.
+    days = _fixture_days(date(2026, 11, 2), 20)  # Mon Nov 2 .. Sat Nov 21
+    fetcher = FakeFetcher(days)
+    pipeline.update_dataset(
+        root, symbols=["EURUSD"], start="2026-11-02", end="2026-11-19",
+        raw_dir=raw, fetcher=fetcher,
+    )
+    # Delete M5 and its manifest entry so the drift check stays quiet; the
+    # next incremental run must still rebuild M5 from the whole stored M1,
+    # not just the fetched tail.
+    (root / "EURUSD" / "EURUSD_M5.parquet").unlink()
+    manifest = json.loads((root / "manifest.json").read_text())
+    del manifest["EURUSD"]["files"]["EURUSD_M5.parquet"]
+    (root / "manifest.json").write_text(json.dumps(manifest))
+    rep = pipeline.update_dataset(
+        root, symbols=["EURUSD"], end="2026-11-22", raw_dir=raw, fetcher=fetcher,
+    )
+    assert rep.ok
+    expected = _expected_frames(days)
+    pd.testing.assert_frame_equal(
+        _read(root, "EURUSD", "M5").reset_index(drop=True),
+        expected["M5"].reset_index(drop=True),
+        check_dtype=False,
+    )
+    assert pipeline.verify_manifest(root) == []
+
+
 def test_incremental_update_validates_rebuilt_higher_tfs(tmp_path):
     """A corrupted stored H1 head must fail validation instead of publishing."""
     root = tmp_path / "dukascopy"

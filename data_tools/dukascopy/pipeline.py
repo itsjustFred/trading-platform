@@ -302,13 +302,12 @@ def _higher_tf_frame(
 ) -> pd.DataFrame:
     """Stored bins before ``cutoff`` plus the resampled tail at/after it.
 
-    When the stored file is missing entirely the frame is resampled from the
-    whole M1 history — a partial file must never be silently truncated to the
-    tail. ``bid_m1``/``ask_m1`` may be tail slices; only rows at/after
-    ``cutoff`` are used.
+    ``existing`` must be a non-empty stored frame: a missing higher-TF file
+    has to be rebuilt from the whole M1 history by the caller, since the
+    ``bid_m1``/``ask_m1`` slices here may cover only the fetch tail.
     """
     if existing is None or existing.empty:
-        return _resample_all(bid_m1, ask_m1, tf)
+        raise ValueError("missing higher-TF frame must be rebuilt from full M1")
     rule = convert.RULES[tf]
     tail_bid = bid_m1.loc[bid_m1["timestamp"] >= cutoff]
     tail_ask = ask_m1.loc[ask_m1["timestamp"] >= cutoff]
@@ -585,15 +584,20 @@ def _all_frames(
 
     # Higher timeframes: rebuild from the first bin touched by the fetch
     # window — the bin containing fetch_start 00:00 UTC — unless stored
-    # state is untrusted (tf_rebuild/full), in which case resample all of M1.
+    # state is untrusted (tf_rebuild/full) or a higher-TF file is missing,
+    # in which case resample all of M1: tail slices alone would truncate it.
     start_ts = pd.Timestamp(fetch_start.isoformat(), tz="UTC")
-    if tf_rebuild or full:
+    stored_tfs = {tf: read_existing(tf) for tf in TIMEFRAMES[1:]}
+    if (
+        tf_rebuild
+        or full
+        or any(df is None or df.empty for df in stored_tfs.values())
+    ):
         for tf in TIMEFRAMES[1:]:
             frames[tf] = _resample_all(bid_m1, ask_m1, tf)
             report.one_sided_rows[tf] = validate.validate_frame(
                 frames[tf], context=f"{symbol} {tf}"
             )
-            read_existing(tf)
         del bid_m1, ask_m1
     else:
         # Only the M1 tail at/after the earliest cutoff is needed for the
@@ -605,7 +609,7 @@ def _all_frames(
         for tf in TIMEFRAMES[1:]:
             cutoff = convert.bin_floor(tf, start_ts)
             frames[tf] = _higher_tf_frame(
-                read_existing(tf), tail_bid, tail_ask, tf, cutoff
+                stored_tfs[tf], tail_bid, tail_ask, tf, cutoff
             )
             report.one_sided_rows[tf] = validate.validate_frame(
                 frames[tf], context=f"{symbol} {tf}"
