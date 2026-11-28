@@ -15,7 +15,10 @@ from pathlib import Path
 from data_tools.catalog_builder import scan_ohlcv
 from runner.cli import _detect_date_range
 from shared.constants import DATA_DIR
+from shared.logging import get_logger
 from shared.strategy_registry import DEFAULT_STRATEGIES_DIR
+
+logger = get_logger("runner.agent_backtest_target")
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 STRATEGIES_DIR = DEFAULT_STRATEGIES_DIR
@@ -159,8 +162,8 @@ def _load_ohlcv_entries() -> list[dict]:
             entries = payload.get("ohlcv", []) if isinstance(payload, dict) else []
             if isinstance(entries, list) and entries:
                 return [entry for entry in entries if isinstance(entry, dict)]
-        except Exception:
-            pass
+        except Exception:  # except-kind: best-effort - corrupt catalog falls back to scan
+            logger.debug("Could not read OHLCV catalog %s", catalog_path, exc_info=True)
     return scan_ohlcv(DATA_DIR)
 
 

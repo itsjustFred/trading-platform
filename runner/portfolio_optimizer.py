@@ -200,7 +200,7 @@ def _load_strategy_equity(
         from shared.database import load_backtest_result
 
         result = load_backtest_result(backtest_id)
-    except Exception as exc:
+    except Exception as exc:  # except-kind: propagate - wrapped in ValueError with backtest id
         raise ValueError(
             f"Could not load equity curve for backtest {backtest_id!r}: {exc}"
         ) from exc

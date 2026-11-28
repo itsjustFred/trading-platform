@@ -59,7 +59,7 @@ def order_not_submitted() -> Iterator[None]:
     except BaseException as exc:  # except-kind: money-decision
         try:
             setattr(exc, _ORDER_NOT_SUBMITTED_ATTR, True)
-        except Exception:  # pragma: no cover  # except-kind: money-decision
+        except Exception:  # pragma: no cover  # except-kind: money-decision  # noqa: S110
             # An exception that refuses attributes (exotic exception types)
             # degrades to "outcome unknown", the safe default for every caller.
             pass

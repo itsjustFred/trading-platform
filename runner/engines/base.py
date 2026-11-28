@@ -17,8 +17,11 @@ from typing import Any, Callable
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from runner.engines import contract
+from shared.logging import get_logger
 from shared.models import VALID_TIMEFRAMES, BacktestResult
 from shared.strategy_registry import load_strategy_meta, read_strategy_source
+
+logger = get_logger("runner.engines.base")
 
 #: Deprecated alias of :attr:`BacktestConfig.max_position_exposure_pct`.
 #: Kept so old invocations keep working during the Cleanup 16-E migration.
@@ -376,7 +379,12 @@ def resolve_strategy_parameters(
         # by load_strategy_module); allow metadata reads outside the default
         # strategy tree by containing to the file's own directory.
         meta = load_strategy_meta(resolved, resolved.parent)
-    except Exception:
+    except Exception:  # except-kind: best-effort - meta read failure falls back to overrides only
+        logger.warning(
+            "Could not load strategy meta for %s; parameter defaults are skipped",
+            resolved,
+            exc_info=True,
+        )
         meta = {}
 
     defaults = meta.get("parameters", {}) if isinstance(meta, dict) else {}
