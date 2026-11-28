@@ -427,7 +427,8 @@ def test_ask_ohlc_parameter_no_longer_changes_anything():
 
     default = _single_trade(_run(_frame(bars), strategy))
     with pytest.warns(DeprecationWarning, match="ask_ohlc"):
-        opted_in = _single_trade(_run(_frame(bars), strategy, {"ask_ohlc": True}))
+        result = _run(_frame(bars), strategy, {"ask_ohlc": True})
+    opted_in = _single_trade(result)
 
     assert default.exits[0].reason == "stop_loss"
     assert default.exits[0].price == pytest.approx(101.0)
@@ -544,3 +545,29 @@ def test_spread_price_col_does_not_add_fixed_bps_on_two_sided_data():
 
     assert trade.entry_price == pytest.approx(FLAT_BID[0] + SPREAD)
     assert trade.exits[0].price == pytest.approx(FLAT_BID[3])
+
+
+def test_all_nan_ask_columns_keep_spread_price_col_slippage_resolution():
+    # ``ask_*`` columns that are entirely NaN carry no two-sided information:
+    # the frame prices like a one-sided feed, so ``spread_price_col`` still
+    # derives the ask AND the auto slippage model must not be re-resolved
+    # without it — native_adapter reports ``price_basis="single_price"`` for
+    # the same data, so the two checks must agree.
+    frame = _frame([FLAT_BID] * 4)
+    for column in ("ask_open", "ask_high", "ask_low", "ask_close"):
+        frame[column] = float("nan")
+    frame["spread_price"] = SPREAD
+    engine = TradeEngine(
+        _config(
+            {
+                "slippage": "auto",
+                "spread_price_col": "spread_price",
+            }
+        ),
+        symbol="EURUSD",
+        asset_class="forex",
+    )
+
+    engine.run(frame, _strategy(4, direction="LONG"))
+
+    assert engine.slippage_model.describe()["model"] == "fixed_bps"

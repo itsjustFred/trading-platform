@@ -31,8 +31,8 @@ from runner.engine_pkg.orders import Order, OrderType, Position
 from runner.engine_pkg.result import build_indicator_series, build_result
 from runner.engines import contract
 from runner.engines._shared import (
-    ASK_COLUMNS,
     bar_spread_units,
+    frame_has_ask_side,
     has_ask_side,
     resolve_ask_high_low,
     resolve_ask_price,
@@ -53,7 +53,7 @@ from runner.engines.contract import (
     usable_exit_price,
 )
 from runner.fees import resolve_fee_model
-from runner.slippage import _EXTERNAL_SPREAD_PARAMS, resolve_slippage_model
+from runner.slippage import EXTERNAL_SPREAD_PARAMS, resolve_slippage_model
 from shared.lot_grid import floor_qty_to_step
 from shared.models import (
     BacktestResult,
@@ -1141,16 +1141,17 @@ class TradeEngine:
     def _bar_spread(self, row: pd.Series) -> float:
         """Legacy ``spread_price_col`` spread in price units, for one-sided frames.
 
-        #472: a frame that carries ``ask_*`` columns states the ask exactly,
-        so the configured spread column is not consulted at all (and cannot
-        be charged on top of the ask — ``run`` also re-resolves the
-        slippage model without it on such frames). On a frame WITHOUT ask
-        columns the rule is: ``ask = bid + spread_price_col`` when the
-        column is configured, else ``ask = bid`` — and the same fill/trigger
-        table applies on that derived ask (buys on it, sells on the bid,
-        SHORT SL/TP trigger on it). This is a deliberate semantics change
-        on ``spread_price_col`` frames: previously a SHORT stop triggered
-        on the bid and filled at level + spread.
+        #472: a row that carries usable ``ask_*`` values states the ask
+        exactly, so the configured spread column is not consulted for it
+        (and cannot be charged on top of the ask — ``run`` also
+        re-resolves the slippage model without it on frames with usable
+        ask columns). On a row/frame WITHOUT usable ask values the rule is:
+        ``ask = bid + spread_price_col`` when the column is configured,
+        else ``ask = bid`` — and the same fill/trigger table applies on
+        that derived ask (buys on it, sells on the bid, SHORT SL/TP trigger
+        on it). This is a deliberate semantics change on
+        ``spread_price_col`` frames: previously a SHORT stop triggered on
+        the bid and filled at level + spread.
         """
         if has_ask_side(row):
             return 0.0
@@ -2690,28 +2691,30 @@ class TradeEngine:
     def _resolve_two_sided_slippage(self, frame: pd.DataFrame) -> None:
         """#472: ``spread_price_col`` is ignored on a two-sided frame.
 
-        The ``ask_*`` columns state the ask exactly, so the legacy spread
-        column must not ALSO degrade the slippage model to fixed bps — that
-        would charge the spread on top of the ask-denominated fills. The
-        model is resolved in ``__init__`` before the data is known, so on a
-        frame that carries ``ask_*`` columns it is re-resolved here with the
-        external-spread params stripped. An explicit ``slippage_model``
-        object is the caller's own and is left untouched, and stripping can
-        never introduce a resolution error the ``__init__`` pass did not
-        already raise.
+        The usable ``ask_*`` values state the ask exactly, so the legacy
+        spread column must not ALSO degrade the slippage model to fixed
+        bps — that would charge the spread on top of the ask-denominated
+        fills. (A frame whose ask columns are entirely NaN carries no
+        two-sided information and keeps the one-sided resolution — the
+        same ``frame_has_ask_side`` predicate ``price_basis`` reports.)
+        The model is resolved in ``__init__`` before the data is known, so
+        on a frame that carries usable ``ask_*`` values it is re-resolved
+        here with the external-spread params stripped. An explicit
+        ``slippage_model`` object is the caller's own and is left
+        untouched, and stripping can never introduce a resolution error
+        the ``__init__`` pass did not already raise.
         """
         params = self.config.parameters or {}
         if params.get("slippage_model") is not None:
             return
-        columns = {str(col) for col in frame.columns}
-        if not any(col in columns for col in ASK_COLUMNS):
+        if not frame_has_ask_side(frame):
             return
-        if not any(params.get(key) for key in _EXTERNAL_SPREAD_PARAMS):
+        if not any(params.get(key) for key in EXTERNAL_SPREAD_PARAMS):
             return
         stripped = {
             key: value
             for key, value in params.items()
-            if key not in _EXTERNAL_SPREAD_PARAMS
+            if key not in EXTERNAL_SPREAD_PARAMS
         }
         self.slippage_model = resolve_slippage_model(
             stripped, asset_class=self._slippage_asset_class

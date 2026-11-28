@@ -12,7 +12,7 @@ from runner.approval_gate import require_generated_strategy_approval
 from runner.engine import TradeEngine
 from runner.engines import contract
 from runner.engines._drawings import _normalize_drawings
-from runner.engines._shared import ASK_COLUMNS
+from runner.engines._shared import frame_has_ask_side
 from runner.engines.base import (
     NATIVE_TRAILING_SL_PARAM,
     BacktestConfig,
@@ -227,13 +227,7 @@ class NativeAdapter(EngineAdapter):
             # does not make the fills two-sided). The model only adds its
             # own cost on top (fixed bps) or stands down (bar spread: the
             # quoted spread is already inside the fill).
-            column_by_lower = {str(col).lower(): col for col in data.columns}
-            ask_columns = [
-                column_by_lower[name] for name in ASK_COLUMNS if name in column_by_lower
-            ]
-            has_two_sided = bool(ask_columns) and bool(
-                data[ask_columns].notna().to_numpy().any()
-            )
+            has_two_sided = frame_has_ask_side(data)
             price_basis = "bid_ask" if has_two_sided else "single_price"
             slippage_models[symbol] = {
                 **engine.slippage_model.describe(),

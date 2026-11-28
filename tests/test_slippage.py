@@ -693,6 +693,46 @@ class TestNativeAdapterMetadata:
         # buys still fill at the ask on a two-sided frame (#472).
         assert model_meta["price_basis"] == "bid_ask"
 
+    def test_price_basis_single_price_on_all_nan_ask_columns(
+        self, tmp_path: Path
+    ) -> None:
+        """``ask_*`` columns that are entirely NaN carry no two-sided
+        information: ``price_basis`` reports ``single_price`` — the same
+        predicate the engine uses to keep ``spread_price_col`` applied."""
+        from runner.engines.base import BacktestConfig
+        from runner.engines.native_adapter import NativeAdapter
+        from tests.helpers import write_ohlcv
+
+        strategy_path = tmp_path / "strat.py"
+        strategy_path.write_text(
+            "import pandas as pd\n"
+            "def generate_signals(df, params):\n"
+            "    n = len(df)\n"
+            "    entries = pd.Series([i == 10 for i in range(n)], index=df.index)\n"
+            "    exits = pd.Series([i == 20 for i in range(n)], index=df.index)\n"
+            "    return entries, exits, {}, []\n"
+        )
+        frame = _forex_frame()
+        for column in ("ask_open", "ask_high", "ask_low", "ask_close"):
+            frame[column] = float("nan")
+        write_ohlcv(tmp_path, "EURUSD", frame, asset_class="forex")
+
+        config = BacktestConfig(
+            strategy_name="slip",
+            symbols=["EURUSD"],
+            timeframe="1h",
+            start_date="2024-01-01",
+            end_date="2024-01-31",
+            initial_capital=100_000,
+            risk_per_trade_pct=0.01,
+            modeling_resolution="main_timeframe",
+            data_dir=str(tmp_path),
+            parameters={"fees": "zero"},
+        )
+        result = NativeAdapter().run(config, str(strategy_path))
+        model_meta = result.meta.data["slippage"]["models"]["EURUSD"]
+        assert model_meta["price_basis"] == "single_price"
+
 
 class TestSignalReplaySlippage:
     def _adapter(self, **kwargs):

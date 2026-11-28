@@ -155,7 +155,7 @@ _BPS_SPELLINGS = frozenset({"bps", "fixed", "fixed_bps"})
 #: spread on a two-sided frame lives inside the fill prices themselves
 #: (ask open / ask level), and ask-side fills pass ``fill_side="ask"`` so
 #: the bar-spread model does not charge it a second time on those legs.
-_EXTERNAL_SPREAD_PARAMS = ("spread_price_col",)
+EXTERNAL_SPREAD_PARAMS = ("spread_price_col",)
 
 #: Engines that apply a fill-price slippage model (#130 scope: the native
 #: engine and signal replay — the engines #318 keeps). Every other engine
@@ -377,11 +377,12 @@ def _auto_model(params: dict[str, Any], asset_class: str) -> SlippageModel:
     if ac in FX_SPREAD_ASSET_CLASSES:
         bps = _class_default_bps(ac, params)
         # A run that already prices the spread through the legacy
-        # spread_price_col parameter must not pay it twice. (On a
-        # two-sided frame the native engine strips spread_price_col before
-        # resolving — see TradeEngine._resolve_two_sided_slippage — so this
-        # degrade only fires on one-sided frames.)
-        if any(params.get(key) for key in _EXTERNAL_SPREAD_PARAMS):
+        # spread_price_col parameter must not pay it twice. (On a frame
+        # with usable ask quote columns the native engine strips
+        # spread_price_col before resolving — see
+        # TradeEngine._resolve_two_sided_slippage — so this degrade only
+        # fires on one-sided frames.)
+        if any(params.get(key) for key in EXTERNAL_SPREAD_PARAMS):
             return FixedBpsSlippage(bps=bps, asset_class=ac)
         return BarSpreadSlippage(default_bps=bps, asset_class=ac)
     # Recognized-but-unmapped class: no per-class cost exists, so the run
@@ -425,8 +426,8 @@ def _spread_model(
     fallback = _spread_fallback_bps(params, asset_class, bps_override)
     # Same double-count guard as the auto model: a run that already prices
     # the spread through spread_price_col must not pay it twice (native
-    # strips the param on two-sided frames before resolving).
-    if any(params.get(key) for key in _EXTERNAL_SPREAD_PARAMS):
+    # strips the param on frames with usable ask columns before resolving).
+    if any(params.get(key) for key in EXTERNAL_SPREAD_PARAMS):
         return FixedBpsSlippage(bps=fallback, asset_class=asset_class)
     return BarSpreadSlippage(default_bps=fallback, asset_class=asset_class)
 

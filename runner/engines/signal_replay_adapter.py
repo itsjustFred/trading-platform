@@ -18,6 +18,7 @@ from risk.engine import RiskEngine
 from risk.models import TradeSignal as RiskTradeSignal
 from risk.models import realized_risk_amount, realized_risk_percent
 from runner.engines import contract
+from runner.engines._shared import frame_has_ask_side
 from runner.fees import resolve_fee_model
 from runner.slippage import BarSpreadSlippage, resolve_slippage_model
 from runner.stats import compute_stats_for_result
@@ -1132,9 +1133,7 @@ class SignalReplayAdapter:
             # carries usable ask columns. Here "bid_ask" means the resolved
             # bar-spread model can actually use the ask columns; a fixed or
             # none model on the same data fills on the bid.
-            has_two_sided = any(
-                str(col).startswith("ask_") for col in replay_frame.columns
-            )
+            has_two_sided = frame_has_ask_side(replay_frame)
             price_basis = (
                 "bid_ask"
                 if has_two_sided and isinstance(model, BarSpreadSlippage)

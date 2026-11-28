@@ -216,11 +216,19 @@ and pynecore do not model slippage and record that fact in
   reader never has to guess which cost model produced the numbers.
 - When a strategy already prices the spread through `spread_price_col`,
   the auto model degrades to fixed bps so the quoted spread is not
-  charged twice — but ONLY on one-sided frames. On a two-sided frame the
-  `ask_*` columns state the ask exactly, so `spread_price_col` is ignored
-  entirely: it is not consulted for fills AND the native engine re-resolves
-  the slippage model without it (`TradeEngine._resolve_two_sided_slippage`),
-  so the model cannot switch to fixed bps on top of the ask (#472). The
+  charged twice — but ONLY on one-sided frames. On a frame with usable
+  `ask_*` quote values the ask is stated exactly, so `spread_price_col`
+  is not consulted for those rows AND the native engine re-resolves the
+  slippage model without it (`TradeEngine._resolve_two_sided_slippage`),
+  so the model cannot switch to fixed bps on top of the ask (#472). Two
+  boundaries keep this honest: a frame whose `ask_*` columns are entirely
+  NaN (or an `ask_volume`-only frame) carries no two-sided information —
+  it prices like a one-sided feed, `price_basis` reports
+  `single_price`, and `spread_price_col` still applies — and a single row
+  missing ask values inside a two-sided frame falls back to
+  `bid + spread_price_col` for that row only (`has_ask_side` /
+  `frame_has_ask_side` in `runner/engines/_shared.py` are the shared
+  predicates). The
   legacy `ask_ohlc` parameter is inert on the native engine and passing it
   truthy emits a `DeprecationWarning`; it remains a vectorbt-only opt-in
   for SHORT stop/TP *triggers*, and those ask-triggered exits pass

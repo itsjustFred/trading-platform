@@ -125,6 +125,63 @@ def has_ask_side(row: Any) -> bool:
     return any(_row_value(row, column) is not None for column in ASK_COLUMNS)
 
 
+def frame_has_ask_side(data: pd.DataFrame) -> bool:
+    """True when ``data`` carries usable ``ask_*`` quote columns (#472).
+
+    Frame-level counterpart of :func:`has_ask_side`: at least one of the
+    four quote columns must be present AND hold a non-NaN value — an
+    all-NaN ask column or an ``ask_volume``-only frame prices exactly like
+    a one-sided feed. This is the single predicate the native engine's
+    slippage re-resolution, the native adapter's ``price_basis`` and
+    signal replay share, so the three can never disagree about whether a
+    frame is two-sided.
+    """
+    column_by_lower = {str(col).lower(): col for col in data.columns}
+    ask_columns = [
+        column_by_lower[name] for name in ASK_COLUMNS if name in column_by_lower
+    ]
+    return bool(ask_columns) and bool(
+        data[ask_columns].notna().to_numpy().any()
+    )
+
+
+def _row_numeric_values(row: Any) -> dict[str, float]:
+    """Lowercased column name -> float for each usable numeric value on ``row``."""
+    values: dict[str, float] = {}
+    try:
+        items = row.items() if hasattr(row, "items") else []
+    except (AttributeError, TypeError):
+        return values
+    for key, raw in items:
+        if raw is None or (isinstance(raw, float) and pd.isna(raw)):
+            continue
+        try:
+            values[str(key).lower()] = float(raw)
+        except (TypeError, ValueError):
+            continue
+    return values
+
+
+def _ask_bid_spreads(values: dict[str, float]) -> list[float]:
+    """Positive ask-minus-bid differences across the four quote fields."""
+    diffs: list[float] = []
+    for field in ("open", "high", "low", "close"):
+        ask = values.get(f"ask_{field}")
+        bid = values.get(field)
+        if ask is None or bid is None:
+            continue
+        diff = ask - bid
+        if diff > 0 and pd.notna(diff):
+            diffs.append(diff)
+    return diffs
+
+
+def _median(values: list[float]) -> float:
+    ordered = sorted(values)
+    mid = len(ordered) // 2
+    return ordered[mid] if len(ordered) % 2 else (ordered[mid - 1] + ordered[mid]) / 2.0
+
+
 def bar_spread_units(row: Any) -> float | None:
     """Per-bar ask-minus-bid spread in price units, or ``None``.
 
@@ -137,34 +194,13 @@ def bar_spread_units(row: Any) -> float | None:
     merely repeats the canonical series) are ignored — they carry no
     spread information and must not produce a negative adjustment.
     """
-    values: dict[str, float] = {}
-    try:
-        items = row.items() if hasattr(row, "items") else []
-    except (AttributeError, TypeError):
-        return None
-    for key, raw in items:
-        if raw is None or (isinstance(raw, float) and pd.isna(raw)):
-            continue
-        try:
-            values[str(key).lower()] = float(raw)
-        except (TypeError, ValueError):
-            continue
+    values = _row_numeric_values(row)
     if not values:
         return None
-    diffs: list[float] = []
-    for field in ("open", "high", "low", "close"):
-        ask = values.get(f"ask_{field}")
-        bid = values.get(field)
-        if ask is None or bid is None:
-            continue
-        diff = ask - bid
-        if diff > 0 and pd.notna(diff):
-            diffs.append(diff)
+    diffs = _ask_bid_spreads(values)
     if not diffs:
         return None
-    diffs.sort()
-    mid = len(diffs) // 2
-    return diffs[mid] if len(diffs) % 2 else (diffs[mid - 1] + diffs[mid]) / 2.0
+    return _median(diffs)
 
 
 def resolve_ask_high_low(row: pd.Series, spread: float) -> tuple[float | None, float | None]:
