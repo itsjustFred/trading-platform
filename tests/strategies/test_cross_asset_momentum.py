@@ -14,15 +14,12 @@ sowie falschen Gewichten [0.4,0.3,0.2,0.1] erzeugt; Quelle: [0.35,0.30,
 """
 
 import math
-import sys
 from pathlib import Path
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).parent.parent.parent))
-
-from runner.engines.base import BacktestConfig
 from runner.engines.vectorbt_adapter import VectorbtAdapter
+from tests.builders import make_backtest_config
 
 STRATEGY_PATH = str(Path(__file__).parent.parent.parent / "strategies" / "cross_asset_momentum" / "cross_asset_momentum.py")
 TEST_START = "2024-01-01"
@@ -36,7 +33,7 @@ EXPECTED_NET_PROFIT = 230.60
 @pytest.fixture(scope="module")
 def backtest_result():
     engine = VectorbtAdapter()
-    config = BacktestConfig(signal_exit_fill="close", parameters={"fees": "zero"},
+    config = make_backtest_config(signal_exit_fill="close", parameters={"fees": "zero"},
         strategy_name="cross_asset_momentum",
         symbols=[TEST_SYMBOL],
         timeframe=TEST_TIMEFRAME,
@@ -134,7 +131,6 @@ class TestSourceFidelity:
         import importlib.util
         from pathlib import Path
 
-        import pandas as pd
 
         spec = importlib.util.spec_from_file_location(
             "xam", str(Path(STRATEGY_PATH))

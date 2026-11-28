@@ -33,6 +33,7 @@ from live_runner import alpaca_adapter, ctrader_adapter, daemon, loss_breaker, p
 from live_runner.credential_env import parse_bool_env
 from live_runner.ctrader_adapter import CTraderLiveAdapter
 from shared.models import LiveDeploymentConfig
+from tests.builders import make_live_deployment
 
 LIVE_RUNNER_DIR = Path(__file__).resolve().parents[2] / "live_runner"
 
@@ -185,7 +186,7 @@ def _deployment_with_signal_config(
     *,
     settings: dict[str, object] | None = None,
 ) -> LiveDeploymentConfig:
-    return LiveDeploymentConfig(
+    return make_live_deployment(
         strategy_name="fx_breakout",
         account_id="ctrader-demo",
         symbols=["EURUSD"],

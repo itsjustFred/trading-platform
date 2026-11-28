@@ -66,9 +66,9 @@ def test_engine_shim_exposes_package_public_surface():
 
 def test_size_trade_returns_typed_record():
     """_size_trade must keep returning the typed record (not a loose dict)."""
-    from runner.engines.base import BacktestConfig
+    from tests.builders import make_backtest_config
 
-    config = BacktestConfig(parameters={"fees": "zero"},
+    config = make_backtest_config(parameters={"fees": "zero"},
         strategy_name="t",
         symbols=["X"],
         timeframe="1h",

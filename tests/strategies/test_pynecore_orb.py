@@ -11,16 +11,13 @@ EURUSD 1h ist die falsche Zeiteinheit fuer OR-30m-Logik)
 """
 
 import math
-import sys
 from pathlib import Path
 
 import pandas as pd
 import pytest
 
-sys.path.insert(0, str(Path(__file__).parent.parent.parent))
-
-from runner.engines.base import BacktestConfig
 from runner.engines.pynecore_adapter import PyneCoreAdapter
+from tests.builders import make_backtest_config
 
 STRATEGY_PATH = str(Path(__file__).parent.parent.parent / "strategies" / "pynecore_orb" / "pynecore_orb.py")
 # The synthetic-frame mirror of the session state machine lives in
@@ -38,7 +35,7 @@ EXPECTED_NET_PROFIT = 1110.20
 @pytest.fixture(scope="module")
 def backtest_result():
     engine = PyneCoreAdapter()
-    config = BacktestConfig(signal_exit_fill="close", parameters={"fees": "zero"},
+    config = make_backtest_config(signal_exit_fill="close", parameters={"fees": "zero"},
         strategy_name="pynecore_orb",
         symbols=[TEST_SYMBOL],
         timeframe=TEST_TIMEFRAME,
