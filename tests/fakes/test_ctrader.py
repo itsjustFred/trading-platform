@@ -8,7 +8,6 @@ here first.
 
 from __future__ import annotations
 
-import os
 import subprocess
 import sys
 import textwrap
@@ -16,6 +15,7 @@ from pathlib import Path
 
 import pytest
 
+from tests.conftest import sandboxed_env
 from tests.fakes import ctrader as fake_module
 from tests.fakes.ctrader import (
     FakeCTraderBroker,
@@ -734,16 +734,15 @@ def test_client_disconnect_clears_pending_deferreds_without_errbacking() -> None
 # ─-) the adapter seam (subprocess: the reactor must be clean) ────────────────
 
 
-def test_fake_ctrader_transport_drives_a_real_adapter_connect(tmp_path) -> None:
+def test_fake_ctrader_transport_drives_a_real_adapter_connect() -> None:
     """``connect`` must run auth -> symbols -> symbol props -> reconcile on the fake.
 
     Runs in a subprocess for the same reason the account-discovery reactor
     tests do: ``ctrader_open_api`` binds ``twisted.internet.reactor`` at
     import, and only a fresh interpreter guarantees the asyncio reactor the
-    adapter installs is the one the client package binds. The child gets a
-    sandboxed environment - DATA_DIR/LOG_DIR/HOME under ``tmp_path`` and no
-    inherited credentials - because it imports ``shared.constants``, which
-    would otherwise load the checkout's real ``.env`` (AGENTS.md).
+    adapter installs is the one the client package binds. The child gets
+    ``sandboxed_env()`` - the child imports ``shared.constants``, which would
+    otherwise load the checkout's real ``.env`` (AGENTS.md).
     """
     repo = Path(__file__).resolve().parents[2]
     code = textwrap.dedent(
@@ -786,27 +785,19 @@ def test_fake_ctrader_transport_drives_a_real_adapter_connect(tmp_path) -> None:
         print("ok")
         """
     ).format(repo=str(repo))
-    env = {
-        "PATH": os.environ.get("PATH", ""),
-        "HOME": str(tmp_path),
-        "TMPDIR": str(tmp_path),
-        "DATA_DIR": str(tmp_path / "data"),
-        "LOG_DIR": str(tmp_path / "logs"),
-        "PYTHONUNBUFFERED": "1",
-    }
     result = subprocess.run(
         [sys.executable, "-c", code],
         capture_output=True,
         text=True,
         timeout=120,
         cwd=str(repo),
-        env=env,
+        env=sandboxed_env(),
     )
     assert result.returncode == 0, result.stderr
     assert "ok" in result.stdout
 
 
-def test_the_real_adapter_submits_and_closes_through_the_fake(tmp_path) -> None:
+def test_the_real_adapter_submits_and_closes_through_the_fake() -> None:
     """``submit_order`` + ``close_all_positions`` end to end on the fake.
 
     Same subprocess constraint as the connect test: the adapter binds its
@@ -879,21 +870,13 @@ def test_the_real_adapter_submits_and_closes_through_the_fake(tmp_path) -> None:
         print("ok")
         """
     ).format(repo=str(repo))
-    env = {
-        "PATH": os.environ.get("PATH", ""),
-        "HOME": str(tmp_path),
-        "TMPDIR": str(tmp_path),
-        "DATA_DIR": str(tmp_path / "data"),
-        "LOG_DIR": str(tmp_path / "logs"),
-        "PYTHONUNBUFFERED": "1",
-    }
     result = subprocess.run(
         [sys.executable, "-c", code],
         capture_output=True,
         text=True,
         timeout=120,
         cwd=str(repo),
-        env=env,
+        env=sandboxed_env(),
     )
     assert result.returncode == 0, result.stderr
     assert "ok" in result.stdout
