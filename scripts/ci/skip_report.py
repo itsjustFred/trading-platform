@@ -82,6 +82,10 @@ MUST_NOT_SKIP_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
         r"^tests\.test_strategy_meta_adapters",
         r"^tests\.test_strategy_ir",
         # Sizing, fills, fees, slippage, exits — the money math itself.
+        # test_ohlcv_store verifies the store→consumer contract (sizing,
+        # slippage resolve the manifest's asset_class), so it imports the
+        # money path and must never skip either.
+        r"^tests\.test_ohlcv_store",
         r"^tests\.test_sizing",
         r"^tests\.test_lot_grid",
         r"^tests\.test_realistic_fills",
