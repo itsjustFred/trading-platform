@@ -79,7 +79,7 @@ TIMEFRAME_MINUTES: dict[str, float] = {
 SEGMENT_MIN_DENSITY = 0.95
 SEGMENT_MAX_GAP_MULTIPLIER = 3.0
 US_EQUITY_ASSET_CLASSES = frozenset(
-    {"equity", "equities", "stock", "stocks", "etf", "etfs", "index"}
+    {"equity", "equities", "stock", "stocks", "etf", "etfs", "index", "indices"}
 )
 US_EQUITY_CALENDAR_SOURCES = frozenset(
     {"alpaca", "dolthub", "huggingface", "test", "yfinance"}

@@ -258,6 +258,40 @@ def test_delete_symbol_data_removes_contained_parquet(
     assert not target.exists()
 
 
+def test_delete_symbol_data_manifest_write_precedes_unlink(
+    security_client, tmp_path, monkeypatch
+):
+    """A failed manifest update must not leave a declared-but-missing file.
+
+    The endpoint updates ``manifest.json`` under the source lock BEFORE
+    unlinking the parquet, so a crash or error in the manifest write leaves
+    the file on disk still declared — recoverable — instead of a manifest
+    entry pointing at nothing, which makes every store reader fail loudly.
+    """
+    import viewer.main as viewer_app_module
+    from shared import ohlcv_store
+
+    target = _write_store_ohlcv(tmp_path, "dukascopy", "EURUSD", "1h")
+    monkeypatch.setattr(viewer_app_module, "_refresh_catalog", lambda: None)
+    monkeypatch.setattr(
+        viewer_app_module.cache_manager, "invalidate_cache", lambda *a, **k: None
+    )
+    monkeypatch.setattr(viewer_app_module, "_invalidate_data_views_cache", lambda: None)
+
+    def _boom(*args, **kwargs):
+        raise OSError("manifest write failed")
+
+    monkeypatch.setattr(ohlcv_store, "write_manifest", _boom)
+
+    response = security_client.delete(f"/api/data/symbol?path={target}")
+
+    assert response.status_code == 500
+    # The parquet survives and the manifest still declares it: consistent.
+    assert target.exists()
+    manifest = ohlcv_store.read_manifest(tmp_path, "dukascopy")
+    assert "EURUSD" in manifest
+
+
 # ---------------------------------------------------------------------------
 # Seam 5: bulk-delete id containment
 # ---------------------------------------------------------------------------

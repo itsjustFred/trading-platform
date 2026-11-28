@@ -593,7 +593,13 @@ class TestValidateHolidayCalendar:
             pd.Timestamp("2024-01-09T02:00:00Z"),
         )
 
-    def _write_equity_bars(self, root: Path, timestamps: list[str]) -> Path:
+    def _write_equity_bars(
+        self,
+        root: Path,
+        timestamps: list[str],
+        asset_class: str = "equity",
+        timeframe: str = "1d",
+    ) -> Path:
         from shared import ohlcv_store
 
         frame = pd.DataFrame(
@@ -607,7 +613,7 @@ class TestValidateHolidayCalendar:
             }
         )
         return ohlcv_store.write_frame(
-            root, "test", "AAPL", "1d", frame, asset_class="equity"
+            root, "test", "AAPL", timeframe, frame, asset_class=asset_class
         )
 
     def test_session_overlap_starts_after_prior_bar_close(self) -> None:
@@ -636,6 +642,55 @@ class TestValidateHolidayCalendar:
         )
         result = validate_module.validate_parquet(target)
         assert result.gaps == []
+
+    @pytest.mark.parametrize("asset_class", ["equities", "etfs", "indices"])
+    def test_july4_gap_skipped_for_equity_like_spellings(
+        self, tmp_path, monkeypatch, asset_class
+    ) -> None:
+        """Plural/alternate equity-like spellings get the same holiday skip.
+
+        ``shared.ohlcv_store.selection_rank`` and
+        ``shared.venue_calendar.US_EQUITY_ASSET_CLASSES`` already accept these
+        spellings; a manifest carrying one must not silently lose the
+        exchange-holiday gap exemption and report a fake data hole.
+        """
+        import data_tools.validate as validate_module
+
+        monkeypatch.setattr(validate_module, "DATA_DIR", tmp_path)
+        # 1h bars Wed 2024-07-03 -> Fri 2024-07-05: the ~41h span exceeds the
+        # 180-minute intraday threshold, so only the July 4th holiday
+        # classification keeps it out of ``result.gaps``.
+        target = self._write_equity_bars(
+            tmp_path,
+            ["2024-07-03T20:00:00Z", "2024-07-05T13:30:00Z"],
+            asset_class=asset_class,
+            timeframe="1h",
+        )
+        result = validate_module.validate_parquet(target)
+        assert result.gaps == []
+
+    def test_indices_asset_class_uses_us_equity_calendar(self, tmp_path) -> None:
+        """``_uses_us_equity_calendar`` must recognise the ``indices`` spelling.
+
+        Without it the coverage gate treats index data as a non-US venue and
+        reports NYSE holidays as internal gaps.
+        """
+        from shared import ohlcv_store
+
+        frame = pd.DataFrame(
+            {
+                "timestamp": pd.to_datetime(["2024-07-03T00:00:00Z"], utc=True),
+                "open": [100.0],
+                "high": [101.0],
+                "low": [99.0],
+                "close": [100.5],
+                "volume": [1000.0],
+            }
+        )
+        ohlcv_store.write_frame(
+            tmp_path, "test", "SPX", "1d", frame, asset_class="indices"
+        )
+        assert auto_download._uses_us_equity_calendar("SPX", "1d", tmp_path)
 
     def test_long_outage_spanning_holiday_remains_an_error(self, tmp_path, monkeypatch) -> None:
         import data_tools.validate as validate_module

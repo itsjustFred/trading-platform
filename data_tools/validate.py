@@ -65,7 +65,9 @@ GAP_THRESHOLD_MINUTES = {
 #: Asset classes with exchange holidays (B3: gap skips apply to these only —
 #: FX/metals trade through most US holidays, so blanket skipping would hide
 #: real data holes there).
-_EQUITY_LIKE_ASSET_CLASSES = frozenset({"equity", "stock", "stocks", "etf", "index"})
+_EQUITY_LIKE_ASSET_CLASSES = frozenset(
+    {"equity", "equities", "stock", "stocks", "etf", "etfs", "index", "indices"}
+)
 _EXPECTED_GAP_CLASSIFICATIONS = frozenset({"overnight", "weekend", "holiday"})
 
 

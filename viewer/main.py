@@ -16363,9 +16363,12 @@ async def delete_symbol_data(path: str = Query(default="")) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail="File not found")
 
     try:
-        file_path.unlink()
         # Keep the source manifest consistent: a deleted parquet must not
-        # stay declared or every store reader would keep resolving it.
+        # stay declared or every store reader would keep resolving it. The
+        # manifest is rewritten BEFORE the unlink, inside the source lock:
+        # a crash between the two then leaves an undeclared orphan file
+        # (harmless — readers only resolve declared segments) instead of a
+        # manifest entry pointing at a missing parquet.
         entry = ohlcv_store.entry_for_path(DATA_DIR, file_path)
         if entry is not None:
             with ohlcv_store.manifest_update_lock(DATA_DIR, entry.source):
@@ -16379,6 +16382,9 @@ async def delete_symbol_data(path: str = Query(default="")) -> dict[str, Any]:
                     else:
                         manifest.pop(entry.symbol, None)
                         ohlcv_store.write_manifest(DATA_DIR, entry.source, manifest)
+                file_path.unlink()
+        else:
+            file_path.unlink()
         cache_manager.invalidate_cache(DATA_DIR, reason="manual")
         _invalidate_data_views_cache()
         _refresh_catalog()
