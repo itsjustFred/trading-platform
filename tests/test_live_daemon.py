@@ -933,9 +933,18 @@ def test_retired_discord_warning_fires_once_per_deployment_per_process() -> None
 
 
 class _SpyAdapter:
-    """Records every broker-facing call the sync loop can make."""
+    """Records every broker-facing call the sync loop can make.
+
+    The method names are the daemon's real mutation surface
+    (``cancel_open_orders``, ``close_all_positions`` gated on
+    ``supports_flatten``, ``cancel_orphaned_protections`` and the kill-switch
+    flatten): a regression that routes a retired row into enforcement calls
+    one of these and is caught here instead of raising AttributeError into a
+    log line.
+    """
 
     demo = True
+    supports_flatten = True
 
     def __init__(self) -> None:
         self.mutations: list[str] = []
@@ -964,6 +973,15 @@ class _SpyAdapter:
 
     async def flatten_positions(self, *args, **kwargs):
         self.mutations.append("flatten_positions")
+
+    async def cancel_open_orders(self, *args, **kwargs):
+        self.mutations.append("cancel_open_orders")
+
+    async def close_all_positions(self, *args, **kwargs):
+        self.mutations.append("close_all_positions")
+
+    async def cancel_orphaned_protections(self, *args, **kwargs):
+        self.mutations.append("cancel_orphaned_protections")
 
     async def cancel_working_orders(self, *args, **kwargs):
         self.mutations.append("cancel_working_orders")
@@ -994,11 +1012,22 @@ def test_paused_retired_discord_rows_get_no_broker_mutation_on_a_sync_tick() -> 
     adapter = _SpyAdapter()
     adapters = {"acc-1": adapter}
 
-    _run_ticks_recorder(
+    recorder = _run_ticks_recorder(
         deployments, ticks=2, accounts=[account], adapters=adapters, tasks={}
     )
 
     assert adapter.mutations == []
+    # A failed enforcement attempt would surface as an ERROR log line even if
+    # the spy missed the call; assert the loop stayed quiet too.
+    failure_lines = [
+        entry
+        for entry in recorder.errors
+        if any(
+            token in str(entry[0]).lower()
+            for token in ("failed", "flatten", "cancel", "close")
+        )
+    ]
+    assert failure_lines == []
     # The adapter and its execution listener are retained (same as main): the
     # rows are recognised, listed and enforced like any other - they simply
     # have no signal source left to dispatch from.

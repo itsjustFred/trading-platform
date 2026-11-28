@@ -14445,10 +14445,18 @@ async def update_live_deployment_status_endpoint(
         # A retired source (discord) can never produce a signal either; refuse
         # it with the policy's own reason instead of spending broker
         # round-trips on a deployment that is recognised but inert.
-        from live_runner.deployment_policy import untradeable_signal_source_reason
+        from live_runner.deployment_policy import (
+            RETIRED_DISCORD_SIGNAL_SOURCE,
+            normalize_signal_source,
+            untradeable_signal_source_reason,
+        )
 
         untradeable_reason = untradeable_signal_source_reason(deployment.signal_source)
-        if untradeable_reason is not None and "retired" in untradeable_reason:
+        if (
+            untradeable_reason is not None
+            and normalize_signal_source(deployment.signal_source)
+            == RETIRED_DISCORD_SIGNAL_SOURCE
+        ):
             await _audit_live_control(
                 action="deployment.status",
                 target_type="live_deployment",

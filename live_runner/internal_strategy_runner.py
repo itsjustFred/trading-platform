@@ -301,11 +301,6 @@ def internal_runner_untradeable_reason(
             "the internal strategy runner is not enabled for this deployment; "
             f"set settings.{INTERNAL_RUNNER_ENABLED_KEY}=true to opt in"
         )
-    if deployment_signal_processor_name(deployment):
-        return (
-            "signal_processor configuration is not applied by the internal "
-            "strategy runner; remove it from signal_config"
-        )
     try:
         load_target(deployment.strategy_name)
     except Exception as exc:  # except-kind: money-decision
