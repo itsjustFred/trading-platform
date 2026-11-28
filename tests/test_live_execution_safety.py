@@ -6182,6 +6182,33 @@ def test_ctrader_submit_keeps_the_resolved_volume_when_the_scale_moves_mid_submi
     assert saved[0].metadata["qty"] == pytest.approx(2.0)
 
 
+def test_ctrader_submit_keeps_the_sizing_pip_value_through_normalization(
+    monkeypatch,
+) -> None:
+    """The pre-build #146 re-check reads ``pip_value_units_per_qty`` off the
+    normalized signal, so normalization must not strip it.
+
+    A broader metadata cleanup that dropped the key would leave the re-check
+    with no units and silently skip - sending a pre-move volume on a daemon
+    entry, with nothing on the wire to show the scale moved. This pins that the
+    key the refusal rests on survives to the persisted signal.
+    """
+    _module, adapter, saved, volumes = _ctrader_submit_harness(monkeypatch)
+    entry_metadata = dict(_ctrader_entry_signal().metadata or {})
+    entry_metadata.update(
+        {"pip_value_units_per_qty": 10.0, "pip_value_source": "broker"}
+    )
+    daemon_signal = _ctrader_entry_signal().model_copy(
+        update={"metadata": entry_metadata}
+    )
+
+    assert asyncio.run(adapter.submit_order(daemon_signal, qty=2.0007)) == "777"
+
+    assert volumes == [2000]
+    assert saved[0].metadata["pip_value_units_per_qty"] == 10.0
+    assert saved[0].metadata["pip_value_source"] == "broker"
+
+
 def test_ctrader_submit_refuses_a_daemon_entry_whose_scale_moved_mid_submit(
     monkeypatch,
 ) -> None:
