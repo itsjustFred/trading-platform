@@ -585,7 +585,8 @@ def test_client_send_resolves_the_deferred_and_routes_by_client_msg_id() -> None
     assert type(payload).__name__ == "ProtoOAExecutionEvent"
     # The response went through the message-received callback first, exactly
     # like upstream Client._received.
-    assert seen and seen[0] is message
+    assert seen
+    assert seen[0] is message
 
 
 def test_client_disconnect_clears_pending_deferreds_without_errbacking() -> None:

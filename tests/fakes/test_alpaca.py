@@ -13,7 +13,7 @@ from types import SimpleNamespace
 
 import pytest
 from alpaca.common.exceptions import APIError
-from alpaca.trading.enums import OrderClass, OrderSide, OrderType, TimeInForce
+from alpaca.trading.enums import OrderClass, OrderSide, OrderStatus, OrderType, TimeInForce
 from alpaca.trading.requests import (
     LimitOrderRequest,
     MarketOrderRequest,
@@ -81,7 +81,8 @@ def test_the_fill_lands_later_and_is_the_only_one() -> None:
     updates = client.advance(1.0)
 
     assert [update.event for update in updates] == ["fill"]
-    assert str(order.status.value) == "filled" and order.filled_qty == 10.0
+    assert str(order.status.value) == "filled"
+    assert order.filled_qty == 10.0
     assert client.position(AAPL) == 10.0
     assert updates[0].order.filled_qty == 10.0, (
         "the stream event carries the CUMULATIVE filled quantity"
@@ -277,9 +278,7 @@ def test_a_submit_response_carries_the_bracket_legs_nested() -> None:
 def test_legs_are_held_until_the_parent_fills_and_then_go_working() -> None:
     client = FakeAlpacaTradingClient(mark_prices={AAPL: 100.0})
     order = _bracket(client)
-    assert all(leg.status == OrderType.MARKET.value for leg in order.legs) or all(
-        str(leg.status.value) == "held" for leg in order.legs
-    )
+    assert all(leg.status == OrderStatus.HELD for leg in order.legs)
 
     client.advance(30.0)
 
@@ -371,8 +370,9 @@ def test_a_submission_the_broker_refuses_raises_an_api_error() -> None:
         reject_submissions=lambda request: "insufficient buying power",
     )
 
+    request = _buy()
     with pytest.raises(APIError) as failure:
-        client.submit_order(_buy())
+        client.submit_order(request)
 
     assert "insufficient buying power" in str(failure.value)
     assert client.orders == [], "a refused submission never reaches the book"
@@ -381,12 +381,11 @@ def test_a_submission_the_broker_refuses_raises_an_api_error() -> None:
 def test_a_short_sale_is_refused_before_the_order_is_booked() -> None:
     client = FakeAlpacaTradingClient(mark_prices={AAPL: 100.0})
 
+    request = MarketOrderRequest(
+        symbol=AAPL, qty=5, side=OrderSide.SELL, time_in_force=TimeInForce.GTC
+    )
+    client.submit_order(request)
     with pytest.raises(APIError):
-        client.submit_order(
-            MarketOrderRequest(
-                symbol=AAPL, qty=5, side=OrderSide.SELL, time_in_force=TimeInForce.GTC
-            )
-        )
         client.advance(5.0)
 
     assert client.positions == {}, "an unbookable fill never creates a position"
@@ -398,12 +397,15 @@ def test_a_rejection_sequence_is_consumed_in_order() -> None:
         mark_prices={AAPL: 100.0}, reject_submissions=["first refusal", "second refusal"]
     )
 
+    first = _buy()
+    second = _buy()
+    third = _buy()
     with pytest.raises(APIError, match="first refusal"):
-        client.submit_order(_buy())
+        client.submit_order(first)
     with pytest.raises(APIError, match="second refusal"):
-        client.submit_order(_buy())
+        client.submit_order(second)
 
-    order = client.submit_order(_buy())
+    order = client.submit_order(third)
     assert str(order.status.value) != "rejected", "the sequence is drained, not repeated"
 
 

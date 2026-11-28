@@ -93,7 +93,7 @@ def _float(raw: Any) -> float:
         value = float(raw)
     except (TypeError, ValueError):
         return 0.0
-    return value if value == value and value not in {float("inf"), float("-inf")} else 0.0
+    return value if math.isfinite(value) else 0.0
 
 
 def _optional_float(raw: Any) -> float | None:
