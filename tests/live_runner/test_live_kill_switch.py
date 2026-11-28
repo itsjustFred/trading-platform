@@ -150,8 +150,8 @@ def _deployment(
         symbols=["AAPL"],
         timeframe="1h",
         status=status,
-        signal_source="discord",
-        signal_source_type="discord",
+        signal_source="internal",
+        signal_source_type="internal",
         signal_config={"channel_id": "100000000000000121"},
         settings={},
     )

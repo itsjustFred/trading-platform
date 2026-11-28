@@ -50,6 +50,23 @@ def test_live_endpoints_return_expected_payloads(monkeypatch, isolated_db):
         balance=10_000.0,
         equity=10_010.0,
     )
+    execution_row = {
+        "signal_id": signal_id,
+        "execution_id": "22222222-2222-2222-2222-222222222222",
+        "deployment_id": deployment_id,
+        "symbol": "AAPL",
+        "action": "buy",
+        "theoretical_price": 100.0,
+        "actual_price": 100.25,
+        "slippage": 0.25,
+        "slippage_bps": 25.0,
+        "filled_qty": 1.0,
+        "commission": 0.01,
+        "signal_timestamp": datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc),
+        "execution_timestamp": datetime(2026, 1, 1, 12, 0, 2, tzinfo=timezone.utc),
+        "broker_order_id": "broker-123",
+        "signal_metadata": {"qty": 1},
+    }
 
     monkeypatch.setattr(viewer_main_module, "_seed_default_live_accounts", lambda: None)
     # Creating a deployment now requires a KNOWN account: the endpoint refuses an
@@ -83,27 +100,7 @@ def test_live_endpoints_return_expected_payloads(monkeypatch, isolated_db):
         "load_live_account_stats_inputs",
         lambda _account_id: (
             [balance] if _account_id == account_id else [],
-            [
-                {
-                    "signal_id": signal_id,
-                    "execution_id": "22222222-2222-2222-2222-222222222222",
-                    "deployment_id": deployment_id,
-                    "symbol": "AAPL",
-                    "action": "buy",
-                    "theoretical_price": 100.0,
-                    "actual_price": 100.25,
-                    "slippage": 0.25,
-                    "slippage_bps": 25.0,
-                    "filled_qty": 1.0,
-                    "commission": 0.01,
-                    "signal_timestamp": datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc),
-                    "execution_timestamp": datetime(2026, 1, 1, 12, 0, 2, tzinfo=timezone.utc),
-                    "broker_order_id": "broker-123",
-                    "signal_metadata": {"qty": 1},
-                }
-            ]
-            if _account_id == account_id
-            else [],
+            [execution_row] if _account_id == account_id else [],
         ),
     )
     monkeypatch.setattr(
@@ -115,25 +112,7 @@ def test_live_endpoints_return_expected_payloads(monkeypatch, isolated_db):
     monkeypatch.setattr(
         viewer_main_module,
         "list_live_signal_executions_for_deployments",
-        lambda _deployment_ids: [
-            {
-                "signal_id": signal_id,
-                "execution_id": "22222222-2222-2222-2222-222222222222",
-                "deployment_id": deployment_id,
-                "symbol": "AAPL",
-                "action": "buy",
-                "theoretical_price": 100.0,
-                "actual_price": 100.25,
-                "slippage": 0.25,
-                "slippage_bps": 25.0,
-                "filled_qty": 1.0,
-                "commission": 0.01,
-                "signal_timestamp": datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc),
-                "execution_timestamp": datetime(2026, 1, 1, 12, 0, 2, tzinfo=timezone.utc),
-                "broker_order_id": "broker-123",
-                "signal_metadata": {"qty": 1},
-            }
-        ],
+        lambda _deployment_ids: [execution_row],
     )
     monkeypatch.setattr(
         viewer_main_module,
@@ -238,10 +217,10 @@ def test_live_deployments_crud_endpoints(monkeypatch, isolated_db):
         "symbol_filter": ["AAPL", "MSFT"],
         "timeframe": "1h",
         "status": "ACTIVE",
-        "signal_source_type": "discord",
+        "signal_source_type": "internal",
         "signal_source_id": "RAMJET",
-        "signal_source": "discord",
-        "signal_config": {"channel_id": "1431465140905185452", "wait_candle_close": True},
+        "signal_source": "internal",
+        "signal_config": {"wait_candle_close": True},
     }
 
     monkeypatch.setattr(viewer_main_module, "_seed_default_live_accounts", lambda: None)
@@ -349,11 +328,11 @@ def test_live_deployments_crud_endpoints(monkeypatch, isolated_db):
             "account_id": account_id,
             "symbols": ["AAPL", "MSFT"],
             "timeframe": "1h",
-            "signal_source_type": "discord",
+            "signal_source_type": "internal",
             "signal_source_id": "RAMJET",
             "symbol_filter": ["AAPL", "MSFT"],
-            "signal_source": "discord",
-            "signal_config": {"channel_id": "1431465140905185452", "wait_candle_close": True},
+            "signal_source": "internal",
+            "signal_config": {"wait_candle_close": True},
             "settings": {"risk_per_trade_pct": 0.01},
         },
     )
@@ -361,11 +340,10 @@ def test_live_deployments_crud_endpoints(monkeypatch, isolated_db):
     created = create_resp.json()
     assert created["id"] == deployment_id
     assert created["status"] == "ACTIVE"
-    assert created["signal_source_type"] == "discord"
-    assert created["signal_source_id"] == "RAMJET"
-    assert created["symbol_filter"] == ["AAPL", "MSFT"]
-    assert created["signal_source"] == "discord"
-    assert created["signal_config"]["channel_id"] == "1431465140905185452"
+    assert created["signal_source_type"] == "internal"
+    # symbol_filter was a Discord dispatch concept; internal deployments carry none.
+    assert created["symbol_filter"] == []
+    assert created["signal_source"] == "internal"
     assert created["settings"]["risk_per_trade_pct"] == 0.01
 
     update_resp = client.put(
@@ -601,14 +579,15 @@ def test_arming_a_deployment_with_an_unresolved_conflict_is_refused(
     database_module.create_live_deployment(
         database_module.LiveDeploymentConfig(
             id=_uuid.UUID(deployment_id),
-            strategy_name="trend_following/trend_following.py",
             account_id="acc-conflict",
             symbols=["EURUSD"],
             timeframe="M15",
             # A fresh deployment is created PAUSED, so this is the state a conflict
-            # halt is imposed on.
+            # halt is imposed on. Internal + opted in + a resolvable strategy is
+            # the only armable shape left now that Discord ingestion is retired.
             status="PAUSED",
-            signal_source_type="discord",
+            strategy_name="example_sma",
+            settings={"internal_runner_enabled": True},
         )
     )
 
@@ -685,8 +664,11 @@ def test_arming_a_deployment_with_an_unresolved_conflict_is_refused(
             "confirmation": {"confirmed_deployment_id": deployment_id},
         },
     )
-    assert resumed.status_code == 200, resumed.text
-    assert database_module.get_live_deployment(deployment_id).status == "ACTIVE"
+    # The conflict gate is cleared, so the refusal now comes from the next gate:
+    # an internal deployment has no viewer arm path (arming internal deployments
+    # is a separate follow-up), which proves the conflict check no longer fires.
+    assert resumed.status_code == 409, resumed.text
+    assert "internal" in resumed.json()["detail"]
 
 
 def test_resolving_on_a_missing_deployment_is_a_404_and_is_audited(
@@ -1067,51 +1049,6 @@ def test_ctrader_top5_endpoint_dry_run(monkeypatch):
     assert payload["deployments"][0]["signal_config"]["source_backtest_id"] == "bt-1"
 
 
-def test_discord_stockkit_deployment_rejects_wrong_account(monkeypatch):
-    import viewer.main as viewer_main_module
-
-    monkeypatch.setattr(viewer_main_module, "_seed_default_live_accounts", lambda: None)
-    monkeypatch.setattr(
-        viewer_main_module,
-        "list_services",
-        lambda *args, **kwargs: [
-            Service(
-                id="88888888-8888-8888-8888-888888888888",
-                name="RAMJET",
-                type=ServiceType.DISCORD_BOT,
-                status=ServiceStatus.RUNNING,
-                config={
-                    "token_env_key": "DISCORD_BOT_RAMJET_TOKEN",
-                    "channel_id": "1431465140905185452",
-                },
-                created_at=datetime.now(timezone.utc),
-            )
-        ],
-    )
-    monkeypatch.setattr(
-        viewer_main_module,
-        "_ensure_live_account_for_deployment",
-        lambda _account_id: {"id": _account_id, "broker": "alpaca", "name": "Wrong"},
-    )
-
-    client = TestClient(viewer_main_module.app)
-    response = client.post(
-        "/api/live/deployments",
-        json={
-            "strategy_name": "my_live_strategy",
-            "account_id": "wrong-account",
-            "symbols": ["AAPL"],
-            "timeframe": "1h",
-            "signal_source_type": "discord",
-            "signal_source_id": "RAMJET",
-            "signal_source": "discord",
-            "signal_config": {"channel_id": "1431465140905185452", "signal_processor": "ramjet"},
-        },
-    )
-
-    assert response.status_code == 400
-    assert "PA3T0MQAGQ51" in response.json()["detail"]
-
 
 def test_services_crud_and_logs_endpoints(monkeypatch):
     import viewer.main as viewer_main_module
@@ -1126,9 +1063,8 @@ def test_services_crud_and_logs_endpoints(monkeypatch):
         return [service for service in payload if service.type == service_type]
 
     def _create_service(service: Service):
-        created = service.model_copy(update={"id": service_id})
-        services[service_id] = created
-        return created
+        services[str(service.id)] = service
+        return service
 
     def _get_service(value: str):
         return services.get(value)
@@ -1182,7 +1118,9 @@ def test_services_crud_and_logs_endpoints(monkeypatch):
 
     client = TestClient(viewer_main_module.app)
 
-    create_response = client.post(
+    # discord_bot creation is refused (retired source), so the stored row the
+    # rest of this test exercises is seeded directly, as a pre-removal row.
+    retired_response = client.post(
         "/api/services",
         json={
             "name": "RAMJET",
@@ -1194,18 +1132,47 @@ def test_services_crud_and_logs_endpoints(monkeypatch):
             },
         },
     )
+    assert retired_response.status_code == 400
+    assert "retired" in retired_response.json()["detail"]
+
+    services[service_id] = Service(
+        id=service_id,
+        name="RAMJET",
+        type=ServiceType.DISCORD_BOT,
+        status=ServiceStatus.RUNNING,
+        config={
+            "token_env_key": "DISCORD_BOT_RAMJET_TOKEN",
+            "channel_id": "1431465140905185452",
+        },
+        created_at=datetime.now(timezone.utc),
+    )
+
+    create_response = client.post(
+        "/api/services",
+        json={
+            "name": "weekly-refresh",
+            "type": "scheduled_job",
+            "status": "running",
+            "config": {"cron": "0 2 * * 1", "job_type": "refresh"},
+        },
+    )
     assert create_response.status_code == 201
     created = create_response.json()
-    assert created["id"] == service_id
-    assert created["name"] == "RAMJET"
-    assert created["type"] == "discord_bot"
+    assert created["name"] == "weekly-refresh"
+    assert created["type"] == "scheduled_job"
     assert created["status"] == "running"
+
+    # The retired discord_bot row is still listed, marked retired.
+    discord_list = client.get("/api/services", params={"type": "discord_bot"})
+    assert discord_list.status_code == 200
+    discord_rows = discord_list.json()
+    assert len(discord_rows) == 1
+    assert discord_rows[0]["retired"] is True
 
     list_response = client.get("/api/services")
     assert list_response.status_code == 200
     listed = list_response.json()
-    assert len(listed) == 1
-    assert listed[0]["name"] == "RAMJET"
+    assert {row["name"] for row in listed} == {"RAMJET", "weekly-refresh"}
 
     detail_response = client.get(f"/api/services/{service_id}")
     assert detail_response.status_code == 200
@@ -1582,16 +1549,19 @@ def test_live_signals_endpoint_returns_signal_log(monkeypatch):
         "list_live_deployments_for_account",
         lambda _account_id: (
             [
-                LiveDeploymentConfig(
-                    id=deployment_id,
-                    strategy_name="discord_scalper",
-                    account_id=account_id,
-                    symbols=["AAPL"],
-                    timeframe="1m",
-                    status="ACTIVE",
-                    signal_source="discord",
-                    signal_config={"wait_candle_close": True},
-                    settings={},
+                LiveDeploymentConfig.model_validate(
+                    {
+                        "id": deployment_id,
+                        "strategy_name": "discord_scalper",
+                        "account_id": account_id,
+                        "symbols": ["AAPL"],
+                        "timeframe": "1m",
+                        "status": "ACTIVE",
+                        "signal_source": "discord",
+                        "signal_config": {"wait_candle_close": True},
+                        "settings": {},
+                    },
+                    context={"stored_row": True},
                 )
             ]
             if _account_id == account_id
@@ -2200,7 +2170,6 @@ def test_a_submission_claim_expires_while_the_first_submit_is_still_running(
             symbols=["EURUSD"],
             timeframe="M15",
             status="ACTIVE",
-            signal_source_type="discord",
         )
     )
     assert created.status == "ACTIVE", (
@@ -2733,7 +2702,6 @@ def test_the_migrations_apply_to_a_population_shaped_like_production(isolated_db
             symbols=["EURUSD"],
             timeframe="M15",
             status="STOPPED",
-            signal_source_type="discord",
         )
     )
 
@@ -2990,7 +2958,6 @@ def _deployment_config(deployment_id: str, status: str):
         symbols=["AAPL"],
         timeframe="1h",
         status=status,
-        signal_source_type="discord",
         signal_source_id="RAMJET",
     )
 
@@ -3021,7 +2988,6 @@ def test_deleting_a_deployment_with_history_is_a_conflict_and_restores_the_statu
             symbols=["EURUSD"],
             timeframe="1h",
             status="ACTIVE",
-            signal_source_type="discord",
         )
     )
     with database_module.get_session() as session:
@@ -3086,7 +3052,6 @@ def test_a_refused_delete_keeps_the_stop_enforcement_stamp(
             symbols=["EURUSD"],
             timeframe="1h",
             status="STOPPED",
-            signal_source_type="discord",
         )
     )
     with database_module.get_session() as session:
@@ -3188,7 +3153,6 @@ def _repoint_fixture(database_module, *, status: str = "PAUSED"):
             symbols=["EURUSD"],
             timeframe="M15",
             status=status,
-            signal_source_type="discord",
         )
     )
     return deployment_id, TestClient(viewer_main_module.app), viewer_main_module
@@ -3367,92 +3331,6 @@ def test_an_acknowledged_expired_lease_allows_the_repoint_and_is_audited(
     assert entries[0]["detail"].get("unreconciled_submissions_acknowledged") == 1
 
 
-def test_discord_deployment_routing_uses_the_configured_account_label(monkeypatch):
-    """The viewer must resolve the route's account number from `.accounts.env`.
-
-    `.accounts.env` is never installed into the process environment, so a
-    resolver left to `os.environ` falls back to the static table. That table goes
-    stale whenever a paper account is re-created, and the endpoint then rejects
-    correctly routed deployments with a 400.
-    """
-    import live_runner.credential_env as credential_env
-    import viewer.main as viewer_main_module
-
-    monkeypatch.setattr(viewer_main_module, "_seed_default_live_accounts", lambda: None)
-    # The promotion gate (#165) treats an account whose type discovery does not
-    # report as real money. This test is about a demo/paper account, so
-    # discovery says so.
-    monkeypatch.setattr(
-        viewer_main_module,
-        "_cached_live_accounts_payload",
-        lambda *args, **kwargs: [
-            {"id": "acc-1", "broker": "alpaca", "is_demo": True, "is_demo_asserted": True}
-        ],
-    )
-    monkeypatch.setattr(
-        viewer_main_module,
-        "list_services",
-        lambda *args, **kwargs: [
-            Service(
-                id="88888888-8888-8888-8888-888888888888",
-                name="RAMJET",
-                type=ServiceType.DISCORD_BOT,
-                status=ServiceStatus.RUNNING,
-                config={
-                    "token_env_key": "DISCORD_BOT_RAMJET_TOKEN",
-                    "channel_id": "100000000000000002",
-                },
-                created_at=datetime.now(timezone.utc),
-            )
-        ],
-    )
-    monkeypatch.setattr(
-        viewer_main_module,
-        "_ensure_live_account_for_deployment",
-        lambda account_id: {
-            "id": account_id,
-            "broker": "alpaca",
-            "name": "Labelled paper account",
-            "broker_login": "PA-LABELLED-RAMJET",
-        },
-    )
-    monkeypatch.setattr(
-        viewer_main_module,
-        "create_live_deployment",
-        lambda deployment: deployment,
-    )
-
-    client = TestClient(viewer_main_module.app)
-    payload = {
-        "strategy_name": "discord::ramjet",
-        "account_id": "acc-1",
-        "symbols": ["AAPL"],
-        "timeframe": "1h",
-        "signal_source_type": "discord",
-        "signal_source_id": "RAMJET",
-        "signal_source": "discord",
-        "signal_config": {"channel_id": "100000000000000002"},
-    }
-
-    monkeypatch.setattr(
-        credential_env,
-        "load_accounts_env_values",
-        lambda *_args, **_kwargs: {
-            "ALPACA_ACCOUNT_NAME_ACC1": "RamJet",
-            "ALPACA_ACCOUNT_NUMBER_ACC1": "PA-LABELLED-RAMJET",
-        },
-    )
-    assert client.post("/api/live/deployments", json=payload).status_code == 201
-
-    # Without the accounts-env the configured label is invisible and the stale
-    # static table rejects the same deployment.
-    monkeypatch.setattr(
-        credential_env, "load_accounts_env_values", lambda *_args, **_kwargs: {}
-    )
-    response = client.post("/api/live/deployments", json=payload)
-    assert response.status_code == 400
-    assert "must route to Alpaca account" in response.json()["detail"]
-
 
 def test_create_rejects_unsupported_trailing_override_with_400(monkeypatch):
     """#150 nit: the write-path trailing check must surface as a 400, not a 500."""
@@ -3495,15 +3373,12 @@ def test_create_rejects_unsupported_trailing_override_with_400(monkeypatch):
 
     client = TestClient(viewer_main_module.app)
     payload = {
-        "strategy_name": "discord::ramjet",
+        "strategy_name": "internal_strategy",
         "account_id": "acc-1",
         "symbols": ["AAPL"],
         "timeframe": "1h",
-        "signal_source_type": "discord",
-        "signal_source_id": "RAMJET",
-        "signal_source": "discord",
+        "signal_source": "internal",
         "signal_config": {
-            "channel_id": "100000000000000002",
             "signal_processor_config": {"trailing_mode": "supertrend_flip"},
         },
     }
@@ -3703,3 +3578,93 @@ def test_live_dashboard_passes_unknown_totals_through_as_null(monkeypatch):
     (row,) = response.json()["accounts"]
     assert row["total_trades"] is None
     assert row["total_pnl"] is None
+
+
+def _stored_discord_live_deployment(deployment_id: str) -> "LiveDeploymentConfig":
+    """A discord deployment as the DB read path rehydrates it (stored-row context)."""
+    from shared.models import STORED_ROW_CONTEXT
+
+    return LiveDeploymentConfig.model_validate(
+        {
+            "id": deployment_id,
+            "strategy_name": "discord::nitro",
+            "account_id": "acc-disc",
+            "symbols": ["AAPL"],
+            "timeframe": "1h",
+            "status": "PAUSED",
+            "signal_source": "discord",
+            "signal_source_type": "discord",
+            "signal_config": {"channel_id": "123456789012345678"},
+        },
+        context={STORED_ROW_CONTEXT: True},
+    )
+
+
+def test_arming_a_retired_discord_deployment_is_refused_without_broker_contact(
+    monkeypatch, isolated_db_sandbox
+):
+    """PUT /status ACTIVE on a stored discord row: 409 'retired', no broker call."""
+    import uuid as _uuid
+
+    from fastapi.testclient import TestClient
+
+    import viewer.main as viewer_main_module
+
+    database_module, _engine, _data_dir = isolated_db_sandbox
+    database_module.ensure_live_account("acc-disc", "alpaca", is_demo=True)
+
+    broker_calls: list[str] = []
+
+    async def _must_not_reverify(account_id: str) -> bool:
+        broker_calls.append(account_id)
+        return True
+
+    monkeypatch.setattr(
+        viewer_main_module, "_reverify_account_against_broker", _must_not_reverify
+    )
+
+    deployment_id = str(_uuid.uuid4())
+    database_module.create_live_deployment(
+        _stored_discord_live_deployment(deployment_id)
+    )
+
+    client = TestClient(viewer_main_module.app)
+    response = client.put(
+        f"/api/live/deployments/{deployment_id}/status",
+        json={
+            "status": "ACTIVE",
+            "confirmation": {"confirmed_deployment_id": deployment_id},
+        },
+    )
+
+    assert response.status_code == 409
+    assert "retired" in response.json()["detail"]
+    assert broker_calls == []
+    assert database_module.get_live_deployment(deployment_id).status == "PAUSED"
+
+
+def test_creating_a_deployment_with_a_discord_signal_source_is_refused(isolated_db_sandbox):
+    """POST /api/live/deployments with signal_source_type 'discord' -> 400."""
+    from fastapi.testclient import TestClient
+
+    import viewer.main as viewer_main_module
+
+    database_module, _engine, _data_dir = isolated_db_sandbox
+    database_module.ensure_live_account("acc-1", "alpaca", is_demo=True)
+
+    client = TestClient(viewer_main_module.app)
+    response = client.post(
+        "/api/live/deployments",
+        json={
+            "strategy_name": "discord::nitro",
+            "account_id": "acc-1",
+            "symbols": ["AAPL"],
+            "timeframe": "1h",
+            "signal_source_type": "discord",
+            "signal_source": "discord",
+            "signal_config": {"channel_id": "123456789012345678"},
+        },
+    )
+
+    assert response.status_code == 400
+    assert "retired" in response.json()["detail"]

@@ -141,7 +141,6 @@ def test_daemon_fails_closed_before_adapter_creation_for_duplicate_ctrader_targe
             daemon.sync_deployments_loop(
                 {},
                 {},
-                {},
                 accounts_env=Path("/nonexistent/accounts.env"),
                 interval_seconds=0,
             )

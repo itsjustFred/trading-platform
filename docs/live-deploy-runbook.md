@@ -8,7 +8,7 @@ Status: credential-gated as of 2026-07-13.
   as an explicit argument (preflight's `--accounts-env`, the daemon's `accounts_env` parameter);
   there is no environment override, so every reader resolves the same path.
 - Alpaca account blocks `ACC1..3` (Nitro, RamJet, RocketFuel) contain paper endpoints only; IDs werden aus `.accounts.env` aufgeloest, nicht hier dokumentiert.
-- Discord bot tokens and channel IDs are set for Nitro, RamJet, and RocketFuel.
+- Discord signal ingestion was removed (maintainer decision 2026-11-26): stored `discord` deployments are retired and never trade. Discord remains only as the ops-alert webhook (`OPS_ALERT_WEBHOOK_URL`).
 - cTrader credentials are demo credentials if the cTrader smoke is run.
 - Trailing stops: live support is per broker (see "Live Trailing Stops" below). Alpaca executes
   `none` and `percent`; cTrader executes `none` only. Any other combination is rejected when the
@@ -298,8 +298,9 @@ clean-up.
 
 ACTIVE deployments with `signal_source`/`signal_source_type` = `internal` are
 evaluated by `live_runner/internal_strategy_runner.py` (daemon task
-`internal-strategy-loop`, 15 s tick). Discord deployments are unaffected —
-their signals still arrive through the channel listeners.
+`internal-strategy-loop`, 15 s tick). Discord signal ingestion was removed
+(maintainer decision 2026-11-26): stored `discord` deployments are retired —
+the daemon warns once per row at startup and never dispatches them.
 
 **Opt-in.** An internal deployment is only evaluated when
 `settings["internal_runner_enabled"]` is explicitly truthy (`true`, `1`,
@@ -421,8 +422,7 @@ out-of-window bars fail closed — no order is emitted.
 
 **Orders.** Emitted intents go through the daemon's
 `_submit_internal_strategy_signal` → `trade_signal_to_live_signal` →
-`_prepare_claim_and_submit_signal`, the same prepare/claim/submit path as
-Discord signals: live level resolution, risk sizing, the SL/TP guard, the
+`_prepare_claim_and_submit_signal`: live level resolution, risk sizing, the SL/TP guard, the
 promotion gate, the demo/paper hard block, the submission lease and adapter
 persistence all apply unchanged. A strategy `exits` row becomes a
 reduce-only `FULL_EXIT` against the deployment's own ledger quantity — it can
@@ -434,8 +434,8 @@ full-size TP and emitting only the first would silently drop the native
 partial-exit ladder. Entries carrying engine sizing-only stop fields
 (`sizing_sl_price`/`sizing_stop`/`sizing_sl`/`stop_distance`) are likewise
 skipped — the live path cannot reproduce the engine's sizing math. A
-`signal_processor` configuration is refused outright: processors are a
-Discord-pipeline concept the internal path never runs. An entry with no TP
+`signal_processor` configuration is refused outright: processors belong to
+the retired Discord pipeline and archive replay, never the internal path. An entry with no TP
 level is emitted with the unbounded-TP policy above; an entry with no stop
 gets the fallback-distance broker stop, so the daemon's SL/TP guard always
 sees a real stop. A *stale* exit is skipped like a stale entry — with the
@@ -448,7 +448,7 @@ that feeds sizing, the pre-submit caps, leverage or exit quantity, and the
 section (`account_order_placement` in `live_runner/account_order_lock.py`;
 the daemon reaches it through `_account_order_placement`). Two of this
 daemon's own signal submissions of the same account — entries and exits of
-any deployment, Discord or internal — can never interleave another of this
+any deployment — can never interleave another of this
 daemon's signal submissions, or a STOPPED/kill-switch flatten, between the
 read and the write; submissions of *different* accounts are unaffected. The
 lock does **not** make the read→write atomic against the broker: a working
@@ -652,11 +652,10 @@ No live code path applies per-deployment strategy parameters, so a strategy is
 promoted with its `STRATEGY_META` defaults: write optimised parameters into the
 file, then promote. A deployment that carries `settings.strategy_parameters` is
 refused on real money. Other `settings` keys (risk limits, selection metadata)
-are not strategy parameters and are not bound. A non-internal (Discord)
-deployment without a `signal_processor` trades the raw channel signal, so no
-strategy file runs and nothing can be hashed: it is refused on real money even
-if a strategy of the same name is promoted. Only internal deployments are
-checked against a strategy file.
+are not strategy parameters and are not bound. A stored non-internal deployment
+without a `signal_processor` has no strategy file to hash: it is refused on real
+money even if a strategy of the same name is promoted. Only internal deployments
+are checked against a strategy file.
 
 The gate sits in the daemon, the preflight and the viewer. The operator tools
 `live_runner/test_signal_trigger.py --live` and `scripts/live_smoke.py` do not
@@ -763,7 +762,7 @@ source the demo-only block uses there. Unknown means real money.
 | Point | Real-money verdict |
 |---|---|
 | `live_runner.preflight` (every configured deployment) | the paper/demo mode preflight resolved from the credentials |
-| Daemon, `prepare_order_with_risk` (every entry order, internal and Discord) | `_adapter_is_demo(adapter)` |
+| Daemon, `prepare_order_with_risk` (every entry order) | `_adapter_is_demo(adapter)` |
 | Viewer `POST /api/live/deployments` (created `ACTIVE`) | broker discovery `is_demo` (asserted) |
 | Viewer `PUT /api/live/deployments/{id}/status` → `ACTIVE` | the fresh broker re-verification |
 | Viewer `POST /api/live/deployments/ctrader/top5`, dry run included | broker discovery `is_demo` (asserted) |
@@ -816,9 +815,9 @@ on top of a cap that is already full.
 
 Provision the deployment file from `live_deployments.example.yaml` into the
 ignored `live_deployments.yaml`. Replace every environment placeholder with a
-value obtained from the broker or Discord administration console; do not copy
-account references, channel IDs, or author IDs into the example or any tracked
-file.
+value obtained from the broker administration console or the alerting webhook
+configuration; do not copy account references or channel IDs into the example
+or any tracked file.
 
 Keep secrets and account references in the ignored `.accounts.env` and local
 deployment file. When a broker account, API key, OAuth token, Discord channel,
@@ -826,7 +825,9 @@ or trusted author changes, provision the replacement through the provider,
 update the local files, run the non-ordering preflight, and revoke the old
 credential or access grant. Keep deployments paused until paper verification is
 complete. Account references are routing metadata rather than secrets, but they
-must still be rotated when an account is retired or reassigned.
+must still be rotated when an account is retired or reassigned. Stored `discord`
+deployments are retired (Discord signal ingestion was removed): stop them rather
+than re-pointing them at a new source.
 
 ## Non-Ordering Preflight
 
@@ -849,9 +850,10 @@ The daemon trades the ACTIVE rows of the `live_deployments` table, not the YAML.
 - an ACTIVE row whose `account_id` is not in `live_accounts`, or whose symbols or timeframe are
   empty;
 - an ACTIVE row with a stored symbol that is padded, blank or not a string (`" AAPL"`, `null`): the
-  daemon's Discord signal match compares a stored symbol verbatim, so that symbol never matches;
-- an ACTIVE row whose stored `signal_source` is neither `internal` nor `discord` (case aside, and
-  not blank): the daemon compares it verbatim, so the row does not route as configured;
+  deployment's symbol matching compares a stored symbol verbatim, so that symbol never matches;
+- an ACTIVE row whose stored `signal_source` is outside the recognised set (`internal`, plus the
+  retired `discord` stored rows still load) — case aside, and not blank: the daemon compares it
+  verbatim, so the row does not route as configured;
 - two ACTIVE rows for the same `(strategy_name, account_id)` — the daemon dispatches every ACTIVE
   match, so the same strategy would submit a second order per signal;
 - a `DATABASE_URL` that points at an in-memory database, which no read-only check can inspect;
@@ -859,8 +861,7 @@ The daemon trades the ACTIVE rows of the `live_deployments` table, not the YAML.
 
 Warnings (the preflight still exits 0): a YAML deployment with no ACTIVE DB row (the daemon will
 not trade it), a YAML deployment listed twice, and any field where the DB value and the YAML
-disagree — `symbols`, `timeframe`, `signal_source` (the flag that routes a deployment's Discord
-signals) and `signal_source_id` (which credential it is dispatched with). Symbols and timeframes are
+disagree — `symbols`, `timeframe`, `signal_source` and `signal_source_id`. Symbols and timeframes are
 normalized on both sides before they are compared, so a case or alias difference (`aapl`, `1H`) is
 not reported as drift. Whitespace around a stored symbol is not normalized away: the row is an error
 above, because the daemon does not match it. The DB value is what runs, so a warning means the daemon is about to trade
@@ -877,7 +878,6 @@ uv run python -m live_runner.preflight --config live_deployments.yaml --accounts
 ```bash
 # Also connect to every broker account and read balance/positions (still no orders):
 uv run python -m live_runner.preflight --config live_deployments.yaml --accounts-env .accounts.env --check-connectivity
-uv run python scripts/live_smoke.py --mode discord-replay --reports-dir docs/reports
 ```
 
 The preflight prints exactly one JSON document on stdout (parseable with `jq`); its log lines go to stderr.
@@ -979,7 +979,7 @@ lock is the kernel's.
 the running build does not have yet applies them on startup (see "Commission sign migration
 (cTrader, #205)"). Roll out as stop, deploy, start: never run an old and a new build side by side.
 
-Keep the daemon running long enough to verify Discord connection, paper order submission, fill handling, and `reconcile_executions`.
+Keep the daemon running long enough to verify broker connection, paper order submission, fill handling, alert delivery, and `reconcile_executions`.
 
 ## Stopping the daemon
 
@@ -987,13 +987,13 @@ Keep the daemon running long enough to verify Discord connection, paper order su
 
 1. No new broker work is accepted. An order submission, a trailing-stop amendment, a STOPPED enforcement sweep or a kill-switch sweep that starts now is refused (a signal is logged and dropped before the broker request; a stop amendment leaves the previous broker-side stop in force and the bars unprocessed; a STOPPED sweep leaves the deployment unenforced and is retried; a kill-switch sweep leaves the halt due and is retried on the next start). A STOPPED enforcement that is already running is one unit: its order cancel, its flatten and the sweep of the protections the flatten detached are drained together, because dropping the later steps would leave the account flat with detached stops still resting. A kill-switch sweep is one unit the same way.
 2. Broker work already in flight is allowed to finish - all four kinds above - before anything is cancelled (default 30 s for the whole drain). None of them is cancelled out from under the broker request *within that 30 s*, so the daemon always knows the outcome of what it sent while the drain held. When the drain times out instead, whatever is still in flight is abandoned and its broker outcome is unknown - that is exactly what the `1` says, and a broker request already handed to a worker thread is not something a cancel can reach.
-3. The daemon then stops itself: its loops, its listeners, the Discord bots, the scheduler, its broker connections and the Twisted reactor's thread pool (default 20 s per phase, seven phases - loop cancel, listener cancel, Discord close, scheduler stop, adapter disconnect, signal-archive close, reactor release).
+3. The daemon then stops itself: its loops, its listeners, the scheduler, its broker connections and the Twisted reactor's thread pool (default 20 s per phase, six phases - loop cancel, listener cancel, scheduler stop, adapter disconnect, signal-archive close, reactor release).
 4. Exit code `0` on a clean shutdown, `1` if the drain or a cleanup phase timed out or failed. After `1`, the outcome of the broker work that did not finish is unknown: an order submission keeps its lease (reconcile the account before sending new signals), a stop amendment leaves the broker's own state in force, and a STOPPED sweep is retried. A daemon that crashed also exits 1, with its traceback in the log: every exit path, crash included, leaves the process immediately instead of running the interpreter's teardown.
 5. A second signal forces an immediate exit (code `130`) and skips all cleanup. A Ctrl-C that lands before the handlers are installed - during startup - exits `130` too, the same code the interpreter would have reported.
 
 Shutdown itself never cancels or closes open orders or positions at the broker; they are left exactly as they were.
 
-Worst case the bounded shutdown takes 30 s (drain) plus 20 s for each of the 7 cleanup phases, then the daemon's own tail inside `run_daemon`: a bounded join of its worker threads - at most 30 s (`WORKER_JOIN_TIMEOUT_SECONDS`), because a worker still writing keeps the single-instance lock - and a bounded flush of the alert sink - at most 2 s (`SHUTDOWN_FLUSH_SECONDS`). That is 202 s in total before the daemon has even reported (`live_runner.shutdown.WORST_CASE_SHUTDOWN_SECONDS`; `tests/test_shutdown_budget_contract.py` pins that constant, this figure and the generated unit file together). The tail after the daemon has reported is bounded too: `main` closes the loop itself rather than letting `asyncio.run` do it, and waits at most 2 s (`EXIT_PATH_TIMEOUT_SECONDS`) for the tasks it cancelled to unwind. Closing the loop is not the end of it - a task that awaited a broker request in a worker thread honours its cancel and still leaves that thread running, and no deadline can reach it - so `main` then flushes the Sentry queue - at most 2 s (`SENTRY_FLUSH_TIMEOUT_SECONDS`) - and leaves the process with `os._exit`, which skips the interpreter's own teardown: that teardown would join every thread the bounded shutdown could not account for, with no deadline, and the join is what turns a shutdown that already reported its verdict into one the service manager SIGKILLs. So the whole window is 206 s, exit path included. On systemd the stop timeout has to stay above that so the unit is not SIGKILLed mid-shutdown: `scripts/setup_services.sh` generates `trading-daemon.service` with `TimeoutStopSec=240`. A hand-written unit needs the same, because a daemon that is killed before it finishes never reports its exit code - and a `1` is the operator's only signal that a broker outcome needs reconciliation.
+Worst case the bounded shutdown takes 30 s (drain) plus 20 s for each of the 6 cleanup phases, then the daemon's own tail inside `run_daemon`: a bounded join of its worker threads - at most 30 s (`WORKER_JOIN_TIMEOUT_SECONDS`), because a worker still writing keeps the single-instance lock - and a bounded flush of the alert sink - at most 2 s (`SHUTDOWN_FLUSH_SECONDS`). That is 182 s in total before the daemon has even reported (`live_runner.shutdown.WORST_CASE_SHUTDOWN_SECONDS`; `tests/test_shutdown_budget_contract.py` pins that constant, this figure and the generated unit file together). The tail after the daemon has reported is bounded too: `main` closes the loop itself rather than letting `asyncio.run` do it, and waits at most 2 s (`EXIT_PATH_TIMEOUT_SECONDS`) for the tasks it cancelled to unwind. Closing the loop is not the end of it - a task that awaited a broker request in a worker thread honours its cancel and still leaves that thread running, and no deadline can reach it - so `main` then flushes the Sentry queue - at most 2 s (`SENTRY_FLUSH_TIMEOUT_SECONDS`) - and leaves the process with `os._exit`, which skips the interpreter's own teardown: that teardown would join every thread the bounded shutdown could not account for, with no deadline, and the join is what turns a shutdown that already reported its verdict into one the service manager SIGKILLs. So the whole window is 186 s, exit path included. On systemd the stop timeout has to stay above that so the unit is not SIGKILLed mid-shutdown: `scripts/setup_services.sh` generates `trading-daemon.service` with `TimeoutStopSec=240`. A hand-written unit needs the same, because a daemon that is killed before it finishes never reports its exit code - and a `1` is the operator's only signal that a broker outcome needs reconciliation.
 
 On Windows only Ctrl-C/Ctrl-Break (`SIGINT`) can be delivered; `SIGTERM` cannot, so stop the process with Ctrl-C.
 
@@ -1192,12 +1192,12 @@ not tracked.
 
 ### ACTIVE deployments nothing can trade (#242)
 
-The daemon trades Discord deployments through the channel listeners and `internal` deployments through the
+The daemon trades `internal` deployments through the
 internal strategy runner (#348) — but only when the deployment opted in
 (`settings["internal_runner_enabled"]` truthy) and its `strategy_name` resolves through
 `live_runner.promotion.strategy_target` (a bare slug naming `strategies/<name>/<name>.py`). An ACTIVE
 `internal` deployment that fails either check — and any stored `signal_source` that is neither `internal`
-nor `discord` — has no runner behind it: it still gets a broker adapter and an execution listener, so the
+nor the retired `discord` — has no runner behind it: it still gets a broker adapter and an execution listener, so the
 dashboard and the listener log make it look live, but it will never place an order.
 
 The deployment-sync loop alerts this at ERROR, carrying `alert: "untradeable_active_deployment"` and
@@ -1208,8 +1208,8 @@ event), not as a Sentry tag, so filter it on `untradeable_reason`/`alert` as eve
 
 It is not repeated on every tick of the (permanent) sync loop: the first tick of every daemon start reports
 each affected row, and a row is reported again only when its status or signal source changes, so restarting
-or repointing is what you see again. The daemon does not block or stop: the operator stops the row or moves
-it to a Discord signal source, or — for an `internal` row — set
+or repointing is what you see again. The daemon does not block or stop: the operator stops the row, or — for an
+`internal` row — set
 `settings["internal_runner_enabled"]` and fix its `strategy_name`.
 
 For `internal` rows the daemon's alert reason comes from the runner itself
@@ -1223,17 +1223,16 @@ Both preflights warn for these rows using the same definition
 (`live_runner.deployment_policy.untradeable_signal_source_reason`), so a clean preflight no longer hides
 them, but they see different things:
 
-- **yaml preflight** (`live_runner/preflight.py`): warns for every ACTIVE non-Discord deployment in the
-  `live_deployments.yaml` it validates.
+- **yaml preflight** (`live_runner/preflight.py`): warns for every ACTIVE deployment in the
+  `live_deployments.yaml` it validates whose source has no listener runner.
 - **`--check-db` preflight** (`live_runner/preflight_db.py`): reads the ACTIVE rows out of SQLite instead.
-  It warns for an untradeable row whose YAML twin is *tradeable* (Discord) or absent, because the YAML
+  It warns for an untradeable row whose YAML twin is itself tradeable or absent, because the YAML
   side is then quiet about it; when the twin is itself untradeable the YAML check has already reported
   the pair and a second warning for the same row would only double-count. A stored `signal_source` outside
-  `KNOWN_SIGNAL_SOURCES` (`internal` plus everything the daemon can trade) still fails this preflight (exit
-  1) rather than warning, because nothing routes the row as configured. Adding a source to the daemon's
-  tradeable set does not make it storable: `LiveDeploymentConfig.signal_source` is a Literal over
-  `internal`/`discord` and the DB read coerces anything else to `internal`, so a new source is a
-  model-and-migration change (`live_runner/deployment_policy.py` says so where the set is defined).
+  `KNOWN_SIGNAL_SOURCES` (`internal` plus the retired `discord`) still fails this preflight (exit
+  1) rather than warning, because nothing routes the row as configured. `discord` stays recognised so
+  stored rows keep loading and listing; new discord deployments are rejected at create time
+  (`live_runner/deployment_policy.py` says so where the set is defined).
 
 An ACTIVE `internal` row is untradeable only while it lacks the runner opt-in or names a strategy that does
 not resolve; once both hold, the internal strategy runner trades it (see "Internal strategy live runner"
@@ -1254,7 +1253,7 @@ daemon reads it again on its first tick after starting.
 Two checkpoints, both fail closed:
 
 - **Before every entry.** `prepare_order_with_risk`, the single chokepoint every entry order of
-  every deployment (Discord and internal alike) passes through. It runs *after* the exit branch
+  every deployment passes through. It runs *after* the exit branch
   there, so a halt never blocks closing a position - trapping an operator in open exposure is
   the opposite of what the feature is for. It also runs before any broker state is read, so a
   halted account costs no round-trip.
@@ -1328,8 +1327,7 @@ Every attempt, refused ones included, is attributed in `live_control_audit`
 - It does not disconnect the adapter. A halted account that still needs a sweep keeps its
   adapter connected for the sweep - the same retention STOPPED enforcement uses. Only the
   *deployment execution* listeners are gated on the runnable set, so retention never grants
-  trading permission; a Discord connection for an ACTIVE deployment can still be listening, and
-  what stops its orders is the entry gate, not a missing listener.
+  trading permission; what stops an entry is the entry gate itself.
 - It does not stop the live trailing-stop loop (#167). A `flatten` sweep cancels what the flatten
   orphaned; an `entries` halt leaves every working order exactly where it is.
 - It does not replace STOPPED. A STOPPED deployment is a deployment-level stop enforced once per
@@ -1446,8 +1444,8 @@ sweeps. This applies to every pause, manual ones included. Consequence: a
 deployment halted for a conflict can still close the position the ledger *does*
 know about; it just cannot add anything.
 
-For that to be reachable the account has to stay wired up: the broker adapter, the
-Discord listener and the per-account task set are kept for an account whose
+For that to be reachable the account has to stay wired up: the broker adapter and the
+per-account task set are kept for an account whose
 deployments are all `PAUSED` (they were selected from an `ACTIVE`-only account
 set, which dropped every exit at the task level). Those tasks dispatch and record;
 what may be *opened* is still decided per signal, so no entry can come out of it.

@@ -78,7 +78,6 @@ ALLOWED_UPWARD_EDGES: frozenset[tuple[str, str]] = frozenset(
         ("shared.database", "live_runner.exit_signals"),
         ("shared.database", "live_runner.loss_breaker"),
         ("shared.database", "live_runner.pre_submit_caps"),
-        ("shared.database", "live_runner.service_discovery"),
         ("shared.database", "live_runner.stockkit_routing"),
         ("shared.database", "risk.live"),
         # shared/strategy_registry.py lazy-imports the approval gate so listing

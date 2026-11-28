@@ -15,7 +15,6 @@ import pytest
 from pydantic import ValidationError
 
 from live_runner import daemon
-from risk.models import TradeSignal
 from shared.models import LiveDeploymentConfig, LiveSignal
 from shared.trailing import (
     KNOWN_TRAILING_MODES,
@@ -48,8 +47,8 @@ def _deployment(signal_config: dict | None = None) -> LiveDeploymentConfig:
         account_id="acct-1",
         symbols=["AAPL"],
         timeframe="5m",
-        signal_source_type="discord",
-        signal_source="discord",
+        signal_source_type="internal",
+        signal_source="internal",
         signal_config=signal_config or {},
     )
 
@@ -389,98 +388,9 @@ def test_deployment_override_check_ignores_unrelated_shapes() -> None:
 # ── signal time, live path ───────────────────────────────────────────────────
 
 
-class _Processor:
-    def __init__(self, trailing_cfg) -> None:
-        self._trailing_cfg = trailing_cfg
-
-    def process_signal(self, *, raw_signal, market_data):
-        metadata = dict(raw_signal.get("metadata") or {})
-        if self._trailing_cfg is not None:
-            metadata["trailing_sl_config"] = self._trailing_cfg
-        return TradeSignal(
-            action="buy",
-            symbol=raw_signal["symbol"],
-            entry_price=100.0,
-            stop_loss=95.0,
-            take_profit=110.0,
-            timeframe="5m",
-            metadata=metadata,
-        )
-
-
-def _process(monkeypatch, trailing_cfg, adapter=None) -> TradeSignal:
-    monkeypatch.setattr(
-        daemon, "get_signal_processor", lambda name, config: _Processor(trailing_cfg)
-    )
-    monkeypatch.setattr(daemon, "_build_processor_market_data", lambda signal, timeframe: None)
-    signal = TradeSignal(
-        action="buy",
-        symbol="AAPL",
-        entry_price=100.0,
-        stop_loss=None,
-        take_profit=None,
-        timeframe="5m",
-        metadata={},
-    )
-    if adapter is None:
-        return daemon._apply_signal_processor(
-            signal, _deployment({"signal_processor": "ramjet"})
-        )
-    return daemon._apply_signal_processor(
-        signal, _deployment({"signal_processor": "ramjet"}), adapter=adapter
-    )
-
-
-#: What the gates read from an adapter: its broker and its declared capability.
 _ALPACA_LIKE = SimpleNamespace(broker_name="alpaca", supports_stop_amendment=True)
 _CTRADER_LIKE = SimpleNamespace(broker_name="ctrader", supports_stop_amendment=False)
 _ALPACA_WITHOUT_AMEND = SimpleNamespace(broker_name="alpaca", supports_stop_amendment=False)
-
-
-@pytest.mark.parametrize(
-    "trailing_cfg",
-    [
-        {"mode": "percent", "percent": 0.02},
-        {"mode": "supertrend_flip"},
-        {"mode": "bogus"},
-        "percent",
-    ],
-)
-def test_live_signal_with_unexecutable_trailing_is_refused(monkeypatch, trailing_cfg) -> None:
-    with pytest.raises(ValueError, match=r"[Tt]railing|trailing_sl_config|removed"):
-        _process(monkeypatch, trailing_cfg)
-
-
-@pytest.mark.parametrize("adapter", [_CTRADER_LIKE, _ALPACA_WITHOUT_AMEND])
-def test_live_percent_signal_is_refused_for_an_adapter_that_cannot_trail(
-    monkeypatch, adapter
-) -> None:
-    with pytest.raises(ValueError, match="'percent' is not supported"):
-        _process(monkeypatch, {"mode": "percent", "percent": 0.02}, adapter)
-
-
-@pytest.mark.parametrize("trailing_cfg", [{"mode": "supertrend_flip"}, {"mode": "bogus"}])
-def test_live_signal_with_a_mode_no_adapter_executes_is_refused(
-    monkeypatch, trailing_cfg
-) -> None:
-    with pytest.raises(ValueError, match=r"[Tt]railing|removed"):
-        _process(monkeypatch, trailing_cfg, _ALPACA_LIKE)
-
-
-def test_live_percent_signal_passes_the_processor_gate_on_a_trailing_adapter(
-    monkeypatch,
-) -> None:
-    processed = _process(monkeypatch, {"mode": "percent", "percent": 0.02}, _ALPACA_LIKE)
-    assert processed.metadata["trailing_sl_config"] == {"mode": "percent", "percent": 0.02}
-
-
-@pytest.mark.parametrize("trailing_cfg", [{"mode": "none"}, None])
-def test_live_signal_without_trailing_passes_the_processor_gate(
-    monkeypatch, trailing_cfg
-) -> None:
-    processed = _process(monkeypatch, trailing_cfg)
-    assert processed.stop_loss == 95.0
-    assert processed.metadata["signal_processor"] == "ramjet"
 
 
 class _UntouchableAdapter:
@@ -717,26 +627,6 @@ _ALPACA_SERVING = SimpleNamespace(
 
 
 @pytest.mark.parametrize("timeframe", _UNTRAILABLE)
-def test_processor_gate_refuses_a_percent_entry_on_an_untrailable_timeframe(
-    monkeypatch, timeframe: str
-) -> None:
-    monkeypatch.setattr(
-        daemon,
-        "get_signal_processor",
-        lambda name, config: _Processor({"mode": "percent", "percent": 0.02}),
-    )
-    monkeypatch.setattr(daemon, "_build_processor_market_data", lambda signal, timeframe: None)
-    signal = TradeSignal(
-        action="buy", symbol="AAPL", entry_price=100.0, stop_loss=None,
-        take_profit=None, timeframe=timeframe, metadata={},
-    )
-    deployment = _deployment({"signal_processor": "ramjet"})
-    deployment.timeframe = timeframe
-    with pytest.raises(ValueError, match="cannot be executed live on timeframe"):
-        daemon._apply_signal_processor(signal, deployment, adapter=_ALPACA_SERVING)
-
-
-@pytest.mark.parametrize("timeframe", _UNTRAILABLE)
 def test_order_preparation_refuses_a_percent_entry_on_an_untrailable_timeframe(
     monkeypatch, timeframe: str
 ) -> None:
@@ -764,16 +654,6 @@ _FULL_FLIP_CONFIG = {
     "supertrend_period": 10,
     "supertrend_multiplier": 3.0,
 }
-
-
-@pytest.mark.parametrize("adapter", [_ALPACA_LIKE, _CTRADER_LIKE, None])
-def test_live_signal_with_a_complete_supertrend_flip_config_is_refused(
-    monkeypatch, adapter
-) -> None:
-    """The workflow is removed: even a complete flip config is refused on
-    every broker, and the refusal names the removed mode."""
-    with pytest.raises(ValueError, match="removed"):
-        _process(monkeypatch, _FULL_FLIP_CONFIG, adapter)
 
 
 @pytest.mark.parametrize("adapter", [_ALPACA_LIKE, _CTRADER_LIKE])

@@ -201,10 +201,9 @@ def _db_row_drift(row: DbDeploymentRow, yaml_dep: LiveDeploymentConfig) -> list[
     information. A padded stored symbol is not hidden by this normalization: ``_db_row_errors``
     reports it as an error.
 
-    ``signal_source`` is on this list because the daemon gates Discord dispatch on the DB value
-    (``live_runner.daemon._dispatchable_discord_deployments_for_account`` and
-    ``_discord_dispatchable_account_ids``): a row that says ``discord`` on a deployment the YAML
-    configures as ``internal`` receives Discord signals, and the YAML-side check in
+    ``signal_source`` is on this list because the daemon routes on the DB value:
+    a row that disagrees with its YAML twin about the source is a deployment the
+    two describe differently, and the YAML-side check in
     ``live_runner.preflight._validate_deployments`` never sees the DB row.
     ``signal_source_id`` is on this list because it names the credential the daemon resolves that
     deployment to.
@@ -295,7 +294,7 @@ def diff_db_and_yaml(
         if reason is not None and not twin_is_untradeable:
             warnings.append(
                 f"DB deployment {row.label}: {reason}; it will never trade. "
-                "Stop it or move it to a Discord signal source."
+                "Stop it or repoint it to a signal source the daemon runs."
             )
         if row.key in db_by_key:
             # Not cosmetic drift: the daemon dispatches every ACTIVE match, so this row submits

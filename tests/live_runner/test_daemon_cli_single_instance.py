@@ -146,7 +146,7 @@ class TestSingleInstanceGuard:
         reached: list[str] = []
         monkeypatch.setattr(
             daemon,
-            "_discover_and_register_discord_services",
+            "_recover_failed_services",
             lambda **_kwargs: reached.append("discovery"),
         )
         with SingleInstanceLock(daemon.daemon_lock_path()):
@@ -169,7 +169,7 @@ class TestSingleInstanceGuard:
         def _stop_at_discovery(*_args: Any, **_kwargs: Any) -> list[Any]:
             raise _DiscoveryReached("discovery reached")
 
-        monkeypatch.setattr(daemon, "_discover_and_register_discord_services", _stop_at_discovery)
+        monkeypatch.setattr(daemon, "_recover_failed_services", _stop_at_discovery)
 
         with pytest.raises(_DiscoveryReached):
             asyncio.run(daemon.run_daemon())
@@ -213,7 +213,7 @@ class TestSingleInstanceGuard:
         def _stop_at_discovery(*_args: Any, **_kwargs: Any) -> list[Any]:
             raise RuntimeError("discovery reached")
 
-        monkeypatch.setattr(daemon, "_discover_and_register_discord_services", _stop_at_discovery)
+        monkeypatch.setattr(daemon, "_recover_failed_services", _stop_at_discovery)
         loop = asyncio.new_event_loop()
         monkeypatch.setattr(loop, "_default_executor", _InterruptedJoin(), raising=False)
         try:
@@ -263,7 +263,7 @@ class TestSingleInstanceGuard:
             assert unblock.wait(10), "the test never unblocked the startup discovery"
             return []
 
-        monkeypatch.setattr(daemon, "_discover_and_register_discord_services", _blocking_discovery)
+        monkeypatch.setattr(daemon, "_recover_failed_services", _blocking_discovery)
 
         def _run_daemon() -> None:
             loop = asyncio.new_event_loop()
@@ -392,7 +392,6 @@ def _stub_the_daemons_loops(monkeypatch: Any, adapter: _StreamAdapterStub) -> No
     async def _sync_loop(
         active_adapters: dict[str, Any],
         active_listener_tasks: dict[str, Any],
-        active_discord_tasks: dict[str, Any],
         **_kwargs: Any,
     ) -> None:
         active_adapters["account-1"] = adapter
@@ -404,7 +403,6 @@ def _stub_the_daemons_loops(monkeypatch: Any, adapter: _StreamAdapterStub) -> No
         await asyncio.sleep(0)
         raise _LoopsStopped("the daemon's loops stopped")
 
-    monkeypatch.setattr(daemon, "_discover_and_register_discord_services", _no_thread_call)
     monkeypatch.setattr(daemon, "_recover_failed_services", _no_thread_call)
     monkeypatch.setattr(daemon, "ServiceScheduler", _FakeScheduler)
     monkeypatch.setattr(daemon, "sync_deployments_loop", _sync_loop)

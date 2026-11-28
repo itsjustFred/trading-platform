@@ -27,19 +27,9 @@ deployments:
     #   broker_reconciliation_consecutive_mismatches: 2
     #   broker_reconciliation_enabled: true
 
-  - strategy_name: fx_breakout
-    account_id: ctrader-demo
-    symbols:
-      - EURUSD
-      - XAUUSD
-    timeframe: 15m
-    status: PAUSED
-    signal_source: discord
-    signal_config:
-      channel_id: ${DISCORD_BOT_FX_CHANNEL_ID}
-      trusted_author_ids:
-        - ${DISCORD_BOT_FX_AUTHOR_ID}
-      wait_candle_close: true
-      # A StockKit bot (Nitro / RamJet / RocketFuel on Alpaca) is marked
-      # explicitly; an unknown route then fails closed at creation and dispatch:
-      # stockkit_route: rocketfuel
+# Discord signal ingestion was removed (maintainer decision 2026-11-26): a
+# deployment with ``signal_source: discord`` is refused outright - the config
+# parser rejects it, so the whole file fails to load. Only stored DB rows
+# written before the removal still carry the source; the daemon recognises
+# them, warns once, and never trades them. New deployments must use
+# ``signal_source: internal`` (or omit it, which defaults to internal).

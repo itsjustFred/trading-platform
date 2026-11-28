@@ -1791,7 +1791,7 @@ async def _sync_live_market_data_stream_background() -> None:
             # C1: quotes resolve credentials from the same file-first source
             # as execution, never bare process env.
             from live_runner.credential_env import load_accounts_env_values
-            from live_runner.service_discovery import DEFAULT_ACCOUNTS_ENV
+            from live_runner.credential_env import DEFAULT_ACCOUNTS_ENV
 
             env_values = await asyncio.to_thread(
                 load_accounts_env_values, DEFAULT_ACCOUNTS_ENV
@@ -5428,6 +5428,10 @@ def _serialize_service_payload(service: Service) -> dict[str, Any]:
         # one, which is exactly the ambiguity a heartbeat exists to remove.
         "last_activity_age_seconds": None if age_seconds is None else max(0.0, age_seconds),
         "is_stale": last_activity is None or age_seconds > SERVICE_STALE_AFTER_SECONDS,
+        # Discord signal ingestion was removed: stored discord_bot rows are
+        # retired - nothing runs them, so the UI marks them instead of
+        # showing a RUNNING nothing executes.
+        "retired": service.type == ServiceType.DISCORD_BOT,
         "created_at": service.created_at.isoformat(),
     }
     safe_payload = redact_value(payload)
@@ -13492,6 +13496,14 @@ async def get_services_endpoint(
 
 @app.post("/api/services", status_code=201)
 async def create_service_endpoint(payload: ServiceCreateRequest) -> dict[str, Any]:
+    if str(payload.type or "").strip().lower() == ServiceType.DISCORD_BOT.value:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "service type 'discord_bot' is retired: Discord signal ingestion "
+                "was removed and nothing can run one"
+            ),
+        )
     try:
         service = Service(
             name=str(payload.name or "").strip(),
@@ -13715,62 +13727,24 @@ async def create_verification_evidence(
         raise HTTPException(status_code=400, detail=_public_value_error_detail(exc)) from exc
 
 
-async def _resolve_live_deployment_signal_source(
+def _resolve_live_deployment_signal_source(
     *,
-    signal_source_type: str,
     strategy_name: str,
     symbols: list[str],
-    symbol_filter: list[str],
-    signal_source_id: str,
     signal_config_payload: dict[str, Any],
 ) -> tuple[str, list[str], str, list[str], dict[str, Any]]:
-    """Validate/normalize the signal-source inputs for a live deployment."""
-    if signal_source_type == "internal":
-        if not strategy_name:
-            raise HTTPException(status_code=400, detail="strategy_name is required for internal signal source")
-        if not symbols:
-            raise HTTPException(status_code=400, detail="At least one symbol is required")
-        return "", [], strategy_name, symbols, signal_config_payload
+    """Validate/normalize the signal-source inputs for a live deployment.
 
-    matched_service: Service | None = None
-    if signal_source_id:
-        discord_services = await asyncio.to_thread(
-            list_services,
-            service_type=ServiceType.DISCORD_BOT,
-        )
-        matched_service = next(
-            (
-                service
-                for service in discord_services
-                if str(service.name or "").strip().lower() == signal_source_id.lower()
-            ),
-            None,
-        )
-        if matched_service is None:
-            raise HTTPException(status_code=404, detail="Discord signal source service not found")
-        signal_source_id = matched_service.name
-    elif not str(signal_config_payload.get("channel_id") or "").strip():
-        raise HTTPException(
-            status_code=400,
-            detail="signal_source_id is required for discord signal source",
-        )
+    Only ``internal`` remains: Discord signal ingestion was removed
+    (maintainer decision 2026-11-26) and the endpoint refuses ``discord``
+    before this runs. ``signal_source_id`` and ``symbol_filter`` come back
+    empty: they belonged to the retired Discord routing inputs.
+    """
     if not strategy_name:
-        strategy_name = (
-            f"discord::{signal_source_id.lower()}"
-            if signal_source_id
-            else "discord::legacy"
-        )
-    if not symbols and symbol_filter:
-        symbols = list(symbol_filter)
+        raise HTTPException(status_code=400, detail="strategy_name is required for internal signal source")
     if not symbols:
-        symbols = ["*"]
-    if signal_source_id:
-        signal_config_payload.setdefault("service_name", signal_source_id)
-    if matched_service and isinstance(matched_service.config, dict):
-        channel_id = str(matched_service.config.get("channel_id") or "").strip()
-        if channel_id and not str(signal_config_payload.get("channel_id") or "").strip():
-            signal_config_payload["channel_id"] = channel_id
-    return signal_source_id, symbol_filter, strategy_name, symbols, signal_config_payload
+        raise HTTPException(status_code=400, detail="At least one symbol is required")
+    return "", [], strategy_name, symbols, signal_config_payload
 
 
 @app.get(LIVE_DEPLOYMENTS_PATH)
@@ -14094,7 +14068,7 @@ def _validate_live_deployment_route(
     routed deployment.
     """
     from live_runner.credential_env import load_accounts_env_values
-    from live_runner.service_discovery import DEFAULT_ACCOUNTS_ENV
+    from live_runner.credential_env import DEFAULT_ACCOUNTS_ENV
 
     try:
         accounts_env_values = load_accounts_env_values(DEFAULT_ACCOUNTS_ENV)
@@ -14122,7 +14096,12 @@ def _validate_live_deployment_route(
 @app.post(
     LIVE_DEPLOYMENTS_PATH,
     status_code=201,
-    responses={409: {"description": "The deployment is refused by the promotion gate (#165)"}},
+    responses={
+        400: {
+            "description": "The payload is refused (retired source, bad fields or config)"
+        },
+        409: {"description": "The deployment is refused by the promotion gate (#165)"},
+    },
 )
 async def create_live_deployment_endpoint(
     payload: LiveDeploymentCreateRequest,
@@ -14140,8 +14119,13 @@ async def create_live_deployment_endpoint(
         signal_source_id=payload.signal_source_id,
         symbol_filter=payload.symbol_filter,
     )
-    if signal_source_type not in {"internal", "discord"}:
-        raise HTTPException(status_code=400, detail="signal_source_type must be 'discord' or 'internal'")
+    if signal_source_type == "discord":
+        raise HTTPException(
+            status_code=400,
+            detail="signal_source 'discord' is retired: Discord signal ingestion was removed",
+        )
+    if signal_source_type != "internal":
+        raise HTTPException(status_code=400, detail="signal_source_type must be 'internal'")
 
     account_payload = await asyncio.to_thread(_ensure_live_account_for_deployment, payload.account_id)
     inferred_broker = str(account_payload.get("broker", "")).strip().lower()
@@ -14175,12 +14159,9 @@ async def create_live_deployment_endpoint(
         strategy_name,
         symbols,
         signal_config_payload,
-    ) = await _resolve_live_deployment_signal_source(
-        signal_source_type=signal_source_type,
+    ) = _resolve_live_deployment_signal_source(
         strategy_name=strategy_name,
         symbols=symbols,
-        symbol_filter=symbol_filter,
-        signal_source_id=signal_source_id,
         signal_config_payload=signal_config_payload,
     )
 
@@ -14447,9 +14428,9 @@ async def update_live_deployment_status_endpoint(
             )
 
         # Check what can actually trade before spending a broker round-trip on
-        # it. An internal-source deployment has no live evaluator, so no account
-        # verification can make it capable of trading, and a 409 naming that
-        # reason is far more actionable than a broker error.
+        # it. An internal-source deployment has no viewer arm path, so no
+        # account verification can make it capable of trading, and a 409 naming
+        # that reason is far more actionable than a broker error.
         source_type = str(deployment.signal_source_type or "").strip().lower()
         if source_type == "internal":
             await _audit_live_control(
@@ -14468,9 +14449,45 @@ async def update_live_deployment_status_endpoint(
                 status_code=409,
                 detail=(
                     "This deployment uses the 'internal' signal source, which has "
-                    "no live evaluator, so it can never produce a signal. Arming "
-                    "it would report it as trading while it never can. Use a "
-                    "Discord signal source, or build the evaluator first."
+                    "no live evaluator on this path, so it can never produce a "
+                    "signal. Arming it would report it as trading while it never "
+                    "can."
+                ),
+            )
+
+        # A retired source (discord) can never produce a signal either; refuse
+        # it with the policy's own reason instead of spending broker
+        # round-trips on a deployment that is recognised but inert.
+        from live_runner.deployment_policy import (
+            RETIRED_DISCORD_SIGNAL_SOURCE,
+            normalize_signal_source,
+            untradeable_signal_source_reason,
+        )
+
+        untradeable_reason = untradeable_signal_source_reason(deployment.signal_source)
+        if (
+            untradeable_reason is not None
+            and normalize_signal_source(deployment.signal_source)
+            == RETIRED_DISCORD_SIGNAL_SOURCE
+        ):
+            await _audit_live_control(
+                action="deployment.status",
+                target_type="live_deployment",
+                target_id=deployment_id,
+                request=request,
+                succeeded=False,
+                detail={
+                    "requested_status": requested_status,
+                    "reason": untradeable_reason,
+                    "account_id": str(deployment.account_id or ""),
+                },
+            )
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "This deployment cannot trade: "
+                    f"{untradeable_reason} Arming it would report it as trading "
+                    "while it never can."
                 ),
             )
 
