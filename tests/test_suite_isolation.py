@@ -1491,6 +1491,140 @@ def test_a_child_never_sees_a_credential_variable_the_sweep_removed() -> None:
     assert "TOKEN None" in result.stdout, result.stdout + result.stderr
 
 
+def test_a_grandchild_of_a_sandboxed_child_inherits_the_guard() -> None:
+    """A child that starts its own child hands the sandbox on, markers included.
+
+    The child's own sweep cleared the marker variables - they are not allowlist names - so a
+    grandchild started with the inherited environment (what production code does when a daemon
+    or a viewer worker starts one) lost the guard entirely: no ``.env`` redirect, no
+    accounts-env isolation, no network refusal. The markers survive the sweep in a child now,
+    and the grandchild runs under the same sandbox as its parent.
+    """
+    from tests.conftest import sandboxed_env
+
+    grandchild = (
+        "import live_runner.credential_env as credential_env\n"
+        "print('ACCOUNTS', credential_env.DEFAULT_ACCOUNTS_ENV)\n"
+        "import dotenv\n"
+        "print('LOADER', dotenv.load_dotenv.__name__)\n"
+        "import socket\n"
+        "try:\n"
+        "    socket.getaddrinfo('1.1.1.1', 443)\n"
+        "    print('NET', 'REACHED')\n"
+        "except Exception as exc:\n"
+        "    print('NET', type(exc).__name__)\n"
+    )
+    child = (
+        "import subprocess, sys\n"
+        "probe = " + repr(grandchild) + "\n"
+        "result = subprocess.run(\n"
+        "    [sys.executable, '-c', probe],\n"
+        "    capture_output=True, text=True, check=False,\n"
+        ")\n"
+        "print('GRANDCHILD', result.stdout)\n"
+        "raise SystemExit(result.returncode)\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", child],
+        cwd=str(_PROJECT_ROOT),
+        env=sandboxed_env(),
+        capture_output=True,
+        text=True,
+        timeout=300,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert f"ACCOUNTS {ISOLATED_ACCOUNTS_ENV}" in result.stdout, (
+        "a grandchild resolved the accounts env outside the session sandbox: "
+        + result.stdout
+        + result.stderr
+    )
+    assert "LOADER _redirected_load_dotenv" in result.stdout, (
+        "a grandchild loaded .env through the raw loader: " + result.stdout + result.stderr
+    )
+    assert "NET SuiteHermeticityViolation" in result.stdout, (
+        "a grandchild reached the network unguarded: " + result.stdout + result.stderr
+    )
+
+
+def test_a_forged_child_marker_does_not_adopt_the_named_session(tmp_path: Path) -> None:
+    """A caller can spell the marker variables; only ``sandboxed_env()`` can make them true.
+
+    ``TP_TEST_CHILD_SANDBOX=1 TP_TEST_SESSION_ROOT=<elsewhere> DATA_DIR=<prod>`` in the shell
+    would make a top-level run take the child branch, where the data roots are only filled in,
+    so the suite would write against a directory the caller named. The marker is genuine only
+    with the nonce ``sandboxed_env()`` wrote into the session directory it handed over.
+    """
+    forged = tmp_path / "forged-session"
+    forged.mkdir()
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            "tests/test_suite_isolation.py::test_env_data_dir_is_the_conftest_session_dir",
+        ],
+        cwd=str(_PROJECT_ROOT),
+        env={
+            "PATH": os.environ["PATH"],
+            "PYTHONPATH": str(_PROJECT_ROOT),
+            "HOME": str(tmp_path / "home"),
+            "DATA_DIR": str(tmp_path / "prod-data"),
+            "TP_TEST_CHILD_SANDBOX": "1",
+            "TP_TEST_SESSION_ROOT": str(forged),
+        },
+        capture_output=True,
+        text=True,
+        timeout=300,
+        check=False,
+    )
+    assert result.returncode == pytest.ExitCode.OK, (
+        "a forged child marker made the run adopt the named session: "
+        + result.stdout
+        + result.stderr
+    )
+
+
+def test_a_forged_child_override_list_is_not_honoured(tmp_path: Path) -> None:
+    """The recorded-override list is a handoff, not a caller's input.
+
+    ``TP_TEST_CHILD_ENV=ALPACA_API_KEY ALPACA_API_KEY=dummyA pytest`` would carry the key
+    through the suite's own sweep into every test, because both sweeps skip names the list
+    records. The list means something only in a process ``sandboxed_env()`` started.
+    """
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            "tests/test_suite_isolation.py::test_no_external_credential_env_var_is_set",
+        ],
+        cwd=str(_PROJECT_ROOT),
+        env={
+            "PATH": os.environ["PATH"],
+            "PYTHONPATH": str(_PROJECT_ROOT),
+            "HOME": str(tmp_path / "home"),
+            "TP_TEST_CHILD_ENV": "ALPACA_API_KEY",
+            "ALPACA_API_KEY": "dummy-not-a-real-key",
+        },
+        capture_output=True,
+        text=True,
+        timeout=300,
+        check=False,
+    )
+    assert result.returncode == pytest.ExitCode.OK, (
+        "a forged override list carried a credential into the suite: "
+        + result.stdout
+        + result.stderr
+    )
+
+
 def test_a_sandbox_sharing_child_must_be_finished_by_its_test(tmp_path: Path) -> None:
     """The lifetime contract, enforced: a sharing child still alive at teardown fails.
 
