@@ -5,10 +5,12 @@ have bars is decided empirically from the symbol's own history plus a small
 set of rules measured against the real dataset:
 
 - **Saturday** is closed for every instrument.
-- **Sunday** is closed when the symbol has no Sunday session — measured as
-  fewer than a third of the Sundays in the year around the candidate day
-  having bars (index/energy feeds here have eras with and without Sunday
-  sessions, so a static list cannot work).
+- **Sunday** is open for the FX pairs, which have a structural Sunday
+  session on this feed. For every other instrument it is closed when the
+  symbol has no Sunday session — measured as fewer than a third of the
+  Sundays in the year around the candidate day having bars (index/energy
+  feeds here have eras with and without Sunday sessions, so a static list
+  cannot work).
 - **Good Friday** is closed for every instrument except the FX pairs, which
   trade through it in this feed.
 - **Easter Monday** is closed for EURO50 and BRENT (the only symbols whose
@@ -19,8 +21,9 @@ set of rules measured against the real dataset:
   the whole weekly publish.
 - Any other **weekday** is closed when the same calendar date was empty in
   at least half of its occurrences over the last eight years of the symbol's
-  own bars (covers fixed-date holidays like May 1 or Oct 3 that recur on the
-  same month-day).
+  own bars, provided at least three past occurrences exist (covers
+  fixed-date holidays like May 1 or Oct 3 that recur on the same
+  month-day; fewer samples are not enough evidence either way).
 
 ``bar_days`` is the set of ``datetime.date`` on which the symbol produced at
 least one M1 bar on either side, covering stored history plus the fresh
@@ -40,6 +43,7 @@ EASTER_MONDAY_CLOSED = frozenset({"EURO50", "BRENT"})
 _SUNDAY_WINDOW_DAYS = 364
 _SUNDAY_MIN_FRACTION = 1 / 3
 _RECURRENCE_YEARS = 8
+_RECURRENCE_MIN_OCCURRENCES = 3
 
 
 def easter_sunday(year: int) -> date:
@@ -105,17 +109,23 @@ def _recurrence_closed(day: date, bar_days: set[date]) -> bool:
         occurrences += 1
         if past not in bar_days:
             closed += 1
-    return occurrences > 0 and closed * 2 >= occurrences
+    return (
+        occurrences >= _RECURRENCE_MIN_OCCURRENCES and closed * 2 >= occurrences
+    )
 
 
 def market_closed(symbol: str, day: date, bar_days: set[date]) -> bool:
     """Whether ``day`` is a market-closed day for ``symbol``."""
     if day.weekday() == 5:
         return True
-    if day.weekday() == 6:
-        return _sunday_closed(day, bar_days)
+    # Year-end comes before the Sunday rule: a year-end Sunday (e.g. Dec 25
+    # 2022) is closed even for symbols with a Sunday session.
     if _year_end_closed(day):
         return True
+    if day.weekday() == 6:
+        if symbol in FX_SYMBOLS:
+            return False
+        return _sunday_closed(day, bar_days)
     if symbol not in FX_SYMBOLS and day == good_friday(day.year):
         return True
     if symbol in EASTER_MONDAY_CLOSED and day == easter_monday(day.year):

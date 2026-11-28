@@ -346,8 +346,8 @@ Each symbol entry in `manifest.json` records `asset_class`, `region`,
   2015-01-01, bypassing the stored M1 and raw cache.
 - `data_tools/dukascopy/upload.py` — SigV4-signed S3 client for R2;
   manifest-driven and idempotent: every listed object is HEAD-compared by
-  size, missing/drifted objects are PUT and re-verified, and
-  `manifest.json` is always uploaded last.
+  size and single-part ETag (MD5), missing/drifted objects are PUT and
+  re-verified, and `manifest.json` is always uploaded last.
 
 ### CLI and scheduling
 

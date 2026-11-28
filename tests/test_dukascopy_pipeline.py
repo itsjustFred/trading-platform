@@ -362,6 +362,40 @@ def test_market_closed_recurring_weekday_holiday():
     assert duk_calendar.market_closed("DAX", date(2026, 5, 1), bar_days) is True
 
 
+def test_market_closed_recurrence_needs_minimum_occurrences():
+    """A single empty past occurrence is not enough evidence of a holiday."""
+    # Only 2025 history: May 1 2025 was empty, but that is one occurrence —
+    # too few to call 2026-05-01 closed, so an empty day must fail the run.
+    bar_days = {date(2025, 6, 2)}
+    assert duk_calendar.market_closed("DAX", date(2026, 5, 1), bar_days) is False
+    # With two more empty occurrences the recurrence rule kicks in.
+    bar_days |= {date(2024, 6, 3), date(2023, 6, 5)}
+    assert duk_calendar.market_closed("DAX", date(2026, 5, 1), bar_days) is True
+
+
+def test_fx_sunday_is_open_even_without_sunday_history():
+    """FX pairs have a structural Sunday session; no empirical check needed."""
+    bar_days = {date(2026, 11, 16)}  # a Monday; no Sundays at all
+    sunday = date(2026, 11, 22)
+    assert sunday.weekday() == 6
+    assert duk_calendar.market_closed("EURUSD", sunday, bar_days) is False
+    # Non-FX symbols still use the empirical Sunday rule.
+    assert duk_calendar.market_closed("SP500", sunday, bar_days) is True
+
+
+def test_year_end_sunday_is_closed_for_fx():
+    """Dec 25 2022 was a Sunday: year-end closure must beat the Sunday rule."""
+    christmas_sunday = date(2022, 12, 25)
+    assert christmas_sunday.weekday() == 6
+    # Enough Sunday sessions in history that the empirical rule (and the FX
+    # Sunday default) alone would call the day open.
+    bar_days = {
+        date(2022, 1, 2) + timedelta(weeks=i) for i in range(52)
+    }
+    bar_days.discard(christmas_sunday)
+    assert duk_calendar.market_closed("EURUSD", christmas_sunday, bar_days) is True
+
+
 # ─── incremental update ──────────────────────────────────────────────────────
 
 
@@ -778,15 +812,15 @@ def test_late_arriving_day_is_picked_up_on_next_run(tmp_path):
     """A 0-byte cached day inside the fetch window is refetched, not final."""
     root = tmp_path / "dukascopy"
     raw = tmp_path / "raw"
-    start = date(2026, 11, 16)
-    days = _fixture_days(start, 7)  # Mon 16 .. Sun 22
-    sat = date(2026, 11, 21)  # Saturday: empty is acceptable
-    sun = date(2026, 11, 22)  # Sunday session absent: keeps the refetch window open
+    start = date(2026, 12, 21)  # Monday; year-end window keeps empty days closed
+    days = _fixture_days(start, 7)  # Mon 21 .. Sun 27
+    sat = date(2026, 12, 26)  # Saturday: empty is acceptable
+    sun = date(2026, 12, 27)  # Sunday inside year-end: empty is acceptable
     days[sat] = {"BID": None, "ASK": None}
     days[sun] = {"BID": None, "ASK": None}
     fetcher = FakeFetcher(days)
     rep1 = pipeline.update_dataset(
-        root, symbols=["EURUSD"], start="2026-11-16", end="2026-11-23",
+        root, symbols=["EURUSD"], start="2026-12-21", end="2026-12-28",
         raw_dir=raw, fetcher=fetcher,
     )
     assert rep1.ok
@@ -795,7 +829,7 @@ def test_late_arriving_day_is_picked_up_on_next_run(tmp_path):
     late = _fixture_days(sat, 1)[sat]
     days[sat] = late
     rep2 = pipeline.update_dataset(
-        root, symbols=["EURUSD"], end="2026-11-23",
+        root, symbols=["EURUSD"], end="2026-12-28",
         raw_dir=raw, fetcher=fetcher,
     )
     assert rep2.ok
