@@ -291,6 +291,16 @@ def _valid_frame() -> pd.DataFrame:
         (lambda df: df.assign(ask_open=0.5), "ask_open"),
         (lambda df: df.assign(bid_high=0.5), "inconsistent"),
         (lambda df: df.assign(ask_low=2.0), "inconsistent"),
+        (
+            lambda df: df.assign(timestamp=df["timestamp"].dt.tz_localize(None)),
+            "tz-aware",
+        ),
+        (
+            lambda df: df.assign(
+                timestamp=df["timestamp"].dt.tz_convert("US/Eastern")
+            ),
+            "UTC",
+        ),
     ],
 )
 def test_validate_frame_rejects_contract_violations(mutate, match):

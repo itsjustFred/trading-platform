@@ -132,13 +132,15 @@ class R2Client:
         )
 
     def put_file(self, local_path: Path, key: str) -> int:
+        # Hash and stream through one open handle so the signed payload hash
+        # always describes the bytes actually sent (same inode, no TOCTOU).
         digest = hashlib.sha256()
         size = 0
         with open(local_path, "rb") as fh:
             for chunk in iter(lambda: fh.read(1 << 20), b""):
                 digest.update(chunk)
                 size += len(chunk)
-        with open(local_path, "rb") as fh:
+            fh.seek(0)
             resp = self._request(
                 "PUT", key, body=fh, payload_hash=digest.hexdigest()
             )

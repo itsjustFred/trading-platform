@@ -271,6 +271,9 @@ def _write_parquet_tmp(df: pd.DataFrame, final: Path) -> Path:
 
 def _merge_side(stored: pd.DataFrame, fresh: pd.DataFrame) -> pd.DataFrame:
     """Append ``fresh`` M1 rows onto ``stored``; fresh wins on timestamp ties."""
+    for name, df in (("stored", stored), ("fresh", fresh)):
+        if df["timestamp"].duplicated().any():
+            raise ValueError(f"{name} M1 frame has duplicate timestamps")
     if stored.empty:
         return fresh.reset_index(drop=True)
     if fresh.empty:
@@ -736,12 +739,16 @@ def _repair_symbol(
 
 
 def _clean_stale_tmps(root: Path) -> int:
-    """Remove leftover publish temps from an interrupted run."""
+    """Remove leftover publish temps from an interrupted run.
+
+    Only files matching the pipeline's own temp naming are touched, so a
+    foreign ``*.tmp`` scratch file in the dataset tree is left alone.
+    """
     removed = 0
-    candidates = list(root.glob("*.tmp")) + list(root.glob(".*.tmp"))
+    candidates = list(root.glob(f".{MANIFEST_NAME}.*.tmp"))
     for sym_dir in root.iterdir():
         if sym_dir.is_dir():
-            candidates.extend(sym_dir.glob("*.tmp"))
+            candidates.extend(sym_dir.glob("*.parquet.*.tmp"))
     for tmp in candidates:
         if tmp.is_file():
             tmp.unlink(missing_ok=True)

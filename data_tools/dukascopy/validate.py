@@ -51,10 +51,16 @@ def validate_frame(df: pd.DataFrame, *, context: str) -> int:
     """
     if "timestamp" not in df.columns:
         raise DatasetValidationError(f"{context}: missing 'timestamp' column")
+    if not isinstance(df["timestamp"].dtype, pd.DatetimeTZDtype):
+        raise DatasetValidationError(
+            f"{context}: timestamp must be a tz-aware datetime column"
+        )
+    if str(df["timestamp"].dt.tz) != "UTC":
+        raise DatasetValidationError(f"{context}: timestamp must be UTC")
     ts = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
     if ts.isna().any():
         raise DatasetValidationError(f"{context}: {int(ts.isna().sum())} unparsable timestamps")
-    if not df["timestamp"].is_monotonic_increasing or df["timestamp"].duplicated().any():
+    if not ts.is_monotonic_increasing or ts.duplicated().any():
         raise DatasetValidationError(f"{context}: timestamps not strictly increasing/unique")
 
     for side in ("bid", "ask"):
