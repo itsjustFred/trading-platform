@@ -44,20 +44,44 @@ def gate(monkeypatch, tmp_path):
     return module
 
 
-def _write_shard(path: Path, start: str, end: str, *, corrupt: bool = False) -> None:
+def _write_shard(
+    data_root: Path,
+    symbol: str = "US500",
+    timeframe: str = "1h",
+    start: str = "2025-01-01",
+    end: str = "2025-01-02",
+    *,
+    segment: str = "",
+    source: str = "test",
+    corrupt: bool = False,
+) -> Path:
+    """One manifest-layout dataset file for ``symbol``/``timeframe``.
+
+    ``segment`` writes an additional segment file of the same dataset (the
+    store's shard mechanism); ``corrupt`` overwrites the parquet bytes after
+    the manifest entry exists, so the gate must surface it as unreadable.
+    """
     import pandas as pd
 
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if corrupt:
-        path.write_bytes(b"not-a-parquet-file")
-        return
+    from shared import ohlcv_store
+
     frame = pd.DataFrame(
         {
             "timestamp": pd.date_range(start, end, freq="1h", tz="UTC"),
+            "open": 1.0,
+            "high": 1.0,
+            "low": 1.0,
             "close": 1.0,
+            "volume": 1.0,
         }
     )
-    frame.to_parquet(path, index=False)
+    path = ohlcv_store.write_frame(
+        data_root, source, symbol, timeframe, frame,
+        asset_class="equities", segment=segment,
+    )
+    if corrupt:
+        path.write_bytes(b"not-a-parquet-file")
+    return path
 
 
 def test_strict_mode_fails_on_missing_dataset(gate, monkeypatch):
@@ -77,9 +101,7 @@ def test_lenient_mode_skips_on_missing_dataset(gate):
 
 
 def test_lenient_mode_skips_on_insufficient_coverage(gate, tmp_path):
-    _write_shard(
-        tmp_path / "ohlcv" / "US500" / "1h.parquet", "2025-01-01", "2025-02-15"
-    )
+    _write_shard(tmp_path, "US500", "1h", "2025-01-01", "2025-02-15")
 
     with pytest.raises(pytest.skip.Exception) as excinfo:
         gate._require_ohlcv_coverage("US500", "1h", "2025-01-01", "2025-03-31")
@@ -89,9 +111,7 @@ def test_lenient_mode_skips_on_insufficient_coverage(gate, tmp_path):
 
 def test_strict_mode_fails_on_insufficient_coverage(gate, monkeypatch, tmp_path):
     monkeypatch.setattr(gate, "FAIL_ON_MISSING_DATA", True)
-    _write_shard(
-        tmp_path / "ohlcv" / "US500" / "1h.parquet", "2025-01-01", "2025-02-15"
-    )
+    _write_shard(tmp_path, "US500", "1h", "2025-01-01", "2025-02-15")
 
     with pytest.raises(pytest.fail.Exception) as excinfo:
         gate._require_ohlcv_coverage("US500", "1h", "2025-01-01", "2025-03-31")
@@ -102,14 +122,10 @@ def test_strict_mode_fails_on_insufficient_coverage(gate, monkeypatch, tmp_path)
 def test_coverage_check_does_not_union_shard_extents(gate, tmp_path):
     """M2: shards with a hole between them must not pass as 'covered'."""
     _write_shard(
-        tmp_path / "ohlcv" / "US500" / "shard-a" / "1h.parquet",
-        "2025-01-01",
-        "2025-03-01",
+        tmp_path, "US500", "1h", "2025-01-01", "2025-03-01", segment="shard-a"
     )
     _write_shard(
-        tmp_path / "ohlcv" / "US500" / "shard-b" / "1h.parquet",
-        "2025-12-01",
-        "2025-12-31",
+        tmp_path, "US500", "1h", "2025-12-01", "2025-12-31", segment="shard-b"
     )
 
     assert not gate._covers_requested_period(
@@ -120,14 +136,10 @@ def test_coverage_check_does_not_union_shard_extents(gate, tmp_path):
 def test_contiguous_year_shards_cover_the_window(gate, tmp_path):
     """Year-sharded datasets are legitimate: sorted extents must chain."""
     _write_shard(
-        tmp_path / "ohlcv" / "US500" / "2024" / "1h.parquet",
-        "2024-01-01",
-        "2025-01-01",
+        tmp_path, "US500", "1h", "2024-01-01", "2025-01-01", segment="2024"
     )
     _write_shard(
-        tmp_path / "ohlcv" / "US500" / "2025" / "1h.parquet",
-        "2025-01-01",
-        "2025-09-30",
+        tmp_path, "US500", "1h", "2025-01-01", "2025-09-30", segment="2025"
     )
 
     gate._require_ohlcv_coverage("US500", "1h", "2024-01-01", "2025-06-30")
@@ -136,14 +148,10 @@ def test_contiguous_year_shards_cover_the_window(gate, tmp_path):
 def test_gap_between_shards_is_reported_with_labels(gate, tmp_path):
     """A hole between shards is a coverage failure naming both shards."""
     _write_shard(
-        tmp_path / "ohlcv" / "US500" / "a" / "1h.parquet",
-        "2025-01-01",
-        "2025-03-01",
+        tmp_path, "US500", "1h", "2025-01-01", "2025-03-01", segment="a"
     )
     _write_shard(
-        tmp_path / "ohlcv" / "US500" / "b" / "1h.parquet",
-        "2025-09-01",
-        "2025-12-31",
+        tmp_path, "US500", "1h", "2025-09-01", "2025-12-31", segment="b"
     )
 
     with pytest.raises(pytest.skip.Exception) as excinfo:
@@ -156,8 +164,10 @@ def test_gap_between_shards_is_reported_with_labels(gate, tmp_path):
 
 def test_corrupt_parquet_is_surfaced_not_silently_ignored(gate, tmp_path):
     """M3: an unreadable file must be named in the reason, not dropped."""
-    corrupt = tmp_path / "ohlcv" / "US500" / "broken" / "1h.parquet"
-    _write_shard(corrupt, "2025-01-01", "2025-03-01", corrupt=True)
+    _write_shard(
+        tmp_path, "US500", "1h", "2025-01-01", "2025-03-01",
+        segment="broken", corrupt=True,
+    )
 
     with pytest.raises(pytest.skip.Exception) as excinfo:
         gate._require_ohlcv_coverage("US500", "1h", "2025-01-01", "2025-03-31")
@@ -169,12 +179,12 @@ def test_corrupt_parquet_is_surfaced_not_silently_ignored(gate, tmp_path):
 
 def test_corrupt_parquet_fails_with_strict_mode(gate, monkeypatch, tmp_path):
     """A corrupt file next to a covering file is still a hard failure in strict mode."""
-    corrupt = tmp_path / "ohlcv" / "US500" / "broken" / "1h.parquet"
-    _write_shard(corrupt, "2025-01-01", "2025-03-01", corrupt=True)
     _write_shard(
-        tmp_path / "ohlcv" / "US500" / "good" / "1h.parquet",
-        "2025-01-01",
-        "2025-03-31",
+        tmp_path, "US500", "1h", "2025-01-01", "2025-03-01",
+        segment="broken", corrupt=True,
+    )
+    _write_shard(
+        tmp_path, "US500", "1h", "2025-01-01", "2025-03-31", segment="good"
     )
 
     monkeypatch.setattr(gate, "FAIL_ON_MISSING_DATA", True)
@@ -184,9 +194,7 @@ def test_corrupt_parquet_fails_with_strict_mode(gate, monkeypatch, tmp_path):
 
 
 def test_fully_covering_single_file_passes(gate, tmp_path):
-    _write_shard(
-        tmp_path / "ohlcv" / "US500" / "1h.parquet", "2025-01-01", "2025-04-01"
-    )
+    _write_shard(tmp_path, "US500", "1h", "2025-01-01", "2025-04-01")
 
     gate._require_ohlcv_coverage("US500", "1h", "2025-01-01", "2025-03-31")
 
@@ -225,7 +233,7 @@ def test_strict_mode_failures_are_not_counted_as_skips(gate, tmp_path, capsys):
     failure a "skip", an operator reading the CI log would triage a broken
     run as a data-limited one.
     """
-    _write_shard(tmp_path / "ohlcv" / "US500" / "1h.parquet", "2025-01-01", "2025-02-01")
+    _write_shard(tmp_path, "US500", "1h", "2025-01-01", "2025-02-01")
     gate.FAIL_ON_MISSING_DATA = True
 
     with pytest.raises(gate.pytest.fail.Exception if hasattr(gate, "pytest") else Exception):
@@ -253,7 +261,7 @@ def test_ohlcv_opt_in_reads_a_local_dataset_outside_the_suite_data_dir(gate, mon
     they name them explicitly with TP_TEST_OHLCV_DIR (read-only; the data-dir guard never sees
     it)."""
     local_datasets = tmp_path / "local-datasets"
-    _write_shard(local_datasets / "forex" / "EURUSD" / "1h.parquet", "2024-01-01", "2024-01-02")
+    _write_shard(local_datasets, "EURUSD", "1h", "2024-01-01", "2024-01-02")
     monkeypatch.delenv("TP_TEST_OHLCV_DIR", raising=False)
     assert not gate._has_ohlcv_data("EURUSD", "1h")
 

@@ -573,9 +573,11 @@ def test_pyne_cli_receives_full_day_bounds_for_date_only_config(monkeypatch, tmp
             "volume": [1000.0] * 48,
         }
     )
-    ohlcv_dir = tmp_path / "ohlcv" / "test" / "PYNE" / "1h.parquet"
-    ohlcv_dir.parent.mkdir(parents=True, exist_ok=True)
-    frame.to_parquet(ohlcv_dir, index=False)
+    from shared import ohlcv_store
+
+    ohlcv_store.write_frame(
+        tmp_path, "test", "PYNE", "1h", frame, asset_class="equities"
+    )
     strategy = tmp_path / "pyne_bound.py"
     strategy.write_text(
         "STRATEGY_META = {'name': 'pyne_bound'}\n"

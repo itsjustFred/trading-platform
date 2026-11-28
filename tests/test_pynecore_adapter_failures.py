@@ -12,19 +12,26 @@ from tests.builders import make_backtest_config
 
 
 def _write_ohlcv(tmp_path: Path, symbol: str) -> None:
-    path = tmp_path / "data" / "ohlcv" / "test" / symbol / "1d.parquet"
-    path.parent.mkdir(parents=True, exist_ok=True)
+    from shared import ohlcv_store
+
     stamps = pd.date_range("2024-01-02", periods=20, freq="D", tz="UTC")
-    pd.DataFrame(
-        {
-            "timestamp": stamps,
-            "open": [100.0] * len(stamps),
-            "high": [101.0] * len(stamps),
-            "low": [99.0] * len(stamps),
-            "close": [100.5] * len(stamps),
-            "volume": [1000.0] * len(stamps),
-        }
-    ).to_parquet(path, index=False)
+    ohlcv_store.write_frame(
+        tmp_path / "data",
+        "test",
+        symbol,
+        "1d",
+        pd.DataFrame(
+            {
+                "timestamp": stamps,
+                "open": [100.0] * len(stamps),
+                "high": [101.0] * len(stamps),
+                "low": [99.0] * len(stamps),
+                "close": [100.5] * len(stamps),
+                "volume": [1000.0] * len(stamps),
+            }
+        ),
+        asset_class="equities",
+    )
 
 
 def _config(tmp_path: Path, symbols: list[str]) -> BacktestConfig:

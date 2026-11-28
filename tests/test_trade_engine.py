@@ -13,6 +13,7 @@ from runner.engines.base import BacktestConfig
 from runner.engines.contract import parse_date_bound
 from runner.engines.native_adapter import NativeAdapter
 from runner.engines.vectorbt_adapter import VectorbtAdapter
+from shared import ohlcv_store
 from shared.constants import DATA_DIR
 from tests.builders import make_backtest_config
 from tests.helpers import TEST_OHLCV_DIR_ENV, resolve_ohlcv_root
@@ -521,8 +522,10 @@ def test_example_sma_native_vs_vectorbt_smoke_on_local_data():
         pytest.skip("example_sma strategy not found")
 
     ohlcv_root = resolve_ohlcv_root(DATA_DIR)
-    parquet_files = list(ohlcv_root.rglob("**/1h.parquet"))
-    if not parquet_files:
+    datasets = list(
+        ohlcv_store.list_datasets(ohlcv_root.parent, timeframe="1h")
+    )
+    if not datasets:
         pytest.skip(
             f"No local 1h OHLCV parquet data under {ohlcv_root}: set "
             f"{TEST_OHLCV_DIR_ENV}=/path/to/ohlcv to run this real-data smoke "
@@ -531,9 +534,9 @@ def test_example_sma_native_vs_vectorbt_smoke_on_local_data():
 
     selected = next(
         (
-            path
-            for path in parquet_files
-            if _has_coverage(path, start="2024-01-01", end="2025-12-31")
+            entry
+            for entry in datasets
+            if _has_coverage(entry.path, start="2024-01-01", end="2025-12-31")
         ),
         None,
     )
@@ -543,7 +546,7 @@ def test_example_sma_native_vs_vectorbt_smoke_on_local_data():
             f"2024-01-01..2025-12-31 (set {TEST_OHLCV_DIR_ENV}=/path/to/ohlcv)"
         )
 
-    symbol = selected.parent.name
+    symbol = selected.symbol
     cfg = make_backtest_config(risk_per_trade_pct=0.01,
         strategy_name="example_sma",
         symbols=[symbol],

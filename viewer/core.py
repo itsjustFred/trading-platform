@@ -893,6 +893,16 @@ def ohlcv_asset_class(symbol: str, timeframe: str) -> str:
     for path in matches:
         entry = ohlcv_store.entry_for_path(DATA_DIR, path)
         asset_classes.add(entry.asset_class if entry is not None else "")
+    if asset_classes == {""} and len(matches) == 1:
+        # The single match is a legacy-layout file the store cannot resolve
+        # (#471 phase 1: ``_ohlcv_candidates`` still scans the old tree).
+        # Defer to the manifest dataset for the same symbol/timeframe when
+        # one exists; phase 2 rewrites this lookup against the store.
+        entry = ohlcv_store.find_dataset(
+            DATA_DIR, normalized_symbol, normalized_timeframe
+        )
+        if entry is not None:
+            asset_classes = {entry.asset_class}
     if len(asset_classes) != 1:
         return ""
     return asset_classes.pop()

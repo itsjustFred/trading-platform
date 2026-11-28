@@ -42,10 +42,16 @@ def _write_ohlcv(
     start: str = "2026-10-01",
     periods: int = 1000,
 ) -> None:
-    symbol_dir = data_root / "ohlcv" / "yfinance" / "equity" / "US" / symbol
-    symbol_dir.mkdir(parents=True)
-    _ohlcv_frame(start=start, periods=periods, freq=freq).to_parquet(
-        symbol_dir / f"{timeframe}.parquet", index=False
+    from shared import ohlcv_store
+
+    ohlcv_store.write_frame(
+        data_root,
+        "yfinance",
+        symbol,
+        timeframe,
+        _ohlcv_frame(start=start, periods=periods, freq=freq),
+        asset_class="equity",
+        region="US",
     )
 
 

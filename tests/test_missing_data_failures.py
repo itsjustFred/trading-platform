@@ -47,20 +47,27 @@ def _write_strategy(tmp_path: Path) -> Path:
 
 
 def _write_ohlcv(tmp_path: Path, symbol: str) -> None:
-    path = tmp_path / "data" / "ohlcv" / "test" / symbol / "1d.parquet"
-    path.parent.mkdir(parents=True, exist_ok=True)
+    from shared import ohlcv_store
+
     stamps = pd.date_range("2024-01-02", periods=20, freq="D", tz="UTC")
     close = [100.0 + i for i in range(len(stamps))]
-    pd.DataFrame(
-        {
-            "timestamp": stamps,
-            "open": close,
-            "high": [c + 1 for c in close],
-            "low": [c - 1 for c in close],
-            "close": close,
-            "volume": [1000.0] * len(stamps),
-        }
-    ).to_parquet(path, index=False)
+    ohlcv_store.write_frame(
+        tmp_path / "data",
+        "test",
+        symbol,
+        "1d",
+        pd.DataFrame(
+            {
+                "timestamp": stamps,
+                "open": close,
+                "high": [c + 1 for c in close],
+                "low": [c - 1 for c in close],
+                "close": close,
+                "volume": [1000.0] * len(stamps),
+            }
+        ),
+        asset_class="equities",
+    )
 
 
 @pytest.mark.parametrize("adapter_factory", [VectorbtAdapter, NativeAdapter])

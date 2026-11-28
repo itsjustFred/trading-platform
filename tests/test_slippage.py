@@ -1294,19 +1294,18 @@ class TestViewerOhlcvAssetClass:
     def test_asset_class_comes_from_the_loaded_ohlcv_path(
         self, monkeypatch, tmp_path: Path
     ) -> None:
+        from tests.helpers import write_ohlcv
         from viewer import core
 
         monkeypatch.setattr(core, "DATA_DIR", tmp_path)
-        path = (
-            tmp_path
-            / "ohlcv"
-            / "dukascopy"
-            / "forex"
-            / "EURUSD"
-            / "1h.parquet"
+        write_ohlcv(
+            tmp_path,
+            "EURUSD",
+            _engine_frame(),
+            timeframe="1h",
+            source="dukascopy",
+            asset_class="forex",
         )
-        path.parent.mkdir(parents=True)
-        _engine_frame().to_parquet(path, index=False)
 
         assert core.ohlcv_asset_class("EURUSD", "1h") == "forex"
         assert core.ohlcv_asset_class("MISSING", "1h") == ""

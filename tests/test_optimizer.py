@@ -122,10 +122,21 @@ def _write_base_backtest(
     result.save(backtests_dir / "base-demo.trades.json")
 
 
-def _write_ohlcv_bars(data_dir: Path, symbol: str, timestamps: list[str]) -> None:
-    path = data_dir / "ohlcv" / "test" / symbol / "1d.parquet"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame(
+def _write_ohlcv_bars(
+    data_dir: Path, symbol: str, timestamps: list[str], *, manifest: bool = True
+) -> None:
+    """Fixture bars in both layouts.
+
+    ``manifest=True`` writes through ``ohlcv_store.write_frame`` for the
+    migrated runner readers and also drops the legacy
+    ``ohlcv/<source>/<asset_class>/<symbol>/<tf>.parquet`` file that the
+    phase-2 ``auto_download`` coverage gates still scan. ``manifest=False``
+    writes only the legacy file — for cases whose timestamps violate the
+    store's write contract but that exercise ``auto_download`` directly.
+    """
+    from shared import ohlcv_store
+
+    frame = pd.DataFrame(
         {
             "timestamp": timestamps,
             "open": [100.0] * len(timestamps),
@@ -134,7 +145,18 @@ def _write_ohlcv_bars(data_dir: Path, symbol: str, timestamps: list[str]) -> Non
             "close": [100.5] * len(timestamps),
             "volume": [1000.0] * len(timestamps),
         }
-    ).to_parquet(path, index=False)
+    )
+    if manifest:
+        ohlcv_store.write_frame(
+            data_dir, "test", symbol, "1d", frame, asset_class="equities"
+        )
+    # Legacy fixture path, identical to what this helper wrote before #471:
+    # ``ohlcv/<source>/<symbol>/<tf>.parquet``. ``auto_download``'s venue
+    # resolver only recognises this shallow shape (or a recognised singular
+    # asset class) for ``has_sufficient_segment_coverage``.
+    legacy_path = data_dir / "ohlcv" / "test" / symbol / "1d.parquet"
+    legacy_path.parent.mkdir(parents=True, exist_ok=True)
+    frame.to_parquet(legacy_path, index=False)
 
 
 def test_has_ohlcv_bars_in_range_uses_exact_valid_utc_timestamps(tmp_path: Path):
@@ -142,6 +164,7 @@ def test_has_ohlcv_bars_in_range_uses_exact_valid_utc_timestamps(tmp_path: Path)
         tmp_path,
         "AAPL",
         ["invalid", "2024-01-02T00:00:00+00:00", "2024-01-09T00:00:00+00:00"],
+        manifest=False,
     )
 
     assert has_ohlcv_bars_in_range(

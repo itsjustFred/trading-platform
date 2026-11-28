@@ -327,21 +327,26 @@ def _assert_json_equal(actual: Any, expected: Any, path: str = "$") -> None:
 
 def _build_fixture(tmp_path: Path) -> tuple[Path, Path, Path]:
     data_dir = tmp_path / "data"
-    parquet_path = (
-        data_dir / "ohlcv" / "golden" / "equities" / "PARITY" / "1h.parquet"
-    )
-    parquet_path.parent.mkdir(parents=True)
+    from tests.helpers import write_ohlcv
+
     timestamps = pd.date_range("2024-01-01T00:00:00Z", periods=len(CLOSES), freq="h")
-    pd.DataFrame(
-        {
-            "timestamp": timestamps,
-            "open": CLOSES,
-            "high": [close + 1.0 for close in CLOSES],
-            "low": [close - 1.0 for close in CLOSES],
-            "close": CLOSES,
-            "volume": [1000.0] * len(CLOSES),
-        }
-    ).to_parquet(parquet_path, index=False)
+    write_ohlcv(
+        data_dir,
+        "PARITY",
+        pd.DataFrame(
+            {
+                "timestamp": timestamps,
+                "open": CLOSES,
+                "high": [close + 1.0 for close in CLOSES],
+                "low": [close - 1.0 for close in CLOSES],
+                "close": CLOSES,
+                "volume": [1000.0] * len(CLOSES),
+            }
+        ),
+        timeframe="1h",
+        source="golden",
+        asset_class="equities",
+    )
 
     strategy_path = tmp_path / "strategies" / "backtest_golden.py"
     strategy_path.parent.mkdir()

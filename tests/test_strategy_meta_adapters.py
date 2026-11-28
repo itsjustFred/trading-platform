@@ -21,6 +21,14 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 STRATEGIES_DIR = DEFAULT_STRATEGIES_DIR
 
 
+def _write_ohlcv(data_root: Path, symbol: str, timeframe: str, frame: pd.DataFrame) -> None:
+    from shared import ohlcv_store
+
+    ohlcv_store.write_frame(
+        data_root, "test_source", symbol, timeframe, frame, asset_class="equities"
+    )
+
+
 
 def _load_module(path: Path):
     spec = importlib.util.spec_from_file_location(path.stem, str(path))
@@ -69,8 +77,6 @@ def generate_signals(df: pd.DataFrame, params: dict):
     )
 
     data_root = tmp_path / "data"
-    parquet_dir = data_root / "ohlcv" / "test_source" / "equities" / "AAPL"
-    parquet_dir.mkdir(parents=True)
     df = pd.DataFrame(
         {
             "timestamp": pd.date_range("2024-01-01", periods=5, freq="D", tz="UTC"),
@@ -81,7 +87,7 @@ def generate_signals(df: pd.DataFrame, params: dict):
             "volume": [10, 11, 12, 13, 14],
         }
     )
-    df.to_parquet(parquet_dir / "1d.parquet", index=False)
+    _write_ohlcv(data_root, "AAPL", "1d", df)
 
     adapter = VectorbtAdapter()
     result = adapter.run(
@@ -140,18 +146,21 @@ def generate_signals(df: pd.DataFrame, params: dict):
     )
 
     data_root = tmp_path / "data"
-    parquet_dir = data_root / "ohlcv" / "test_source" / "equities" / "AAPL"
-    parquet_dir.mkdir(parents=True)
-    pd.DataFrame(
-        {
-            "timestamp": pd.date_range("2024-01-01", periods=6, freq="D", tz="UTC"),
-            "open": [100, 101, 102, 103, 104, 105],
-            "high": [101, 102, 103, 104, 105, 106],
-            "low": [99, 100, 101, 102, 103, 104],
-            "close": [100, 101, 102, 103, 104, 105],
-            "volume": [10, 11, 12, 13, 14, 15],
-        }
-    ).to_parquet(parquet_dir / "1d.parquet", index=False)
+    _write_ohlcv(
+        data_root,
+        "AAPL",
+        "1d",
+        pd.DataFrame(
+            {
+                "timestamp": pd.date_range("2024-01-01", periods=6, freq="D", tz="UTC"),
+                "open": [100, 101, 102, 103, 104, 105],
+                "high": [101, 102, 103, 104, 105, 106],
+                "low": [99, 100, 101, 102, 103, 104],
+                "close": [100, 101, 102, 103, 104, 105],
+                "volume": [10, 11, 12, 13, 14, 15],
+            }
+        ),
+    )
 
     result = VectorbtAdapter().run(
         make_backtest_config(
@@ -227,18 +236,21 @@ def generate_signals(df: pd.DataFrame, params: dict):
     )
 
     data_root = tmp_path / "data"
-    parquet_dir = data_root / "ohlcv" / "test_source" / "equities" / "AAPL"
-    parquet_dir.mkdir(parents=True)
-    pd.DataFrame(
-        {
-            "timestamp": pd.date_range("2024-01-01", periods=3, freq="D", tz="UTC"),
-            "open": [100, 101, 102],
-            "high": [101, 102, 103],
-            "low": [99, 100, 101],
-            "close": [100, 101, 102],
-            "volume": [10, 11, 12],
-        }
-    ).to_parquet(parquet_dir / "1d.parquet", index=False)
+    _write_ohlcv(
+        data_root,
+        "AAPL",
+        "1d",
+        pd.DataFrame(
+            {
+                "timestamp": pd.date_range("2024-01-01", periods=3, freq="D", tz="UTC"),
+                "open": [100, 101, 102],
+                "high": [101, 102, 103],
+                "low": [99, 100, 101],
+                "close": [100, 101, 102],
+                "volume": [10, 11, 12],
+            }
+        ),
+    )
 
     result = VectorbtAdapter().run(
         make_backtest_config(signal_exit_fill="close", risk_per_trade_pct=0.01,
@@ -282,35 +294,43 @@ def generate_signals(df: pd.DataFrame, params: dict):
     )
 
     data_root = tmp_path / "data"
-    symbol_dir = data_root / "ohlcv" / "test_source" / "equities" / "AAPL"
-    symbol_dir.mkdir(parents=True)
-    pd.DataFrame(
-        {
-            "timestamp": pd.date_range("2024-01-01T00:00:00Z", periods=3, freq="1h", tz="UTC"),
-            "open": [100, 101, 110],
-            "high": [101, 111, 112],
-            "low": [99, 100, 109],
-            "close": [100, 110, 111],
-            "volume": [10, 11, 12],
-        }
-    ).to_parquet(symbol_dir / "1h.parquet", index=False)
-    pd.DataFrame(
-        {
-            "timestamp": pd.to_datetime(
-                [
-                    "2024-01-01T01:15:00Z",
-                    "2024-01-01T01:30:00Z",
-                    "2024-01-01T02:15:00Z",
-                ],
-                utc=True,
-            ),
-            "open": [100.5, 104.0, 104.5],
-            "high": [104.5, 105.5, 105.0],
-            "low": [100.0, 103.5, 104.0],
-            "close": [104.0, 105.0, 104.8],
-            "volume": [1, 1, 1],
-        }
-    ).to_parquet(symbol_dir / "1m.parquet", index=False)
+    _write_ohlcv(
+        data_root,
+        "AAPL",
+        "1h",
+        pd.DataFrame(
+            {
+                "timestamp": pd.date_range("2024-01-01T00:00:00Z", periods=3, freq="1h", tz="UTC"),
+                "open": [100, 101, 110],
+                "high": [101, 111, 112],
+                "low": [99, 100, 109],
+                "close": [100, 110, 111],
+                "volume": [10, 11, 12],
+            }
+        ),
+    )
+    _write_ohlcv(
+        data_root,
+        "AAPL",
+        "1m",
+        pd.DataFrame(
+            {
+                "timestamp": pd.to_datetime(
+                    [
+                        "2024-01-01T01:15:00Z",
+                        "2024-01-01T01:30:00Z",
+                        "2024-01-01T02:15:00Z",
+                    ],
+                    utc=True,
+                ),
+                "open": [100.5, 104.0, 104.5],
+                "high": [104.5, 105.5, 105.0],
+                "low": [100.0, 103.5, 104.0],
+                "close": [104.0, 105.0, 104.8],
+                "volume": [1, 1, 1],
+            }
+        ),
+    )
 
     result = VectorbtAdapter().run(
         make_backtest_config(
@@ -374,18 +394,21 @@ def generate_signals(df: pd.DataFrame, params: dict):
     )
 
     data_root = tmp_path / "data"
-    parquet_dir = data_root / "ohlcv" / "test_source" / "equities" / "AAPL"
-    parquet_dir.mkdir(parents=True)
-    pd.DataFrame(
-        {
-            "timestamp": pd.date_range("2024-01-01", periods=5, freq="D", tz="UTC"),
-            "open": [100, 101, 102, 103, 104],
-            "high": [101, 102, 103, 104, 105],
-            "low": [99, 100, 101, 102, 103],
-            "close": [100, 101, 102, 103, 104],
-            "volume": [10, 11, 12, 13, 14],
-        }
-    ).to_parquet(parquet_dir / "1d.parquet", index=False)
+    _write_ohlcv(
+        data_root,
+        "AAPL",
+        "1d",
+        pd.DataFrame(
+            {
+                "timestamp": pd.date_range("2024-01-01", periods=5, freq="D", tz="UTC"),
+                "open": [100, 101, 102, 103, 104],
+                "high": [101, 102, 103, 104, 105],
+                "low": [99, 100, 101, 102, 103],
+                "close": [100, 101, 102, 103, 104],
+                "volume": [10, 11, 12, 13, 14],
+            }
+        ),
+    )
 
     result = VectorbtAdapter().run(
         make_backtest_config(

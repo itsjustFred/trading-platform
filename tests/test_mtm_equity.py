@@ -463,9 +463,11 @@ def generate_signals(df, params):
 
 
 def _write_symbol(data_dir: Path, symbol: str, frame: pd.DataFrame, timeframe: str = "1d") -> None:
-    target = data_dir / "ohlcv" / "test_source" / "equities" / symbol
-    target.mkdir(parents=True, exist_ok=True)
-    frame.to_parquet(target / f"{timeframe}.parquet", index=False)
+    from shared import ohlcv_store
+
+    ohlcv_store.write_frame(
+        data_dir, "test_source", symbol, timeframe, frame, asset_class="equities"
+    )
 
 
 

@@ -412,9 +412,11 @@ def ref_execute(frame: pd.DataFrame, sig: Signals, cfg: RefConfig) -> list[RefTr
 def _write(
     data_dir: Path, frame: pd.DataFrame, *, symbol="SYN", timeframe="1d", cls="equities"
 ) -> None:
-    target = data_dir / "ohlcv" / "test_source" / cls / symbol
-    target.mkdir(parents=True, exist_ok=True)
-    frame.to_parquet(target / f"{timeframe}.parquet", index=False)
+    from shared import ohlcv_store
+
+    ohlcv_store.write_frame(
+        data_dir, "test_source", symbol, timeframe, frame, asset_class=cls
+    )
 
 
 def _config(
