@@ -164,10 +164,10 @@ def combine_sides(bid: pd.DataFrame, ask: pd.DataFrame) -> pd.DataFrame:
         how="outer",
         validate="one_to_one",
         suffixes=("_bid", "_ask"),
-    ).sort_values("timestamp")
+    )
     rename = {f"{c}_{side}": f"{side}_{c}" for side in ("bid", "ask") for c in OHLCV}
-    joined = joined.rename(columns=rename).sort_index()
-    return joined.reset_index()[M1_COLUMNS]
+    joined = joined.rename(columns=rename).sort_values("timestamp")
+    return joined.reset_index(drop=True)[M1_COLUMNS]
 
 
 def frames_for(bid_m1: pd.DataFrame, ask_m1: pd.DataFrame) -> dict[str, pd.DataFrame]:

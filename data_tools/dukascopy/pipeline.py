@@ -28,10 +28,13 @@ import tempfile
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 
 import numpy as np
 import pandas as pd
+
+if TYPE_CHECKING:
+    import pyarrow.parquet as pq
 
 from data_tools.dukascopy import calendar as duk_calendar
 from data_tools.dukascopy import convert, fetch, validate
@@ -165,11 +168,34 @@ def _parquet_footer(path: Path) -> dict | None:
         or not getattr(first_stats, "has_min_max", False)
         or not getattr(last_stats, "has_min_max", False)
     ):
-        return {"rows": md.num_rows}
+        return {"rows": md.num_rows, **_edge_timestamps(pf)}
     return {
         "rows": md.num_rows,
         "first": str(pd.to_datetime(first_stats.min, utc=True)),
         "last": str(pd.to_datetime(last_stats.max, utc=True)),
+    }
+
+
+def _edge_timestamps(pf: pq.ParquetFile) -> dict[str, str]:
+    """``first``/``last`` timestamps read from the outer row groups.
+
+    Fallback for files written without column statistics: frames are stored
+    time-sorted, so the span lives in the first and last row groups.
+    """
+    try:
+        first = (
+            pf.read_row_group(0, columns=["timestamp"]).column("timestamp")[0].as_py()
+        )
+        last = (
+            pf.read_row_group(pf.metadata.num_row_groups - 1, columns=["timestamp"])
+            .column("timestamp")[-1]
+            .as_py()
+        )
+    except Exception:  # noqa: BLE001 - unreadable edges just skip the span check
+        return {}
+    return {
+        "first": str(pd.to_datetime(first, utc=True)),
+        "last": str(pd.to_datetime(last, utc=True)),
     }
 
 
@@ -198,18 +224,28 @@ def _entry_file_problems(root: Path, symbol: str, entry: dict) -> list[tuple[str
     return problems
 
 
-def _umask() -> int:
-    mask = os.umask(0)
-    os.umask(mask)
-    return mask
+def _tmp_sibling(final: Path, prefix: str) -> Path:
+    """Empty temp file next to ``final`` with mode ``0666 & ~umask``.
+
+    ``mkstemp`` hard-codes 0600, so the file is recreated exclusively through
+    ``open()`` — which lets the kernel apply the process umask — before the
+    parquet/json writers truncate it in place (the mode is preserved).
+    """
+    fd, name = tempfile.mkstemp(prefix=prefix, suffix=".tmp", dir=str(final.parent))
+    os.close(fd)
+    tmp = Path(name)
+    tmp.unlink()
+    with open(tmp, "xb"):
+        pass
+    return tmp
 
 
-def _publish_mode(final: Path) -> int:
-    """Mode for a published file: keep the existing file's mode, else 0666&~umask."""
+def _publish_mode(final: Path, tmp: Path) -> int:
+    """Mode for a published file: keep the existing file's mode, else the temp's."""
     try:
         return stat_mod.S_IMODE(final.stat().st_mode)
     except OSError:
-        return 0o666 & ~_umask()
+        return stat_mod.S_IMODE(tmp.stat().st_mode)
 
 
 def _fsync_file(path: Path) -> None:
@@ -222,15 +258,11 @@ def _fsync_file(path: Path) -> None:
 
 def _write_parquet_tmp(df: pd.DataFrame, final: Path) -> Path:
     """Write ``df`` to a temp sibling of ``final``; caller renames to publish."""
-    fd, tmp_name = tempfile.mkstemp(
-        prefix=final.name + ".", suffix=".tmp", dir=str(final.parent)
-    )
-    os.close(fd)
-    tmp = Path(tmp_name)
+    tmp = _tmp_sibling(final, final.name + ".")
     try:
         df.reset_index(drop=True).to_parquet(tmp, index=False, compression="zstd")
         _fsync_file(tmp)
-        os.chmod(tmp, _publish_mode(final))
+        os.chmod(tmp, _publish_mode(final, tmp))
     except Exception:
         tmp.unlink(missing_ok=True)
         raise
@@ -379,8 +411,7 @@ def _gap_violations(
 def _merge_missing_days(entry: dict, missing: dict[str, list[str]]) -> None:
     for side, days in missing.items():
         key = f"missing_days_{side}"
-        existing = list(entry.get(key) or [])
-        entry[key] = sorted(set(existing) | set(days))
+        entry[key] = sorted(set(entry.get(key) or []) | set(days))
 
 
 def _parse_date(value: str | date | None) -> date | None:
@@ -486,6 +517,7 @@ def _all_frames(
     tf_rebuild: bool,
     full: bool,
     coverage_floor: int,
+    expected_span: tuple[pd.Timestamp | None, pd.Timestamp | None] | None,
     existing_m1_fp: int | None,
     existing_m1_last: pd.Timestamp | None,
     report: SymbolReport,
@@ -522,6 +554,12 @@ def _all_frames(
             f"{coverage_floor}-row coverage floor"
         )
         return None
+    if full and expected_span is not None:
+        span_error = _full_span_error(combined_m1, expected_span)
+        if span_error is not None:
+            report.status = "failed"
+            report.error = span_error
+            return None
     if existing_m1_last is not None:
         report.new_m1_rows = int(
             (combined_m1["timestamp"] > existing_m1_last).sum()
@@ -586,6 +624,7 @@ def _process_symbol(
     full: bool,
     tf_rebuild: bool,
     coverage_floor: int,
+    expected_span: tuple[pd.Timestamp | None, pd.Timestamp | None] | None,
     fetcher: FetchFn,
     staged: list[tuple[Path, Path]],
 ) -> SymbolReport:
@@ -636,6 +675,7 @@ def _process_symbol(
         tf_rebuild=tf_rebuild,
         full=full,
         coverage_floor=coverage_floor,
+        expected_span=expected_span,
         existing_m1_fp=existing_m1_fp,
         existing_m1_last=existing_m1_last,
         report=report,
@@ -758,6 +798,43 @@ def _coverage_floor(old_entry: dict, symbol: str, *, full: bool) -> int:
     return int(int(rows) * FULL_MIN_ROW_RATIO) if rows else 0
 
 
+def _entry_ts(value: object) -> pd.Timestamp | None:
+    """Parse a manifest timestamp string; None when absent or unparseable."""
+    if not value:
+        return None
+    try:
+        ts = pd.Timestamp(str(value))
+    except (TypeError, ValueError):
+        return None
+    return None if pd.isna(ts) else ts
+
+
+def _expected_m1_span(
+    entry: dict, symbol: str
+) -> tuple[pd.Timestamp | None, pd.Timestamp | None]:
+    """Published ``(first, last)`` M1 span from the manifest entry."""
+    info = (entry.get("files") or {}).get(f"{symbol}_M1.parquet") or {}
+    return _entry_ts(info.get("first")), _entry_ts(info.get("last"))
+
+
+def _full_span_error(
+    combined_m1: pd.DataFrame,
+    expected_span: tuple[pd.Timestamp | None, pd.Timestamp | None],
+) -> str | None:
+    """Refuse a ``--full`` rebuild whose M1 span no longer covers the manifest."""
+    exp_first, exp_last = expected_span
+    got_first = combined_m1["timestamp"].iloc[0]
+    got_last = combined_m1["timestamp"].iloc[-1]
+    if (exp_first is not None and got_first > exp_first) or (
+        exp_last is not None and got_last < exp_last
+    ):
+        return (
+            f"full rebuild span {got_first}..{got_last} does not cover the "
+            f"published span {exp_first}..{exp_last}"
+        )
+    return None
+
+
 def _rebuild_manifest(
     manifest: dict, updated_entries: dict[str, tuple[dict, dict]]
 ) -> dict[str, dict]:
@@ -799,15 +876,11 @@ def _rebuild_manifest(
 
 def _write_manifest(root: Path, new_manifest: dict) -> None:
     """Atomically replace ``manifest.json`` (temp file + fsync + rename)."""
-    fd, tmp_name = tempfile.mkstemp(
-        prefix=f".{MANIFEST_NAME}.", suffix=".tmp", dir=str(root)
-    )
-    os.close(fd)
-    manifest_tmp = Path(tmp_name)
+    manifest_tmp = _tmp_sibling(root / MANIFEST_NAME, f".{MANIFEST_NAME}.")
     try:
         manifest_tmp.write_text(json.dumps(new_manifest, indent=1))
         _fsync_file(manifest_tmp)
-        os.chmod(manifest_tmp, _publish_mode(root / MANIFEST_NAME))
+        os.chmod(manifest_tmp, _publish_mode(root / MANIFEST_NAME, manifest_tmp))
         os.replace(manifest_tmp, root / MANIFEST_NAME)
     except Exception:
         manifest_tmp.unlink(missing_ok=True)
@@ -848,7 +921,7 @@ def update_dataset(
 
     if isinstance(symbols, str):
         symbols = [symbols]
-    wanted = list(symbols) if symbols else list(CANONICAL_SYMBOLS)
+    wanted = list(symbols) if symbols is not None else list(CANONICAL_SYMBOLS)
 
     cleaned = _clean_stale_tmps(root)
     if cleaned:
@@ -907,6 +980,7 @@ def update_dataset(
                     full=full,
                     tf_rebuild=tf_rebuild,
                     coverage_floor=coverage_floor,
+                    expected_span=_expected_m1_span(old_entry, symbol),
                     fetcher=fetch_fn,
                     staged=staged,
                 )

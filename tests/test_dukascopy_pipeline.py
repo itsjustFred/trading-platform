@@ -238,6 +238,20 @@ def test_week_floor_sunday_alignment():
     )
 
 
+def test_combine_sides_sorts_minutes_present_on_one_side_only():
+    """One-sided-only minutes must not leave the joined frame unsorted."""
+    day = date(2026, 11, 20)
+    # bid: 00:00 and 02:00; ask: 01:00 and 02:00 -> 00:00 bid-only, 01:00
+    # ask-only; inputs deliberately out of order.
+    bid = _side_frame(day, [120, 0], ask=False)
+    ask = _side_frame(day, [60, 120], ask=True)
+    out = convert.combine_sides(bid, ask)
+    assert out["timestamp"].is_monotonic_increasing
+    assert list(out["timestamp"].dt.strftime("%H:%M")) == ["00:00", "01:00", "02:00"]
+    assert bool(out["bid_open"].isna().iloc[1])
+    assert bool(out["ask_open"].isna().iloc[0])
+
+
 # ─── validation ──────────────────────────────────────────────────────────────
 
 
@@ -720,7 +734,9 @@ def test_full_ignores_stored_m1_and_refuses_shrinking_coverage(tmp_path, monkeyp
         root, symbols=["EURUSD"], start="2026-11-16", end="2026-11-19",
         raw_dir=raw, fetcher=fetcher,
     )
-    # Poison the stored M1 with an extra stale row and a matching manifest lie.
+    # Poison the stored M1 with an extra stale row and a matching manifest lie
+    # about the row count (first/last stay truthful so the --full span guard
+    # still sees the published coverage).
     m1_path = root / "EURUSD" / "EURUSD_M1.parquet"
     m1 = pd.read_parquet(m1_path)
     stale = m1.iloc[[0]].copy()
@@ -729,9 +745,6 @@ def test_full_ignores_stored_m1_and_refuses_shrinking_coverage(tmp_path, monkeyp
     poisoned.to_parquet(m1_path, index=False)
     manifest = json.loads((root / "manifest.json").read_text())
     manifest["EURUSD"]["files"]["EURUSD_M1.parquet"]["rows"] = len(poisoned)
-    manifest["EURUSD"]["files"]["EURUSD_M1.parquet"]["first"] = str(
-        poisoned["timestamp"].iloc[0]
-    )
     (root / "manifest.json").write_text(json.dumps(manifest))
     fetcher.calls.clear()
     rep = pipeline.update_dataset(
@@ -744,6 +757,29 @@ def test_full_ignores_stored_m1_and_refuses_shrinking_coverage(tmp_path, monkeyp
     m1 = _read(root, "EURUSD", "M1")
     assert "2015-06-01" not in set(m1["timestamp"].dt.strftime("%Y-%m-%d"))
     assert pipeline.verify_manifest(root) == []
+
+
+def test_full_refuses_rebuild_that_shrinks_the_published_span(tmp_path, monkeypatch):
+    root = tmp_path / "dukascopy"
+    raw = tmp_path / "raw"
+    monkeypatch.setattr(pipeline, "DATASET_START", date(2026, 11, 16))
+    days = _fixture_days(date(2026, 11, 16), 3)
+    fetcher = FakeFetcher(days)
+    pipeline.update_dataset(
+        root, symbols=["EURUSD"], start="2026-11-16", end="2026-11-19",
+        raw_dir=raw, fetcher=fetcher,
+    )
+    # The manifest claims data through next week; the rebuild cannot cover it.
+    manifest = json.loads((root / "manifest.json").read_text())
+    manifest["EURUSD"]["files"]["EURUSD_M1.parquet"]["last"] = (
+        "2026-11-25 00:00:00+00:00"
+    )
+    (root / "manifest.json").write_text(json.dumps(manifest))
+    with pytest.raises(pipeline.IncompleteFetchError, match="span"):
+        pipeline.update_dataset(
+            root, symbols=["EURUSD"], full=True, end="2026-11-19",
+            raw_dir=raw, fetcher=fetcher,
+        )
 
 
 def test_start_after_manifest_last_is_rejected(tmp_path):
@@ -819,6 +855,47 @@ def test_fetch_uses_https():
     from data_tools.dukascopy import fetch as fetch_mod
 
     assert fetch_mod.URL.startswith("https://")
+
+
+def test_verify_manifest_checks_span_without_column_statistics(tmp_path):
+    """Parquet files written without stats still get their span verified."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    root = tmp_path / "dukascopy"
+    sym = root / "EURUSD"
+    sym.mkdir(parents=True)
+    df = _valid_frame()
+    table = pa.Table.from_pandas(df, preserve_index=False)
+    pq.write_table(table, sym / "EURUSD_M1.parquet", write_statistics=False)
+    manifest = {
+        "EURUSD": {
+            "files": {
+                "EURUSD_M1.parquet": {
+                    "rows": len(df),
+                    "first": str(df["timestamp"].iloc[0]),
+                    "last": str(df["timestamp"].iloc[-1]),
+                }
+            }
+        }
+    }
+    (root / "manifest.json").write_text(json.dumps(manifest))
+    assert pipeline.verify_manifest(root) == []
+    # Drift the claimed span: the stats-free footer must still catch it.
+    manifest["EURUSD"]["files"]["EURUSD_M1.parquet"]["last"] = (
+        "2027-01-01 00:00:00+00:00"
+    )
+    (root / "manifest.json").write_text(json.dumps(manifest))
+    assert any("span" in p for p in pipeline.verify_manifest(root))
+
+
+def test_empty_symbol_list_processes_nothing(tmp_path):
+    rep = pipeline.update_dataset(
+        tmp_path / "dukascopy", symbols=[], end="2026-11-19",
+        raw_dir=tmp_path / "raw",
+    )
+    assert rep.symbols == []
+    assert rep.ok
 
 
 # ─── upload: manifest-driven, idempotent ─────────────────────────────────────

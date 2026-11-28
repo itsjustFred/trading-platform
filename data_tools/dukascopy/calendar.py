@@ -138,13 +138,11 @@ def empty_days_in_window(
     while day < end:
         has_bid = day in bid_days
         has_ask = day in ask_days
-        if has_bid and has_ask:
-            pass
-        elif has_bid:
-            bid_only.append(day.isoformat())
-        elif has_ask:
-            ask_only.append(day.isoformat())
-        else:
+        if not has_bid and not has_ask:
             both.append(day.isoformat())
+        elif has_bid and not has_ask:
+            bid_only.append(day.isoformat())
+        elif has_ask and not has_bid:
+            ask_only.append(day.isoformat())
         day += timedelta(days=1)
     return {"both": both, "bid": bid_only, "ask": ask_only}
