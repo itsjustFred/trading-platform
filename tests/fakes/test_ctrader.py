@@ -804,3 +804,96 @@ def test_fake_ctrader_transport_drives_a_real_adapter_connect(tmp_path) -> None:
     )
     assert result.returncode == 0, result.stderr
     assert "ok" in result.stdout
+
+
+def test_the_real_adapter_submits_and_closes_through_the_fake(tmp_path) -> None:
+    """``submit_order`` + ``close_all_positions`` end to end on the fake.
+
+    Same subprocess constraint as the connect test: the adapter binds its
+    event loop and the Twisted reactor at connect, so the whole flow runs in
+    one fresh interpreter on a sandboxed environment.
+    """
+    repo = Path(__file__).resolve().parents[2]
+    code = textwrap.dedent(
+        """
+        import asyncio
+        import sys
+        from datetime import datetime, timezone
+
+        sys.path.insert(0, {repo!r})
+        import live_runner.ctrader_adapter as ctrader_module
+        from tests.fakes.ctrader import (
+            FakeCTraderBroker,
+            FakeCTraderSymbol,
+            fake_ctrader_transport,
+        )
+        from live_runner.ctrader_adapter import CTraderLiveAdapter
+        from shared.models import LiveSignal
+
+        # Keep submit_order off the database; the broker fake is the subject.
+        ctrader_module.get_live_signal_broker_order_id = lambda *a, **k: None
+        ctrader_module.get_live_signal_timestamp = lambda *a, **k: None
+        ctrader_module.save_live_signal = lambda s: (str(s.id), True)
+        ctrader_module.set_live_signal_broker_order_id = lambda *a, **k: True
+
+        broker = FakeCTraderBroker(
+            account_id=46736452,
+            symbols=[FakeCTraderSymbol.fx("EURUSD", 1)],
+            mark_prices={{"EURUSD": 1.1}},
+        )
+        with fake_ctrader_transport(broker) as (b, client):
+            adapter = CTraderLiveAdapter(
+                app_id="app",
+                app_secret="secret",
+                access_token="token",
+                account_id="46736452",
+                demo=True,
+                connect_max_attempts=1,
+                connect_timeout_seconds=10,
+            )
+
+            async def main():
+                await adapter.connect()
+                signal = LiveSignal(
+                    deployment_id="dep-1",
+                    symbol="EURUSD",
+                    action="buy",
+                    theoretical_price=1.1,
+                    timestamp=datetime.now(timezone.utc),
+                    metadata={{"stop_loss": 1.05, "take_profit": 1.20}},
+                )
+                order_id = await adapter.submit_order(signal, qty=1.0)
+                assert order_id
+                broker.advance(1.0)
+                positions = await adapter.get_positions()
+                assert positions and positions[0]["qty"] > 0
+
+                outcome = await adapter.close_all_positions()
+                assert outcome.failed == ()
+                assert outcome.unidentified == ()
+                broker.advance(1.0)
+                assert await adapter.get_positions() == []
+                await adapter.disconnect()
+
+            asyncio.run(main())
+        print("ok")
+        """
+    ).format(repo=str(repo))
+    env = {
+        "PATH": os.environ.get("PATH", ""),
+        "HOME": str(tmp_path),
+        "TMPDIR": str(tmp_path),
+        "DATA_DIR": str(tmp_path / "data"),
+        "LOG_DIR": str(tmp_path / "logs"),
+        "PYTHONUNBUFFERED": "1",
+    }
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        cwd=str(repo),
+        env=env,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "ok" in result.stdout

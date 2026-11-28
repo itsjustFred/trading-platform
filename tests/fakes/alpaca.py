@@ -19,23 +19,28 @@ that object, and it keeps broker state rather than answering a fixed script:
 * **bracket/OTO legs.** The legs are child orders with their own broker ids,
   nested under the parent in every ``nested=True`` listing - including in the
   ``submit_order`` response, the only place ``_register_bracket_legs`` ever
-  learns them.
+  learns them. On the parent's fill the take-profit leg goes working while
+  the stop-loss leg stays ``held`` (#245): invisible to ``status=open`` but
+  still filling, and reachable only as a leg of the filled parent in a
+  ``status=all`` listing.
 * **partial fills**, driven by ``partial_fill_ratio``.
-* **rejections**: before acceptance (an ``APIError``, the shape Alpaca uses for
-  insufficient buying power) and after it (an order the broker acked and then
-  rejected).
+* **rejections**: before acceptance (an ``APIError`` in alpaca-py's real
+  shape - JSON body plus ``http_error`` - like insufficient buying power or
+  qty) and after it (an order the broker acked and then rejected).
 * **DAY vs GTC.** A DAY order expires at the end of its session; a GTC one
   survives it. ``advance`` walks the fake clock.
-* **the quantity-reservation rule.** A close is refused while a working
-  reducing-side order still reserves the position's quantity - the rule that
-  makes the flatten cancel its protections first.
+* **the quantity-reservation rule.** A sell exceeding the unreserved
+  quantity - or any short sale on a long-only account - is refused at
+  SUBMIT, and a close is refused while a working reducing-side order still
+  reserves the position's quantity - the rule that makes the flatten cancel
+  its protections first.
 
 Usage::
 
     from tests.fakes.alpaca import FakeAlpacaTradingClient, fake_alpaca_transport
 
     with fake_alpaca_transport() as (client, _stream, _data):
-        adapter = AlpacaLiveAdapter(api_key="k", secret_key="s", paper=True)
+        adapter = AlpacaLiveAdapter(api_key="k", secret_key="s", paper=True, account_id="acc")
         asyncio.run(adapter.connect())            # the REST client IS the fake
         broker_order_id = await adapter.submit_order(signal, qty=5)
         client.advance(1.0)                       # the broker acknowledges, then fills
@@ -48,6 +53,7 @@ of on which private field the adapter happened to set.
 
 from __future__ import annotations
 
+import json
 import math
 import sys
 import types
@@ -56,6 +62,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from typing import Any
+from uuid import uuid4
 
 from alpaca.common.exceptions import APIError
 from alpaca.trading.enums import (
@@ -185,9 +192,6 @@ class FakeAlpacaOrder:
     parent_order_id: str | None = None
     #: Why the broker refused an order it had acked.
     failed_reason: str | None = None
-    #: Whether this order fills as soon as the broker has it, as a
-    #: ``close_position`` market order does.
-    fills_immediately: bool = False
 
 
 @dataclass
@@ -296,8 +300,8 @@ class FakeAlpacaTradingClient:
 
         An order that only ever reads as ``filled`` on the very next lookup is a
         double that cannot catch an adapter which treats its submit response as
-        the fill, so this is the only place fills happen - a ``close_position``
-        market order excepted, which the broker fills inside the call.
+        the fill, so this is the only place fills happen - ``close_position``
+        orders included, which the broker only acknowledges inside the call.
         """
         if seconds:
             self.now = self.now + timedelta(seconds=seconds)
@@ -320,13 +324,20 @@ class FakeAlpacaTradingClient:
                 if order.failed_reason is not None:
                     order.status = OrderStatus.REJECTED
                     order.failed_at = self.now
+                    emitted.append(self._status_update(order, "rejected"))
                     continue
             if _text(order.status) in {"accepted", "new", "partially_filled"}:
+                emitted.extend(self._maybe_fill(order))
+            elif self._held_leg_is_live(order):
+                # A ``held`` stop leg of a FILLED parent still protects the
+                # position: it is invisible to ``status=open`` but fills when
+                # its stop is touched (#245).
                 emitted.extend(self._maybe_fill(order))
             if _is_day(order) and _text(order.status) in ("new", "accepted", "partially_filled"):
                 if _session_ended(order.submitted_at, self.now):
                     order.status = OrderStatus.EXPIRED
                     order.expired_at = self.now
+                    emitted.append(self._status_update(order, "expired"))
         self.trade_updates.extend(emitted)
         return emitted
 
@@ -344,15 +355,34 @@ class FakeAlpacaTradingClient:
         limit = int(requested_limit) if requested_limit else self.page_size
         direction = _text(getattr(filter, "direction", "desc")) or "desc"
 
-        if status == "all":
-            # Everything the account ever submitted, terminal orders included.
-            page = list(self.orders)
-        else:
-            page = [
-                order
+        def _visible(order: FakeAlpacaOrder) -> bool:
+            status_text = _text(order.status)
+            if status == "all":
+                return True
+            if status == "closed":
+                return status_text in _TERMINAL_ORDER_STATUSES
+            # ``held`` legs never appear in an open listing (#245): a filled
+            # bracket's stop leg rests at the broker but is only reachable as
+            # a leg of the filled parent in a ``status=all`` listing, while
+            # its working take-profit leg DOES surface as a top-level row.
+            return status_text not in _TERMINAL_ORDER_STATUSES and status_text != "held"
+
+        if nested:
+            page = [order for order in self.orders if _visible(order)]
+            listed_ids = {order.id for order in page}
+            # A working leg whose parent is not itself listed (the filled
+            # bracket's take-profit leg) surfaces as its own top-level row.
+            page.extend(
+                leg
                 for order in self.orders
-                if _text(order.status) not in _TERMINAL_ORDER_STATUSES
-            ]
+                for leg in order.legs
+                if _visible(leg) and order.id not in listed_ids
+            )
+        else:
+            page = [order for order in self.orders if _visible(order)]
+            page.extend(
+                leg for order in self.orders for leg in order.legs if _visible(leg)
+            )
         if symbols:
             page = [order for order in page if order.symbol.upper() in symbols]
         if until is not None:
@@ -371,8 +401,7 @@ class FakeAlpacaTradingClient:
         page = page[:limit]
         if not nested:
             # Alpaca only nests legs when the request asks for them: a flat
-            # listing returns the parent rows with an empty ``legs`` list, so
-            # a caller that forgot ``nested=True`` cannot see them here either.
+            # listing returns every order - legs included - as its own row.
             return [replace(order, legs=[]) for order in page]
         return page
 
@@ -388,11 +417,10 @@ class FakeAlpacaTradingClient:
             return matches[0]
         if not matches:
             raise _not_found(f"client_order_id={client_order_id}")
-        raise APIError(
-            {
-                "code": 409,
-                "message": f"multiple orders match client_order_id={client_order_id}",
-            }
+        raise _api_error(
+            40910000,
+            f"multiple orders match client_order_id={client_order_id}",
+            409,
         )
 
     def get_all_positions(self) -> list[FakeAlpacaPositionRow]:
@@ -410,9 +438,16 @@ class FakeAlpacaTradingClient:
         refusal = _rule_text(self.reject_submissions, order_data)
         if refusal is not None:
             if self.reject_with_api_error:
-                raise APIError({"code": 40310000, "message": refusal})
+                raise _api_error(40310000, refusal, 403)
             return self._reject(order_data, refusal)
         order = self._new_order(order_data)
+        qty_refusal = self._submit_qty_refusal(order)
+        if qty_refusal is not None:
+            # Alpaca refuses at SUBMIT, before the order reaches the book:
+            # "insufficient qty available for order". An exit larger than the
+            # unreserved quantity - or any short sale on a long-only account -
+            # never gets as far as a fill.
+            raise _api_error(40310000, qty_refusal, 403)
         self.submissions.append(order)
         self.orders.append(order)
         self._attach_legs(order_data, order)
@@ -463,6 +498,7 @@ class FakeAlpacaTradingClient:
         original.status = OrderStatus.REPLACED
         original.replaced_by = replacement.id
         original.replaced_at = self.now
+        self.trade_updates.append(self._status_update(original, "replaced"))
         if replacement.parent_order_id is not None:
             parent = self.get_order_by_id(replacement.parent_order_id)
             parent.legs = [replacement if leg is original else leg for leg in parent.legs]
@@ -478,21 +514,18 @@ class FakeAlpacaTradingClient:
         key = str(symbol).strip().upper()
         row = self.positions.get(key)
         if row is None or _float(row.qty) == 0.0:
-            raise APIError({"code": 40410000, "message": f"position does not exist for {key}"})
+            raise _api_error(40410000, f"position does not exist for {key}", 404)
         open_qty = _float(row.qty)
         if self.reserved_qty(key) > 0.0:
             # Alpaca: "unable to close position; there are working orders
             # reserving the quantity". This is why the flatten cancels its
             # protections first, so a double that always closes let a flatten
             # that forgets to cancel pass.
-            raise APIError(
-                {
-                    "code": 40310000,
-                    "message": (
-                        f"unable to close position for {key}; "
-                        "working orders reserve the quantity"
-                    ),
-                }
+            raise _api_error(
+                40310000,
+                f"unable to close position for {key}; "
+                "working orders reserve the quantity",
+                403,
             )
         requested = _optional_float(getattr(close_options, "qty", None))
         percentage = _optional_float(getattr(close_options, "percentage", None))
@@ -509,15 +542,17 @@ class FakeAlpacaTradingClient:
             order_type=OrderType.MARKET,
             order_class=OrderClass.SIMPLE,
             time_in_force=TimeInForce.DAY,
-            status=OrderStatus.ACCEPTED,
+            status=OrderStatus.PENDING_NEW,
             submitted_at=self.now,
-            fills_immediately=True,
         )
         self.orders.append(order)
         self.submissions.append(order)
-        # A ``close_position`` market order executes inside the call: Alpaca
-        # hands back a filled order and nets the position before returning.
-        self._fill(order, requested, self._mark_price(key))
+        # ``DELETE /v2/positions/{symbol}`` answers an accepted/pending_new
+        # order, NOT a fill: the fill arrives on the stream, sometimes before
+        # the HTTP response - the race ``_FLATTEN_IN_FLIGHT_TTL_SECONDS``
+        # exists for. ``advance`` runs it through the same fill pipeline as
+        # any other order (``fill_seconds=0`` makes it immediate).
+        self.advance(0.0)
         return order
 
     def close_all_positions(self, cancel_orders: bool = False) -> list[FakeAlpacaOrder]:
@@ -658,12 +693,38 @@ class FakeAlpacaTradingClient:
         parent.legs.sort(key=lambda leg: _text(leg.order_type) != "stop")
 
     def _next_order_id(self) -> str:
+        # Real Alpaca order ids are UUIDs; the adapter's submission path
+        # validates them as such, so a non-UUID id would fail only there.
         self._seq += 1
-        return f"fake-{self._seq:08d}"
+        return str(uuid4())
 
     def _next_execution_id(self) -> str:
         self._execution_seq += 1
         return f"fake-exec-{self._execution_seq}"
+
+    def _submit_qty_refusal(self, order: FakeAlpacaOrder) -> str | None:
+        """The broker's submit-time quantity check, or ``None`` when it passes.
+
+        Long-only accounts cannot sell what they do not hold: a sell that
+        would take the position negative, or exceed the quantity working
+        orders leave unreserved, is refused before acceptance. Notional
+        orders are skipped - the fake cannot price them into shares.
+        """
+        if self.allow_shorting:
+            return None
+        qty = _float(order.qty)
+        if qty <= 0.0 or order.notional is not None:
+            return None
+        row = self.positions.get(order.symbol)
+        pos_qty = 0.0 if row is None else _float(row.qty)
+        sign = 1.0 if _text(order.side) == "buy" else -1.0
+        if pos_qty + sign * qty < 0.0:
+            return f"insufficient qty available for order ({qty:g} shares)"
+        if (pos_qty > 0.0 and sign < 0.0) or (pos_qty < 0.0 and sign > 0.0):
+            available = abs(pos_qty) - self.reserved_qty(order.symbol)
+            if qty > available + 1e-9:
+                return f"insufficient qty available for order ({qty:g} shares)"
+        return None
 
     def _reject(self, request: Any, reason: str) -> FakeAlpacaOrder:
         order = self._new_order(request)
@@ -679,10 +740,15 @@ class FakeAlpacaTradingClient:
             if order.id != order_id:
                 continue
             if _text(order.status) in _TERMINAL_ORDER_STATUSES:
-                raise _not_found(order_id)
+                # Alpaca answers a cancel of a terminal order with a 422,
+                # not a 404: the order exists, it just cannot be cancelled.
+                raise _api_error(42210000, "order is not cancelable", 422)
             if self.cancel_settles:
                 order.status = OrderStatus.CANCELED
                 order.canceled_at = self.now
+                # Alpaca pushes a ``canceled`` trade update for a settled
+                # cancel, the same event ``_GONE_WITHOUT_EXECUTING`` reads.
+                self.trade_updates.append(self._status_update(order, "canceled"))
             else:
                 # Alpaca keeps an accepted cancel in the book as ``pending_cancel``
                 # until it settles.
@@ -690,13 +756,25 @@ class FakeAlpacaTradingClient:
             return
         raise _not_found(order_id)
 
+    def _held_leg_is_live(self, order: FakeAlpacaOrder) -> bool:
+        """Whether a ``held`` leg may fill: only once its parent has filled."""
+        if _text(order.status) != "held" or order.parent_order_id is None:
+            return False
+        parent = next(
+            (candidate for candidate in self.orders if candidate.id == order.parent_order_id),
+            None,
+        )
+        return parent is not None and _text(parent.status) == "filled"
+
     def _maybe_fill(self, order: FakeAlpacaOrder) -> list[FakeAlpacaTradeUpdate]:
-        if _text(order.status) not in {"accepted", "new", "partially_filled"}:
+        if _text(order.status) not in {"accepted", "new", "partially_filled", "held"}:
+            return []
+        if _text(order.status) == "held" and not self._held_leg_is_live(order):
             return []
         if not self._marketable(order):
             return []
         due_at = order.submitted_at or self.now
-        if not order.fills_immediately and not _is_due(due_at, self.fill_seconds, self.now):
+        if not _is_due(due_at, self.fill_seconds, self.now):
             return []
         remaining = _float(order.qty) - _float(order.filled_qty)
         if remaining <= 0.0:
@@ -741,8 +819,9 @@ class FakeAlpacaTradingClient:
             else (previous * _float(order.filled_avg_price) + qty * price) / cumulative
         )
         order.filled_at = self.now
-        if order.limit_price is None and order.stop_price is None:
-            order.limit_price = price
+        # A filled market order keeps ``limit_price=None``: real market orders
+        # never carry one, and an adapter that falls back to it as a price
+        # must not be able to pass only here.
         if cumulative >= _float(order.qty) - 1e-9:
             order.filled_qty = _float(order.qty)
             order.status = OrderStatus.FILLED
@@ -750,7 +829,8 @@ class FakeAlpacaTradingClient:
         else:
             order.status = OrderStatus.PARTIALLY_FILLED
         if _text(order.status) == "filled":
-            self._cancel_oco_siblings(order)
+            siblings = self._cancel_oco_siblings(order)
+            return [self._trade_update(order, qty, price), *siblings]
         return [self._trade_update(order, qty, price)]
 
     def _trade_update(
@@ -774,8 +854,8 @@ class FakeAlpacaTradingClient:
         if not self.allow_shorting and after < 0.0 and before >= 0.0:
             # A netted book refuses the sell outright, and no position row is
             # invented for it: a fill that cannot happen records nothing.
-            raise APIError(
-                {"code": 40310000, "message": f"short selling is not permitted for {key}"}
+            raise _api_error(
+                40310000, f"short selling is not permitted for {key}", 403
             )
         if row is None:
             row = FakeAlpacaPositionRow(symbol=key, qty=0.0, asset_class=AssetClass.US_EQUITY)
@@ -795,26 +875,52 @@ class FakeAlpacaTradingClient:
         row.market_value = after * price
         row.unrealized_pl = after * (price - _float(row.avg_entry_price))
 
-    def _cancel_oco_siblings(self, filled: FakeAlpacaOrder) -> None:
+    def _cancel_oco_siblings(self, filled: FakeAlpacaOrder) -> list[FakeAlpacaTradeUpdate]:
         """Remove a filled bracket leg's siblings: OCO, one order is all that runs."""
         if filled.parent_order_id is None:
-            return
+            return []
         for parent in self.orders:
             if parent.id != filled.parent_order_id:
                 continue
-            for leg in parent.legs:
-                if leg is not filled and _text(leg.status) not in _TERMINAL_ORDER_STATUSES:
-                    leg.status = OrderStatus.CANCELED
-            return
+            canceled = [
+                leg
+                for leg in parent.legs
+                if leg is not filled and _text(leg.status) not in _TERMINAL_ORDER_STATUSES
+            ]
+            for leg in canceled:
+                leg.status = OrderStatus.CANCELED
+                leg.canceled_at = self.now
+            return [self._status_update(leg, "canceled") for leg in canceled]
+        return []
+
+    def _status_update(
+        self, order: FakeAlpacaOrder, event: str
+    ) -> FakeAlpacaTradeUpdate:
+        """A non-fill trade update: ``rejected``/``expired``/``canceled``/``replaced``."""
+        return FakeAlpacaTradeUpdate(
+            event=event,
+            order=replace(order),
+            timestamp=self.now,
+            execution_id=self._next_execution_id(),
+        )
 
 
 def _release_legs(parent: FakeAlpacaOrder) -> None:
-    """When a bracket/OTO parent fills, its held legs go working."""
+    """When a bracket/OTO parent fills, its take-profit leg goes working.
+
+    The stop-loss leg stays ``held`` (#245): observed on Alpaca paper, it is
+    absent from every ``status=open`` listing and only reachable as a leg of
+    the filled parent in a ``status=all`` listing - yet it still protects the
+    position, so ``advance`` keeps filling it once its parent is filled.
+    """
     for leg in parent.legs:
-        if _text(leg.status) == "held":
-            leg.status = OrderStatus.NEW
-            leg.submitted_at = parent.filled_at or leg.submitted_at
-            leg.qty = _float(parent.filled_qty) or _float(parent.qty)
+        if _text(leg.status) != "held":
+            continue
+        if _text(leg.order_type) == "stop":
+            continue
+        leg.status = OrderStatus.NEW
+        leg.submitted_at = parent.filled_at or leg.submitted_at
+        leg.qty = _float(parent.filled_qty) or _float(parent.qty)
 
 
 def _opposite(side: Any) -> Any:
@@ -851,7 +957,25 @@ def _session_ended(submitted_at: datetime | None, now: datetime) -> bool:
 
 
 def _not_found(order_id: Any) -> APIError:
-    return APIError({"code": 40410000, "message": f"order {order_id} not found"})
+    return _api_error(40410000, f"order {order_id} not found", 404)
+
+
+def _api_error(code: int, message: str, status_code: int) -> APIError:
+    """An ``APIError`` shaped like alpaca-py's real one.
+
+    alpaca-py builds ``APIError`` from the raw response body and the HTTP
+    error: ``.code``/``.message`` ``json.loads`` the body and ``.status_code``
+    reads ``http_error.response.status_code``. A dict body or a missing
+    ``http_error`` makes those properties raise ``TypeError``/return ``None``,
+    so every refusal the fake raises goes through here.
+    """
+    http_error = types.SimpleNamespace(
+        response=types.SimpleNamespace(status_code=status_code),
+        request=None,
+    )
+    return APIError(
+        json.dumps({"code": code, "message": message}), http_error=http_error
+    )
 
 
 def _rule_text(

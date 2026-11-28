@@ -21,12 +21,17 @@ not drive `connect()`.
 from tests.fakes.alpaca import FakeAlpacaTradingClient, fake_alpaca_transport
 
 client = FakeAlpacaTradingClient(mark_prices={"AAPL": 100.0})
-with fake_alpaca_transport(client):
-    adapter = AlpacaLiveAdapter(api_key="k", secret_key="s", paper=True)
+with fake_alpaca_transport(client) as (client, stream, historical):
+    adapter = AlpacaLiveAdapter(api_key="k", secret_key="s", paper=True, account_id="acc")
     asyncio.run(adapter.connect())
     asyncio.run(adapter.submit_order(signal, qty=10.0))
-    client.advance(30.0)   # the broker fills; trade updates reach the stream
+    updates = client.advance(30.0)   # the broker fills; returns trade updates
+    stream.deliver(client)           # ...which must be pushed to reach _on_trade_update
 ```
+
+`advance()` only records and returns updates - nothing is pushed for you.
+`FakeTradingStream.deliver(client)` hands the recorded updates to subscribed
+callbacks; `client.trade_updates` holds them either way.
 
 Key knobs: `mark_prices`, `fill_seconds` (confirmation delay),
 `partial_fill_ratio`, `reject_submissions` (callable or list consumed in
@@ -58,11 +63,12 @@ broker = FakeCTraderBroker(
     symbols=[FakeCTraderSymbol.fx("EURUSD", 1)],
     mark_prices={"EURUSD": 1.10},
 )
-with fake_ctrader_transport(broker):
+with fake_ctrader_transport(broker) as (_broker, client):
     adapter = CTraderLiveAdapter(...)
     asyncio.run(adapter.connect())
     asyncio.run(adapter.submit_order(signal, qty=1.0))
-    broker.advance(1.0)    # fills; ProtoOAExecutionEvents reach _on_message
+    for event in broker.advance(1.0):   # fills; returns ProtoOAExecutionEvents
+        client.deliver(event)           # ...push each through _received -> _on_message
 ```
 
 Key knobs: `account_type` (`"netted"` merges opposite fills on a symbol,

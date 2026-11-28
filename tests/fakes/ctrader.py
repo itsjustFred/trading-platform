@@ -536,7 +536,7 @@ class FakeCTraderBroker:
             )
             direction = 1.0 if position_side == _SIDE_BUY else -1.0
             gross_ccy = (price - entry) * direction * (volume / 100.0)
-            gross = int(round(gross_ccy * 10 ** self.money_digits))
+            gross = round(gross_ccy * 10 ** self.money_digits)
             detail.entryPrice = float(entry)
             detail.grossProfit = gross
             detail.swap = 0
@@ -544,7 +544,7 @@ class FakeCTraderBroker:
             # The realised result lands on the account balance, so a later
             # ``TraderReq`` reports the money the close actually made.
             self.balance_ccy += (gross + detail.commission) / (10 ** self.money_digits)
-            detail.balance = int(round(self.balance_ccy * 10 ** self.money_digits))
+            detail.balance = round(self.balance_ccy * 10 ** self.money_digits)
             detail.closedVolume = int(volume)
             detail.balanceVersion = 1
             detail.moneyDigits = self.money_digits

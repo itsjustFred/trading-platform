@@ -221,13 +221,24 @@ def test_a_position_nets_and_disappears_once_flat() -> None:
 
 
 def test_a_netted_book_refuses_to_open_short() -> None:
-    client = FakeAlpacaTradingClient(mark_prices={AAPL: 100.0})
-    client.submit_order(
-        MarketOrderRequest(symbol=AAPL, qty=5, side=OrderSide.SELL, time_in_force=TimeInForce.GTC)
-    )
+    """The refusal happens at SUBMIT, before the order is booked.
 
-    with pytest.raises(APIError):
-        client.advance(5.0)
+    Alpaca rejects an opening short on a long-only account inside the
+    ``submit_order`` call itself - the order never reaches the book, so an
+    adapter that only discovers the failure at fill time cannot exist here.
+    """
+    client = FakeAlpacaTradingClient(mark_prices={AAPL: 100.0})
+
+    with pytest.raises(APIError) as failure:
+        client.submit_order(
+            MarketOrderRequest(
+                symbol=AAPL, qty=5, side=OrderSide.SELL, time_in_force=TimeInForce.GTC
+            )
+        )
+
+    assert failure.value.status_code == 403
+    assert client.orders == [], "a refused submission never reaches the book"
+    assert client.positions == {}
 
 
 def test_a_two_way_book_may_go_short() -> None:
@@ -276,6 +287,13 @@ def test_a_submit_response_carries_the_bracket_legs_nested() -> None:
 
 
 def test_legs_are_held_until_the_parent_fills_and_then_go_working() -> None:
+    """On the parent fill the take-profit leg goes working; the stop stays held.
+
+    Observed on Alpaca paper (#245): the SL leg rests at the broker but is
+    absent from every ``status=open`` listing and reachable only as a leg of
+    the filled parent in ``status=all`` - yet it still fills when its stop is
+    touched.
+    """
     client = FakeAlpacaTradingClient(mark_prices={AAPL: 100.0})
     order = _bracket(client)
     assert all(leg.status == OrderStatus.HELD for leg in order.legs)
@@ -283,10 +301,34 @@ def test_legs_are_held_until_the_parent_fills_and_then_go_working() -> None:
     client.advance(30.0)
 
     assert order.filled_qty == 10.0
-    assert all(str(leg.status.value) == "new" for leg in order.legs)
+    stop, target = order.legs
+    assert target.status == OrderStatus.NEW, "the TP leg goes working on the parent fill"
+    assert stop.status == OrderStatus.HELD, "the SL leg stays held (#245)"
     assert client.reserved_qty(AAPL) == 10.0, (
         "an OCO pair reserves the parent's quantity once, not twice"
     )
+
+
+def test_a_held_stop_leg_still_protects_the_position() -> None:
+    """Invisible to ``status=open`` but live: its stop fill lands on ``advance``."""
+    client = FakeAlpacaTradingClient(mark_prices={AAPL: 100.0})
+    order = _bracket(client)
+    client.advance(30.0)
+    stop, target = order.legs
+
+    open_page = client.get_orders(
+        filter=SimpleNamespace(status="open", symbols=None, nested=True, limit=500)
+    )
+    assert [row.id for row in open_page] == [target.id], (
+        "the working TP leg is the only top-level open row; the held SL is not listed"
+    )
+
+    client.set_mark_price(AAPL, 94.0)
+    client.advance(5.0)
+
+    assert str(stop.status.value) == "filled"
+    assert str(target.status.value) == "canceled", "the OCO sibling is removed"
+    assert client.position(AAPL) == 0.0
 
 
 def test_a_filling_leg_removes_its_oco_sibling() -> None:
@@ -316,6 +358,12 @@ def test_a_close_is_refused_while_a_bracket_reserves_the_quantity() -> None:
 
 
 def test_a_close_is_accepted_once_nothing_reserves_the_quantity() -> None:
+    """``close_position`` answers accepted; the fill lands on ``advance``.
+
+    Alpaca's ``DELETE /v2/positions/{symbol}`` returns a pending_new/accepted
+    order, not a fill - the fill arrives on the stream later, sometimes before
+    the HTTP response (the race ``_FLATTEN_IN_FLIGHT_TTL_SECONDS`` exists for).
+    """
     client = FakeAlpacaTradingClient(mark_prices={AAPL: 100.0})
     client.submit_order(_buy())
     client.advance(30.0)
@@ -323,9 +371,30 @@ def test_a_close_is_accepted_once_nothing_reserves_the_quantity() -> None:
     closed = client.close_position(AAPL)
 
     assert closed.qty == 10.0
-    assert client.position(AAPL) == 0.0
+    assert str(closed.status.value) in {"pending_new", "new", "accepted"}
+    assert client.position(AAPL) == 10.0, "the position is still open at ack time"
     assert client.close_calls == [AAPL]
+
+    client.advance(2.0)
+
+    assert client.position(AAPL) == 0.0
+    assert str(closed.status.value) == "filled"
     assert [update.event for update in client.trade_updates][-1] == "fill"
+
+
+def test_a_close_fill_can_be_delayed_like_any_other_order() -> None:
+    client = FakeAlpacaTradingClient(mark_prices={AAPL: 100.0}, fill_seconds=5.0)
+    client.submit_order(_buy())
+    client.advance(30.0)
+
+    closed = client.close_position(AAPL)
+    client.advance(0.0)
+
+    assert str(closed.status.value) != "filled", "the close is not instant by default"
+    assert client.position(AAPL) == 10.0
+
+    client.advance(5.0)
+    assert client.position(AAPL) == 0.0
 
 
 # ── partial fills ────────────────────────────────────────────────────────────
@@ -384,11 +453,42 @@ def test_a_short_sale_is_refused_before_the_order_is_booked() -> None:
     request = MarketOrderRequest(
         symbol=AAPL, qty=5, side=OrderSide.SELL, time_in_force=TimeInForce.GTC
     )
-    client.submit_order(request)
-    with pytest.raises(APIError):
-        client.advance(5.0)
+    with pytest.raises(APIError) as failure:
+        client.submit_order(request)
 
+    assert failure.value.status_code == 403
+    assert "insufficient qty" in str(failure.value)
+    assert client.orders == [], "a refused submission never reaches the book"
     assert client.positions == {}, "an unbookable fill never creates a position"
+
+
+def test_an_exit_larger_than_the_unreserved_quantity_is_refused_at_submit() -> None:
+    """A sell exceeding what working orders leave unreserved never reaches the book."""
+    client = FakeAlpacaTradingClient(mark_prices={AAPL: 100.0})
+    client.submit_order(_buy(qty=10.0))
+    client.advance(30.0)
+    # A resting sell (limit above the mark, so it cannot fill) reserves 4 of
+    # the 10 shares.
+    client.submit_order(
+        LimitOrderRequest(
+            symbol=AAPL,
+            qty=4.0,
+            side=OrderSide.SELL,
+            limit_price=110.0,
+            time_in_force=TimeInForce.GTC,
+            client_order_id="signal-exit-1",
+        )
+    )
+
+    with pytest.raises(APIError) as failure:
+        client.submit_order(
+            MarketOrderRequest(
+                symbol=AAPL, qty=7.0, side=OrderSide.SELL, time_in_force=TimeInForce.GTC
+            )
+        )
+
+    assert "insufficient qty" in str(failure.value)
+    assert len(client.orders) == 2, "the refused exit was never booked"
 
 
 def test_a_rejection_sequence_is_consumed_in_order() -> None:
@@ -409,19 +509,56 @@ def test_a_rejection_sequence_is_consumed_in_order() -> None:
     assert str(order.status.value) != "rejected", "the sequence is drained, not repeated"
 
 
-def test_a_flat_listing_hides_the_bracket_legs() -> None:
-    """Without ``nested=True`` the parent row comes back with empty ``legs``."""
+def test_a_flat_listing_returns_working_legs_as_their_own_rows() -> None:
+    """Without ``nested=True`` Alpaca lists every working order flat.
+
+    Held legs never appear in ``status=open`` at all (#245); once the parent
+    fills, the take-profit leg goes working and surfaces as its own row while
+    the held stop leg stays invisible.
+    """
     client = FakeAlpacaTradingClient(mark_prices={AAPL: 100.0})
-    _bracket(client)
+    order = _bracket(client)
+
+    flat = client.get_orders(filter=SimpleNamespace(status="open", limit=500))
+    assert [row.id for row in flat] == [order.id], (
+        "before the parent fills only it is open; both legs are held"
+    )
+
+    client.advance(30.0)
+    target = order.legs[1]  # legs sort stop-first; index 1 is the take-profit
 
     flat = client.get_orders(filter=SimpleNamespace(status="open", limit=500))
     nested = client.get_orders(
         filter=SimpleNamespace(status="open", limit=500, nested=True)
     )
+    assert [row.id for row in flat] == [target.id], (
+        "the working TP leg is its own row; the held SL leg is not listed"
+    )
+    assert all(row.legs == [] for row in flat)
+    assert [row.id for row in nested] == [target.id]
 
-    assert len(flat) == len(nested) == 1
-    assert flat[0].legs == [], "a non-nested listing does not expose the legs"
-    assert len(nested[0].legs) == 2
+
+def test_terminal_transitions_reach_the_stream_as_trade_updates() -> None:
+    """Alpaca pushes ``rejected``/``canceled`` updates, not only fills.
+
+    The adapter's ``_GONE_WITHOUT_EXECUTING`` set is fed by exactly these
+    events; a fake that only ever emitted fills could not exercise it.
+    """
+    client = FakeAlpacaTradingClient(
+        mark_prices={AAPL: 100.0},
+        reject_after_acknowledgement=lambda request: "post-ack refusal",
+    )
+    rejected = client.submit_order(_buy())
+    client.advance(30.0)
+
+    assert [update.event for update in client.trade_updates] == ["rejected"]
+    assert str(rejected.status.value) == "rejected"
+
+    working = FakeAlpacaTradingClient(mark_prices={AAPL: 100.0})
+    order = working.submit_order(_buy(limit_price=95.0))
+    working.cancel_order_by_id(order.id)
+
+    assert [update.event for update in working.trade_updates] == ["canceled"]
 
 
 def test_a_rejection_the_broker_makes_after_acknowledging_leaves_the_book() -> None:
@@ -491,6 +628,45 @@ def test_an_accepted_cancel_that_has_not_settled_rests_in_pending_cancel() -> No
     assert order.id in {working.id for working in client.working_orders()}
 
 
+def test_cancelling_a_terminal_order_is_a_422_not_a_404() -> None:
+    """Alpaca answers ``DELETE /v2/orders/{id}`` on a filled order with 422.
+
+    The order exists - it just cannot be cancelled - so a 404 would let an
+    adapter's already-gone path swallow a real broker error.
+    """
+    client = FakeAlpacaTradingClient(mark_prices={AAPL: 100.0})
+    order = client.submit_order(_buy())
+    client.advance(30.0)
+    assert str(order.status.value) == "filled"
+
+    with pytest.raises(APIError) as failure:
+        client.cancel_order_by_id(order.id)
+
+    assert failure.value.status_code == 422
+    assert "not cancelable" in str(failure.value)
+
+
+def test_api_errors_carry_alpaca_pys_real_shape() -> None:
+    """``APIError(json.dumps(body), http_error=stub)``: ``.code``/``.status_code`` work.
+
+    A dict body breaks alpaca-py's ``code``/``message`` properties, which the
+    adapter's error classifiers read.
+    """
+    client = FakeAlpacaTradingClient(mark_prices={AAPL: 100.0})
+
+    with pytest.raises(APIError) as failure:
+        client.submit_order(
+            MarketOrderRequest(
+                symbol=AAPL, qty=5, side=OrderSide.SELL, time_in_force=TimeInForce.GTC
+            )
+        )
+
+    error = failure.value
+    assert error.status_code == 403
+    assert error.code == 40310000
+    assert "insufficient qty" in error.message
+
+
 def test_a_replacement_gets_a_new_order_id_and_marks_the_old_one_replaced() -> None:
     client = FakeAlpacaTradingClient(mark_prices={AAPL: 1.0})
     order = client.submit_order(_buy(qty=5.0, limit_price=500.0))
@@ -556,3 +732,81 @@ def test_a_recorded_trade_update_reaches_a_subscribed_stream() -> None:
 
     assert len(seen) == 1
     assert seen[0].event == "fill"
+
+
+# ── the real adapter, end to end ──────────────────────────────────────────────
+
+
+def _patched_signal_store(monkeypatch) -> None:
+    """Keep ``submit_order`` off the database; the broker fake is the subject."""
+    import live_runner.alpaca_adapter as alpaca_module
+
+    monkeypatch.setattr(
+        alpaca_module,
+        "save_live_signal",
+        lambda signal: (str(signal.id or "sig-1"), True),
+    )
+    monkeypatch.setattr(
+        alpaca_module, "set_live_signal_broker_order_id", lambda *a, **k: True
+    )
+
+
+def _entry_live_signal() -> object:
+    from datetime import datetime, timezone
+
+    from shared.models import LiveSignal
+
+    return LiveSignal(
+        deployment_id="11111111-1111-1111-1111-111111111111",
+        symbol=AAPL,
+        action="buy",
+        theoretical_price=100.0,
+        timestamp=datetime.now(timezone.utc),
+        # Unbounded TP: an OTO entry whose only leg is the stop - the #245
+        # case where the flatten must find a ``held`` leg no ``status=open``
+        # listing shows.
+        metadata={
+            "stop_loss": 95.0,
+            "take_profit_policy": "unbounded_exit_on_opposite_signal",
+        },
+    )
+
+
+def test_the_real_adapter_submits_a_bracket_and_flattens_through_the_fake(
+    monkeypatch, isolated_db_sandbox
+) -> None:
+    """``AlpacaLiveAdapter.submit_order`` + ``close_all_positions`` on the fake.
+
+    The full path - request build, submit, bracket-leg registration, the
+    held-leg listing rules and the flatten's cancel-then-close - runs against
+    broker semantics, not a hand-rolled double. The entry is an OTO bracket:
+    its stop leg stays ``held`` after the fill (#245), invisible to
+    ``status=open`` and reachable only through ``status=all``.
+    """
+    from live_runner.alpaca_adapter import AlpacaLiveAdapter
+
+    # ``fill_seconds=0``: the close fill lands inside ``close_position``'s own
+    # advance, ahead of the flatten's re-read - the timing the in-flight
+    # attribution window exists for.
+    client = FakeAlpacaTradingClient(mark_prices={AAPL: 100.0}, fill_seconds=0.0)
+    adapter = AlpacaLiveAdapter(api_key="k", secret_key="s", paper=True, account_id="acc")
+    wire_alpaca_adapter(adapter, client)
+    _patched_signal_store(monkeypatch)
+
+    async def run() -> None:
+        broker_order_id = await adapter.submit_order(_entry_live_signal(), qty=10.0)
+        assert broker_order_id
+        client.advance(30.0)
+        positions = await adapter.get_positions()
+        assert positions and positions[0]["qty"] == 10.0
+
+        outcome = await adapter.close_all_positions()
+        assert outcome.failed == ()
+        client.advance(30.0)
+        assert await adapter.get_positions() == []
+
+    asyncio.run(run())
+
+    # The flatten cancelled the bracket legs before closing: nothing rests.
+    assert client.working_orders() == []
+    assert client.position(AAPL) == 0.0
