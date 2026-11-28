@@ -9,16 +9,13 @@ Symbol/Timeframe: SPY / 1d
 """
 
 import math
-import sys
 from pathlib import Path
 
 import pandas as pd
 import pytest
 
-sys.path.insert(0, str(Path(__file__).parent.parent.parent))
-
-from runner.engines.base import BacktestConfig
 from runner.engines.vectorbt_adapter import VectorbtAdapter
+from tests.builders import make_backtest_config
 
 STRATEGY_PATH = str(Path(__file__).parent.parent.parent / "strategies" / "post_vix_dip_buy" / "post_vix_dip_buy.py")
 TEST_START = "2025-01-01"
@@ -39,7 +36,7 @@ EXPECTED_NET_PROFIT = 0.00
 @pytest.fixture(scope="module")
 def backtest_result():
     engine = VectorbtAdapter()
-    config = BacktestConfig(signal_exit_fill="close", parameters={"fees": "zero"},
+    config = make_backtest_config(signal_exit_fill="close", parameters={"fees": "zero"},
         strategy_name="post_vix_dip_buy",
         symbols=[TEST_SYMBOL],
         timeframe=TEST_TIMEFRAME,

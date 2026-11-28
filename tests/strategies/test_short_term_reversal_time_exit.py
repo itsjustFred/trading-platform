@@ -12,8 +12,8 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from runner.engines.base import BacktestConfig
 from runner.engines.native_adapter import NativeAdapter
+from tests.builders import make_backtest_config
 from tests.helpers import with_zero_fees
 from tests.helpers import write_ohlcv as _write_ohlcv
 
@@ -59,7 +59,9 @@ def _run(tmp_path: Path, **cfg):
         "parameters": {},
     }
     payload.update(cfg)
-    return frame, NativeAdapter().run(BacktestConfig(**with_zero_fees(payload)), STRATEGY_PATH)
+    return frame, NativeAdapter().run(
+        make_backtest_config(**with_zero_fees(payload)), STRATEGY_PATH
+    )
 
 
 def test_five_bar_hold_is_open_of_bar_i_plus_1_to_open_of_bar_i_plus_6(tmp_path: Path):

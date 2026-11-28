@@ -46,12 +46,13 @@ supported environment may grow a dependency on it again.
 from __future__ import annotations
 
 import ast
-import os
 import re
 import subprocess
 from collections import Counter
 from collections.abc import Iterable
 from pathlib import Path
+
+from tests.conftest import sandboxed_env
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -188,16 +189,13 @@ def _iter_source_files(repo_root: Path = REPO_ROOT) -> list[Path]:
     first-party source; if git cannot answer, fail loudly rather than fall
     back to an untracked-file scan.
     """
-    # Inherit the user environment minus GIT_*: a parent GIT_DIR/GIT_WORK_TREE
-    # must not redirect the query, while HOME (and with it a user's
-    # safe.directory setting) stays so container/devcontainer checkouts owned
-    # by another uid do not die on "dubious ownership".
-    env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    # The sandboxed environment: it drops the GIT_* variables a parent GIT_DIR or
+    # GIT_WORK_TREE would redirect the query with, and keeps PATH so git resolves.
     try:
         proc = subprocess.run(
             ["git", "-C", str(repo_root), "ls-files", "-z", "--", "*.py"],
             capture_output=True,
-            env=env,
+            env=sandboxed_env(),
             check=True,
         )
     except (OSError, subprocess.CalledProcessError) as exc:
@@ -510,11 +508,7 @@ def test_iter_source_files_tolerates_tracked_but_deleted(tmp_path: Path) -> None
             ["git", "-C", str(tmp_path), *args],
             check=True,
             capture_output=True,
-            env={
-                key: value
-                for key, value in os.environ.items()
-                if not key.startswith("GIT_")
-            },
+            env=sandboxed_env(),
         )
 
     git("init", "-q")

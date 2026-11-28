@@ -16,7 +16,6 @@ These tests document the agreed behavior of the viewer backend:
 from __future__ import annotations
 
 import json
-import sys
 import tempfile
 import uuid
 from pathlib import Path
@@ -25,8 +24,6 @@ from types import SimpleNamespace
 import pandas as pd
 import pytest
 from fastapi.testclient import TestClient
-
-sys.path.insert(0, str(Path(__file__).parent.parent))
 
 
 def _make_parquet(path: Path) -> None:

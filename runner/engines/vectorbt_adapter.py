@@ -1261,6 +1261,31 @@ def _exit_order_type_at(
     return order_type, invalid
 
 
+#: Signal keys this adapter executes natively (``require_explicit_roles``
+#: allowlist in :func:`_prepare_next_open_execution_data`). The subset other
+#: engines ignore lives in ``shared.strategy_registry.VECTORBT_ONLY_SIGNAL_KEYS``
+#: — the matrix queue excludes strategies emitting them off vectorbt (#318).
+#: ``tests/test_strategy_registry_static.py`` pins the two sets together, so a
+#: new execution key must be registered there (or justified as shared) or CI
+#: fails.
+_EXECUTION_SIGNAL_KEYS = frozenset(
+    {
+        "entries",
+        "exits",
+        "stop_loss",
+        "sl_price",
+        "take_profit",
+        "tp_price",
+        "atr",
+        "direction",
+        "entry_stop",
+        "exit_price",
+        "exit_reason",
+        "exit_order_type",
+    }
+)
+
+
 def _prepare_next_open_execution_data(
     signals: pd.DataFrame,
     indicators: IndicatorMap,
@@ -1280,20 +1305,12 @@ def _prepare_next_open_execution_data(
     """
     roles = dict(explicit_roles or {})
     if require_explicit_roles:
-        canonical = {
-            "entries",
-            "exits",
-            "stop_loss",
-            "sl_price",
-            "take_profit",
-            "tp_price",
-            "atr",
-            "direction",
-            "entry_stop",
-            "exit_price",
-            "exit_reason",
-            "exit_order_type",
-        }
+        # Signal keys this adapter executes but other engines ignore live in
+        # ``shared.strategy_registry.VECTORBT_ONLY_SIGNAL_KEYS`` — the matrix
+        # queue excludes strategies emitting them off vectorbt (#318). When a
+        # new execution key is added to ``_EXECUTION_SIGNAL_KEYS``, register it
+        # there too; the registry test pins the two sets together.
+        canonical = _EXECUTION_SIGNAL_KEYS
         for column in signals.columns:
             if str(column).lower() not in canonical and str(column) not in roles:
                 raise ValueError(
@@ -1397,8 +1414,8 @@ def _indicator_meta_key(name: str) -> str:
 #: Protective-level aliases in canonical-first order (#237). A strategy that
 #: publishes both spellings of one level must resolve identically in every
 #: engine, so the winner can never depend on the indicators dict's insertion
-#: order. The order is the one ``risk.live._LIVE_SL_KEYS``/``_LIVE_TP_KEYS``
-#: and the native ``TradeEngine._extract_levels`` use.
+#: order. The order is the one ``risk.signal_levels.SL_METADATA_KEYS``/
+#: ``TP_METADATA_KEYS`` and the native ``TradeEngine._extract_levels`` use.
 _LEVEL_ALIASES: dict[str, tuple[str, ...]] = {
     "sizing_stop": ("sizing_stop", "sizing_sl_price", "sizing_sl"),
     "stop_loss": ("stop_loss", "sl_price"),

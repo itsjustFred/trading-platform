@@ -7,12 +7,9 @@ nicht baubar, kein Fake-Sentiment aus Preisdaten).
 """
 
 import importlib.util
-import sys
 from pathlib import Path
 
 import pandas as pd
-
-sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 STRATEGY_PATH = PROJECT_ROOT / "strategies" / "tiingo_sentiment" / "tiingo_sentiment.py"

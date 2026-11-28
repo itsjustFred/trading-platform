@@ -50,6 +50,7 @@ from data_tools.differential_slice import (
 )
 from data_tools.downloaders import dukascopy_native
 from scripts import fetch_differential_slice as fetch_script
+from tests.conftest import sandboxed_env
 from tests.helpers.differential_slice import slice_like_frame, violations, write_slice_like
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -470,6 +471,7 @@ def test_the_fetch_script_reuses_a_valid_cached_slice(tmp_path):
         text=True,
         cwd=str(REPO_ROOT),
         timeout=300,
+        env=sandboxed_env(),
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert "reusing the valid cached slice" in result.stdout

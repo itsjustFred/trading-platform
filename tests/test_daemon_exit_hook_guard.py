@@ -52,6 +52,9 @@ import subprocess
 import sys
 from pathlib import Path
 
+import tests.conftest as suite_conftest
+from tests.conftest import sandboxed_env
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 LIVE_RUNNER = REPO_ROOT / "live_runner"
 
@@ -298,6 +301,19 @@ def _scan_source(rel_path: str, source: str) -> list[str]:
     return violations
 
 
+#: The files the sandbox's child shim loads into the probe's child, by repo-relative path. The
+#: probe runs with ``sandboxed_env()``, so the shim's own conftest is in the closure of every
+#: *test* child before the daemon is - and in nothing else: a production module that reached
+#: for ``tests/conftest.py`` itself is a finding, so the exclusion is narrow by file rather
+#: than by package, and it exists only for a child the sandbox actually loaded the file into.
+_SANDBOX_CHILD_SHIM_FILES = frozenset(
+    name
+    for path in [suite_conftest._SESSION_ROOT / "sandbox-shim-loaded-files"]
+    if path.is_file()
+    for name in path.read_text(encoding="utf-8").split()
+)
+
+
 def _is_first_party(rel: str) -> bool:
     """Whether a repo-root-relative path is a first-party daemon module.
 
@@ -307,10 +323,16 @@ def _is_first_party(rel: str) -> bool:
     inside the checkout, a stray ``venv/``, an editable install - is excluded,
     so third-party teardown hooks (Sentry's flush, certifi's temp files) are
     not policed here.
+
+    The sandbox shim's own files are excluded as well, for the one reason above
+    (see ``_SANDBOX_CHILD_SHIM_FILES``); the rest of ``tests/`` is scanned like
+    any other package, so a production module that reached into the suite would
+    be reported.
     """
     parts = rel.split("/")
     return (
         parts[0] in _FIRST_PARTY_PACKAGES
+        and rel not in _SANDBOX_CHILD_SHIM_FILES
         and "site-packages" not in parts
         and "__pycache__" not in parts
     )
@@ -344,6 +366,7 @@ def _daemon_process_modules() -> list[str]:
         capture_output=True,
         text=True,
         check=True,
+        env=sandboxed_env(),
     )
     return [p for p in json.loads(proc.stdout) if _is_first_party(p)]
 
@@ -413,6 +436,26 @@ def test_the_probe_scans_only_first_party_modules() -> None:
         assert "site-packages" not in rel.split("/"), rel
         assert not rel.startswith((".venv/", "venv/")), rel
         assert _is_first_party(rel), rel
+
+
+def test_the_shim_exclusion_is_the_exact_set_the_shim_loads() -> None:
+    """The guard's one exclusion is the shim's own file, asserted as an exact set.
+
+    A widened exclusion - a package, a directory, any file under ``tests/`` - would blind the
+    daemon's teardown-hook scan to a module the daemon really imports, and the daemon leaves
+    through ``os._exit``, so the missed hook never runs. Pinned against both the recorded file
+    and the generated shim text, so a widening edit fails here rather than in a leak.
+    """
+    assert _SANDBOX_CHILD_SHIM_FILES == {"tests/conftest.py"}
+    marker = suite_conftest._SESSION_ROOT / "sandbox-shim-loaded-files"
+    assert marker.is_file(), "the shim no longer records the files it loads into a child"
+    assert set(marker.read_text(encoding="utf-8").split()) == _SANDBOX_CHILD_SHIM_FILES
+    shim = (suite_conftest.CHILD_SANDBOX_SHIM_DIR / "sitecustomize.py").read_text(encoding="utf-8")
+    for rel in _SANDBOX_CHILD_SHIM_FILES:
+        # The shim joins the repo root it is handed at runtime, so the text names the parts.
+        assert f"os.path.join(_repo, {rel!r})" in shim, (
+            f"the shim no longer loads {rel}, so the guard's exclusion of it is stale"
+        )
 
 
 def test_the_guard_catches_a_planted_exit_hook() -> None:
