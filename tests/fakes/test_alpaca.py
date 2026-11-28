@@ -392,6 +392,36 @@ def test_a_short_sale_is_refused_before_the_order_is_booked() -> None:
     assert client.positions == {}, "an unbookable fill never creates a position"
 
 
+def test_a_rejection_sequence_is_consumed_in_order() -> None:
+    """``reject_submissions=["first", "second"]`` refuses twice, then accepts."""
+    client = FakeAlpacaTradingClient(
+        mark_prices={AAPL: 100.0}, reject_submissions=["first refusal", "second refusal"]
+    )
+
+    with pytest.raises(APIError, match="first refusal"):
+        client.submit_order(_buy())
+    with pytest.raises(APIError, match="second refusal"):
+        client.submit_order(_buy())
+
+    order = client.submit_order(_buy())
+    assert str(order.status.value) != "rejected", "the sequence is drained, not repeated"
+
+
+def test_a_flat_listing_hides_the_bracket_legs() -> None:
+    """Without ``nested=True`` the parent row comes back with empty ``legs``."""
+    client = FakeAlpacaTradingClient(mark_prices={AAPL: 100.0})
+    _bracket(client)
+
+    flat = client.get_orders(filter=SimpleNamespace(status="open", limit=500))
+    nested = client.get_orders(
+        filter=SimpleNamespace(status="open", limit=500, nested=True)
+    )
+
+    assert len(flat) == len(nested) == 1
+    assert flat[0].legs == [], "a non-nested listing does not expose the legs"
+    assert len(nested[0].legs) == 2
+
+
 def test_a_rejection_the_broker_makes_after_acknowledging_leaves_the_book() -> None:
     client = FakeAlpacaTradingClient(
         mark_prices={AAPL: 100.0},

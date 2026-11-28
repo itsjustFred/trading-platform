@@ -250,9 +250,21 @@ class FakeAlpacaTradingClient:
         self.acknowledgement_seconds = acknowledgement_seconds
         self.fill_seconds = fill_seconds
         self.partial_fill_ratio = partial_fill_ratio
-        self.reject_submissions = reject_submissions
+        # Sequences are consumed in order: normalize to a list the rule pop
+        # can drain, so ``["first", "second"]`` refuses the first matching
+        # submission with "first" and the next with "second".
+        self.reject_submissions = (
+            list(reject_submissions)
+            if reject_submissions is not None and not callable(reject_submissions)
+            else reject_submissions
+        )
         self.reject_with_api_error = reject_with_api_error
-        self.reject_after_acknowledgement = reject_after_acknowledgement
+        self.reject_after_acknowledgement = (
+            list(reject_after_acknowledgement)
+            if reject_after_acknowledgement is not None
+            and not callable(reject_after_acknowledgement)
+            else reject_after_acknowledgement
+        )
         self.cancel_settles = cancel_settles
         self.close_error = close_error
         self.submit_error = submit_error
@@ -309,9 +321,6 @@ class FakeAlpacaTradingClient:
                     order.status = OrderStatus.REJECTED
                     order.failed_at = self.now
                     continue
-                    order.status = OrderStatus.REJECTED
-                    order.failed_at = self.now
-                    continue
             if _text(order.status) in {"accepted", "new", "partially_filled"}:
                 emitted.extend(self._maybe_fill(order))
             if _is_day(order) and _text(order.status) in ("new", "accepted", "partially_filled"):
@@ -361,9 +370,10 @@ class FakeAlpacaTradingClient:
         page.sort(key=_submitted_at_key, reverse=direction == "desc")
         page = page[:limit]
         if not nested:
-            # Alpaca never nests legs in a ``status=open`` listing; the legs
-            # live inside the parent and nothing else exposes them.
-            return page
+            # Alpaca only nests legs when the request asks for them: a flat
+            # listing returns the parent rows with an empty ``legs`` list, so
+            # a caller that forgot ``nested=True`` cannot see them here either.
+            return [replace(order, legs=[]) for order in page]
         return page
 
     def get_order_by_id(self, order_id: str) -> FakeAlpacaOrder:
@@ -603,7 +613,6 @@ class FakeAlpacaTradingClient:
             submitted_at=self.now,
         )
 
-
     def _attach_legs(self, request: Any, parent: FakeAlpacaOrder) -> None:
         """Create a bracket/OTO's legs as the broker does: child orders of their own."""
         if _text(getattr(request, "order_class", OrderClass.SIMPLE)) not in {
@@ -647,33 +656,6 @@ class FakeAlpacaTradingClient:
             )
         # Alpaca lists the stop-loss leg first and the take-profit second.
         parent.legs.sort(key=lambda leg: _text(leg.order_type) != "stop")
-
-    def _new_order(self, request: Any) -> FakeAlpacaOrder:
-        """Read a submission request as the book sees it.
-
-        The broker stamps each submission in arrival order, and several arrive
-        inside one fake tick: the clock steps a microsecond per submission so
-        every order has its own ``submitted_at``, which is the only way the
-        ``status=all`` pagination's ``until`` bound can move past a boundary.
-        """
-        self.now = self.now + timedelta(microseconds=1)
-        return FakeAlpacaOrder(
-            id=self._next_order_id(),
-            client_order_id=str(getattr(request, "client_order_id", "") or ""),
-            symbol=str(getattr(request, "symbol", "") or "").strip().upper(),
-            side=getattr(request, "side", OrderSide.BUY),
-            qty=_optional_float(getattr(request, "qty", None)) or 0.0,
-            notional=_optional_float(getattr(request, "notional", None)),
-            order_type=getattr(request, "type", OrderType.MARKET),
-            order_class=getattr(request, "order_class", OrderClass.SIMPLE),
-            time_in_force=getattr(request, "time_in_force", TimeInForce.GTC),
-            limit_price=_optional_float(getattr(request, "limit_price", None)),
-            stop_price=_optional_float(getattr(request, "stop_price", None)),
-            status=OrderStatus.PENDING_NEW,
-            asset_class=getattr(request, "asset_class", AssetClass.US_EQUITY),
-            extended_hours=bool(getattr(request, "extended_hours", False)),
-            submitted_at=self.now,
-        )
 
     def _next_order_id(self) -> str:
         self._seq += 1
@@ -745,6 +727,11 @@ class FakeAlpacaTradingClient:
     ) -> list[FakeAlpacaTradeUpdate]:
         if qty <= 0.0:
             return []
+        # Net the position FIRST: a fill the book cannot take (a short sale on
+        # a long-only account) raises before the order row is touched, so the
+        # book never shows an order filled against a position that does not
+        # exist.
+        self._net_position(order.symbol, order.side, qty, price)
         previous = _float(order.filled_qty)
         cumulative = previous + qty
         order.filled_qty = cumulative
@@ -762,7 +749,6 @@ class FakeAlpacaTradingClient:
             _release_legs(order)
         else:
             order.status = OrderStatus.PARTIALLY_FILLED
-        self._net_position(order.symbol, order.side, qty, price)
         if _text(order.status) == "filled":
             self._cancel_oco_siblings(order)
         return [self._trade_update(order, qty, price)]
@@ -824,7 +810,6 @@ class FakeAlpacaTradingClient:
 
 def _release_legs(parent: FakeAlpacaOrder) -> None:
     """When a bracket/OTO parent fills, its held legs go working."""
-    """When a bracket/OTO parent fills, its held legs go working."""
     for leg in parent.legs:
         if _text(leg.status) == "held":
             leg.status = OrderStatus.NEW
@@ -880,8 +865,11 @@ def _rule_text(
         except Exception:  # pragma: no cover - a rejection rule must not break the broker
             return None
         return str(text) if text else None
-    remaining = list(rule)
-    return str(remaining.pop(0)) if remaining else None
+    # ``__init__`` normalizes sequences to lists so the refusal is consumed
+    # in order; a bare tuple reaches here only if the attribute was reassigned.
+    if isinstance(rule, list):
+        return str(rule.pop(0)) if rule else None
+    return None
 
 
 def _request_like(order: FakeAlpacaOrder) -> Any:
