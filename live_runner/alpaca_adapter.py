@@ -53,6 +53,12 @@ from live_runner.symbol_class import (
     canonical_crypto_symbol,
     classify_symbol,
 )
+from risk.signal_levels import (
+    SL_METADATA_KEYS,
+    TP_METADATA_KEYS,
+    LevelParsing,
+    resolve_signal_level,
+)
 from shared import venue_calendar
 from shared.alpaca_symbols import classify_alpaca_symbol, crypto_pair_key
 from shared.constants import DATA_DIR
@@ -102,8 +108,6 @@ logger = get_logger("live-runner")
 
 _ALPACA_ACC_RE = re.compile(r"^ALPACA_API_KEY_ACC(?P<index>\d+)$")
 
-_SL_METADATA_KEYS = ("stop_loss", "sl_price", "stop_price", "resolved_stop_loss")
-_TP_METADATA_KEYS = ("take_profit", "tp_price")
 #: Overnight Reg T ceiling for marginable stocks: Alpaca's ``multiplier`` = 4
 #: is intraday buying power only, so positions that may be held overnight are
 #: capped at 2x equity. No platform order is marked intraday-only.
@@ -260,10 +264,10 @@ def _round_bracket_levels_in_place(
         )
     buy = signal.action == "buy"
     for canonical_key, keys in (
-        ("stop_loss", _SL_METADATA_KEYS),
-        ("take_profit", _TP_METADATA_KEYS),
+        ("stop_loss", SL_METADATA_KEYS),
+        ("take_profit", TP_METADATA_KEYS),
     ):
-        level = _resolve_optional_float(metadata, keys)
+        level = resolve_signal_level(metadata, keys, parsing=LevelParsing.ANY_FLOAT).price
         if level is None or not math.isfinite(level) or level <= 0:
             # Missing/invalid levels are refused by _resolve_broker_sl_tp.
             continue
@@ -1162,21 +1166,6 @@ def _is_flat(qty: float) -> bool:
     a NaN that slipped through must not read as "nothing open".
     """
     return math.isclose(qty, 0.0, rel_tol=0.0, abs_tol=1e-12)
-
-
-def _resolve_optional_float(metadata: Mapping[str, Any], keys: tuple[str, ...]) -> float | None:
-    for key in keys:
-        if key not in metadata:
-            continue
-        value = metadata.get(key)
-        if value is None:
-            continue
-        try:
-            parsed = float(value)
-        except (TypeError, ValueError, OverflowError) as exc:
-            raise ValueError(f"Invalid {key}: {value!r}") from exc
-        return parsed
-    return None
 
 
 _DATE_TIME_PREFIX = re.compile(r"^\d{4}-\d{2}-\d{2}[Tt ]\d{2}:\d{2}")
@@ -2739,8 +2728,15 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         opening orders only.
         """
         metadata = signal.metadata or {}
-        stop_loss = _resolve_optional_float(metadata, _SL_METADATA_KEYS)
-        take_profit = _resolve_optional_float(metadata, _TP_METADATA_KEYS)
+        # One allowlist and one resolver for both levels (G19). ANY_FLOAT keeps
+        # this adapter's own leniency: it refuses non-finite and non-positive
+        # levels itself, below, after the missing-level guard.
+        stop_loss = resolve_signal_level(
+            metadata, SL_METADATA_KEYS, parsing=LevelParsing.ANY_FLOAT
+        ).price
+        take_profit = resolve_signal_level(
+            metadata, TP_METADATA_KEYS, parsing=LevelParsing.ANY_FLOAT
+        ).price
         exit_only = (
             str(metadata.get("risk_sizing_mode") or "") == EXIT_ONLY_RISK_SIZING_MODE
         )
