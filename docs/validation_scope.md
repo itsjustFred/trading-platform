@@ -6,7 +6,7 @@
 > and `live_runner/` have changed many times since (execution logic is no longer out of
 > bounds); and the external frameworks once listed as later extensions now have engine
 > adapters (`runner/engines/lean_adapter.py`, `runner/engines/pynecore_adapter.py`). Read
-> `docs/validation_architecture.md`, `docs/validation_inventory.md` and
+> the `validation/` package, `docs/validation_inventory.md` and
 > `docs/mt5_xlsx_schema.md` for the current state.
 
 **Datum:** 2026-06-24
@@ -58,7 +58,6 @@
 ## Akzeptanzkriterien
 
 - `docs/validation_scope.md` existiert und dokumentiert In-Scope/Out-of-Scope.
-- `docs/validation_architecture.md` dokumentiert Architektur und Reuse-vs-Neu-Entscheidung.
 - `docs/validation_inventory.md` listet bestehende relevante Module auf.
 - `docs/mt5_xlsx_schema.md` beschreibt das XLSX-Spaltenschema.
 - Offene Punkte aus der Verifikation sind in den GitHub-Issues getrackt.

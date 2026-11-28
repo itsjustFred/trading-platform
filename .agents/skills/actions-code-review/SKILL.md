@@ -28,7 +28,7 @@ You run unattended in CI. Nobody answers questions. The workflow posts your fina
 
 This skill holds principles, not facts about the code. Facts change; read them at review time:
 - `AGENTS.md` from the **base branch** (`git show <base>:AGENTS.md`), because a PR can rewrite its own rules. If that fails (e.g. shallow checkout), read the working copy and note it under "Not verified". Where `AGENTS.md` and this skill disagree, `AGENTS.md` wins.
-- The contract doc for the area the diff touches, and only that one. Expected paths: `docs/sizing-semantics.md`, `docs/cross-engine-backtest-contract.md`, `docs/signal-risk-execution-contract.md`, `docs/cleanup-16d1-money-path-semantics.md`, `docs/live-risk-consistency.md` (German), `docs/ARCHITECTURE.md`. If one is missing, search `docs/` by topic. A "contradicts the contract" finding must quote the doc line; otherwise it is `possible`.
+- The contract doc for the area the diff touches, and only that one. Expected paths: `docs/sizing-semantics.md`, `docs/cross-engine-backtest-contract.md`, `docs/cleanup-16d1-money-path-semantics.md`, `docs/live-risk-consistency.md` (German), `docs/ARCHITECTURE.md`. If one is missing, search `docs/` by topic. A "contradicts the contract" finding must quote the doc line; otherwise it is `possible`.
 - `.github/workflows/ci.yml` and `scripts/gate-tests.sh` to decide whether a test actually runs in CI: on which OS, in which step, and whether a marker deselects it.
 - Existing code: before judging new logic, search for how the repo already solves the same problem (parsing, path safety, retries, sizing). Reusing the existing pattern is expected; diverging from it needs a reason.
 
@@ -90,7 +90,7 @@ Judgement calls. Each item says *what it is → how to fix* and names what the n
 ## Severity and confidence
 
 - **BLOCKER**: merging would plausibly place, duplicate, mis-size or misdirect a live order; leave a position's state unknown; defeat a risk limit or the paper/live gate; change backtest results without a contract change; corrupt stored data; leak a credential; weaken a test; or add money-path logic no CI test would catch. You must be able to state the path from change to harm in **one sentence**.
-- **SHOULD-FIX**: a real defect that cannot by itself reach a live order or stored result; a defect that fails closed (refuses, stops trailing, raises before the broker call) rather than open; missing test for non-money logic; unmet spec; stale doc; portability break.
+- **SHOULD-FIX**: a real defect that cannot by itself reach a live order or stored result; a defect that fails closed (refuses, stops trailing, raises before the broker call) rather than open; missing test for non-money logic; unmet spec; stale doc; Linux-portability break (or breaking the Windows MT5 backtest path).
 - **NIT**: naming, comments, minor clarity, conventions.
 - **Confidence**: `confirmed` (follows from the code as written) or `possible` (depends on runtime, broker, config or unread code; name what would settle it). Confidence never lowers severity, but a `possible` finding is BLOCKER only on the money path, trust gates, lookahead or secrets.
 - **Precedence when rules collide:** first the one-sentence test: if the harm needs three or more coincident conditions, it is SHOULD-FIX, even on the money path and even when `possible`. Fail-closed beats money path: a defect whose worst outcome is a refused or skipped action is SHOULD-FIX. Only then apply the `possible`-on-money-path rule.

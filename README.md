@@ -44,7 +44,7 @@ environment for development and CI:
 
 ```bash
 uv lock --check
-uv sync --frozen --extra dev
+uv sync --frozen --all-extras
 python scripts/check_requirements_drift.py
 ```
 
