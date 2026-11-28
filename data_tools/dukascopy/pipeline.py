@@ -235,8 +235,7 @@ def _tmp_sibling(final: Path, prefix: str) -> Path:
     os.close(fd)
     tmp = Path(name)
     tmp.unlink()
-    with open(tmp, "xb"):
-        pass
+    open(tmp, "xb").close()
     return tmp
 
 
@@ -278,8 +277,8 @@ def _merge_side(stored: pd.DataFrame, fresh: pd.DataFrame) -> pd.DataFrame:
         return fresh.reset_index(drop=True)
     if fresh.empty:
         return stored.reset_index(drop=True)
-    merged = pd.concat([stored, fresh], ignore_index=True)
-    merged = merged.drop_duplicates(subset=["timestamp"], keep="last")
+    kept = stored[~stored["timestamp"].isin(fresh["timestamp"])]
+    merged = pd.concat([kept, fresh], ignore_index=True)
     merged = merged.sort_values("timestamp").reset_index(drop=True)
     merged["timestamp"] = pd.to_datetime(merged["timestamp"], utc=True)
     return merged
