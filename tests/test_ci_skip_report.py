@@ -210,13 +210,19 @@ def test_is_money_path_covers_live_runner_and_engine_tests() -> None:
         for module_pattern, _reason in ALLOWED_SKIPS
         for module in ("tests.fakes.test_alpaca", "tests.fakes.test_ctrader")
     )
-    # A ``slow`` marker would deselect a fakes test under ``-m "not slow"`` —
-    # invisible to the JUnit skip gate — so none may carry it.
+    # A ``slow`` marker or ``collect_ignore`` would deselect fakes tests
+    # under ``-m "not slow"`` — invisible to the JUnit skip gate — so no
+    # file under tests/fakes (conftest.py included) may carry either.
     fakes_root = Path(__file__).resolve().parents[1] / "tests" / "fakes"
-    for path in sorted(fakes_root.glob("test_*.py")):
-        assert "mark.slow" not in path.read_text(encoding="utf-8"), (
+    for path in sorted(fakes_root.rglob("*.py")):
+        source = path.read_text(encoding="utf-8")
+        assert "mark.slow" not in source, (
             f"{path.name} must not be slow-marked: deselected tests never "
             "reach the skip report"
+        )
+        assert "collect_ignore" not in source, (
+            f"{path.name} must not ignore collection: deselected tests "
+            "never reach the skip report"
         )
     assert not is_money_path("tests.test_safe_path")
     assert not is_money_path("tests.strategies.test_channel_breakout")

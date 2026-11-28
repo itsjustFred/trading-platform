@@ -284,6 +284,8 @@ def _is_violation(test: SkippedTest) -> bool:
     """
     if not is_money_path(test.module) or is_allowed_skip(test.module, test.reason):
         return False
+    # An xfail on tests.fakes hides the adapter breakage the contract tests
+    # exist to catch — keep the fakes carve-out.
     return test.kind != "pytest.xfail" or _is_fakes_module(test.module)
 
 
