@@ -24,7 +24,7 @@ import pandas as pd
 import yfinance as yf
 
 from data_tools.downloaders.base import Downloader, DownloadResult, SourceMeta
-from data_tools.path_safety import build_dataset_path
+from shared import ohlcv_store
 from shared.constants import DATA_DIR, normalize_timeframe
 
 logger = logging.getLogger(__name__)
@@ -199,15 +199,7 @@ class YFinanceDownloader(Downloader):
         symbol: str,
         timeframe: str,
     ) -> Path:
-        path = build_dataset_path(
-            output_dir,
-            "ohlcv",
-            self.source_name,
-            "equity",
-            "US",
-            symbol,
-            f"{timeframe}.parquet",
-        )
+        path = ohlcv_store.data_path(output_dir, self.source_name, symbol, timeframe)
         path.parent.mkdir(parents=True, exist_ok=True)
         return path
 
@@ -358,7 +350,9 @@ class YFinanceDownloader(Downloader):
                 )
             )
 
-        combined = self._merge_and_store_single_file(out_path, df)
+        combined = self._merge_and_store_single_file(
+            out_path, df, asset_class="equity", region="US"
+        )
         # C5: a clipped intraday window is an explicit artifact, not just a
         # warning — downstream coverage sees the truncation.
         truncated = False

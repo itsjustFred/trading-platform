@@ -41,6 +41,7 @@ from runner.universe_provenance import (
     survivorship_bias_diagnostic,
     unknown_universe_provenance,
 )
+from shared import ohlcv_store
 from shared.atomic_io import write_text_atomically
 from shared.constants import DATA_DIR, OPTIMIZATIONS_DIR, normalize_timeframe
 from shared.models import BacktestResult, LEGACY_SIGNAL_EXIT_FILL, resolve_defined_stat
@@ -2439,19 +2440,18 @@ def _asset_returns_frame_from_market_data(
         modeling_resolution="open_close",
         log_callback=lambda message: None,
     )
-    root = Path(data_dir) / "ohlcv" if data_dir else DATA_DIR / "ohlcv"
+    data_root = Path(data_dir) if data_dir else DATA_DIR
     series: dict[str, pd.Series] = {}
     start_ts = pd.to_datetime(start, utc=True, errors="coerce")
     end_ts = pd.to_datetime(end, utc=True, errors="coerce")
     for symbol in symbols:
-        matches = sorted(
-            root.rglob(f"**/{symbol}/{timeframe}.parquet"),
-            key=lambda item: item.as_posix(),
+        entries = ohlcv_store.list_datasets(
+            data_root, symbol=symbol, timeframe=timeframe
         )
-        path = matches[0] if matches else None
-        if path is None:
+        if not entries:
             continue
-        frame = pd.read_parquet(path)
+        entry = min(entries, key=lambda item: item.path.as_posix())
+        frame = ohlcv_store.read_frame(entry)
         if "timestamp" not in frame.columns or "close" not in frame.columns:
             continue
         timestamps = pd.to_datetime(frame["timestamp"], utc=True, errors="coerce")

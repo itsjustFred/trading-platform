@@ -51,7 +51,8 @@ from data_tools.downloaders.dukascopy_native import (
     get_decimal_factor,
     parse_ticks,
 )
-from shared.atomic_io import write_text_atomically
+from shared import ohlcv_store
+from shared.atomic_io import write_parquet_atomically, write_text_atomically
 from shared.constants import resolve_genesis_path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -488,7 +489,6 @@ def _assemble_tick_dataframe(
 
 async def _download_month(
     symbol: str,
-    asset_class: str,
     instrument: str,
     month_start: date,
     month_end_exclusive: date,
@@ -618,16 +618,15 @@ async def _download_month(
     if frame.empty:
         raise RuntimeError(f"[{_month_label(month_start)}] Parsed tick dataframe is empty.")
 
-    out_path = (
-        DATA_DIR
-        / "ohlcv"
-        / "dukascopy"
-        / asset_class
-        / symbol.upper()
-        / f"tick_{month_start.year:04d}_{month_start.month:02d}.parquet"
+    out_path = ohlcv_store.data_path(
+        DATA_DIR,
+        "dukascopy",
+        symbol.upper(),
+        "tick",
+        segment=f"{month_start.year:04d}_{month_start.month:02d}",
     )
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    frame.to_parquet(out_path, index=False)
+    write_parquet_atomically(out_path, frame)
     rows = len(frame)
     del frame
     del successful_results
@@ -720,7 +719,6 @@ def _run(
             result = asyncio.run(
                 _download_month(
                     symbol=symbol,
-                    asset_class=asset_class,
                     instrument=instrument,
                     month_start=month_start,
                     month_end_exclusive=month_end,

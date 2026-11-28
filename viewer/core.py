@@ -36,7 +36,6 @@ from runner.auto_agent import (  # noqa: F401 - re-exported for viewer/main.py a
     SUPPORTED_MODEL_NAMES,
     run_auto_agent,
 )
-from runner.engines import contract
 from runner.llm_providers import (  # noqa: F401 - re-exported for viewer/main.py and the API surface
     DEFAULT_LLM_PROVIDER_NAME,
     SUPPORTED_LLM_PROVIDER_NAMES,
@@ -48,6 +47,7 @@ from runner.optimizer import (
     run_optimization as execute_optimization,  # noqa: F401 - re-exported for viewer/main.py and the API surface
 )
 from runner.stats import compute_stats, compute_stats_for_result
+from shared import ohlcv_store
 from shared.constants import (
     DATA_DIR,
     LOG_DIR,
@@ -227,13 +227,6 @@ _OHLCV_TIMEFRAME_RE = re.compile(r"^[A-Za-z0-9]{1,16}$")
 _OHLCV_MAX_MATCHES = 32
 _OHLCV_MAX_BYTES = 256 * 1024 * 1024
 _OHLCV_MAX_ROWS = 2_000_000
-_OHLCV_SOURCE_PRIORITY = {
-    "dukascopy": 0,
-    "yfinance": 1,
-    "huggingface": 2,
-    "alpaca": 3,
-    "dolthub": 4,
-}
 _OHLCV_DF_CACHE_LOCK = threading.RLock()
 _OHLCV_SOURCE_SIGNATURE = tuple[tuple[str, int, int], ...]
 _OHLCV_DF_CACHE: dict[
@@ -667,32 +660,41 @@ def _trade_to_viewer(trade) -> dict:
 
 
 def _ohlcv_candidates(root: Path, symbol: str, timeframe: str) -> list[Path]:
-    normalized_symbol = symbol.casefold()
-    normalized_timeframe = normalize_timeframe(timeframe).casefold()
-    candidates: list[tuple[int, str, Path]] = []
-    for path in root.rglob("*.parquet"):
-        try:
-            relative = path.relative_to(root)
-            parts = relative.parts
-            if len(parts) < 2 or path.is_symlink() or not path.is_file():
-                continue
-            if parts[-2].casefold() != normalized_symbol:
-                continue
-            file_timeframe = path.stem
-            if normalize_timeframe(file_timeframe).casefold() != normalized_timeframe:
-                continue
-            source = parts[0].casefold()
-            priority = _OHLCV_SOURCE_PRIORITY.get(source, len(_OHLCV_SOURCE_PRIORITY))
-            candidates.append((priority, source, path))
-            if len(candidates) > _OHLCV_MAX_MATCHES:
-                return []
-        except (OSError, ValueError):
-            continue
-    if not candidates:
+    """Manifest-declared parquet segments for ``symbol``/``timeframe``.
+
+    Only the dataset ``find_dataset`` would select contributes files —
+    the same ``ohlcv_store.selection_rank`` the engines use — so the chart
+    can never disagree with a backtest about which source a symbol reads
+    (#471).
+    """
+    normalized_timeframe = normalize_timeframe(timeframe)
+    try:
+        entries = ohlcv_store.list_datasets(
+            root.parent, symbol=symbol, timeframe=normalized_timeframe
+        )
+    except Exception as exc:
+        logger.warning("Could not list OHLCV datasets for %s %s: %s", symbol, timeframe, exc)
         return []
-    candidates.sort(key=lambda item: (item[0], item[1], str(item[2])))
-    selected_source = candidates[0][1]
-    return [item[2] for item in candidates if item[1] == selected_source]
+    rank_symbol = str(symbol or "").strip().upper()
+    by_entry: dict[ohlcv_store.DatasetEntry, list[Path]] = {}
+    for entry in entries:
+        paths = [
+            path
+            for path in entry.segments
+            if path.is_file() and not path.is_symlink()
+        ]
+        if paths:
+            by_entry[entry] = paths
+    if not by_entry:
+        return []
+    best_entry = min(
+        by_entry,
+        key=lambda entry: ohlcv_store.selection_rank(entry, rank_symbol),
+    )
+    paths = sorted(set(by_entry[best_entry]))
+    if len(paths) > _OHLCV_MAX_MATCHES:
+        return []
+    return paths
 
 
 def _parquet_row_count(path: Path) -> int:
@@ -760,7 +762,7 @@ def _load_ohlcv_df(symbol: str, timeframe: str) -> pd.DataFrame | None:
         _invalidate_ohlcv_cache(cache_key)
         return None
 
-    ohlcv_root = (DATA_DIR / "ohlcv").resolve()
+    ohlcv_root = ohlcv_store.store_root(DATA_DIR).resolve()
     matches = _ohlcv_candidates(ohlcv_root, normalized_symbol, normalized_timeframe)
     if not matches or len(matches) > _OHLCV_MAX_MATCHES:
         _invalidate_ohlcv_cache(cache_key)
@@ -882,15 +884,17 @@ def ohlcv_asset_class(symbol: str, timeframe: str) -> str:
         or _OHLCV_TIMEFRAME_RE.fullmatch(normalized_timeframe) is None
     ):
         return ""
-    ohlcv_root = (DATA_DIR / "ohlcv").resolve()
+    ohlcv_root = ohlcv_store.store_root(DATA_DIR).resolve()
     matches = _ohlcv_candidates(ohlcv_root, normalized_symbol, normalized_timeframe)
     if not matches or len(matches) > _OHLCV_MAX_MATCHES:
         return ""
     # ``_load_ohlcv_df`` merges every selected match, so the class is only
-    # well-defined when all of them agree on one asset class.
-    asset_classes = {
-        contract.ohlcv_path_metadata(path)["asset_class"] for path in matches
-    }
+    # well-defined when all of them agree on one asset class. Each stored
+    # path resolves back to its manifest dataset entry (#471).
+    asset_classes = set()
+    for path in matches:
+        entry = ohlcv_store.entry_for_path(DATA_DIR, path)
+        asset_classes.add(entry.asset_class if entry is not None else "")
     if len(asset_classes) != 1:
         return ""
     return asset_classes.pop()

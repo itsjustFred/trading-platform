@@ -374,11 +374,11 @@ def test_viewer_fallback_fragments_cover_all_bootstrap_error_strings():
 
 
 def test_timeframe_file_suffix_normalization_preserves_15m():
-    from data_tools.downloaders import jforex_dl
+    from shared import ohlcv_store
 
-    assert jforex_dl._normalize_timeframe_for_file_suffix("15m") == "m15"
-    assert jforex_dl._normalize_timeframe_for_file_suffix("30m") == "m30"
-    assert jforex_dl._normalize_timeframe_for_file_suffix("1m") == "m1"
+    assert ohlcv_store.tf_token("15m") == "M15"
+    assert ohlcv_store.tf_token("30m") == "M30"
+    assert ohlcv_store.tf_token("1m") == "M1"
 
 
 

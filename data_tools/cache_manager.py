@@ -15,11 +15,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from data_tools.catalog_builder import build_catalog, merge_ohlcv_entries, parse_ohlcv_path
+from data_tools.catalog_builder import build_catalog, merge_ohlcv_entries
 from data_tools.file_fingerprint import fingerprint_matches
 from data_tools.path_safety import ensure_dataset_path_within
 from shared.constants import DATA_DIR
 from shared.logging import get_logger
+from shared.ohlcv_store import list_datasets
 
 logger = get_logger("data_tools.cache")
 
@@ -227,15 +228,14 @@ def _catalog_matches_disk(payload: dict[str, Any], data_dir: Path) -> bool:
         return True
 
     actual_paths: set[str] = set()
-    if ohlcv_root.exists():
-        for path in ohlcv_root.rglob("*.parquet"):
+    for dataset in list_datasets(data_dir):
+        for path in dataset.segments or (dataset.path,):
             try:
                 ensure_dataset_path_within(ohlcv_root, path)
             except ValueError:
                 continue
-            if parse_ohlcv_path(path, ohlcv_root) is None or not path.is_file():
-                continue
-            actual_paths.add(str(path.resolve(strict=False)))
+            if path.is_file():
+                actual_paths.add(str(path.resolve(strict=False)))
     return actual_paths == expected_paths
 
 

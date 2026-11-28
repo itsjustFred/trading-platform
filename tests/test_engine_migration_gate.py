@@ -477,9 +477,11 @@ class TestDiffStats:
 
 
 class TestDetectWindow:
-    def _write_shard(self, root: Path, symbol: str, start: str, end: str) -> None:
-        folder = root / "ohlcv" / symbol
-        folder.mkdir(parents=True, exist_ok=True)
+    def _write_shard(
+        self, root: Path, symbol: str, start: str, end: str, *, source: str = "test"
+    ) -> None:
+        from shared import ohlcv_store
+
         frame = pd.DataFrame(
             {
                 "timestamp": pd.date_range(start, end, freq="h", tz="UTC"),
@@ -490,7 +492,9 @@ class TestDetectWindow:
                 "volume": 1.0,
             }
         )
-        frame.to_parquet(folder / "1h.parquet", index=False)
+        ohlcv_store.write_frame(
+            root, source, symbol, "1h", frame, asset_class="equities"
+        )
 
     def test_window_is_the_intersection_not_the_union(self, tmp_path):
         self._write_shard(tmp_path, "AAA", "2024-01-01", "2024-06-30")
@@ -502,27 +506,15 @@ class TestDetectWindow:
         self._write_shard(tmp_path, "AAA", "2024-01-01", "2024-06-30")
         assert gate._detect_window(tmp_path / "ohlcv", ["AAA", "MISSING"], "1h") is None
 
-    def test_window_comes_from_the_first_shard_the_adapter_reads(self, tmp_path):
-        """Two shards for one symbol: the adapters take ``matches[0]`` of the
-        sorted rglob, so the detected window must be that shard's extent —
-        not the union and not the last shard's."""
-        for name, start, end in (
+    def test_window_comes_from_the_dataset_the_adapter_reads(self, tmp_path):
+        """Two sources for one symbol: the detected window must be the extent
+        of the dataset ``find_dataset`` ranks first — the file the adapters
+        actually load — not the union and not the loser's."""
+        for source, start, end in (
             ("a", "2024-01-01", "2024-03-31"),
             ("b", "2024-06-01", "2024-09-30"),
         ):
-            folder = tmp_path / "ohlcv" / name / "AAA"
-            folder.mkdir(parents=True)
-            frame = pd.DataFrame(
-                {
-                    "timestamp": pd.date_range(start, end, freq="h", tz="UTC"),
-                    "open": 1.0,
-                    "high": 1.0,
-                    "low": 1.0,
-                    "close": 1.0,
-                    "volume": 1.0,
-                }
-            )
-            frame.to_parquet(folder / "1h.parquet", index=False)
+            self._write_shard(tmp_path, "AAA", start, end, source=source)
         window = gate._detect_window(tmp_path / "ohlcv", ["AAA"], "1h")
         assert window == ("2024-01-01", "2024-03-31")
 
@@ -541,7 +533,7 @@ class TestSyntheticOhlcv:
     def test_supported_timeframes_write_bars(self, tmp_path, timeframe, start, end):
         bars = gate._write_synthetic_ohlcv(tmp_path, ["X"], timeframe, start, end)
         assert bars > 0
-        assert list(tmp_path.rglob(f"{timeframe}.parquet"))
+        assert list((tmp_path / "ohlcv").rglob("*.parquet"))
 
 
 class TestSyntheticWindowGuard:

@@ -46,6 +46,7 @@ from runner.engines.base import (
 )
 from runner.engines.contract import resolve_same_bar_exit
 from runner.fees import resolve_fee_model
+from shared import ohlcv_store
 from shared.constants import DATA_DIR
 from shared.models import (
     BacktestMeta,
@@ -330,8 +331,9 @@ def _process_symbol(
     # start_date feed the strategy's indicators but create no trades.
     warmup_raw = str(getattr(config, "warmup_start", "") or "").strip()
     load_start = warmup_raw or config.start_date
-    df, data_path = _load_ohlcv(
-        data_root, symbol, config.timeframe, load_start, config.end_date
+    df, entry = _load_ohlcv(
+        data_root, symbol, config.timeframe, load_start, config.end_date,
+        data_source=config.data_source or "",
     )
     if df is None or df.empty:
         raise RuntimeError(
@@ -351,7 +353,7 @@ def _process_symbol(
                 "warmup gate cannot derive trade_from"
             )
 
-    asset_class = _infer_asset_class_from_path(data_path)
+    asset_class = _infer_asset_class(entry)
     intrabar_df, intrabar_timeframe = _load_intrabar_ohlcv(
         data_root,
         symbol,
@@ -359,6 +361,7 @@ def _process_symbol(
         config.modeling_resolution,
         load_start,
         config.end_date,
+        data_source=config.data_source or "",
     )
     extra_timeframes = [intrabar_timeframe] if intrabar_timeframe else []
 
@@ -1782,28 +1785,18 @@ def _load_ohlcv(
     timeframe: str,
     start_date: str,
     end_date: str,
-) -> tuple[pd.DataFrame | None, Path | None]:
-    """Find and load OHLCV parquet for a symbol."""
-    ohlcv_root = data_root / "ohlcv"
-    matches = sorted(
-        ohlcv_root.rglob(f"**/{symbol}/{timeframe}.parquet"),
-        key=lambda path: path.as_posix(),
+    *,
+    data_source: str = "",
+) -> tuple[pd.DataFrame | None, ohlcv_store.DatasetEntry | None]:
+    """Find and load OHLCV data for a symbol via the manifest store."""
+    entry = ohlcv_store.find_dataset(
+        data_root, symbol, timeframe, data_source=data_source
     )
-    if not matches:
+    if entry is None:
         return None, None
 
-    selected_path = matches[0]
-    df = pd.read_parquet(selected_path)
-    df.columns = [c.lower() for c in df.columns]
-    df = contract.normalize_ohlcv_frame(df)
-
-    if "timestamp" in df.columns:
-        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
-        # Conformance (Cleanup 16-A, F9): shared date-filter convention — a
-        # date-only end boundary is inclusive of the full day.
-        df = contract.apply_date_filter(df, start=start_date, end=end_date)
-
-    return df.reset_index(drop=True), selected_path
+    df = ohlcv_store.read_frame(entry, start=start_date, end=end_date)
+    return df, entry
 
 
 def _normalize_intrabar_resolution(value: str | None) -> str:
@@ -1827,12 +1820,17 @@ def _load_intrabar_ohlcv(
     intrabar_resolution: str | None,
     start_date: str,
     end_date: str,
+    *,
+    data_source: str = "",
 ) -> tuple[pd.DataFrame | None, str | None]:
     target_timeframe = _resolve_intrabar_timeframe(base_timeframe, intrabar_resolution)
     if not target_timeframe:
         return None, None
 
-    intrabar_df, _ = _load_ohlcv(data_root, symbol, target_timeframe, start_date, end_date)
+    intrabar_df, _ = _load_ohlcv(
+        data_root, symbol, target_timeframe, start_date, end_date,
+        data_source=data_source,
+    )
     if intrabar_df is None or intrabar_df.empty:
         logger.info(
             "Intrabar data unavailable for %s/%s at %s; falling back to open/close exits",
@@ -1945,15 +1943,10 @@ def _match_intrabar_exit_event(
     return None
 
 
-def _infer_asset_class_from_path(data_path: Path | None) -> str:
-    if data_path is None:
+def _infer_asset_class(entry: ohlcv_store.DatasetEntry | None) -> str:
+    if entry is None:
         return "unknown"
-    parts = data_path.parts
-    try:
-        ohlcv_idx = parts.index("ohlcv")
-        return parts[ohlcv_idx + 2].lower()
-    except (ValueError, IndexError):
-        return "unknown"
+    return entry.asset_class or "unknown"
 
 
 def _extract_trade_meta(

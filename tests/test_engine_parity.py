@@ -66,9 +66,12 @@ def _deterministic_ohlcv() -> pd.DataFrame:
 def parity_data_dir(tmp_path_factory) -> Path:
     """Bundled fixture written into a tmp ohlcv tree (no env dependence)."""
     data_dir = tmp_path_factory.mktemp("parity-data")
-    symbol_dir = data_dir / "ohlcv" / "PARITY"
-    symbol_dir.mkdir(parents=True)
-    _deterministic_ohlcv().to_parquet(symbol_dir / "1h.parquet", index=False)
+    from shared import ohlcv_store
+
+    ohlcv_store.write_frame(
+        data_dir, "PARITY", "PARITY", "1h", _deterministic_ohlcv(),
+        asset_class="equities",
+    )
     return data_dir
 
 

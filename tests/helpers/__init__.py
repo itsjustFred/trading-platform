@@ -100,10 +100,28 @@ def write_ohlcv(
     data_dir, symbol: str, frame: pd.DataFrame, *, timeframe: str = "1h",
     source: str = "test_source", asset_class: str = "equities",
 ) -> None:
-    """Write ``frame`` as the OHLCV parquet for ``symbol`` under ``data_dir``."""
-    symbol_dir = data_dir / "ohlcv" / source / asset_class / symbol
-    symbol_dir.mkdir(parents=True, exist_ok=True)
-    frame.to_parquet(symbol_dir / f"{timeframe}.parquet", index=False)
+    """Write ``frame`` as the OHLCV dataset for ``symbol`` under ``data_dir``.
+
+    Routes through ``ohlcv_store.write_frame`` so fixtures land in the
+    manifest layout (``ohlcv/<source>/<SYMBOL>/<SYMBOL>_<TF>.parquet``).
+    The frame is normalised to the store's write contract first — sorted,
+    unique, UTC timestamps.
+    """
+    from shared import ohlcv_store
+
+    prepared = frame.copy()
+    prepared.columns = [str(column).lower() for column in prepared.columns]
+    if "timestamp" in prepared.columns:
+        prepared["timestamp"] = pd.to_datetime(
+            prepared["timestamp"], utc=True, errors="coerce"
+        )
+        prepared = prepared.dropna(subset=["timestamp"])
+        prepared = prepared.sort_values("timestamp").drop_duplicates(
+            subset=["timestamp"], keep="last"
+        )
+    ohlcv_store.write_frame(
+        data_dir, source, symbol, timeframe, prepared, asset_class=asset_class
+    )
 
 
 def with_zero_fees(payload: dict) -> dict:

@@ -41,25 +41,33 @@ def test_dataset_component_rejects_unsafe_values(component: str) -> None:
 def test_validation_uses_custom_ohlcv_root_for_relative_inference(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    path = tmp_path / "custom" / "ohlcv" / "source" / "equity" / "AAPL" / "1d.parquet"
-    path.parent.mkdir(parents=True)
-    pd.DataFrame(
-        {
-            "timestamp": pd.date_range("2024-01-01", periods=2, freq="D", tz="UTC"),
-            "open": [1.0, 2.0],
-            "high": [2.0, 3.0],
-            "low": [0.0, 1.0],
-            "close": [1.5, 2.5],
-            "volume": [10.0, 11.0],
-        }
-    ).to_parquet(path, index=False)
+    from shared import ohlcv_store
+
+    data_root = tmp_path / "custom"
+    ohlcv_store.write_frame(
+        data_root,
+        "source",
+        "AAPL",
+        "1d",
+        pd.DataFrame(
+            {
+                "timestamp": pd.date_range("2024-01-01", periods=2, freq="D", tz="UTC"),
+                "open": [1.0, 2.0],
+                "high": [2.0, 3.0],
+                "low": [0.0, 1.0],
+                "close": [1.5, 2.5],
+                "volume": [10.0, 11.0],
+            }
+        ),
+        asset_class="equity",
+    )
 
     monkeypatch.chdir(tmp_path)
     results = validation.validate_all(Path("custom"))
 
     assert len(results) == 1
     assert results[0].source == "source"
-    assert results[0].path == "source/equity/AAPL/1d.parquet"
+    assert results[0].path == "source/AAPL/AAPL_D1.parquet"
 
 
 def test_dataset_component_rejects_explicit_parent_component() -> None:
@@ -108,20 +116,22 @@ def test_coverage_rejects_glob_symbol_before_scanning(tmp_path: Path) -> None:
 
 
 def test_alias_refresh_uses_file_fingerprint(tmp_path: Path) -> None:
-    canonical = tmp_path / "ohlcv" / "dukascopy" / "forex" / "EURUSD" / "1m.parquet"
+    from shared import ohlcv_store
+
+    canonical = ohlcv_store.data_path(tmp_path, "dukascopy", "EURUSD", "1m")
     canonical.parent.mkdir(parents=True)
     canonical.write_bytes(b"new canonical data")
-    alias = ensure_alias_copy(canonical, "GBPUSD", "forex", tmp_path)
+    alias = ensure_alias_copy(canonical, "GBPUSD", "1m", "forex", tmp_path)
     alias.write_bytes(b"old canonical data")
 
-    refreshed = ensure_alias_copy(canonical, "GBPUSD", "forex", tmp_path)
+    refreshed = ensure_alias_copy(canonical, "GBPUSD", "1m", "forex", tmp_path)
 
     assert refreshed.read_bytes() == canonical.read_bytes()
 
 
 def test_catalog_cache_rebuilds_after_fingerprint_change(tmp_path: Path) -> None:
-    parquet = tmp_path / "ohlcv" / "test" / "equity" / "AAPL" / "1h.parquet"
-    parquet.parent.mkdir(parents=True)
+    from shared import ohlcv_store
+
     frame = pd.DataFrame(
         {
             "timestamp": pd.date_range("2024-01-01", periods=2, freq="h", tz="UTC"),
@@ -131,7 +141,10 @@ def test_catalog_cache_rebuilds_after_fingerprint_change(tmp_path: Path) -> None
             "close": [1.5, 2.5],
         }
     )
-    frame.to_parquet(parquet, index=False)
+    ohlcv_store.write_frame(
+        tmp_path, "test", "AAPL", "1h", frame, asset_class="equity"
+    )
+    parquet = ohlcv_store.data_path(tmp_path, "test", "AAPL", "1h")
     cache_manager.invalidate_cache()
     try:
         first = cache_manager.get_catalog(tmp_path)
@@ -150,9 +163,9 @@ def test_catalog_cache_rebuilds_after_fingerprint_change(tmp_path: Path) -> None
 def test_catalog_cache_ignores_unparseable_ohlcv_files(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    valid = tmp_path / "ohlcv" / "test" / "equity" / "AAPL" / "1h.parquet"
-    valid.parent.mkdir(parents=True)
-    pd.DataFrame(
+    from shared import ohlcv_store
+
+    frame = pd.DataFrame(
         {
             "timestamp": pd.date_range("2024-01-01", periods=1, freq="h", tz="UTC"),
             "open": [1.0],
@@ -160,9 +173,10 @@ def test_catalog_cache_ignores_unparseable_ohlcv_files(
             "low": [0.0],
             "close": [1.5],
         }
-    ).to_parquet(valid, index=False)
-    bad = tmp_path / "ohlcv" / "src" / "bad.parquet"
-    bad.parent.mkdir(parents=True)
+    )
+    ohlcv_store.write_frame(tmp_path, "test", "AAPL", "1h", frame, asset_class="equity")
+    ohlcv_store.write_frame(tmp_path, "src", "BAD", "1h", frame, asset_class="equity")
+    bad = ohlcv_store.data_path(tmp_path, "src", "BAD", "1h")
     bad.write_bytes(b"not a parquet file")
 
     original_build = cache_manager.build_catalog
@@ -206,10 +220,10 @@ def test_csv_migration_keeps_previous_artifact_when_atomic_write_fails(
 
 
 def test_validation_rejects_symlinked_file_outside_data_root(tmp_path: Path) -> None:
+    from shared import ohlcv_store
+
     root = tmp_path / "data"
     outside = tmp_path / "outside.parquet"
-    target = root / "ohlcv" / "test" / "equity" / "AAPL" / "1d.parquet"
-    target.parent.mkdir(parents=True)
     pd.DataFrame(
         {
             "timestamp": pd.to_datetime(["2024-01-01T00:00:00Z"], utc=True),
@@ -219,6 +233,24 @@ def test_validation_rejects_symlinked_file_outside_data_root(tmp_path: Path) -> 
             "close": [1.5],
         }
     ).to_parquet(outside, index=False)
+    ohlcv_store.write_frame(
+        root,
+        "test",
+        "AAPL",
+        "1d",
+        pd.DataFrame(
+            {
+                "timestamp": pd.to_datetime(["2024-01-01T00:00:00Z"], utc=True),
+                "open": [1.0],
+                "high": [2.0],
+                "low": [0.0],
+                "close": [1.5],
+            }
+        ),
+        asset_class="equity",
+    )
+    target = ohlcv_store.data_path(root, "test", "AAPL", "1d")
+    target.unlink()
     target.symlink_to(outside)
 
     results = validation.validate_all(root)

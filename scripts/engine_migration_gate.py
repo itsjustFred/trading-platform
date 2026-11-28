@@ -76,6 +76,7 @@ from runner.engines.native_adapter import NativeAdapter
 from runner.engines.vectorbt_adapter import VectorbtAdapter
 from runner.stats import merge_canonical_stats
 from scripts.safe_path import under_root
+from shared import ohlcv_store
 from shared.atomic_io import write_text_atomically
 from shared.constants import normalize_timeframe
 from shared.models import StrategyType
@@ -171,23 +172,13 @@ def _ohlcv_root(data_root: Path) -> Path:
     return data_root / "ohlcv"
 
 
-def _first_ohlcv_match(ohlcv_root: Path, symbol: str, timeframe: str) -> Path | None:
-    """The parquet the adapters will actually read (they use ``matches[0]``)."""
-    matches = sorted(
-        ohlcv_root.rglob(f"**/{symbol}/{timeframe}.parquet"),
-        key=lambda path: path.as_posix(),
-    )
-    return matches[0] if matches else None
-
-
 def _probe_symbols(ohlcv_root: Path, timeframe: str, limit: int) -> list[str]:
-    """Symbols with at least one ``<symbol>/<timeframe>.parquet`` shard."""
-    if not ohlcv_root.exists():
-        return []
+    """Symbols with a manifest dataset at ``timeframe``."""
     symbols = {
-        path.parent.name
-        for path in ohlcv_root.rglob(f"*/{timeframe}.parquet")
-        if path.parent.name != ohlcv_root.name
+        entry.symbol
+        for entry in ohlcv_store.list_datasets(
+            ohlcv_root.parent, timeframe=timeframe
+        )
     }
     return sorted(symbols)[:limit]
 
@@ -195,28 +186,25 @@ def _probe_symbols(ohlcv_root: Path, timeframe: str, limit: int) -> list[str]:
 def _detect_window(
     ohlcv_root: Path, symbols: list[str], timeframe: str
 ) -> tuple[str, str] | None:
-    """Intersection of each symbol's first-shard timestamp extent.
+    """Intersection of each symbol's dataset timestamp extent.
 
     Mirrors ``runner.cli._detect_date_range``: every requested symbol must
-    contribute a readable range or the window cannot be fabricated.
+    contribute a readable range or the window cannot be fabricated. The
+    dataset is the one the adapters will actually read (the ranked
+    ``find_dataset`` winner).
     """
+    data_root = ohlcv_root.parent
     starts: list[pd.Timestamp] = []
     ends: list[pd.Timestamp] = []
     for symbol in symbols:
-        path = _first_ohlcv_match(ohlcv_root, symbol, timeframe)
-        if path is None:
+        entry = ohlcv_store.find_dataset(data_root, symbol, timeframe)
+        if entry is None:
             return None
-        try:
-            df = pd.read_parquet(path, columns=["timestamp"])
-        except Exception:
+        bounds = ohlcv_store.dataset_bounds(entry)
+        if bounds is None:
             return None
-        if df.empty:
-            return None
-        ts = pd.to_datetime(df["timestamp"], utc=True, errors="coerce").dropna()
-        if ts.empty:
-            return None
-        starts.append(ts.min())
-        ends.append(ts.max())
+        starts.append(bounds[0])
+        ends.append(bounds[1])
     if len(starts) != len(symbols):
         return None
     start = max(starts).strftime("%Y-%m-%d")
@@ -361,14 +349,14 @@ def _write_synthetic_ohlcv(
                 "volume": rng.integers(500, 5000, size=len(timestamps)).astype(float),
             }
         )
-        symbol_dir = (
-            _ohlcv_root(data_root)
-            / SYNTHETIC_SOURCE
-            / SYNTHETIC_ASSET_CLASS
-            / symbol.upper()
+        ohlcv_store.write_frame(
+            data_root,
+            SYNTHETIC_SOURCE,
+            symbol,
+            timeframe,
+            frame,
+            asset_class=SYNTHETIC_ASSET_CLASS,
         )
-        symbol_dir.mkdir(parents=True, exist_ok=True)
-        frame.to_parquet(symbol_dir / f"{timeframe}.parquet", index=False)
         bars = max(bars, len(frame))
     return bars
 

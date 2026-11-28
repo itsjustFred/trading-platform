@@ -229,16 +229,24 @@ def test_get_catalog_normalizes_and_merges_symbol_timeframe_entries_from_disk(mo
     assert merged["file_count"] == 2
 
 
-def test_get_catalog_normalizes_tick_segment_symbols_from_disk(monkeypatch, tmp_path):
+def test_get_catalog_merges_same_dataset_segment_entries(monkeypatch, tmp_path):
+    """Segment files of one store dataset merge into a single catalog entry.
+
+    Pre-#471 this test fed legacy ``{symbol}/{tf}.parquet`` paths and relied on
+    filename-stem normalization to recover ``XAUUSD``/``tick``. The manifest
+    store emits ``symbol``/``timeframe`` directly, so the fixture now spells
+    the entries the way ``scan_ohlcv`` writes them; the merge contract under
+    test (one dataset, summed rows, both files listed) is unchanged.
+    """
     raw_catalog = {
         "summary": {"total_datasets": 999, "symbols": 999},
         "ohlcv": [
             {
                 "path": str(
-                    tmp_path / "ohlcv" / "dukascopy" / "metals" / "XAUUSD" / "tick_2003_05.parquet"
+                    tmp_path / "ohlcv" / "dukascopy" / "XAUUSD" / "XAUUSD_TICK_2003_05.parquet"
                 ),
-                "symbol": "tick_2003_05",
-                "timeframe": "1d",
+                "symbol": "XAUUSD",
+                "timeframe": "tick",
                 "source": "dukascopy",
                 "asset_class": "metals",
                 "size_bytes": 100,
@@ -248,10 +256,10 @@ def test_get_catalog_normalizes_tick_segment_symbols_from_disk(monkeypatch, tmp_
             },
             {
                 "path": str(
-                    tmp_path / "ohlcv" / "dukascopy" / "metals" / "XAUUSD" / "tick_2003_06.parquet"
+                    tmp_path / "ohlcv" / "dukascopy" / "XAUUSD" / "XAUUSD_TICK_2003_06.parquet"
                 ),
-                "symbol": "tick_2003_06",
-                "timeframe": "1d",
+                "symbol": "XAUUSD",
+                "timeframe": "tick",
                 "source": "dukascopy",
                 "asset_class": "metals",
                 "size_bytes": 120,
@@ -289,8 +297,8 @@ def test_get_catalog_normalizes_tick_segment_symbols_from_disk(monkeypatch, tmp_
     assert merged["end"] == "2003-06-30"
     assert merged["file_count"] == 2
     assert {Path(path).name for path in merged["files"]} == {
-        "tick_2003_05.parquet",
-        "tick_2003_06.parquet",
+        "XAUUSD_TICK_2003_05.parquet",
+        "XAUUSD_TICK_2003_06.parquet",
     }
 
 

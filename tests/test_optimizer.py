@@ -122,10 +122,21 @@ def _write_base_backtest(
     result.save(backtests_dir / "base-demo.trades.json")
 
 
-def _write_ohlcv_bars(data_dir: Path, symbol: str, timestamps: list[str]) -> None:
-    path = data_dir / "ohlcv" / "test" / symbol / "1d.parquet"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame(
+def _write_ohlcv_bars(
+    data_dir: Path, symbol: str, timestamps: list[str], *, manifest: bool = True
+) -> None:
+    """Fixture bars in both layouts.
+
+    ``manifest=True`` writes through ``ohlcv_store.write_frame`` for the
+    migrated runner readers and also drops the legacy
+    ``ohlcv/<source>/<asset_class>/<symbol>/<tf>.parquet`` file that the
+    phase-2 ``auto_download`` coverage gates still scan. ``manifest=False``
+    writes only the legacy file — for cases whose timestamps violate the
+    store's write contract but that exercise ``auto_download`` directly.
+    """
+    from shared import ohlcv_store
+
+    frame = pd.DataFrame(
         {
             "timestamp": timestamps,
             "open": [100.0] * len(timestamps),
@@ -134,7 +145,28 @@ def _write_ohlcv_bars(data_dir: Path, symbol: str, timestamps: list[str]) -> Non
             "close": [100.5] * len(timestamps),
             "volume": [1000.0] * len(timestamps),
         }
-    ).to_parquet(path, index=False)
+    )
+    if manifest:
+        ohlcv_store.write_frame(
+            data_dir, "test", symbol, "1d", frame, asset_class="equities"
+        )
+    else:
+        # Manifest-declared but written directly so malformed timestamps reach
+        # the reader: list_datasets only sees manifest entries, and the legacy
+        # shallow path is no longer scanned by auto_download.
+        from shared import ohlcv_store as _store
+
+        path = _store.data_path(data_dir, "test", symbol, "1d")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        frame.to_parquet(path, index=False)
+        manifest = _store.read_manifest(data_dir, "test")
+        meta = manifest.get(symbol, {})
+        meta.setdefault("files", {})[path.name] = {"rows": len(frame), "first": "", "last": ""}
+        meta["asset_class"] = "equities"
+        meta.setdefault("source_symbol", symbol)
+        manifest[symbol] = meta
+        _store.write_manifest(data_dir, "test", manifest)
+    return
 
 
 def test_has_ohlcv_bars_in_range_uses_exact_valid_utc_timestamps(tmp_path: Path):
@@ -142,6 +174,7 @@ def test_has_ohlcv_bars_in_range_uses_exact_valid_utc_timestamps(tmp_path: Path)
         tmp_path,
         "AAPL",
         ["invalid", "2024-01-02T00:00:00+00:00", "2024-01-09T00:00:00+00:00"],
+        manifest=False,
     )
 
     assert has_ohlcv_bars_in_range(

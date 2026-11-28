@@ -22,6 +22,7 @@ from runner.engines._shared import frame_has_ask_side
 from runner.fees import resolve_fee_model
 from runner.slippage import BarSpreadSlippage, resolve_slippage_model
 from runner.stats import compute_stats_for_result
+from shared import ohlcv_store
 from shared.constants import DATA_DIR, VALID_TIMEFRAMES, normalize_timeframe
 from shared.models import BacktestMeta, BacktestResult, EquityPoint, Trade, TradeExit
 from shared.trailing import (
@@ -1151,37 +1152,36 @@ class SignalReplayEngine:
         if not normalized_symbol:
             return None
 
-        ohlcv_root = self.data_dir / "ohlcv"
-        matches = sorted(ohlcv_root.rglob(f"**/{normalized_symbol}/{normalized_timeframe}.parquet"))
-        if not matches:
+        # The replay historically merged every source's copy of the symbol at
+        # this timeframe; the manifest store keeps one entry per source, so
+        # merge them all in deterministic path order (first entry's asset
+        # class wins, same "first match" convention as before).
+        entries = sorted(
+            ohlcv_store.list_datasets(
+                self.data_dir,
+                symbol=normalized_symbol,
+                timeframe=normalized_timeframe,
+            ),
+            key=lambda entry: entry.path.as_posix(),
+        )
+        if not entries:
             return None
-        # #130: classify the instrument from the OHLCV layout so the
-        # slippage defaults apply per asset class (first match wins, same
-        # convention as the native adapter).
-        self._asset_class_by_symbol[normalized_symbol] = contract.ohlcv_path_metadata(
-            matches[0]
-        )["asset_class"]
+        # #130: classify the instrument from the manifest entry so the
+        # slippage defaults apply per asset class.
+        self._asset_class_by_symbol[normalized_symbol] = entries[0].asset_class or ""
 
-        frames: list[pd.DataFrame] = []
-        for path in matches:
-            try:
-                frame = pd.read_parquet(path)
-            except (ValueError, OSError):
-                continue
-            frame.columns = [str(column).lower() for column in frame.columns]
-            frame = contract.normalize_ohlcv_frame(frame)
-            if "timestamp" not in frame.columns:
-                continue
-            frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True, errors="coerce")
-            frame = frame.dropna(subset=["timestamp"])
-            if not frame.empty:
-                frames.append(frame)
-
+        frames = [
+            frame
+            for entry in entries
+            if not (frame := ohlcv_store.read_frame(entry)).empty
+        ]
         if not frames:
             return None
 
         merged = pd.concat(frames, ignore_index=True, sort=False)
-        merged = merged.drop_duplicates(subset=["timestamp"], keep="last").sort_values("timestamp")
+        merged = merged.drop_duplicates(subset=["timestamp"], keep="last").sort_values(
+            "timestamp"
+        )
         merged = merged.reset_index(drop=True)
         # Conformance (Cleanup 16-A, F9): shared date-filter convention — a
         # date-only end boundary is inclusive of the full day. This must be

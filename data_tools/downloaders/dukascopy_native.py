@@ -4,7 +4,8 @@ Native Python Dukascopy Downloader — async .bi5 fetcher with LZMA decompressio
 Downloads tick/candle data directly from Dukascopy's datafeed servers,
 eliminating the Node.js CLI dependency.
 
-Output: Parquet files at ~/data/ohlcv/dukascopy/{asset_class}/{symbol}/{timeframe}.parquet
+Output: Parquet files at ~/data/ohlcv/dukascopy/{SYMBOL}/{SYMBOL}_{TF}.parquet
+(asset_class/region live in the source manifest, not the path)
 
 Usage:
     python -m data_tools.downloaders.dukascopy_native --symbols EURUSD --timeframes m1 \\
@@ -897,8 +898,8 @@ async def download_minute_candles(
 
     The public face of the minute-candle path, for callers that want the bars
     and not a parquet file. ``DukascopyNativeDownloader.download`` can only
-    write into the catalog (a ``{sym}/{tf}.parquet`` under the data dir, plus a
-    ``source_meta.json`` entry and smart-resume merge), which is not what a
+    write into the catalog (a ``<SYMBOL>_<TF>.parquet`` under the manifest
+    OHLCV store, plus a ``source_meta.json`` entry and smart-resume merge), which is not what a
     one-off reference slice wants: it must be reproducible from a fixed window
     and must not touch the catalog of the machine it runs on.
 
@@ -1382,7 +1383,7 @@ class DukascopyNativeDownloader(Downloader):
 
         await _wait_for_control(pause_event, stop_event)
 
-        df = self._merge_and_store_single_file(out_path, df)
+        df = self._merge_and_store_single_file(out_path, df, asset_class=asset_class)
         warnings.append(f"requested_range:{requested_start}->{requested_end}")
         _report_progress(report_progress, 100.0, f"Saved {out_path.name}")
 

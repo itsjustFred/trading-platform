@@ -210,9 +210,12 @@ def _buy_signal_payload(**overrides):
 
 def _write_ohlcv_shard(data_dir, symbol: str = "AAPL", timeframe: str = "1m") -> None:
     """Drop a fixture frame where ``_load_ohlcv`` looks for it."""
-    target = data_dir / "ohlcv" / symbol / f"{timeframe}.parquet"
-    target.parent.mkdir(parents=True, exist_ok=True)
-    _one_bar_frame().to_parquet(target, index=False)
+    from shared import ohlcv_store
+
+    ohlcv_store.write_frame(
+        data_dir, "test", symbol, timeframe, _one_bar_frame(),
+        asset_class="equities",
+    )
 
 
 def _replay_engine(data_dir) -> SignalReplayEngine:

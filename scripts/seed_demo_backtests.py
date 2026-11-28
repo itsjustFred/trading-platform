@@ -26,6 +26,7 @@ _guard.ensure_own_checkout("seed_demo_backtests")
 # scripts that must carry the guard. Kept deliberately, and silenced rather than removed:
 # dropping it would take this script off the roster and out of the gate that keeps it alive.
 import shared  # noqa: F401
+from shared import ohlcv_store
 from shared.constants import DATA_DIR
 from shared.database import init_db, save_result_to_sqlite
 from shared.models import (
@@ -54,9 +55,9 @@ def mk_ohlcv(symbol: str, base: float, source: str, asset_class: str, timeframe:
         l = min(o, c) - 0.3
         rows.append({"timestamp": t, "open": o, "high": h, "low": l, "close": c, "volume": 1000 + i})
     df = pd.DataFrame(rows)
-    path = DATA_DIR / "ohlcv" / source / asset_class / symbol / f"{timeframe}.parquet"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    df.to_parquet(path, index=False)
+    ohlcv_store.write_frame(
+        DATA_DIR, source, symbol, timeframe, df, asset_class=asset_class
+    )
 
 
 def main() -> None:

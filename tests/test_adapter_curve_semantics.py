@@ -35,9 +35,11 @@ def curve_env(tmp_path: Path):
     strategy_dir.mkdir()
     strategy_path = strategy_dir / "curve_sma.py"
     strategy_path.write_text(STRATEGY)
-    symbol_dir = tmp_path / "ohlcv" / "test_source" / "equities" / "CRV"
-    symbol_dir.mkdir(parents=True)
-    _frame().to_parquet(symbol_dir / "1h.parquet", index=False)
+    from shared import ohlcv_store
+
+    ohlcv_store.write_frame(
+        tmp_path, "test_source", "CRV", "1h", _frame(), asset_class="equities"
+    )
     config = make_backtest_config(risk_per_trade_pct=0.01,
         strategy_name="curve_sma",
         symbols=["CRV"],
@@ -156,10 +158,13 @@ class TestNativeCurveExitOrder:
         (tmp_path / "strategies").mkdir()
         strategy_path = tmp_path / "strategies" / "overlap_curve.py"
         strategy_path.write_text(_OVERLAP_STRATEGY)
-        symbol_dir = tmp_path / "ohlcv" / "test_source" / "equities" / "OVL"
-        symbol_dir.mkdir(parents=True)
+        from shared import ohlcv_store
+
         frame = _overlap_frame()
-        frame.to_parquet(symbol_dir / "1h.parquet", index=False)
+        ohlcv_store.write_frame(
+            tmp_path, "test_source", "OVL", "1h", frame,
+            asset_class="equities",
+        )
         config = make_backtest_config(
             risk_per_trade_pct=0.01,
             parameters={"fees": "zero", "slippage": "none"},

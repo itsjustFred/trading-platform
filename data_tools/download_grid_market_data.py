@@ -27,8 +27,8 @@ import pandas as pd
 
 from data_tools.downloaders.dukascopy_native import DukascopyNativeDownloader
 from data_tools.file_fingerprint import file_fingerprint, files_have_same_content
-from data_tools.path_safety import build_dataset_path
 from data_tools.resample import resample_file
+from shared import ohlcv_store
 from shared.atomic_io import atomic_replace, write_parquet_atomically
 from shared.constants import (
     DATA_DIR,
@@ -205,10 +205,17 @@ def symbol_asset_class(canonical_symbol: str) -> str:
 def ensure_alias_copy(
     canonical_path: Path,
     requested_symbol: str,
+    timeframe: str,
     asset_class: str,
     output_dir: Path,
+    *,
+    source_symbol: str = "",
 ) -> Path:
     """Copy the canonical parquet under the requested symbol name.
+
+    The alias is a byte-identical copy declared in the dukascopy manifest via
+    :func:`shared.ohlcv_store.register_file`, so ``runner.backtest_grid`` can
+    backtest the exact requested grid.
 
     Equal file size is not freshness: a re-download that merges or replaces rows
     can produce a byte-identical size while the content changed (DV-B30). The
@@ -218,22 +225,39 @@ def ensure_alias_copy(
     external restores (rsync -a, tar, git checkout) can reorder mtimes without
     changing content, which would make a stale alias look fresh.
     """
-    alias_path = build_dataset_path(
-        output_dir,
-        "ohlcv",
-        "dukascopy",
-        asset_class,
-        requested_symbol,
-        canonical_path.name,
-    )
+    alias_path = ohlcv_store.data_path(output_dir, "dukascopy", requested_symbol, timeframe)
     canonical_fingerprint = file_fingerprint(canonical_path)
-    if alias_path.exists() and canonical_fingerprint is not None:
-        if file_fingerprint(alias_path) == canonical_fingerprint:
-            return alias_path
-        if files_have_same_content(canonical_path, alias_path):
-            return alias_path
+    if (
+        alias_path.exists()
+        and canonical_fingerprint is not None
+        and (
+            file_fingerprint(alias_path) == canonical_fingerprint
+            or files_have_same_content(canonical_path, alias_path)
+        )
+    ):
+        # Refresh the manifest entry (idempotent) so a fresh file is
+        # always manifest-declared even if the manifest was rebuilt.
+        ohlcv_store.register_file(
+            output_dir,
+            "dukascopy",
+            requested_symbol,
+            timeframe,
+            alias_path,
+            asset_class=asset_class,
+            source_symbol=source_symbol,
+        )
+        return alias_path
     alias_path.parent.mkdir(parents=True, exist_ok=True)
     atomic_replace(alias_path, lambda target: shutil.copy2(canonical_path, target))
+    ohlcv_store.register_file(
+        output_dir,
+        "dukascopy",
+        requested_symbol,
+        timeframe,
+        alias_path,
+        asset_class=asset_class,
+        source_symbol=source_symbol,
+    )
     return alias_path
 
 
@@ -253,13 +277,7 @@ def download_symbol(
 ) -> dict[str, Any]:
     downloader = DukascopyNativeDownloader()
     asset_class = symbol_asset_class(canonical_symbol)
-    canonical_dir = build_dataset_path(
-        output_dir, "ohlcv", "dukascopy", asset_class, canonical_symbol
-    )
-    requested_dir = build_dataset_path(
-        output_dir, "ohlcv", "dukascopy", asset_class, requested_symbol
-    )
-    source_path = build_dataset_path(canonical_dir, "1m.parquet")
+    source_path = ohlcv_store.data_path(output_dir, "dukascopy", canonical_symbol, "1m")
     requested_timeframes = sorted(set(timeframes), key=_timeframe_sort_key)
     known_timeframes = [tf for tf in requested_timeframes if tf in SUPPORTED_TIMEFRAMES]
     higher_timeframes = [tf for tf in known_timeframes if tf != "1m"]
@@ -307,12 +325,19 @@ def download_symbol(
                 }
 
             normalize_ohlcv_columns(source_path)
-            requested_1m = ensure_alias_copy(source_path, requested_symbol, asset_class, output_dir)
+            requested_1m = ensure_alias_copy(
+                source_path,
+                requested_symbol,
+                "1m",
+                asset_class,
+                output_dir,
+                source_symbol=canonical_symbol,
+            )
             result["paths"]["1m"] = str(requested_1m)
             result["paths"]["rows_1m"] = parquet_rows(requested_1m)
 
         for tf in higher_timeframes:
-            target_path = build_dataset_path(requested_dir, f"{tf}.parquet")
+            target_path = ohlcv_store.data_path(output_dir, "dukascopy", requested_symbol, tf)
             if (
                 target_path.exists()
                 and not force
@@ -321,7 +346,13 @@ def download_symbol(
                 result["paths"][tf] = str(target_path)
                 result["paths"][f"rows_{tf}"] = parquet_rows(target_path)
                 continue
-            resampled_paths = resample_file(source_path, [tf], output_dir=requested_dir)
+            resampled_paths = resample_file(
+                source_path,
+                [tf],
+                symbol=requested_symbol,
+                asset_class=asset_class,
+                source_symbol=canonical_symbol,
+            )
             target_path = resampled_paths[0]
             result["paths"][tf] = str(target_path)
             result["paths"][f"rows_{tf}"] = parquet_rows(target_path)

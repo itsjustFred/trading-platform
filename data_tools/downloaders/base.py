@@ -19,7 +19,7 @@ from pathlib import Path
 import pandas as pd
 import pyarrow.parquet as pq
 
-from data_tools.path_safety import build_dataset_path
+from shared import ohlcv_store
 from shared.atomic_io import atomic_replace
 
 logger = logging.getLogger(__name__)
@@ -142,16 +142,11 @@ class Downloader(ABC):
     ) -> Path:
         """Build the standardised output path.
 
-        Layout: {output_dir}/ohlcv/{source}/{asset_class}/{symbol}/{tf}.parquet
+        Layout: {output_dir}/ohlcv/{source}/{SYMBOL}/{SYMBOL}_{TF}.parquet.
+        ``asset_class`` is not part of the path; it is recorded in the
+        source manifest by :meth:`_merge_and_store_single_file`.
         """
-        path = build_dataset_path(
-            output_dir,
-            "ohlcv",
-            self.source_name,
-            asset_class,
-            symbol,
-            f"{timeframe}.parquet",
-        )
+        path = ohlcv_store.data_path(output_dir, self.source_name, symbol, timeframe)
         path.parent.mkdir(parents=True, exist_ok=True)
         return path
 
@@ -168,17 +163,61 @@ class Downloader(ABC):
         logger.info("Smart resume enabled for %s from %s", output_path, resume_start)
         return resume_start
 
+    @staticmethod
+    def _dataset_identity(
+        output_path: Path,
+    ) -> tuple[Path, str, str, str, str] | None:
+        """``(data_root, source, symbol, timeframe, segment)`` for a store path.
+
+        Returns None when ``output_path`` is not shaped like
+        ``<root>/ohlcv/<source>/<SYMBOL>/<SYMBOL>_<TF>[_<seg>].parquet``.
+        """
+        ohlcv_dir = next(
+            (parent for parent in (output_path, *output_path.parents) if parent.name == "ohlcv"),
+            None,
+        )
+        if ohlcv_dir is None:
+            return None
+        parts = output_path.relative_to(ohlcv_dir).parts
+        if len(parts) != 3 or not parts[2].endswith(".parquet"):
+            return None
+        source, symbol, _filename = parts
+        stem = parts[2][: -len(".parquet")]
+        prefix = f"{symbol}_"
+        if not stem.startswith(prefix):
+            return None
+        rest = stem[len(prefix) :]
+        token, separator, segment = rest.partition("_")
+        try:
+            timeframe = ohlcv_store.platform_timeframe(token)
+        except ValueError:
+            return None
+        return (
+            ohlcv_dir.parent,
+            source,
+            symbol,
+            timeframe,
+            segment if separator else "",
+        )
+
     def _merge_and_store_single_file(
-        self, output_path: Path, new_data: pd.DataFrame
+        self,
+        output_path: Path,
+        new_data: pd.DataFrame,
+        *,
+        asset_class: str = "",
+        region: str = "",
+        source_symbol: str = "",
     ) -> pd.DataFrame:
         """Persist data in a single parquet file per symbol/timeframe.
 
         If the file exists, it is loaded and merged with incoming rows.
         Duplicate timestamps are removed (keeping newest row), data is sorted,
-        and the target parquet is replaced atomically: the merged frame is
-        written to a temporary file in the same directory and moved into place
-        with :func:`os.replace`, so a crash mid-write can never truncate or
-        corrupt the previously stored canonical data.
+        and the target parquet is replaced atomically through
+        :func:`shared.ohlcv_store.write_frame`, so the source manifest stays
+        in sync. Frames without ``timestamp``/OHLC columns (e.g. raw tick
+        payloads) keep the legacy atomic replace — they cannot be declared in
+        the manifest anyway.
         """
         normalized_new = self._normalize_timestamps(new_data)
 
@@ -204,6 +243,28 @@ class Downloader(ABC):
             )
         else:
             combined = combined.drop_duplicates().reset_index(drop=True)
+
+        identity = self._dataset_identity(output_path)
+        has_ohlc = all(
+            column in combined.columns for column in ("open", "high", "low", "close")
+        ) or all(
+            f"bid_{column}" in combined.columns
+            for column in ("open", "high", "low", "close")
+        )
+        if identity is not None and "timestamp" in combined.columns and has_ohlc:
+            data_root, source, symbol, timeframe, segment = identity
+            ohlcv_store.write_frame(
+                data_root,
+                source,
+                symbol,
+                timeframe,
+                combined,
+                asset_class=asset_class,
+                region=region,
+                source_symbol=source_symbol,
+                segment=segment,
+            )
+            return combined
 
         def _write(target: Path) -> None:
             try:

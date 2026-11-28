@@ -563,20 +563,27 @@ def test_detect_date_range_rejects_disjoint_symbol_ranges(tmp_path):
     import pandas as pd
     import pytest
 
+    from shared import ohlcv_store
+
     for symbol, month in (("AAA", "2020-01"), ("BBB", "2024-06")):
-        path = tmp_path / "ohlcv" / "test" / symbol / "1d.parquet"
-        path.parent.mkdir(parents=True, exist_ok=True)
         stamps = pd.date_range(f"{month}-01", periods=5, freq="D", tz="UTC")
-        pd.DataFrame(
-            {
-                "timestamp": stamps,
-                "open": [1.0] * 5,
-                "high": [1.0] * 5,
-                "low": [1.0] * 5,
-                "close": [1.0] * 5,
-                "volume": [1.0] * 5,
-            }
-        ).to_parquet(path, index=False)
+        ohlcv_store.write_frame(
+            tmp_path,
+            "test",
+            symbol,
+            "1d",
+            pd.DataFrame(
+                {
+                    "timestamp": stamps,
+                    "open": [1.0] * 5,
+                    "high": [1.0] * 5,
+                    "low": [1.0] * 5,
+                    "close": [1.0] * 5,
+                    "volume": [1.0] * 5,
+                }
+            ),
+            asset_class="equities",
+        )
 
     with pytest.raises(ValueError, match="disjoint"):
         runner_cli._detect_date_range(["AAA", "BBB"], "1d", str(tmp_path))

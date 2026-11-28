@@ -70,9 +70,12 @@ def _reference(slug: str) -> pd.DataFrame:
 def _run_engine(slug: str, tmp_path: Path) -> EngineRun:
     strategy, position_pct, fee_rate = RUNS[slug]
     frame = _bars()
-    target = tmp_path / "data" / "ohlcv" / "test_source" / "equities" / SYMBOL
-    target.mkdir(parents=True)
-    frame.to_parquet(target / "1d.parquet", index=False)
+    from shared import ohlcv_store
+
+    ohlcv_store.write_frame(
+        tmp_path / "data", "test_source", SYMBOL, "1d", frame,
+        asset_class="equities",
+    )
     parameters = (
         {"fee_rate": fee_rate, "fee_flat_per_trade": 0.0} if fee_rate else {"fees": "zero"}
     )

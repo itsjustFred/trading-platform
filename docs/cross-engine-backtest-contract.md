@@ -206,8 +206,8 @@ and pynecore do not model slippage and record that fact in
   fixed-bps model; absent config picks the per-asset-class default
   (FX/CFD-like classes → bar spread, equities → 5 bps, crypto → 10 bps,
   all overridable via `slippage_defaults`/`slippage_default_bps`).
-- Instruments are classified from the `ohlcv/{source}/{asset_class}/…`
-  parquet path; runs that cannot be classified — or whose class maps to
+- Instruments are classified from the manifest OHLCV store's
+  dataset `asset_class` (#471); runs that cannot be classified — or whose class maps to
   no slippage model — REFUSE under the default `auto` resolution
   (fail closed like fees, #84): pass `slippage="none"` for a deliberate
   gross run or an explicit cost (`"bps"`/`"spread"`/`slippage_bps`).

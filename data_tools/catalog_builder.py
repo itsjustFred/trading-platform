@@ -15,7 +15,6 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -24,9 +23,9 @@ import pandas as pd
 import pyarrow.parquet as pq
 
 from data_tools.file_fingerprint import file_fingerprint, fingerprint_to_json
-from data_tools.path_safety import ensure_dataset_path_within
 from shared.atomic_io import write_text_atomically
 from shared.constants import DATA_DIR, normalize_timeframe
+from shared.ohlcv_store import DatasetEntry, list_datasets, segment_for_path
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(message)s")
 logger = logging.getLogger(__name__)
@@ -50,19 +49,6 @@ def write_json_atomically(path: Path, payload: str) -> None:
 def write_catalog_json(path: Path, catalog: dict) -> None:
     """Serialize ``catalog`` and persist it atomically to ``path``."""
     write_json_atomically(path, json.dumps(catalog, indent=2, default=str))
-_TIMEFRAME_REGEX = r"(?:tick|mn1|(?:\d+)?(?:s|sec|m|min|h|d|w|mo)|[smhdw]\d+)"
-TIMEFRAME_PATTERN = re.compile(rf"^{_TIMEFRAME_REGEX}$", re.IGNORECASE)
-_SEGMENT_CHARS_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
-SEGMENTED_TIMEFRAME_PATTERN = re.compile(
-    rf"^(?P<timeframe>{_TIMEFRAME_REGEX})(?:[_-].+)$",
-    re.IGNORECASE,
-)
-SYMBOL_PREFIXED_TIMEFRAME_PATTERN = re.compile(
-    rf"^(?P<symbol>.+?)[_-](?P<timeframe>{_TIMEFRAME_REGEX})(?:[_-](?P<segment>.+))?$",
-    re.IGNORECASE,
-)
-
-
 def _load_source_meta(data_dir: Path) -> dict[str, dict]:
     """Load source metadata index if it exists.
 
@@ -130,12 +116,17 @@ def _detect_storage(parquet_path: Path, data_dir: Path) -> str:
     return "local"
 
 
-def _run_validation(parquet_path: Path, symbol: str, timeframe: str) -> dict | None:
+def _run_validation(
+    parquet_path: Path, data_dir: Path | None = None
+) -> dict | None:
     """Run data validation checks and return summary dict."""
     try:
         from data_tools.validate import validate_parquet
 
-        result = validate_parquet(parquet_path)
+        result = validate_parquet(
+            parquet_path,
+            ohlcv_root=(data_dir / "ohlcv") if data_dir is not None else None,
+        )
         return {
             "last_checked": datetime.now(timezone.utc).isoformat(),
             "status": result.status,
@@ -160,62 +151,6 @@ def _run_validation(parquet_path: Path, symbol: str, timeframe: str) -> dict | N
     except (OSError, ValueError, KeyError) as exc:
         logger.debug("Validation skipped for %s: %s", parquet_path, exc)
         return None
-
-
-def _looks_like_timeframe(value: str) -> bool:
-    return bool(TIMEFRAME_PATTERN.match(value.strip()))
-
-
-def _extract_timeframe_and_segment(stem: str) -> tuple[str | None, str | None]:
-    normalized = str(stem or "").strip()
-    if not normalized:
-        return None, None
-    if _looks_like_timeframe(normalized):
-        return normalize_timeframe(normalized), None
-
-    segmented_match = SEGMENTED_TIMEFRAME_PATTERN.match(normalized)
-    if segmented_match is None:
-        return None, None
-
-    timeframe = normalize_timeframe(str(segmented_match.group("timeframe") or ""))
-    if timeframe == "tick":
-        # Tick datasets are commonly segmented by month (e.g. tick_2024_01).
-        # Treat these as timeframe-only filenames when the segment is a plain
-        # partition token to avoid misclassifying the segment as a symbol.
-        segment_candidate = normalized[len(timeframe) + 1 :].strip()
-        if segment_candidate and _SEGMENT_CHARS_PATTERN.match(segment_candidate):
-            return timeframe, segment_candidate
-
-    separator_index = len(timeframe)
-    segment = (
-        normalized[separator_index + 1 :].strip()
-        if len(normalized) > separator_index + 1
-        else ""
-    )
-    return timeframe, (segment or None)
-
-
-def _extract_symbol_timeframe_and_segment(
-    stem: str,
-) -> tuple[str | None, str | None, str | None]:
-    normalized = str(stem or "").strip()
-    if not normalized:
-        return None, None, None
-
-    timeframe, segment = _extract_timeframe_and_segment(normalized)
-    if timeframe is not None:
-        return None, timeframe, segment
-
-    prefixed_match = SYMBOL_PREFIXED_TIMEFRAME_PATTERN.match(normalized)
-    if prefixed_match is None:
-        return None, None, None
-
-    symbol = str(prefixed_match.group("symbol") or "").strip()
-    timeframe_value = normalize_timeframe(str(prefixed_match.group("timeframe") or "").strip())
-    segment_value = str(prefixed_match.group("segment") or "").strip()
-    if not symbol or not timeframe_value:
-        return None, None, None
-    return symbol, timeframe_value, (segment_value or None)
 
 
 def _format_catalog_date(value: object) -> str | None:
@@ -265,130 +200,6 @@ def _should_reuse_cached_summary(
     except (KeyError, TypeError, ValueError):
         return False
     return (cached_ns, cached_size) == fingerprint
-
-
-def _looks_like_bare_symbol(value: str) -> bool:
-    """Whether a filename stem is a plain instrument symbol (no timeframe info).
-
-    Used for flat export layouts where the stem is the only symbol hint. Stems
-    containing separators or timeframe-like spellings cannot be trusted as a
-    bare symbol and must not be catalogued as a "1d" dataset.
-    """
-    normalized = str(value or "").strip()
-    if not normalized or not re.fullmatch(r"[A-Za-z0-9]+", normalized):
-        return False
-    if not any(character.isalpha() for character in normalized):
-        return False
-    if _looks_like_timeframe(normalized):
-        return False
-    return True
-
-
-def parse_ohlcv_path(parquet_path: Path, ohlcv_root: Path) -> dict | None:
-    """Parse an OHLCV parquet path into source/asset_class/symbol/timeframe fields."""
-    rel = parquet_path.relative_to(ohlcv_root)
-    parts = rel.parts
-    if len(parts) < 3:
-        logger.warning("Unexpected path depth: %s", rel)
-        return None
-
-    source = parts[0]
-    asset_class = parts[1]
-    region: str | None = None
-    stem = parquet_path.stem
-    stem_symbol, timeframe, segment = _extract_symbol_timeframe_and_segment(stem)
-
-    if len(parts) >= 5:
-        region = parts[-3]
-        symbol = parts[-2]
-        timeframe_value = timeframe
-    elif len(parts) == 4:
-        parent = parts[-2]
-        if timeframe:
-            timeframe_value = timeframe
-            if stem_symbol and stem_symbol.lower() != parent.lower():
-                region = parent
-                symbol = stem_symbol
-            else:
-                symbol = parent
-        else:
-            # Flat layout {symbol}.parquet: the symbol directory is the region
-            # and the file stem is the symbol. The stem must look like a bare
-            # symbol (no timeframe-like or compound segments), otherwise the
-            # entry is rejected instead of silently catalogued as a "1d" dataset.
-            region = parent
-            symbol = stem
-            timeframe_value = "1d" if _looks_like_bare_symbol(stem) else None
-    else:
-        if timeframe and stem_symbol:
-            symbol = stem_symbol
-            timeframe_value = timeframe
-        elif timeframe:
-            logger.warning("Could not infer symbol from timeframe-only filename: %s", rel)
-            return None
-        else:
-            symbol = stem
-            timeframe_value = "1d" if _looks_like_bare_symbol(stem) else None
-
-    if not timeframe_value:
-        logger.warning(
-            "Skipping parquet with unparseable timeframe (not defaulted to 1d): %s", rel
-        )
-        return None
-
-    entry = {
-        "source": source,
-        "asset_class": asset_class,
-        "symbol": symbol,
-        "timeframe": timeframe_value,
-        "path": str(parquet_path),
-    }
-    if region:
-        entry["region"] = region
-    if segment:
-        entry["segment"] = segment
-    return entry
-
-
-def _locate_ohlcv_root_from_path(parquet_path: Path) -> Path | None:
-    for parent in parquet_path.parents:
-        if parent.name == "ohlcv":
-            return parent
-    return None
-
-
-def _normalize_grouping_entry_from_path(entry: dict) -> dict:
-    path_value = str(entry.get("path") or "").strip()
-    if not path_value.endswith(".parquet"):
-        return entry
-
-    path_obj = Path(path_value)
-    symbol_value = str(entry.get("symbol") or "").strip()
-    timeframe_value = normalize_timeframe(str(entry.get("timeframe") or "").strip())
-    needs_reparse = (
-        not symbol_value
-        or not timeframe_value
-        or symbol_value.lower().startswith("tick_")
-        or (timeframe_value == "1d" and path_obj.stem.lower().startswith("tick_"))
-    )
-    if not needs_reparse:
-        return entry
-
-    ohlcv_root = _locate_ohlcv_root_from_path(path_obj)
-    if ohlcv_root is None:
-        return entry
-
-    reparsed = parse_ohlcv_path(path_obj, ohlcv_root)
-    if reparsed is None:
-        return entry
-
-    normalized = dict(entry)
-    for key in ("source", "asset_class", "symbol", "timeframe", "region", "segment"):
-        if key in reparsed:
-            normalized[key] = reparsed[key]
-        elif key in {"region", "segment"}:
-            normalized.pop(key, None)
-    return normalized
 
 
 def _select_timestamp_column(columns: list[str]) -> str | None:
@@ -728,7 +539,7 @@ def _group_ohlcv_entries(entries: list[dict]) -> list[dict]:
     grouped: dict[tuple[str, str], dict] = {}
 
     for raw_entry in entries:
-        entry = _normalize_grouping_entry_from_path(raw_entry)
+        entry = dict(raw_entry)
         entry["timeframe"] = normalize_timeframe(str(entry.get("timeframe") or ""))
         symbol = str(entry.get("symbol") or "")
         timeframe = str(entry.get("timeframe") or "")
@@ -852,77 +663,131 @@ def merge_ohlcv_entries(entries: list[dict]) -> list[dict]:
     return _group_ohlcv_entries(normalized_entries)
 
 
-def scan_ohlcv(data_dir: Path, include_validation: bool = False) -> list[dict]:
-    """Scan ohlcv/ subdirectory and return dataset entries."""
-    entries = []
-    ohlcv_root = data_dir / "ohlcv"
-    if not ohlcv_root.exists():
-        return entries
+def _summary_with_cache(
+    parquet_path: Path,
+    data_dir: Path,
+    catalog_cache: dict[str, dict],
+) -> dict[str, Any]:
+    try:
+        fingerprint = _file_fingerprint(parquet_path)
+    except OSError:
+        fingerprint = None
+    cached_entry = catalog_cache.get(_catalog_path_key(parquet_path, data_dir))
+    if _should_reuse_cached_summary(cached_entry, fingerprint):
+        summary = {
+            key: cached_entry[key]
+            for key in (
+                "rows",
+                "size_bytes",
+                "mtime_ns",
+                "last_updated",
+                "columns",
+                "start",
+                "end",
+            )
+            if key in cached_entry
+        }
+        if summary.get("last_updated") is None and fingerprint is not None:
+            summary["last_updated"] = _mtime_to_iso(fingerprint[0] / 1_000_000_000)
+        return summary
 
+    try:
+        return read_parquet_summary(parquet_path)
+    except (OSError, ValueError) as exc:
+        logger.warning(_COULD_NOT_READ_MESSAGE, parquet_path, exc)
+        try:
+            stat = parquet_path.stat()
+            summary = {
+                "size_bytes": int(stat.st_size),
+                "mtime_ns": int(stat.st_mtime_ns),
+                "last_updated": _mtime_to_iso(stat.st_mtime),
+            }
+        except OSError:
+            summary = {"size_bytes": 0}
+        summary["rows"] = None
+        summary["error"] = str(exc)
+        return summary
+
+
+def _dataset_segment_entry(
+    parquet_path: Path,
+    data_dir: Path,
+    catalog_cache: dict[str, dict],
+    *,
+    include_validation: bool,
+) -> dict[str, Any]:
+    segment = segment_for_path(data_dir, parquet_path)
+    entry: dict[str, Any] = {
+        "path": str(parquet_path),
+        "format": "parquet",
+        "storage": _detect_storage(parquet_path, data_dir),
+    }
+    if segment:
+        entry["segment"] = segment
+    entry.update(_summary_with_cache(parquet_path, data_dir, catalog_cache))
+
+    if include_validation:
+        validation = _run_validation(parquet_path, data_dir=data_dir)
+        if validation:
+            entry["validation"] = validation
+    return entry
+
+
+def _dataset_catalog_entry(
+    dataset: DatasetEntry,
+    data_dir: Path,
+    catalog_cache: dict[str, dict],
+    *,
+    include_validation: bool,
+    source_meta_index: dict[str, dict],
+) -> dict[str, Any]:
+    segment_paths = list(dataset.segments) or [dataset.path]
+    segments = [
+        _dataset_segment_entry(
+            path,
+            data_dir,
+            catalog_cache,
+            include_validation=include_validation,
+        )
+        for path in segment_paths
+    ]
+
+    entry: dict[str, Any] = {
+        "source": dataset.source,
+        "asset_class": dataset.asset_class,
+        "symbol": dataset.symbol,
+        "timeframe": dataset.timeframe,
+        "path": str(dataset.path),
+        "format": "parquet",
+        "storage": _detect_storage(dataset.path, data_dir),
+        "files": [str(path) for path in segment_paths],
+        "segments": segments,
+    }
+    if dataset.region:
+        entry["region"] = dataset.region
+    if dataset.source_symbol and dataset.source_symbol != dataset.symbol:
+        entry["source_symbol"] = dataset.source_symbol
+
+    meta_key = f"{dataset.source}/{dataset.asset_class}/{dataset.symbol}/{dataset.timeframe}"
+    if meta_key in source_meta_index:
+        entry["source_meta"] = source_meta_index[meta_key]
+    return entry
+
+
+def scan_ohlcv(data_dir: Path, include_validation: bool = False) -> list[dict]:
+    """Scan the manifest-driven OHLCV store and return dataset entries."""
     source_meta_index = _load_source_meta(data_dir)
     catalog_cache = _load_catalog_cache(data_dir)
-
-    for parquet_file in sorted(ohlcv_root.rglob("*.parquet")):
-        try:
-            ensure_dataset_path_within(ohlcv_root, parquet_file)
-        except ValueError as exc:
-            logger.warning("Skipping parquet outside OHLCV root: %s (%s)", parquet_file, exc)
-            continue
-        entry = parse_ohlcv_path(parquet_file, ohlcv_root)
-        if entry is None:
-            continue
-
-        source = entry["source"]
-        asset_class = entry["asset_class"]
-        symbol = entry["symbol"]
-        timeframe = entry["timeframe"]
-        entry["format"] = "parquet"
-        entry["storage"] = _detect_storage(parquet_file, data_dir)
-
-        try:
-            fingerprint = _file_fingerprint(parquet_file)
-            cached_entry = catalog_cache.get(_catalog_path_key(parquet_file, data_dir))
-            if _should_reuse_cached_summary(cached_entry, fingerprint):
-                for key in (
-                    "rows",
-                    "size_bytes",
-                    "mtime_ns",
-                    "last_updated",
-                    "columns",
-                    "start",
-                    "end",
-                ):
-                    if key in cached_entry:
-                        entry[key] = cached_entry[key]
-                if entry.get("last_updated") is None and fingerprint is not None:
-                    entry["last_updated"] = _mtime_to_iso(fingerprint[0] / 1_000_000_000)
-            else:
-                entry.update(read_parquet_summary(parquet_file))
-        except (OSError, ValueError) as e:
-            logger.warning(_COULD_NOT_READ_MESSAGE, parquet_file, e)
-            try:
-                stat = parquet_file.stat()
-                entry["size_bytes"] = int(stat.st_size)
-                entry["mtime_ns"] = int(stat.st_mtime_ns)
-                entry["last_updated"] = _mtime_to_iso(stat.st_mtime)
-            except OSError:
-                entry["size_bytes"] = 0
-            entry["rows"] = None
-            entry["error"] = str(e)
-
-        # Source metadata (from downloaders)
-        meta_key = f"{source}/{asset_class}/{symbol}/{timeframe}"
-        if meta_key in source_meta_index:
-            entry["source_meta"] = source_meta_index[meta_key]
-
-        # Validation (optional, can be slow for large datasets)
-        if include_validation:
-            validation = _run_validation(parquet_file, symbol, timeframe)
-            if validation:
-                entry["validation"] = validation
-
-        entries.append(entry)
-
+    entries = [
+        _dataset_catalog_entry(
+            dataset,
+            data_dir,
+            catalog_cache,
+            include_validation=include_validation,
+            source_meta_index=source_meta_index,
+        )
+        for dataset in list_datasets(data_dir)
+    ]
     return merge_ohlcv_entries(entries)
 
 

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import tempfile
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 
@@ -27,6 +28,7 @@ import pyarrow.parquet as pq
 import pytest
 
 from runner.engines.contract import parse_date_bound
+from shared import ohlcv_store
 from shared.constants import DATA_DIR
 from tests.helpers import resolve_ohlcv_root
 
@@ -116,6 +118,34 @@ def _ohlcv_root() -> Path:
     return resolve_ohlcv_root(DATA_DIR)
 
 
+#: Cached ``<tmp>/ohlcv`` symlink dirs exposing a bare OHLCV root (one that is
+#: not literally named ``ohlcv``) to the manifest store, which resolves
+#: ``<data_root>/ohlcv``.
+_STORE_ROOT_LINKS: dict[Path, Path] = {}
+
+
+def _store_data_root(ohlcv_root: Path) -> Path:
+    """The data root whose ``ohlcv`` child is ``ohlcv_root``.
+
+    ``resolve_ohlcv_root`` yields the OHLCV root itself: ``DATA_DIR/ohlcv``
+    by default (so the data root is its parent), or whatever
+    ``TP_TEST_OHLCV_DIR`` names — which may be a data root containing
+    ``ohlcv/`` or a bare store root under any directory name. The last case
+    is exposed through a cached ``ohlcv`` symlink.
+    """
+    if (ohlcv_root / "ohlcv").is_dir():
+        return ohlcv_root
+    if ohlcv_root.name == "ohlcv":
+        return ohlcv_root.parent
+    linked = _STORE_ROOT_LINKS.get(ohlcv_root)
+    if linked is None:
+        holder = Path(tempfile.mkdtemp(prefix="tp-ohlcv-root-"))
+        (holder / "ohlcv").symlink_to(ohlcv_root, target_is_directory=True)
+        linked = holder
+        _STORE_ROOT_LINKS[ohlcv_root] = linked
+    return linked
+
+
 def _candidate_ohlcv_paths(symbol: str, timeframe: str) -> list[Path]:
     root = _ohlcv_root()
     if not root.exists():
@@ -126,12 +156,11 @@ def _candidate_ohlcv_paths(symbol: str, timeframe: str) -> list[Path]:
     if not symbol or not timeframe:
         return []
 
-    paths = list(root.rglob(f"{symbol}/**/{timeframe}.parquet"))
-
-    # Canonical layout: .../<symbol>/<timeframe>.parquet
-    if timeframe == "1d":
-        # Some datasets are exported as .../<symbol>.parquet (typically 1d).
-        paths.extend(root.rglob(f"{symbol}.parquet"))
+    paths: list[Path] = []
+    for entry in ohlcv_store.list_datasets(
+        _store_data_root(root), symbol=symbol, timeframe=timeframe
+    ):
+        paths.extend(entry.segments or (entry.path,))
 
     return sorted({path.resolve() for path in paths})
 

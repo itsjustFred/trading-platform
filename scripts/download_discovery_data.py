@@ -18,6 +18,27 @@ from typing import Any
 import pandas as pd
 import yfinance as yf
 
+# isort: split
+
+# --- import-origin guard ---
+# `shared` must resolve to this checkout, not the installed package. The mechanism lives in
+# scripts/import_origin.py; only the invocation is per script. scripts/ goes on sys.path - never
+# the repo root, which would repair `import shared` and defeat the guard - so a direct run is
+# refused (exit 2) instead of mutating another tree's schema. See
+# tests/test_script_import_origin.py; run as:
+#     python -m scripts.download_discovery_data
+import sys as _sys
+from pathlib import Path as _path
+
+_scripts_dir = str(_path(__file__).resolve().parent)
+if _scripts_dir not in _sys.path:
+    _sys.path.insert(0, _scripts_dir)
+import import_origin as _guard
+
+_guard.ensure_own_checkout("download_discovery_data")
+# --- end import-origin guard ---
+from shared import ohlcv_store
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DISCOVERY_PATH = Path("/mnt/block-volume-data/discovered_strategies/discovery_20260618_0752.json")
 DATA_DIR = PROJECT_ROOT / "data"
@@ -39,7 +60,7 @@ def load_trials() -> list[dict[str, Any]]:
 
 
 def out_path(symbol: str, timeframe: str) -> Path:
-    return DATA_DIR / "ohlcv" / "yfinance" / "crypto" / "USDT" / symbol / f"{timeframe}.parquet"
+    return ohlcv_store.data_path(DATA_DIR, "yfinance", symbol, timeframe)
 
 
 def existing_is_sufficient(path: Path, timeframe: str) -> bool:
@@ -108,8 +129,10 @@ def download_one(symbol: str, timeframe: str, retries: int = 4) -> dict[str, Any
             if df.empty:
                 raise RuntimeError(f"yfinance returned only empty/NaN rows for {yf_symbol}/{timeframe}")
 
-            path.parent.mkdir(parents=True, exist_ok=True)
-            df.to_parquet(path, index=False)
+            ohlcv_store.write_frame(
+                DATA_DIR, "yfinance", symbol, timeframe, df,
+                asset_class="crypto", region="USDT",
+            )
             return {"symbol": symbol, "timeframe": timeframe, "status": "downloaded", "rows": len(df), "path": str(path)}
         except Exception as exc:
             last_error = str(exc)

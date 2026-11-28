@@ -912,7 +912,9 @@ CRYPTO_ASSET_CLASSES = frozenset({"crypto", "cryptocurrency"})
 METALS_ASSET_CLASSES = frozenset({"metals", "metal", "xau", "xag", "xpt", "xpd"})
 INDEX_ASSET_CLASSES = frozenset({"index", "indices", "idx"})
 FUTURES_ASSET_CLASSES = frozenset({"futures", "future"})
-US_EQUITY_ASSET_CLASSES = frozenset({"equity", "stock", "stocks", "etf"})
+US_EQUITY_ASSET_CLASSES = frozenset(
+    {"equity", "equities", "stock", "stocks", "etf", "etfs"}
+)
 US_EQUITY_SOURCES = frozenset({"alpaca", "dolthub", "huggingface", "test", "yfinance"})
 
 #: Asset classes whose venue is a broker CFD schedule: no built-in session

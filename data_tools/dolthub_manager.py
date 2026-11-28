@@ -8,6 +8,7 @@ from pathlib import Path
 import pandas as pd
 
 from data_tools.path_safety import build_dataset_path
+from shared import ohlcv_store
 from shared.atomic_io import atomic_replace, write_parquet_atomically
 from shared.constants import DATA_DIR
 from shared.sql import quote_identifier, quote_literal
@@ -187,17 +188,21 @@ def _export_table_csv(repo_path: Path, table: str, output_csv: Path):
     atomic_replace(output_csv, _write)
 
 
-def _stock_export_path(target_dir: Path, symbol: str) -> Path:
-    """Return the canonical OHLCV output path and migrate legacy flat exports."""
-    legacy_path = build_dataset_path(target_dir, f"{symbol}.parquet")
-    canonical_path = build_dataset_path(target_dir, symbol, "1d.parquet")
+def _stock_export_path(symbol: str) -> Path:
+    """Return the manifest-store output path for a daily equity export.
 
-    if legacy_path.exists() and not canonical_path.exists():
-        canonical_path.parent.mkdir(parents=True, exist_ok=True)
-        legacy_path.replace(canonical_path)
-        logger.info("Migrated legacy Dolthub export %s -> %s", legacy_path, canonical_path)
+    The file lands at ``ohlcv/dolthub/<SYMBOL>/<SYMBOL>_D1.parquet``.
+    """
+    return ohlcv_store.data_path(DATA_DIR, "dolthub", symbol, "1d")
 
-    return canonical_path
+
+def _write_stock_frame(symbol: str, df: pd.DataFrame) -> None:
+    """Write one exported symbol frame through the OHLCV store."""
+    df = df.sort_values("timestamp").drop_duplicates(subset=["timestamp"])
+    ohlcv_store.write_frame(
+        DATA_DIR, "dolthub", symbol, "1d", df,
+        asset_class="equity", region="US",
+    )
 
 
 def _stocks_table_name(stocks_repo: Path) -> str | None:
@@ -214,7 +219,9 @@ def _export_stocks() -> None:
         return
 
     logger.info("Exporting stocks OHLCV...")
-    target_dir = EXPORT_DIR / "equity" / "US"
+    # CSV staging stays out of the OHLCV store tree; only the manifest
+    # store's parquet output lives under ``ohlcv/dolthub``.
+    target_dir = DOLT_DIR / "_export_staging"
     target_dir.mkdir(parents=True, exist_ok=True)
 
     table_name = _stocks_table_name(stocks_repo)
@@ -231,7 +238,7 @@ def _export_stocks() -> None:
             logger.warning("Skipping unexpected symbol value: %r", symbol)
             continue
 
-        out_parquet = _stock_export_path(target_dir, symbol)
+        out_parquet = _stock_export_path(symbol)
         if out_parquet.exists():
             continue  # skip already exported
 
@@ -298,7 +305,7 @@ def _export_symbol_csv(
         if not df.empty:
             df.rename(columns={"date": "timestamp"}, inplace=True)
             df["timestamp"] = pd.to_datetime(df["timestamp"])
-            write_parquet_atomically(out_parquet, df)
+            _write_stock_frame(symbol, df)
     except Exception as e:
         logger.warning(f"Failed to export {symbol}: {e}")
     finally:
@@ -345,7 +352,7 @@ def export_data():
     stocks_repo = DOLT_DIR / "stocks"
     if stocks_repo.exists() and (stocks_repo / DOLT_METADATA_DIR).exists():
         logger.info("Exporting stocks OHLCV...")
-        target_dir = EXPORT_DIR / "equity" / "US"
+        target_dir = DOLT_DIR / "_export_staging"
         target_dir.mkdir(parents=True, exist_ok=True)
 
         tables = _list_tables(stocks_repo)
@@ -378,7 +385,7 @@ def export_data():
 
                 csv_path: Path | None = None
                 try:
-                    out_parquet = _stock_export_path(target_dir, symbol)
+                    out_parquet = _stock_export_path(symbol)
                     if out_parquet.exists():
                         continue  # skip already exported
                     out_parquet.parent.mkdir(parents=True, exist_ok=True)
@@ -405,7 +412,7 @@ def export_data():
                     if not df.empty:
                         df.rename(columns={"date": "timestamp"}, inplace=True)
                         df["timestamp"] = pd.to_datetime(df["timestamp"])
-                        write_parquet_atomically(out_parquet, df)
+                        _write_stock_frame(symbol, df)
                 except Exception as e:
                     logger.warning(f"Failed to export {symbol}: {e}")
                 finally:

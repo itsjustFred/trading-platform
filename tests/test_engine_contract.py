@@ -116,11 +116,11 @@ def _deterministic_ohlcv(
 
 
 def _write_ohlcv(data_dir: Path, symbol: str, timeframe: str, frame: pd.DataFrame) -> Path:
-    symbol_dir = data_dir / "ohlcv" / "test_source" / "equities" / symbol
-    symbol_dir.mkdir(parents=True, exist_ok=True)
-    path = symbol_dir / f"{timeframe}.parquet"
-    frame.to_parquet(path, index=False)
-    return path
+    from shared import ohlcv_store
+
+    return ohlcv_store.write_frame(
+        data_dir, "test_source", symbol, timeframe, frame, asset_class="equities"
+    )
 
 
 def _config(data_dir: Path, **overrides) -> BacktestConfig:
@@ -1456,8 +1456,11 @@ def main(
 
 
 def _read_parquet(data_dir: Path, symbol: str, timeframe: str) -> pd.DataFrame:
-    path = data_dir / "ohlcv" / "test_source" / "equities" / symbol / f"{timeframe}.parquet"
-    return pd.read_parquet(path)
+    from shared import ohlcv_store
+
+    entry = ohlcv_store.find_dataset(data_dir, symbol, timeframe)
+    assert entry is not None, f"no OHLCV dataset for {symbol}/{timeframe}"
+    return ohlcv_store.read_frame(entry)
 
 
 # ─── Fills (F1/F2) ───────────────────────────────────────────────────────────

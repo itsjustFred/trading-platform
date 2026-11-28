@@ -69,7 +69,8 @@ All runtime data (OHLCV, backtests, catalogs) lives in `DATA_DIR` (default: `./d
 
 ```
 $DATA_DIR/
-  ohlcv/{source}/{asset_class}/{region}/{symbol}/{timeframe}.parquet
+  ohlcv/{source}/manifest.json
+  ohlcv/{source}/{SYMBOL}/{SYMBOL}_{TF}[_{segment}].parquet
   backtests.db
   backtests/*.trades.json
   universes/

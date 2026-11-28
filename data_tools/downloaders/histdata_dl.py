@@ -224,7 +224,7 @@ class HistdataDownloader(Downloader):
         if timeframe != "1m":
             combined = self._resample(combined, timeframe)
 
-        combined = self._merge_and_store_single_file(out_path, combined)
+        combined = self._merge_and_store_single_file(out_path, combined, asset_class="forex")
 
         return DownloadResult(
             symbol=symbol,

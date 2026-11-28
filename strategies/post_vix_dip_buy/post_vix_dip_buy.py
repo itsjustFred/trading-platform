@@ -16,8 +16,8 @@ Source semantics:
 - Exits: TP +2% / SL -0.3% (stop-first on same-bar ambiguity), 50% scale-out
   at 14:00 NY, EOD flatten at 15:50 NY (both filled at that clock time's OPEN). Long-only, one position at a time.
 
-VIX data dependency: the VIX daily close series is read from
-``<DATA_DIR>/ohlcv/**/VIX/1d.parquet``. When the dataset is missing the
+VIX data dependency: the VIX daily close series is read from the manifest
+OHLCV store (``ohlcv_store.find_dataset(DATA_DIR, "VIX", "1d")``). When the dataset is missing the
 regime gate is FAIL-CLOSED: no entries are produced. ``_load_vix_data``
 honours its ``start``/``end`` arguments so callers can request a bounded
 window. SPX daily values (close/prev/SMA200/prior low) are derived from the
@@ -82,14 +82,14 @@ from shared.strategy_markers import entry_exit_markers
 
 
 def _load_vix_data(start: str | None = None, end: str | None = None) -> pd.Series | None:
+    from shared import ohlcv_store
     from shared.constants import DATA_DIR
 
-    ohlcv_root = DATA_DIR / "ohlcv"
-    matches = list(ohlcv_root.rglob("**/VIX/1d.parquet"))
-    if not matches:
+    entry = ohlcv_store.find_dataset(DATA_DIR, "VIX", "1d")
+    if entry is None:
         return None
 
-    df = pd.read_parquet(matches[0])
+    df = ohlcv_store.read_frame(entry)
     df.columns = [c.lower() for c in df.columns]
     if "timestamp" in df.columns:
         df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)

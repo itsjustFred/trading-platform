@@ -6,7 +6,7 @@ import math
 import os
 import re
 from bisect import bisect_left, bisect_right
-from collections.abc import Iterator, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date
 from functools import lru_cache
@@ -17,9 +17,10 @@ from typing import Any, Callable
 import pandas as pd
 import pyarrow.parquet as pq
 
-from data_tools.path_safety import ensure_dataset_path_within, validate_dataset_component
+from data_tools.path_safety import validate_dataset_component
 from shared import market_calendar, venue_calendar
 from shared.constants import DATA_DIR, normalize_timeframe
+from shared.ohlcv_store import DatasetEntry, dataset_bounds, list_datasets, read_frame
 
 logger = logging.getLogger(__name__)
 
@@ -77,8 +78,10 @@ TIMEFRAME_MINUTES: dict[str, float] = {
 }
 SEGMENT_MIN_DENSITY = 0.95
 SEGMENT_MAX_GAP_MULTIPLIER = 3.0
-US_EQUITY_ASSET_CLASSES = frozenset(
-    {"equity", "stock", "stocks", "etf", "index"}
+# Canonical spellings from shared.venue_calendar: index underlyings share
+# the US equity session calendar, so they belong in the same set.
+US_EQUITY_ASSET_CLASSES = (
+    venue_calendar.US_EQUITY_ASSET_CLASSES | venue_calendar.INDEX_ASSET_CLASSES
 )
 US_EQUITY_CALENDAR_SOURCES = frozenset(
     {"alpaca", "dolthub", "huggingface", "test", "yfinance"}
@@ -550,7 +553,7 @@ def timeframe_nominal_days(timeframe: str | None) -> float:
     # sizing `s1` and `tick` as *one day* when they are one second. That silently
     # loosened their gap threshold 3x (1.0 -> 3.0 days), so a two-day hole in tick
     # data was reported as `ok` rather than as a warning. These are real labels:
-    # `KNOWN_TIMEFRAMES` in consolidate_parquets and the viewer both spell them this
+    # `VALID_TIMEFRAMES` in shared.ohlcv_store and the viewer both spell them this
     # way, and the grid downloader lists them by name in UNSUPPORTED_TIMEFRAMES.
     #
     # Not a backtest hazard on its own - `TIMEFRAME_MINUTES` has no entry for either,
@@ -636,21 +639,6 @@ def _fail_on_internal_gaps(data_root: Path, requirements: list[DataRequirement])
             )
 
 
-def _parquet_has_bar_in_range(path: Path, start_ts: pd.Timestamp, end_ts: pd.Timestamp) -> bool:
-    """Return whether the parquet at ``path`` has any timestamp within ``[start_ts, end_ts]``."""
-    try:
-        frame = pd.read_parquet(path, columns=["timestamp"])
-    except Exception as exc:
-        logger.warning("Could not inspect OHLCV timestamps for %s: %s", path, exc)
-        return False
-    if "timestamp" not in frame.columns or frame.empty:
-        return False
-    timestamps = pd.to_datetime(
-        frame["timestamp"], utc=True, errors="coerce", format="mixed"
-    ).dropna()
-    return ((timestamps >= start_ts) & (timestamps <= end_ts)).any()
-
-
 def _timestamp_column_index(parquet_file: "pq.ParquetFile") -> int | None:
     """Index of the (case-insensitive) ``timestamp`` column, or None if absent."""
     columns = list(parquet_file.schema_arrow.names)
@@ -687,18 +675,6 @@ def _row_group_edge_timestamp(
     position = group.num_rows - 1 if last else 0
     parsed = pd.to_datetime(group.column(0)[position].as_py(), utc=True, errors="coerce")
     return None if pd.isna(parsed) else pd.Timestamp(parsed)
-
-
-def ohlcv_timestamp_bounds(path: Path | str) -> tuple[pd.Timestamp, pd.Timestamp] | None:
-    """Public entry point for :func:`_parquet_timestamp_bounds`.
-
-    Returns ``(first_timestamp, last_timestamp)`` of a stored OHLCV parquet, or
-    None when the bounds cannot be established (unreadable file, no timestamp
-    column, no rows). Callers that need to know *when* a symbol's data exists —
-    e.g. the universe provenance / survivorship diagnostic — read the bounds
-    through this name; None means "unknown", never "no data".
-    """
-    return _parquet_timestamp_bounds(Path(path))
 
 
 def _parquet_timestamp_bounds(path: Path) -> tuple[pd.Timestamp, pd.Timestamp] | None:
@@ -813,15 +789,16 @@ def _find_gaps_inside_file(
 
 
 def find_internal_gaps(
-    symbol_dir: Path,
+    data_root: str | Path,
+    symbol: str,
     timeframe: str | None = None,
     *,
     threshold_days: float | None = None,
 ) -> list[dict[str, object]]:
-    """Detect holes *inside* the stored timestamp range of one symbol directory.
+    """Detect holes *inside* the stored timestamp range of one symbol.
 
     Coverage based on global min/max passes files that simply stop in the
-    middle (DV-B15). This compares the bar-to-bar boundaries of every parquet
+    middle (DV-B15). This compares the bar-to-bar boundaries of every dataset
     that belongs to the symbol: adjacent files (segmented/monthly storage) and
     the bars inside one file. Every hole longer than ``threshold_days``
     (default: ``INTERNAL_GAP_WARN_DAYS``, 1 calendar day) is reported, largest
@@ -829,74 +806,63 @@ def find_internal_gaps(
     whichever one happened to be longest. Gaps are measured in calendar days, so a
     regular weekend (~2 days) is reported as a warning.
     """
-    def _matches_timeframe(path: Path) -> bool:
-        if timeframe is None:
-            return True
-        stem = path.stem.lower()
-        normalized = timeframe.lower()
-        return (
-            stem == normalized
-            or stem.startswith(f"{normalized}_")
-            or stem.startswith(f"{normalized}-")
-        )
+    normalized_symbol = str(symbol or "").strip().upper()
+    normalized_timeframe = ""
+    if timeframe is not None and str(timeframe).strip():
+        normalized_timeframe = normalize_timeframe(str(timeframe).strip())
+    try:
+        validate_dataset_component(normalized_symbol, name="symbol")
+        if normalized_timeframe:
+            validate_dataset_component(normalized_timeframe, name="timeframe")
+    except ValueError:
+        return []
 
     if threshold_days is None:
         # Without a timeframe there is no nominal spacing to scale against, so
         # widening would only hide real holes. Keep the fixed floor.
         threshold_days = (
-            scaled_gap_threshold_days(timeframe, INTERNAL_GAP_WARN_DAYS)
-            if timeframe
+            scaled_gap_threshold_days(normalized_timeframe, INTERNAL_GAP_WARN_DAYS)
+            if normalized_timeframe
             else INTERNAL_GAP_WARN_DAYS
         )
 
-    parquet_paths = sorted(
-        path for path in symbol_dir.rglob("*.parquet") if _matches_timeframe(path)
+    entries = list_datasets(
+        data_root,
+        symbol=normalized_symbol,
+        timeframe=normalized_timeframe,
     )
-    bounds: list[tuple[pd.Timestamp, pd.Timestamp, Path]] = []
-    for path in parquet_paths:
-        file_bounds = _parquet_timestamp_bounds(path)
-        if file_bounds is not None:
-            bounds.append((file_bounds[0], file_bounds[1], path))
-    if not bounds:
-        return []
-
     gaps: list[InternalGap] = []
-
-    # Gap between the bars of adjacent files (e.g. monthly/segmented storage).
-    bounds.sort(key=lambda item: item[0])
-    for (_, previous_end, _), (next_start, _, _) in pairwise(bounds):
-        gap_days = (next_start - previous_end).total_seconds() / 86_400
-        if gap_days > threshold_days:
-            gaps.append(
-                InternalGap(
-                    start=previous_end.date().isoformat(),
-                    end=next_start.date().isoformat(),
-                    gap_days=gap_days,
-                    start_ts=previous_end.isoformat(),
-                    end_ts=next_start.isoformat(),
-                )
-            )
-
-    # Largest hole inside each file; see _find_gaps_inside_file for the cost.
-    for _, _, path in bounds:
-        file_gaps = _find_gaps_inside_file(path, threshold_days=threshold_days)
-        gaps.extend(file_gaps)
-
-    # Every hole above the threshold, largest first. The `max()` this replaces
-    # collapsed *across* files as well as within them, so the same fail-open
-    # applied to a segmented layout: a real outage in one month's file was invisible
-    # whenever a longer holiday week lived in another. Largest first keeps the
-    # "most actionable gap first" property the collapse was there to provide.
-    return [gap.to_dict() for gap in sorted(gaps, key=lambda g: g.gap_days, reverse=True)]
-
-
-def _contained_rglob(root: Path, pattern: str) -> Iterator[Path]:
-    for path in root.rglob(pattern):
-        try:
-            ensure_dataset_path_within(root, path)
-        except ValueError:
+    for entry in entries:
+        entry_threshold = (
+            threshold_days
+            if threshold_days is not None
+            else scaled_gap_threshold_days(entry.timeframe, INTERNAL_GAP_WARN_DAYS)
+        )
+        bounds = []
+        for path in entry.segments or (entry.path,):
+            file_bounds = _parquet_timestamp_bounds(path)
+            if file_bounds is not None:
+                bounds.append((file_bounds[0], file_bounds[1], path))
+        if not bounds:
             continue
-        yield path
+        bounds.sort(key=lambda item: item[0])
+        for (_, previous_end, _), (next_start, _, _) in pairwise(bounds):
+            gap_days = (next_start - previous_end).total_seconds() / 86_400
+            if gap_days > entry_threshold:
+                gaps.append(
+                    InternalGap(
+                        start=previous_end.date().isoformat(),
+                        end=next_start.date().isoformat(),
+                        gap_days=gap_days,
+                        start_ts=previous_end.isoformat(),
+                        end_ts=next_start.isoformat(),
+                    )
+                )
+        for _, _, path in bounds:
+            gaps.extend(
+                _find_gaps_inside_file(path, threshold_days=entry_threshold)
+            )
+    return [gap.to_dict() for gap in sorted(gaps, key=lambda g: g.gap_days, reverse=True)]
 
 
 def has_ohlcv_bars_in_range(
@@ -930,24 +896,26 @@ def has_ohlcv_bars_in_range(
     except ValueError:
         return False
 
-    ohlcv_root = _resolve_data_root(data_dir) / "ohlcv"
-    matches = sorted(
-        path
-        for path in _contained_rglob(ohlcv_root, f"**/{normalized_timeframe}.parquet")
-        if path.parent.name.upper() == normalized_symbol
-    )
-    return any(_parquet_has_bar_in_range(path, start_ts, end_ts) for path in matches)
+    for entry in list_datasets(
+        _resolve_data_root(data_dir),
+        symbol=normalized_symbol,
+        timeframe=normalized_timeframe,
+    ):
+        frame = read_frame(entry, start=start, end=end, columns=["timestamp"])
+        if not frame.empty:
+            return True
+    return False
 
 
-def _segment_dataset_files(
+def _segment_dataset_entries(
     symbol: str,
     timeframe: str,
     data_dir: str | Path,
-) -> list[Path]:
-    """Parquet files for ``symbol``/``timeframe`` under ``ohlcv/``.
+) -> list[DatasetEntry]:
+    """Manifest entries for ``symbol``/``timeframe`` under ``ohlcv/``.
 
-    One directory scan serves timestamp collection AND venue-pair discovery;
-    callers that need both must not ``rglob`` twice per segment.
+    One manifest scan serves timestamp collection AND venue-pair discovery;
+    callers that need both must not scan twice per segment.
     """
     normalized_symbol = str(symbol or "").strip().upper()
     normalized_timeframe = normalize_timeframe(str(timeframe or "").strip())
@@ -956,35 +924,35 @@ def _segment_dataset_files(
         validate_dataset_component(normalized_timeframe, name="timeframe")
     except ValueError:
         return []
-    ohlcv_root = _resolve_data_root(data_dir) / "ohlcv"
-    return sorted(
-        path
-        for path in _contained_rglob(ohlcv_root, f"**/{normalized_timeframe}.parquet")
-        if path.parent.name.upper() == normalized_symbol
+    return list_datasets(
+        _resolve_data_root(data_dir),
+        symbol=normalized_symbol,
+        timeframe=normalized_timeframe,
     )
 
 
-def _timestamps_in_files(
-    files: list[Path],
+def _timestamps_in_entries(
+    entries: list[DatasetEntry],
     start_ts: pd.Timestamp,
     end_ts: pd.Timestamp,
 ) -> list[pd.Timestamp]:
     """Collect sorted unique bar timestamps in ``[start_ts, end_ts]``."""
     stamps: set[pd.Timestamp] = set()
-    for path in files:
-        try:
-            frame = pd.read_parquet(path, columns=["timestamp"])
-        except Exception:
-            continue
-        if "timestamp" not in frame.columns or frame.empty:
-            continue
-        parsed = pd.to_datetime(
-            frame["timestamp"], utc=True, errors="coerce", format="mixed"
-        ).dropna()
-        for value in parsed:
-            ts = pd.Timestamp(value)
-            if start_ts <= ts <= end_ts:
-                stamps.add(ts)
+    for entry in entries:
+        for path in entry.segments or (entry.path,):
+            try:
+                frame = pd.read_parquet(path, columns=["timestamp"])
+            except Exception:
+                continue
+            if "timestamp" not in frame.columns or frame.empty:
+                continue
+            parsed = pd.to_datetime(
+                frame["timestamp"], utc=True, errors="coerce", format="mixed"
+            ).dropna()
+            for value in parsed:
+                ts = pd.Timestamp(value)
+                if start_ts <= ts <= end_ts:
+                    stamps.add(ts)
     return sorted(stamps)
 
 
@@ -995,20 +963,15 @@ def _segment_venue_metadata(
 ) -> tuple[set[str], set[str]]:
     normalized_symbol = str(symbol or "").strip().upper()
     normalized_timeframe = normalize_timeframe(str(timeframe or "").strip())
-    ohlcv_root = _resolve_data_root(data_dir) / "ohlcv"
-    matches = _contained_rglob(
-        ohlcv_root,
-        f"**/{normalized_timeframe}.parquet",
-    )
     asset_classes: set[str] = set()
     sources: set[str] = set()
-    for path in matches:
-        if path.parent.name.upper() != normalized_symbol:
-            continue
-        parts = path.relative_to(ohlcv_root).parts
-        if len(parts) >= 4:
-            sources.add(parts[0].lower())
-            asset_classes.add(parts[1].lower())
+    for entry in list_datasets(
+        _resolve_data_root(data_dir),
+        symbol=normalized_symbol,
+        timeframe=normalized_timeframe,
+    ):
+        sources.add(entry.source.lower())
+        asset_classes.add(entry.asset_class.lower())
     return asset_classes, sources
 
 
@@ -1034,45 +997,6 @@ def _uses_us_equity_calendar(
     return _US_STOCK_SYMBOL_PATTERN.fullmatch(normalized) is not None
 
 
-def _venue_pairs_from_files(
-    files: list[Path],
-    ohlcv_root: Path,
-) -> set[tuple[str, str]]:
-    pairs: set[tuple[str, str]] = set()
-    for path in files:
-        parts = path.relative_to(ohlcv_root).parts
-        if len(parts) >= 4:
-            pairs.add((parts[0].lower(), parts[1].lower()))
-        elif len(parts) == 3:
-            pairs.add((parts[0].lower(), ""))
-    return pairs
-
-
-def _segment_venue_pairs(
-    symbol: str,
-    timeframe: str,
-    data_dir: str | Path,
-) -> set[tuple[str, str]]:
-    """``(source, asset_class)`` pairs declared by matching dataset paths.
-
-    Layouts are ``ohlcv/<source>/<asset_class>/.../<symbol>/<tf>.parquet``;
-    a three-component ``ohlcv/<source>/<symbol>/<tf>.parquet`` path (test
-    fixtures) contributes the source with no asset class.
-    """
-    normalized_symbol = str(symbol or "").strip().upper()
-    normalized_timeframe = normalize_timeframe(str(timeframe or "").strip())
-    try:
-        validate_dataset_component(normalized_symbol, name="symbol")
-        validate_dataset_component(normalized_timeframe, name="timeframe")
-    except ValueError:
-        return set()
-    ohlcv_root = _resolve_data_root(data_dir) / "ohlcv"
-    return _venue_pairs_from_files(
-        _segment_dataset_files(normalized_symbol, normalized_timeframe, data_dir),
-        ohlcv_root,
-    )
-
-
 def _resolve_segment_venue_calendar(
     symbol: str,
     timeframe: str,
@@ -1087,7 +1011,10 @@ def _resolve_segment_venue_calendar(
     files, avoiding a second ``rglob`` per segment.
     """
     if pairs is None:
-        pairs = _segment_venue_pairs(symbol, timeframe, data_dir)
+        pairs = {
+            (entry.source.lower(), entry.asset_class.lower())
+            for entry in _segment_dataset_entries(symbol, timeframe, data_dir)
+        }
     pairs = pairs or {("", "")}
     calendars: list[venue_calendar.VenueCalendar] = []
     for src, asset in sorted(pairs):
@@ -1197,8 +1124,8 @@ def has_sufficient_segment_coverage(
         explicit_session = _explicit_session_window(session, session_start, session_end)
     except ValueError:
         return False
-    files = _segment_dataset_files(symbol, normalized_timeframe, data_dir)
-    stamps = _timestamps_in_files(files, start_ts, end_ts)
+    entries = _segment_dataset_entries(symbol, normalized_timeframe, data_dir)
+    stamps = _timestamps_in_entries(entries, start_ts, end_ts)
     if not stamps:
         return False
 
@@ -1224,8 +1151,10 @@ def has_sufficient_segment_coverage(
                 return False
         return True
 
-    ohlcv_root = _resolve_data_root(data_dir) / "ohlcv"
-    pairs = _venue_pairs_from_files(files, ohlcv_root)
+    pairs = {
+        (entry.source.lower(), entry.asset_class.lower())
+        for entry in entries
+    }
     calendar = _resolve_segment_venue_calendar(
         symbol, normalized_timeframe, data_dir, pairs=pairs
     )
@@ -1475,17 +1404,13 @@ def _coverage_for(data_root: Path, symbol: str, timeframe: str) -> tuple[str, st
         validate_dataset_component(timeframe, name="timeframe")
     except ValueError:
         return None
-    ohlcv_root = data_root / "ohlcv"
-    matches = sorted(_contained_rglob(ohlcv_root, f"**/{symbol}/{timeframe}.parquet"))
-    if not matches:
-        return None
-
+    entries = list_datasets(data_root, symbol=symbol, timeframe=timeframe)
     starts: list[str] = []
     ends: list[str] = []
-    for path in matches:
-        bounds = _parquet_timestamp_bounds(path)
+    for entry in entries:
+        bounds = dataset_bounds(entry)
         if bounds is None:
-            logger.warning("Could not inspect OHLCV coverage for %s", path)
+            logger.warning("Could not inspect OHLCV coverage for %s", entry.path)
             continue
         start, end = bounds
         starts.append(start.date().isoformat())
@@ -1664,14 +1589,8 @@ def analyze_ohlcv_coverage(data_root: Path, requirement: DataRequirement) -> dic
             "failed_downloads": [],
             "error": str(exc),
         }
-    symbol_dir_candidates = sorted(
-        _contained_rglob(data_root / "ohlcv", f"**/{symbol}")
-    )
-    gaps: list[dict[str, object]] = []
+    gaps = find_internal_gaps(data_root, symbol, timeframe)
     bounds = _coverage_for(data_root, symbol, timeframe)
-
-    for candidate in symbol_dir_candidates:
-        gaps.extend(find_internal_gaps(candidate, timeframe))
 
     error: str | None = None
     # Both the stored-bounds check below and the gap window filter further down

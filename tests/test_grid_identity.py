@@ -23,22 +23,41 @@ from runner.grid_identity import (
     read_identity,
     strategy_source_sha256,
 )
+from shared import ohlcv_store
 
 
-def _write_frame(path: Path, *, periods: int = 5) -> Path:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame(
-        {
-            "timestamp": pd.date_range("2024-01-01", periods=periods, freq="D", tz="UTC"),
-            "close": [float(index + 1) for index in range(periods)],
-        }
-    ).to_parquet(path, index=False)
-    return path
+def _write_frame(data_dir: Path, source: str, *, periods: int = 5) -> Path:
+    """One AAPL/1d dataset under ``data_dir`` via the manifest store."""
+    closes = [float(index + 1) for index in range(periods)]
+    return ohlcv_store.write_frame(
+        data_dir,
+        source,
+        "AAPL",
+        "1d",
+        pd.DataFrame(
+            {
+                "timestamp": pd.date_range(
+                    "2024-01-01", periods=periods, freq="D", tz="UTC"
+                ),
+                "open": closes,
+                "high": closes,
+                "low": closes,
+                "close": closes,
+                "volume": [1.0] * periods,
+            }
+        ),
+        asset_class="equity",
+        region="US",
+    )
+
+
+def _dataset_path(data_dir: Path, source: str) -> Path:
+    return ohlcv_store.data_path(data_dir, source, "AAPL", "1d")
 
 
 def _setup(tmp_path: Path) -> None:
     """Create the inputs once; rewriting them would change the identity."""
-    _write_frame(tmp_path / "data" / "ohlcv" / "yfinance" / "equity" / "US" / "AAPL" / "1d.parquet")
+    _write_frame(tmp_path / "data", "yfinance")
     strategy = tmp_path / "demo.py"
     strategy.write_text("STRATEGY_META = {'name': 'demo'}\n", encoding="utf-8")
 
@@ -131,8 +150,7 @@ def test_an_unreadable_strategy_is_not_a_wildcard(tmp_path):
 
 def test_the_data_fingerprint_changes_when_a_frame_is_rewritten(tmp_path):
     baseline = _identity(tmp_path)
-    parquet = tmp_path / "data" / "ohlcv" / "yfinance" / "equity" / "US" / "AAPL" / "1d.parquet"
-    _write_frame(parquet, periods=9)
+    _write_frame(tmp_path / "data", "yfinance", periods=9)
     assert _identity(tmp_path)["fingerprint"] != baseline["fingerprint"]
 
 
@@ -153,9 +171,7 @@ def test_the_data_fingerprint_describes_every_candidate_frame(tmp_path):
     _setup(tmp_path)
     primary_only = _identity(tmp_path)["data"]
 
-    _write_frame(
-        tmp_path / "data" / "ohlcv" / "other" / "equity" / "US" / "AAPL" / "1d.parquet"
-    )
+    _write_frame(tmp_path / "data", "other")
     with_rival = _identity(tmp_path)["data"]
 
     assert primary_only is not None
@@ -170,9 +186,7 @@ def test_the_data_fingerprint_describes_every_candidate_frame(tmp_path):
 
 def test_the_symbol_is_matched_case_insensitively(tmp_path):
     """A lower-case request must find the same frame a upper-case one does."""
-    _write_frame(
-        tmp_path / "data" / "ohlcv" / "yfinance" / "equity" / "US" / "AAPL" / "1d.parquet"
-    )
+    _write_frame(tmp_path / "data", "yfinance")
 
     upper = _identity(tmp_path, symbol="AAPL")
 
@@ -193,9 +207,7 @@ def test_the_candidate_frame_order_is_deterministic(tmp_path):
     a coin flip.
     """
     for source in ("yfinance", "other"):
-        _write_frame(
-            tmp_path / "data" / "ohlcv" / source / "equity" / "US" / "AAPL" / "1d.parquet"
-        )
+        _write_frame(tmp_path / "data", source)
 
     first = _identity(tmp_path)["data"]
     second = _identity(tmp_path)["data"]
@@ -298,10 +310,7 @@ def test_data_staleness_reason_passes_a_healthy_identity(tmp_path):
 def test_data_staleness_reason_reports_a_changed_frame(tmp_path):
     _setup(tmp_path)
     identity = _identity(tmp_path)
-    _write_frame(
-        tmp_path / "data" / "ohlcv" / "yfinance" / "equity" / "US" / "AAPL" / "1d.parquet",
-        periods=9,
-    )
+    _write_frame(tmp_path / "data", "yfinance", periods=9)
 
     reason = data_staleness_reason(identity)
 
@@ -312,9 +321,7 @@ def test_data_staleness_reason_reports_a_changed_frame(tmp_path):
 def test_data_staleness_reason_reports_a_deleted_frame(tmp_path):
     _setup(tmp_path)
     identity = _identity(tmp_path)
-    (
-        tmp_path / "data" / "ohlcv" / "yfinance" / "equity" / "US" / "AAPL" / "1d.parquet"
-    ).unlink()
+    _dataset_path(tmp_path / "data", "yfinance").unlink()
 
     reason = data_staleness_reason(identity)
 

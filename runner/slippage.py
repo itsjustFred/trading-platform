@@ -40,6 +40,7 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 from runner.engines._shared import bar_spread_units
+from shared import venue_calendar
 
 __all__ = [
     "BarSpreadSlippage",
@@ -137,9 +138,9 @@ DEFAULT_SLIPPAGE_BPS: dict[str, float] = {
     "cryptocurrencies": 10.0,
 }
 
-_EQUITY_ASSET_CLASSES = frozenset(
-    {"equity", "equities", "stock", "stocks", "etf", "etfs"}
-)
+# Canonical equity spellings: shared.venue_calendar is the single model —
+# the exposure resolver and the OHLCV store ranking read the same set.
+_EQUITY_ASSET_CLASSES = venue_calendar.US_EQUITY_ASSET_CLASSES
 _CRYPTO_ASSET_CLASSES = frozenset(
     {"crypto", "cryptocurrency", "cryptocurrencies"}
 )

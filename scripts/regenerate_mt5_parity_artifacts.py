@@ -44,7 +44,8 @@ from runner.daily_equity import attach_daily_equity
 from runner.engines.base import resolve_strategy_parameters
 from runner.engines.mtm_equity import BASIS_REALIZED_EXIT_TIMED, EQUITY_CURVE_BASIS_KEY
 from runner.stats import compute_stats_for_result
-from shared.constants import DATA_DIR, normalize_timeframe
+from shared import ohlcv_store
+from shared.constants import DATA_DIR
 from shared.models import BacktestMeta, BacktestResult, EquityPoint, Trade, TradeExit
 from strategies.intraday_volatility_breakout.intraday_volatility_breakout import generate_signals
 
@@ -145,38 +146,15 @@ MT5_MAX_LOTS: dict[str, float] = {
 
 
 def _candidate_ohlcv_paths(data_dir: Path, symbol: str, timeframe: str) -> list[Path]:
-    normalized_timeframe = normalize_timeframe(timeframe)
-    stems = {normalized_timeframe}
-    if normalized_timeframe == "1m":
-        stems.update({"m1", "m1_bid", "m1_ask", "1m_bid", "1m_ask"})
-    elif normalized_timeframe == "1h":
-        stems.update({"h1", "h1_bid", "h1_ask", "1h_bid", "1h_ask"})
-    elif normalized_timeframe == "1d":
-        stems.update({"d1", "d1_bid", "d1_ask", "1d_bid", "1d_ask"})
-
     matches: list[Path] = []
-    root = data_dir / "ohlcv"
-    for stem in sorted(stems):
-        matches.extend(sorted(root.rglob(f"**/{symbol}/{stem}.parquet")))
+    for entry in ohlcv_store.list_datasets(
+        data_dir, symbol=symbol, timeframe=timeframe
+    ):
+        matches.extend(entry.segments)
     return sorted(dict.fromkeys(matches))
 
 
-def _source_priority(path: Path, timeframe: str) -> int:
-    normalized_timeframe = normalize_timeframe(timeframe)
-    if path.stem == normalized_timeframe:
-        return 0
-    if path.stem == f"{normalized_timeframe}_bid":
-        return 1
-    if path.stem == f"{normalized_timeframe}_ask":
-        return 2
-    if normalized_timeframe == "1m" and path.stem == "m1_bid":
-        return 3
-    if normalized_timeframe == "1m" and path.stem == "m1_ask":
-        return 4
-    return 10
-
-
-def _normalize_ohlcv_frame(df: pd.DataFrame, source_path: Path, timeframe: str) -> pd.DataFrame:
+def _normalize_ohlcv_frame(df: pd.DataFrame, source_path: Path) -> pd.DataFrame:
     frame = df.copy()
     frame.columns = [str(col).lower() for col in frame.columns]
 
@@ -211,7 +189,6 @@ def _normalize_ohlcv_frame(df: pd.DataFrame, source_path: Path, timeframe: str) 
         frame["volume"] = 0.0
     frame["volume"] = pd.to_numeric(frame["volume"], errors="coerce").fillna(0.0)
     frame["_source_path"] = str(source_path)
-    frame["_source_priority"] = _source_priority(source_path, timeframe)
     return frame
 
 
@@ -223,7 +200,7 @@ def load_ohlcv(data_dir: Path, symbol: str, timeframe: str, start: str, end: str
     frames: list[pd.DataFrame] = []
     for path in matches:
         try:
-            candidate = _normalize_ohlcv_frame(pd.read_parquet(path), path, timeframe)
+            candidate = _normalize_ohlcv_frame(pd.read_parquet(path), path)
         except Exception as exc:
             print(f"Skipping unusable OHLCV candidate {path}: {exc}", file=sys.stderr)
             continue
@@ -240,7 +217,7 @@ def load_ohlcv(data_dir: Path, symbol: str, timeframe: str, start: str, end: str
         )
 
     frame = pd.concat(frames, ignore_index=True, sort=False)
-    frame = frame.sort_values(["timestamp", "_source_priority"], kind="mergesort")
+    frame = frame.sort_values("timestamp", kind="mergesort")
     frame = frame.groupby("timestamp", sort=True, as_index=False).first()
     frame = frame[frame["timestamp"] >= pd.Timestamp(start, tz="UTC")]
     frame = frame[frame["timestamp"] <= pd.Timestamp(end, tz="UTC")]

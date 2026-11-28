@@ -197,19 +197,25 @@ def test_unknown_provenance_names_itself_as_unrecorded():
 
 
 def _write_bars(data_dir: Path, symbol: str, timestamps: list[str], *, timeframe: str = "1d") -> Path:
-    path = data_dir / "ohlcv" / "test" / symbol / f"{timeframe}.parquet"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame(
-        {
-            "timestamp": timestamps,
-            "open": [100.0] * len(timestamps),
-            "high": [101.0] * len(timestamps),
-            "low": [99.0] * len(timestamps),
-            "close": [100.5] * len(timestamps),
-            "volume": [1000.0] * len(timestamps),
-        }
-    ).to_parquet(path, index=False)
-    return path
+    from shared import ohlcv_store
+
+    return ohlcv_store.write_frame(
+        data_dir,
+        "test",
+        symbol,
+        timeframe,
+        pd.DataFrame(
+            {
+                "timestamp": timestamps,
+                "open": [100.0] * len(timestamps),
+                "high": [101.0] * len(timestamps),
+                "low": [99.0] * len(timestamps),
+                "close": [100.5] * len(timestamps),
+                "volume": [1000.0] * len(timestamps),
+            }
+        ),
+        asset_class="equities",
+    )
 
 
 def test_coverage_is_read_from_the_stored_bars(tmp_path: Path):

@@ -469,25 +469,50 @@ def test_missing_data_fails_only_that_cell(monkeypatch, tmp_path):
 
 def test_detect_date_range_handles_case_insensitive_timestamp_column(tmp_path):
     """CodeRabbit (cycle 2, minor): a parquet whose timestamp column is cased
-    differently must still contribute its range (same contract as
-    runner.cli._detect_date_range); a file without any timestamp column fails
-    loudly instead of being projected into a KeyError."""
+    differently must still contribute its range; a manifest-declared file
+    without readable timestamp bounds fails loudly instead of being projected
+    into a KeyError."""
     import pandas as pd
 
+    from shared import ohlcv_store
+
     data_dir = tmp_path / "data"
-    cased = data_dir / "ohlcv" / "test" / "AAA" / "1d.parquet"
-    cased.parent.mkdir(parents=True, exist_ok=True)
     stamps = pd.date_range("2024-01-01", periods=5, freq="D", tz="UTC")
-    pd.DataFrame({"Timestamp": stamps, "close": [1.0] * 5}).to_parquet(cased, index=False)
+    closes = [1.0] * 5
+    ohlcv_store.write_frame(
+        data_dir,
+        "test",
+        "AAA",
+        "1d",
+        pd.DataFrame(
+            {
+                "Timestamp": stamps,
+                "open": closes,
+                "high": closes,
+                "low": closes,
+                "close": closes,
+            }
+        ),
+        asset_class="equities",
+    )
 
     start, end = bg._detect_date_range("AAA", "1d", str(data_dir))
     assert (start, end) == ("2024-01-01", "2024-01-05")
 
-    nots = data_dir / "ohlcv" / "test" / "BBB" / "1d.parquet"
-    nots.parent.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame({"px": [1.0, 2.0]}).to_parquet(nots, index=False)
+    # A manifest-declared file whose timestamps cannot be bounded at all:
+    # detection must refuse loudly, not crash or fabricate a range.
+    bbb_path = (
+        ohlcv_store.source_dir(data_dir, "test") / "BBB" / "BBB_D1.parquet"
+    )
+    bbb_path.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame({"px": [1.0, 2.0]}).to_parquet(bbb_path, index=False)
+    manifest = ohlcv_store.read_manifest(data_dir, "test")
+    manifest.setdefault("BBB", {"files": {}})["files"]["BBB_D1.parquet"] = {
+        "rows": 2
+    }
+    ohlcv_store.write_manifest(data_dir, "test", manifest)
 
-    with pytest.raises(ValueError, match="timestamp column"):
+    with pytest.raises(ValueError, match="valid timestamps"):
         bg._detect_date_range("BBB", "1d", str(data_dir))
 
 
@@ -518,30 +543,45 @@ def test_grid_tasks_carry_keep_indicators(tmp_path, monkeypatch):
 # ─── grid cell identity: a stale artifact is refused, never reused ───────────
 
 
-def _write_frame(path, *, periods: int = 5) -> None:
+def _write_frame(data_dir, source: str = "yfinance", *, periods: int = 5):
+    """One AAPL/1d dataset under ``data_dir`` via the manifest store."""
     import pandas as pd
+    from shared import ohlcv_store
 
-    path.parent.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame(
-        {
-            "timestamp": pd.date_range("2024-01-01", periods=periods, freq="D", tz="UTC"),
-            "close": [float(index + 1) for index in range(periods)],
-        }
-    ).to_parquet(path, index=False)
+    closes = [float(index + 1) for index in range(periods)]
+    return ohlcv_store.write_frame(
+        data_dir,
+        source,
+        "AAPL",
+        "1d",
+        pd.DataFrame(
+            {
+                "timestamp": pd.date_range(
+                    "2024-01-01", periods=periods, freq="D", tz="UTC"
+                ),
+                "open": closes,
+                "high": closes,
+                "low": closes,
+                "close": closes,
+                "volume": [1.0] * periods,
+            }
+        ),
+        asset_class="equity",
+        region="US",
+    )
 
 
 def _identity_fixture(tmp_path, *, periods: int = 5, stamp: bool = True):
     """A data dir, a strategy file and a persisted cell artifact for one cell.
 
-    Returns ``(request, artifact, parquet)``. When ``stamp`` is set the artifact
+    Returns ``(request, artifact, data_dir)``. When ``stamp`` is set the artifact
     carries the identity a real run would have written, so the reuse decision
     has something legitimate to accept.
     """
     from shared.models import BacktestMeta, BacktestResult
 
     data_dir = tmp_path / "data"
-    parquet = data_dir / "ohlcv" / "yfinance" / "equity" / "US" / "AAPL" / "1d.parquet"
-    _write_frame(parquet, periods=periods)
+    _write_frame(data_dir, periods=periods)
     output_dir = tmp_path / "out"
     output_dir.mkdir(parents=True, exist_ok=True)
     strategy = tmp_path / "demo.py"
@@ -582,7 +622,7 @@ def _identity_fixture(tmp_path, *, periods: int = 5, stamp: bool = True):
         result.meta.data = {**result.meta.data, "grid_identity": identity}
     artifact = output_dir / f"{bg.build_run_id(str(strategy), 'AAPL', '1d')}.trades.json"
     result.save(artifact)
-    return request, artifact, parquet
+    return request, artifact, data_dir
 
 
 def _cell_record(request) -> dict:
@@ -598,9 +638,9 @@ def test_resume_recomputes_when_the_underlying_frame_changed(tmp_path):
     the data fingerprint is the only thing that can catch it. Reusing here
     reports numbers from five bars as the answer for nine.
     """
-    request, _artifact, parquet = _identity_fixture(tmp_path)
+    request, _artifact, data_dir = _identity_fixture(tmp_path)
     # A different length, so this is not a mere mtime touch.
-    _write_frame(parquet, periods=9)
+    _write_frame(data_dir, periods=9)
 
     record = _cell_record(request)
 

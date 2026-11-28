@@ -28,9 +28,10 @@ from pathlib import Path
 import pandas as pd
 
 from data_tools.auto_download import TIMEFRAME_MINUTES, _nyse_holidays
-from data_tools.catalog_builder import _extract_timeframe_and_segment
 from data_tools.path_safety import ensure_dataset_path_within
+from shared import venue_calendar
 from shared.constants import DATA_DIR, normalize_timeframe
+from shared.ohlcv_store import DatasetEntry, entry_for_path, list_datasets
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(message)s")
 logger = logging.getLogger(__name__)
@@ -64,8 +65,13 @@ GAP_THRESHOLD_MINUTES = {
 
 #: Asset classes with exchange holidays (B3: gap skips apply to these only —
 #: FX/metals trade through most US holidays, so blanket skipping would hide
-#: real data holes there).
-_EQUITY_LIKE_ASSET_CLASSES = frozenset({"equity", "stock", "stocks", "etf", "index"})
+#: real data holes there). Canonical spellings from shared.venue_calendar:
+#: equity + index asset classes share exchange sessions, so the holiday gap
+#: exemption applies to both — the same sets the store ranking and slippage
+#: read.
+_EQUITY_LIKE_ASSET_CLASSES = (
+    venue_calendar.US_EQUITY_ASSET_CLASSES | venue_calendar.INDEX_ASSET_CLASSES
+)
 _EXPECTED_GAP_CLASSIFICATIONS = frozenset({"overnight", "weekend", "holiday"})
 
 
@@ -420,15 +426,6 @@ def _gap_is_expected_nontrading(
     ) in _EXPECTED_GAP_CLASSIFICATIONS
 
 
-def _asset_class_from_parts(parts: tuple[str, ...]) -> str:
-    for index, part in enumerate(parts):
-        if part.lower() == "ohlcv" and index + 1 < len(parts):
-            return parts[index + 1].lower()
-    if len(parts) >= 2:
-        return parts[1].lower()
-    return ""
-
-
 def _first_column_value(frame: pd.DataFrame, names: tuple[str, ...]) -> object:
     for name in names:
         if name not in frame.columns:
@@ -439,8 +436,10 @@ def _first_column_value(frame: pd.DataFrame, names: tuple[str, ...]) -> object:
     return None
 
 
-def _dataset_metadata(path: Path) -> dict:
-    candidates = [DATA_DIR / "source_meta.json", path.parent / "source_meta.json"]
+def _dataset_metadata(
+    data_root: Path, path: Path, entry: DatasetEntry | None
+) -> dict:
+    candidates = [data_root / "source_meta.json", path.parent / "source_meta.json"]
     for metadata_path in candidates:
         if not metadata_path.exists():
             continue
@@ -450,38 +449,14 @@ def _dataset_metadata(path: Path) -> dict:
             continue
         if not isinstance(payload, Mapping):
             continue
-        # The canonical key first: `source/asset_class/symbol/timeframe`, which is
-        # what the downloader writes and what catalog_builder reads. Verified
-        # against the live file - 56 keys, every one of that shape, none
-        # path-shaped.
-        #
-        # The path-shaped lookups below never matched anything. Every one of them is
-        # a way of naming a *file*, while the writer names a *dataset*, so this
-        # function silently returned nothing and `validate_parquet` always fell back
-        # to the observed-session heuristic - the lossy consumer was the one
-        # deciding whether data is clean. Two readers of one shared file, disagreeing
-        # on its key scheme, which is the third appearance of that shape in this
-        # function's own file (see also the timeframe parsing).
         keys: list[str] = []
-        source = path.parts[-4] if len(path.parts) >= 4 else ""
-        asset_class = path.parts[-3] if len(path.parts) >= 3 else ""
-        symbol = path.parent.name
-        # Parse the stem the way `catalog_builder.parse_ohlcv_path` does, so the key
-        # is the one the downloader wrote (`.../1h`) rather than the segmented file
-        # name (`.../1h_2024_03`). The writer keys on the *dataset* timeframe, and
-        # `catalog_builder` reads it with the same parser; using the raw stem here
-        # would re-introduce the filename-vs-dataset mismatch this branch is fixing,
-        # one layer up. Fall back to the stem when the parser cannot name a
-        # timeframe, so an unexpected layout still looks up *something* rather than
-        # silently returning nothing.
-        parsed_timeframe, _segment = _extract_timeframe_and_segment(path.stem)
-        timeframe_stem = parsed_timeframe or path.stem
-        canonical = f"{source}/{asset_class}/{symbol}/{timeframe_stem}"
-        keys.append(canonical)
-        # Retained for any file written under the old path-shaped scheme.
+        if entry is not None:
+            keys.append(
+                f"{entry.source}/{entry.asset_class}/{entry.symbol}/{entry.timeframe}"
+            )
         keys.extend([str(path), path.as_posix()])
         try:
-            keys.append(str(path.resolve().relative_to(DATA_DIR.resolve())))
+            keys.append(str(path.resolve().relative_to(data_root.resolve())))
         except (OSError, RuntimeError, ValueError):
             pass
         for key in keys:
@@ -545,37 +520,23 @@ def validate_parquet(
     if holidays is None and holiday_dates is not None:
         holidays = holiday_dates
     configured_root = (ohlcv_root or (DATA_DIR / "ohlcv")).resolve()
-    candidate = ensure_dataset_path_within(configured_root, Path(path).expanduser())
-    rel = candidate.relative_to(configured_root)
-    parts = rel.parts
-
-    # Extract metadata from path: {source}/{asset_class}/.../{symbol}/{tf}.parquet
-    source = parts[0] if len(parts) >= 4 else "unknown"
-    symbol = candidate.parent.name
-    # Parse the stem the way the catalog builder does, rather than taking it whole.
-    # `candidate.stem` is wrong for every segmented dataset, which is a layout this
-    # repo deliberately supports: `1m_2024_03` became the timeframe
-    # "1m_2024_03", missed the gap-threshold table, and fell back to the 180-minute
-    # default - a 36x loosening against the 5 minutes a 1-minute file actually gets.
-    # A 30-minute hole in a segmented 1m file was therefore never even considered.
-    #
-    # It also reached further than the threshold: this `timeframe` is passed to
-    # `_gap_classification`, so gap classification was deciding with a name no
-    # calendar could match.
-    #
-    # Measured across the two readers of the same filename:
-    #     1m.parquet         -> 5 min     1m_2024_03.parquet -> 180 min
-    # One parser, both readers - the same discipline the rest of this branch is
-    # about, applied to a filename rather than a broker payload.
-    parsed_timeframe, _segment = _extract_timeframe_and_segment(candidate.stem)
-    timeframe = parsed_timeframe or candidate.stem
+    data_root = configured_root.parent if configured_root.name == "ohlcv" else configured_root
+    store_root = configured_root if configured_root.name == "ohlcv" else configured_root / "ohlcv"
+    candidate = ensure_dataset_path_within(store_root, Path(path).expanduser())
+    rel = candidate.relative_to(store_root)
+    entry = entry_for_path(data_root, candidate)
 
     result = ValidationResult(
         path=str(rel),
-        symbol=symbol,
-        timeframe=timeframe,
-        source=source,
+        symbol=entry.symbol if entry is not None else candidate.parent.name,
+        timeframe=entry.timeframe if entry is not None else "",
+        source=entry.source if entry is not None else "unknown",
     )
+    if entry is None:
+        result.status = "error"
+        result.errors.append("Parquet is not declared in the OHLCV manifest")
+        return result
+    timeframe = entry.timeframe
 
     try:
         df = pd.read_parquet(candidate)
@@ -586,7 +547,7 @@ def validate_parquet(
 
     df.columns = [c.lower() for c in df.columns]
     dataset_metadata = dict(df.attrs) if isinstance(df.attrs, Mapping) else {}
-    dataset_metadata.update(_dataset_metadata(candidate))
+    dataset_metadata.update(_dataset_metadata(data_root, candidate, entry))
     frame_session = _first_column_value(
         df, ("session", "trading_session", "trading_hours", "market_hours")
     )
@@ -696,11 +657,10 @@ def validate_parquet(
             gap_end = ts.loc[idx]
             gap_minutes = large_gaps.iloc[pos].total_seconds() / 60
 
-            asset_class = _asset_class_from_parts(parts)
             classification = _gap_classification(
                 gap_start,
                 gap_end,
-                asset_class,
+                entry.asset_class,
                 timeframe,
                 session=resolved_session,
                 holidays=resolved_holidays,
@@ -792,44 +752,45 @@ def validate_all(data_dir: Path, symbol_filter: str | None = None) -> list[Valid
         return []
 
     results = []
-    for parquet in sorted(ohlcv_root.rglob("*.parquet")):
-        try:
-            validated_path = ensure_dataset_path_within(ohlcv_root, parquet)
-        except ValueError as exc:
-            result = ValidationResult(
-                path=str(parquet),
-                symbol=parquet.parent.name,
-                timeframe=parquet.stem,
-                source="unknown",
-                status="error",
+    for dataset in list_datasets(data_dir):
+        if symbol_filter and dataset.symbol.upper() != symbol_filter.upper():
+            continue
+        for parquet in dataset.segments or (dataset.path,):
+            try:
+                rel_parquet = parquet.relative_to(ohlcv_root)
+            except ValueError:
+                rel_parquet = parquet
+            logger.info("Validating %s ...", rel_parquet)
+            try:
+                r = validate_parquet(parquet, ohlcv_root=ohlcv_root)
+            except ValueError as exc:
+                r = ValidationResult(
+                    path=str(rel_parquet),
+                    symbol=dataset.symbol,
+                    timeframe=dataset.timeframe,
+                    source=dataset.source,
+                    status="error",
+                )
+                r.errors.append(str(exc))
+
+            status_icon = {"ok": "✅", "warning": "⚠️", "error": "❌"}.get(r.status, "?")
+            logger.info(
+                "  %s %s %s: %d rows, %d gaps, %d dupes, %d OHLC violations",
+                status_icon,
+                r.symbol,
+                r.timeframe,
+                r.total_rows,
+                len(r.gaps),
+                r.duplicates,
+                r.ohlc_violations,
             )
-            result.errors.append(str(exc))
-            results.append(result)
-            continue
-        if symbol_filter and parquet.parent.name.upper() != symbol_filter.upper():
-            continue
 
-        logger.info("Validating %s ...", validated_path.relative_to(ohlcv_root))
-        r = validate_parquet(validated_path, ohlcv_root=ohlcv_root)
+            for w in r.warnings:
+                logger.info("    ⚠️  %s", w)
+            for e in r.errors:
+                logger.error("    ❌  %s", e)
 
-        status_icon = {"ok": "✅", "warning": "⚠️", "error": "❌"}.get(r.status, "?")
-        logger.info(
-            "  %s %s %s: %d rows, %d gaps, %d dupes, %d OHLC violations",
-            status_icon,
-            r.symbol,
-            r.timeframe,
-            r.total_rows,
-            len(r.gaps),
-            r.duplicates,
-            r.ohlc_violations,
-        )
-
-        for w in r.warnings:
-            logger.info("    ⚠️  %s", w)
-        for e in r.errors:
-            logger.error("    ❌  %s", e)
-
-        results.append(r)
+            results.append(r)
 
     return results
 

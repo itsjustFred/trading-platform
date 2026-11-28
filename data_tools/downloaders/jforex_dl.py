@@ -4,7 +4,8 @@ JForex Downloader — Dukascopy historical data via JForex Java SDK (JPype bridg
 This downloader connects to Dukascopy through the JForex SDK, requests historical
 bars/ticks, and stores data under the canonical OHLCV path:
 
-    {output_dir}/ohlcv/dukascopy/{asset_class}/{symbol}/{timeframe}.parquet
+    {output_dir}/ohlcv/dukascopy/{SYMBOL}/{SYMBOL}_{TF}.parquet
+    (asset_class/region live in the source manifest, not the path)
 
 Supported output timeframes:
     tick, 1m, 5m, 15m, 30m, 1h, 4h, 1d, 1w
@@ -217,17 +218,6 @@ JFOREX_PERIOD_ATTR: dict[str, str] = {
     "1m": "ONE_MIN",
     "1h": "ONE_HOUR",
     "1d": "DAILY",
-}
-
-FILE_SUFFIX_ALIASES: dict[str, str] = {
-    "1m": "m1",
-    "5m": "m5",
-    "15m": "m15",
-    "30m": "m30",
-    "1h": "h1",
-    "4h": "h4",
-    "1d": "d1",
-    "1w": "w1",
 }
 
 
@@ -1287,11 +1277,6 @@ def _normalize_offer_side(value: str | None) -> str:
     return normalized
 
 
-def _normalize_timeframe_for_file_suffix(timeframe: str) -> str:
-    normalized = str(timeframe or "").strip().lower()
-    return FILE_SUFFIX_ALIASES.get(normalized, normalized)
-
-
 def _bars_with_offer_prefix(df: pd.DataFrame, offer_side: str) -> pd.DataFrame:
     if df.empty:
         return df.copy()
@@ -1320,32 +1305,6 @@ def _resample_offer_prefixed(df: pd.DataFrame, target_tf: str, offer_side: str) 
     )
     resampled = resample_ohlcv(base, target_tf)
     return _bars_with_offer_prefix(resampled, offer_side)
-
-
-def _build_offer_side_output_path(base_path: Path, target_tf: str, offer_side: str) -> Path:
-    stem = base_path.stem
-    normalized_tf = _normalize_timeframe_for_file_suffix(target_tf)
-    suffix = f"{normalized_tf}_{offer_side}"
-    if stem == normalized_tf:
-        stem = suffix
-    elif stem.endswith(f"_{normalized_tf}"):
-        stem = f"{stem}_{offer_side}"
-    else:
-        stem = suffix
-    return base_path.with_name(f"{stem}{base_path.suffix}")
-
-
-def merged_result_path(bid_out_path: Path) -> Path:
-    """Result path for a merged bid/ask download.
-
-    ``DownloadResult.path`` must be a file, never a directory: every consumer
-    reads it as the stored parquet (DV-B9). The bid side is the canonical
-    stored file for merged downloads. Fails closed when the bid file is not
-    on disk, so a partial merge can never masquerade as a successful path.
-    """
-    if not bid_out_path.is_file():
-        raise RuntimeError(f"Merged JForex download did not store {bid_out_path}")
-    return bid_out_path
 
 
 def _query_bars_for_offer_side(
@@ -1444,8 +1403,6 @@ class JForexDownloader(Downloader):
                 raise ValueError(
                     "offer_side='both' is not supported for tick-derived outputs with JForex"
                 )
-            bid_out_path = _build_offer_side_output_path(out_path, target_tf, "bid")
-            ask_out_path = _build_offer_side_output_path(out_path, target_tf, "ask")
             bid_df = _query_bars_for_offer_side(
                 java_instrument=java_instrument,
                 base_tf=base_tf,
@@ -1480,14 +1437,17 @@ class JForexDownloader(Downloader):
                 bid_result_df = _resample_offer_prefixed(bid_df, target_tf, "bid")
                 ask_result_df = _resample_offer_prefixed(ask_df, target_tf, "ask")
 
-            if target_tf == "1w":
-                # Weekly bars are resampled here, so a pre-Monday-convention file would be
-                # merged into rather than replaced; fail before either side is written.
-                assert_stored_weekly_file_current(bid_out_path)
-                assert_stored_weekly_file_current(ask_out_path)
-            self._merge_and_store_single_file(bid_out_path, bid_result_df)
-            self._merge_and_store_single_file(ask_out_path, ask_result_df)
-            result_df = bid_result_df.merge(ask_result_df, on="timestamp", how="inner")
+            # One two-sided file (bid_*/ask_* columns): the manifest layout
+            # has no _bid/_ask sibling files (#471).
+            result_df = (
+                bid_result_df.drop_duplicates(subset=["timestamp"])
+                .merge(
+                    ask_result_df.drop_duplicates(subset=["timestamp"]),
+                    on="timestamp",
+                    how="outer",
+                    validate="one_to_one",
+                )
+            )
             result_df = (
                 result_df.sort_values("timestamp")
                 .drop_duplicates(subset=["timestamp"])
@@ -1522,26 +1482,24 @@ class JForexDownloader(Downloader):
             raise RuntimeError(f"No data left after processing timeframe {target_tf}")
 
         if offer_side == "both":
-            combined = result_df
-            size_bytes = 0
-            if bid_out_path.exists():
-                size_bytes += bid_out_path.stat().st_size
-            if ask_out_path.exists():
-                size_bytes += ask_out_path.stat().st_size
-            # DV-B9: the result must point at the stored bid parquet, never
-            # the symbol directory; fails closed when the file is missing.
-            output_path = merged_result_path(bid_out_path)
+            if target_tf == "1w":
+                assert_stored_weekly_file_current(out_path)
+            combined = self._merge_and_store_single_file(
+                out_path, result_df, asset_class=asset_class
+            )
+            size_bytes = out_path.stat().st_size
+            output_path = out_path
         else:
             if target_tf == "1w" and base_tf != target_tf:
                 assert_stored_weekly_file_current(out_path)
-            combined = self._merge_and_store_single_file(out_path, result_df)
+            combined = self._merge_and_store_single_file(
+                out_path, result_df, asset_class=asset_class
+            )
             size_bytes = out_path.stat().st_size
             output_path = out_path
         warnings: list[str] = [f"offer_side:{offer_side}", f"price_type:{offer_side}"]
         if target_tf != base_tf:
             warnings.append(f"resampled_from:{base_tf}")
-        if offer_side == "both":
-            warnings.extend([f"stored_bid:{bid_out_path.name}", f"stored_ask:{ask_out_path.name}"])
 
         return DownloadResult(
             symbol=normalized_symbol,
