@@ -155,6 +155,17 @@ _ENV_TARGET_LONGS: dict[str, set[str]] = {
 }
 
 
+def _assignments_target_main(assigns: list[str], cwd: Path) -> bool:
+    """True when a ``NAME=value`` prefix points an env tool at main's venv."""
+    for assignment in assigns:
+        for var in ("VIRTUAL_ENV=", "UV_PROJECT_ENVIRONMENT="):
+            if assignment.startswith(var) and _path_in_main_checkout(
+                assignment[len(var) :], cwd
+            ):
+                return True
+    return False
+
+
 def _env_targets_main_checkout(argv: list[str], cwd: Path) -> bool:
     """True when ``argv`` operates on the main checkout regardless of cwd.
 
@@ -164,12 +175,8 @@ def _env_targets_main_checkout(argv: list[str], cwd: Path) -> bool:
     """
     bare = _strip_assignments(argv)[0]
     assigns = argv[: len(argv) - len(bare)]
-    for assignment in assigns:
-        for var in ("VIRTUAL_ENV=", "UV_PROJECT_ENVIRONMENT="):
-            if assignment.startswith(var) and _path_in_main_checkout(
-                assignment[len(var) :], cwd
-            ):
-                return True
+    if _assignments_target_main(assigns, cwd):
+        return True
     if not bare:
         return False
     first = bare[0]
@@ -284,14 +291,20 @@ _GIT_VALUE_LONGS = {
 }
 
 
-def _git_parts(argv: list[str]) -> tuple[str | None, list[str], str | None]:
+def _git_parts(
+    argv: list[str],
+) -> tuple[str | None, list[str], str | None, str | None]:
     """Split ``git [global opts] <subcommand> [args]``.
 
-    Returns (subcommand, args, ``-C`` directory). Unknown global options are
-    skipped as flags; the subcommand is the first non-option token.
+    Returns (subcommand, args, ``-C`` directory, checkout-root hint). The
+    hint comes from ``--work-tree`` or, failing that, the parent of
+    ``--git-dir`` (``<main>/.git`` -> ``<main>``): both retarget the command
+    at another checkout exactly like ``-C``.
     """
     args = argv[1:]
     chdir: str | None = None
+    work_tree: str | None = None
+    git_dir: str | None = None
     i = 0
     while i < len(args):
         tok = args[i]
@@ -307,19 +320,29 @@ def _git_parts(argv: list[str]) -> tuple[str | None, list[str], str | None]:
             i += 2
             continue
         if tok.startswith("--"):
-            name = tok.split("=", 1)[0]
-            if name in _GIT_VALUE_LONGS and "=" not in tok:
-                i += 2
-            else:
+            name, eq, val = tok.partition("=")
+            if name in ("--git-dir", "--work-tree"):
+                if not eq and i + 1 < len(args):
+                    val = args[i + 1]
+                    i += 1
+                if name == "--git-dir":
+                    git_dir = val
+                else:
+                    work_tree = val
+            elif name in _GIT_VALUE_LONGS and "=" not in tok:
                 i += 1
+            i += 1
             continue
         if tok.startswith("-") and tok != "-":
             i += 1
             continue
         break
+    target = work_tree
+    if target is None and git_dir is not None:
+        target = str(Path(git_dir).parent)
     if i >= len(args):
-        return None, [], chdir
-    return args[i].strip("`"), args[i + 1 :], chdir
+        return None, [], chdir, target
+    return args[i].strip("`"), args[i + 1 :], chdir, target
 
 
 def _looks_like_path_restore(arg: str, cwd: Path) -> bool:
@@ -603,10 +626,12 @@ _MAIN_HINT = (
 
 
 def _check_git(argv: list[str], cwd: Path, main_ok: bool) -> str | None:
-    sub, rest, chdir = _git_parts(argv)
+    sub, rest, chdir, target = _git_parts(argv)
     if sub is None:
         return None
     git_cwd = _resolve(cwd, chdir) if chdir else cwd
+    if target is not None:
+        git_cwd = _resolve(git_cwd, target)
     is_main = not main_ok and _is_main_checkout(git_cwd)
 
     if sub == "stash":
@@ -1049,11 +1074,17 @@ def _eval_argv(
                     )
         idx = _skip_options(args, 0, value_opts, value_longs)
         rest = args[idx + skip_pos :] if idx + skip_pos <= len(args) else []
-        # `env` also takes NAME=value assignments before the command.
+        # `env` also takes NAME=value assignments before the command; a
+        # VIRTUAL_ENV=/UV_PROJECT_ENVIRONMENT= pointing into main retargets
+        # the wrapped env tool just like a leading assignment would.
+        env_assigns: list[str] = []
         while rest and _ASSIGN_RE.match(rest[0]):
+            env_assigns.append(rest[0])
             if rest[0] == _MAIN_OK_MARKER:
                 main_ok = True
             rest = rest[1:]
+        if env_assigns and _assignments_target_main(env_assigns, cwd):
+            env_main = True
         if rest:
             return _eval_argv([rest[0], *rest[1:]], cwd, depth + 1, main_ok, env_main)
         return None
@@ -1142,6 +1173,63 @@ def _eval_tokens(
         current.append(tok)
         i += 1
     return flush()
+
+
+def _heredoc_is_shell(prefix: str) -> bool:
+    """True when the command feeding a ``<<`` heredoc is a shell.
+
+    ``prefix`` is the opener-line text before the ``<<``; the last simple
+    command in it is the consumer. Any shell word in that segment counts
+    (``bash <<EOF``, ``env bash <<EOF``, ``x | sh <<EOF``).
+    """
+    is_shell = False
+    for tok in _tokenize(prefix):
+        kind = _op_kind(tok)
+        if kind == "ctrl":
+            is_shell = False
+        elif (
+            kind != "redir"
+            and _ASSIGN_RE.match(tok) is None
+            and _basename(tok).strip("`") in _SHELLS
+        ):
+            is_shell = True
+    return is_shell
+
+
+def _shell_heredoc_bodies(command: str) -> list[str]:
+    """Bodies of heredocs consumed by a shell (``bash <<'EOF' ... EOF``).
+
+    ``_strip_heredocs`` drops bodies so doc/data heredocs are not parsed as
+    commands, but a shell reads its program from the heredoc - the body must
+    be checked like a ``-c`` string.
+    """
+    bodies: list[str] = []
+    # pending: (delimiter, is_shell, body lines)
+    pending: list[tuple[str, bool, list[str]]] = []
+    for line in command.splitlines(keepends=True):
+        if pending:
+            delim, is_shell, buf = pending[0]
+            if line.strip() == delim:
+                if is_shell:
+                    bodies.append("".join(buf))
+                pending.pop(0)
+            elif is_shell:
+                buf.append(line)
+            continue
+        matches = list(_HEREDOC_RE.finditer(line))
+        if not matches:
+            continue
+        prev_end = 0
+        last_shell = False
+        for match in matches:
+            prefix = line[prev_end : match.start()]
+            prev_end = match.end()
+            is_shell = (
+                _heredoc_is_shell(prefix) if prefix.strip() else last_shell
+            )
+            last_shell = is_shell
+            pending.append((match.group(2), is_shell, []))
+    return bodies
 
 
 def _backtick_spans(command: str) -> list[str]:
@@ -1242,6 +1330,10 @@ def _dollar_paren_spans(command: str) -> list[str]:
 def _eval_command_string(
     command: str, cwd: Path, depth: int, main_ok: bool, env_main: bool
 ) -> str | None:
+    for body in _shell_heredoc_bodies(command):
+        verdict = _eval_command_string(body, cwd, depth + 1, main_ok, env_main)
+        if verdict:
+            return verdict
     command = _strip_heredocs(command)
     for span in _backtick_spans(command) + _dollar_paren_spans(command):
         verdict = _eval_command_string(span, cwd, depth + 1, main_ok, env_main)

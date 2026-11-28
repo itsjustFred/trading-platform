@@ -192,6 +192,15 @@ CASES: list[tuple[str, str, bool]] = [
     ("echo result: $(git stash)", "wt", True),
     ("echo '$(git stash)'", "wt", False),  # single-quoted: literal
     ('echo "$(git status)"', "wt", False),
+    # a heredoc fed to a shell executes its body
+    ("bash <<'EOF'\ngit stash\nEOF", "wt", True),
+    ("sh <<EOF\ngit add -A\nEOF", "wt", True),
+    ("bash -s <<'EOF'\ngit reset --hard\nEOF", "wt", True),
+    ("env bash <<'EOF'\ngit clean -fd\nEOF", "wt", True),
+    ("bash <<'EOF'\necho hi\nEOF", "wt", False),
+    # ...but a heredoc consumed by a non-shell is just data
+    ("cat <<'EOF'\ngit stash\nEOF", "wt", False),
+    ("cat > /tmp/x.sh <<'EOF'\ngit stash\nEOF", "wt", False),
     ("uv run ruff format", "wt", True),
     ("uvx ruff format .", "wt", True),
     ("python -m pip --version", "wt", False),
@@ -275,6 +284,19 @@ CASES: list[tuple[str, str, bool]] = [
     ("UV_PROJECT_ENVIRONMENT={main}/.venv uv sync", "wt", True),
     ("VIRTUAL_ENV={main}/.venv pip install foo", "wt", True),
     ("VIRTUAL_ENV=src/.venv uv pip install foo", "wt", False),
+    # assignments the `env` wrapper strips count too
+    ("env VIRTUAL_ENV={main}/.venv pip install foo", "wt", True),
+    ("env UV_PROJECT_ENVIRONMENT={main}/.venv uv sync", "wt", True),
+    ("env FOO=1 VIRTUAL_ENV={main}/.venv uv pip install foo", "wt", True),
+    ("env -i VIRTUAL_ENV={main}/.venv pip install foo", "wt", True),
+    ("env VIRTUAL_ENV=src/.venv pip install foo", "wt", False),
+    # --- git retargeted at another checkout via --git-dir/--work-tree ------------
+    ("git --git-dir={main}/.git --work-tree={main} commit -m x", "wt", True),
+    ("git --git-dir {main}/.git --work-tree {main} stash", "wt", True),
+    ("git --work-tree={main} --git-dir={main}/.git pull", "wt", True),
+    ("git --git-dir={main}/.git --work-tree={main} status", "wt", False),
+    ("git --git-dir={main}/.git log --oneline", "wt", False),
+    ("git --git-dir=src/.git commit -m x", "wt", False),
     # --- outside any checkout: only the global rules apply ----------------------
     ("git commit -m x", "plain", False),
     ("git pull", "plain", False),
