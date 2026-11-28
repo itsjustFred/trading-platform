@@ -4076,6 +4076,9 @@ _BROKER_CLOSE_NAMESPACE = uuid5(NAMESPACE_URL, "trading-platform/live/broker-sid
 BROKER_CLOSE_REASON_ALPACA_STOP_LEG = "alpaca_bracket_stop"
 BROKER_CLOSE_REASON_ALPACA_TARGET_LEG = "alpaca_bracket_target"
 BROKER_CLOSE_REASON_ALPACA_LEG = "alpaca_bracket_leg"
+#: The protective-stop heal's market close (#435): a ``-reprotect`` order that
+#: is not a bracket leg at all, so it must not book as ``alpaca_bracket_leg``.
+BROKER_CLOSE_REASON_ALPACA_REPROTECT_CLOSE = "alpaca_reprotect_close"
 #: A cTrader position close the platform did not submit (SL/TP, flatten, manual).
 #: cTrader does not say WHICH of those fired, so one reason covers them all; the
 #: deal -> position -> opening-order -> clientOrderId chain is what makes the
@@ -7575,9 +7578,18 @@ def list_live_control_audit(
     *,
     limit: int = 100,
     target_id: str | None = None,
+    action: str | None = None,
+    created_after: datetime | None = None,
+    offset: int = 0,
 ) -> list[dict[str, Any]]:
-    """Most recent first. Read-only; there is no delete path on purpose."""
+    """Most recent first. Read-only; there is no delete path on purpose.
+
+    ``limit`` is capped at 1000 rows per page; callers needing a complete
+    window must bound it with ``created_after`` and page with ``offset`` -
+    the cap silently drops the oldest rows otherwise.
+    """
     bounded = max(1, min(int(limit or 100), 1000))
+    bounded_offset = max(0, int(offset or 0))
     init_db()
     with get_session() as session:
         statement = select(LiveControlAuditModel)
@@ -7585,8 +7597,26 @@ def list_live_control_audit(
             statement = statement.where(
                 LiveControlAuditModel.target_id == str(target_id).strip()
             )
+        if action is not None:
+            statement = statement.where(
+                LiveControlAuditModel.action == str(action).strip()
+            )
+        if created_after is not None:
+            # ``created_at`` is stored naive UTC (``_utcnow_naive``).
+            if created_after.tzinfo is not None:
+                created_after = created_after.astimezone(timezone.utc).replace(
+                    tzinfo=None
+                )
+            statement = statement.where(
+                LiveControlAuditModel.created_at >= created_after
+            )
         rows = session.exec(
-            statement.order_by(LiveControlAuditModel.created_at.desc()).limit(bounded)
+            statement.order_by(
+                LiveControlAuditModel.created_at.desc(),
+                LiveControlAuditModel.id.desc(),
+            )
+            .offset(bounded_offset)
+            .limit(bounded)
         ).all()
     return [
         {

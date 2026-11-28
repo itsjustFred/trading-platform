@@ -76,9 +76,9 @@ BROKER_READ_TIMEOUT_SECONDS = 60.0
 #: expects to be working. Both live order paths are short-lived - Alpaca
 #: entries are market orders that fill at the open or are rejected (submitted
 #: GTC only so the protective legs outlive the session; Alpaca's aged-order
-#: policy cancels any GTC order ~90 days after creation and nothing
-#: re-places a protective order lost that way yet - the reconciler's
-#: ``position_without_protective_stop`` finding is what catches it) and
+#: policy cancels any GTC order after 90 days; protective orders inside
+#: the lead window are re-placed, and legs or top-level stops already
+#: canceled by that policy are healed like expired ones) and
 #: cTrader submits
 #: IMMEDIATE_OR_CANCEL - so anything
 #: older than this is a cancelled/expired/rejected historical order, not a

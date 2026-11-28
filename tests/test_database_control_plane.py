@@ -575,3 +575,37 @@ def test_adapter_state_rejects_pipe_in_key_parts(isolated_db_sandbox) -> None:
         database.get_live_adapter_state("a|b", "c")
     with pytest.raises(ValueError, match="must not contain"):
         database.get_live_adapter_state("a", "b|c")
+
+
+def test_list_live_control_audit_created_after_bounds_window(
+    isolated_db_sandbox,
+) -> None:
+    from shared.database import list_live_control_audit, record_live_control_audit
+
+    record_live_control_audit(
+        action="t_created_after_probe",
+        target_type="probe",
+        target_id="one",
+        actor="test",
+        succeeded=True,
+    )
+
+    inside = list_live_control_audit(
+        action="t_created_after_probe",
+        created_after=datetime.now(timezone.utc) - timedelta(hours=1),
+    )
+    outside = list_live_control_audit(
+        action="t_created_after_probe",
+        created_after=datetime.now(timezone.utc) + timedelta(hours=1),
+    )
+
+    assert len(inside) == 1 and inside[0]["target_id"] == "one"
+    assert outside == []
+    assert (
+        list_live_control_audit(
+            action="t_created_after_probe",
+            created_after=datetime.now(timezone.utc) - timedelta(hours=1),
+            offset=1,
+        )
+        == []
+    )
