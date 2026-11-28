@@ -175,6 +175,19 @@ class SkippedTest:
         return f"{self.module}::{self.name}"
 
 
+#: Dotted prefix of the shared broker fakes' contract tests. Single source
+#: for the carve-outs below — the never-allowable skip rule and the xfail
+#: rule key off this package; the money-path regex is pinned by
+#: ``tests/test_ci_skip_report.py``.
+FAKES_MODULE_PREFIX = "tests.fakes"
+
+
+def _is_fakes_module(module: str) -> bool:
+    return module == FAKES_MODULE_PREFIX or module.startswith(
+        FAKES_MODULE_PREFIX + "."
+    )
+
+
 def is_money_path(module: str) -> bool:
     return any(pattern.search(module) for pattern in MUST_NOT_SKIP_PATTERNS)
 
@@ -182,7 +195,7 @@ def is_money_path(module: str) -> bool:
 def is_allowed_skip(module: str, reason: str) -> bool:
     # The broker fakes' contract tests are the money path's tripwire: no
     # reason-scoped exemption may ever cover them.
-    if module.startswith("tests.fakes.") or module == "tests.fakes":
+    if _is_fakes_module(module):
         return False
     return any(
         module_pattern.search(module) and reason_pattern.search(reason)
@@ -269,10 +282,6 @@ def collect_skips(paths: list[Path]) -> tuple[list[SkippedTest], list[str]]:
             continue
         skipped.extend(parse_junit(path))
     return skipped, missing
-
-
-def _is_fakes_module(module: str) -> bool:
-    return module == "tests.fakes" or module.startswith("tests.fakes.")
 
 
 def _is_violation(test: SkippedTest) -> bool:

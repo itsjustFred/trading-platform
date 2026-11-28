@@ -1107,9 +1107,16 @@ def fake_alpaca_transport(
     sys.modules["alpaca.trading.stream"] = _stub_module(
         "alpaca.trading.stream", TradingStream=lambda *args, **kwargs: stream
     )
+    def _crypto_historical(*args: Any, **kwargs: Any) -> Any:
+        raise NotImplementedError(
+            "fake_alpaca_transport does not stub CryptoHistoricalDataClient; "
+            "the adapter's crypto-bar path is out of scope for this fake"
+        )
+
     sys.modules["alpaca.data.historical"] = _stub_module(
         "alpaca.data.historical",
         StockHistoricalDataClient=lambda *args, **kwargs: historical,
+        CryptoHistoricalDataClient=_crypto_historical,
     )
     try:
         yield client, stream, historical

@@ -241,6 +241,9 @@ def test_is_money_path_covers_live_runner_and_engine_tests() -> None:
         "pytest_collection_modifyitems",
         "collect_ignore",
         "PYTEST_ADDOPTS",
+        "-k",
+        "--keyword",
+        "--ignore-glob",
     )
     repo_root = Path(__file__).resolve().parents[1]
     deselection_sources = (
@@ -252,6 +255,7 @@ def test_is_money_path_covers_live_runner_and_engine_tests() -> None:
         ]
         + [fakes_root.parent / "conftest.py"]
         + sorted(fakes_root.rglob("*.py"))
+        + sorted((repo_root / "scripts").rglob("*.sh"))
     )
     for source_path in deselection_sources:
         squashed = re.sub(r"\s+", "", source_path.read_text(encoding="utf-8"))
