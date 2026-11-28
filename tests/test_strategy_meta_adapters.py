@@ -1,13 +1,11 @@
 from __future__ import annotations
 
 import importlib.util
-import sys
 from pathlib import Path
 
 import pandas as pd
 import pytest
 
-from runner.engines.base import BacktestConfig
 from runner.engines.pynecore_adapter import (
     _build_drawings,
     _enrich_trades_with_context,
@@ -17,9 +15,7 @@ from runner.engines.pynecore_adapter import (
 from runner.engines.vectorbt_adapter import VectorbtAdapter, resolve_max_leverage
 from shared.models import Trade, TradeExit
 from shared.strategy_registry import DEFAULT_STRATEGIES_DIR, iter_strategy_files
-
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
+from tests.builders import make_backtest_config
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 STRATEGIES_DIR = DEFAULT_STRATEGIES_DIR
@@ -89,7 +85,7 @@ def generate_signals(df: pd.DataFrame, params: dict):
 
     adapter = VectorbtAdapter()
     result = adapter.run(
-        BacktestConfig(signal_exit_fill="close", parameters={"fees": "zero"},
+        make_backtest_config(signal_exit_fill="close", parameters={"fees": "zero"},
             strategy_name="tuple_strategy",
             symbols=["AAPL"],
             timeframe="1d",
@@ -158,7 +154,8 @@ def generate_signals(df: pd.DataFrame, params: dict):
     ).to_parquet(parquet_dir / "1d.parquet", index=False)
 
     result = VectorbtAdapter().run(
-        BacktestConfig(signal_exit_fill="close", risk_per_trade_pct=0.01, parameters={"fees": "zero"},
+        make_backtest_config(
+            signal_exit_fill="close", risk_per_trade_pct=0.01, parameters={"fees": "zero"},
             strategy_name="supertrend_strategy",
             symbols=["AAPL"],
             timeframe="1d",
@@ -244,7 +241,7 @@ def generate_signals(df: pd.DataFrame, params: dict):
     ).to_parquet(parquet_dir / "1d.parquet", index=False)
 
     result = VectorbtAdapter().run(
-        BacktestConfig(signal_exit_fill="close", risk_per_trade_pct=0.01,
+        make_backtest_config(signal_exit_fill="close", risk_per_trade_pct=0.01,
             strategy_name="meta_params_strategy",
             symbols=["AAPL"],
             timeframe="1d",
@@ -316,7 +313,8 @@ def generate_signals(df: pd.DataFrame, params: dict):
     ).to_parquet(symbol_dir / "1m.parquet", index=False)
 
     result = VectorbtAdapter().run(
-        BacktestConfig(signal_exit_fill="close", risk_per_trade_pct=0.01, parameters={"fees": "zero"},
+        make_backtest_config(
+            signal_exit_fill="close", risk_per_trade_pct=0.01, parameters={"fees": "zero"},
             strategy_name="intrabar_strategy",
             symbols=["AAPL"],
             timeframe="1h",
@@ -390,7 +388,8 @@ def generate_signals(df: pd.DataFrame, params: dict):
     ).to_parquet(parquet_dir / "1d.parquet", index=False)
 
     result = VectorbtAdapter().run(
-        BacktestConfig(signal_exit_fill="close", risk_per_trade_pct=0.01, parameters={"fees": "zero"},
+        make_backtest_config(
+            signal_exit_fill="close", risk_per_trade_pct=0.01, parameters={"fees": "zero"},
             strategy_name="drawing_strategy",
             symbols=["AAPL"],
             timeframe="1d",

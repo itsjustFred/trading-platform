@@ -5,7 +5,15 @@ from textwrap import dedent
 
 import pytest
 
-from live_runner.preflight import _parse_bool_env, run_live_preflight
+from live_runner.credential_env import parse_bool_env
+from live_runner.preflight import _resolve_ctrader_credentials, run_live_preflight
+
+_CTRADER_CREDENTIALS = {
+    "CTRADER_APP_ID": "app",
+    "CTRADER_APP_SECRET": "secret",
+    "CTRADER_ACCESS_TOKEN": "token",
+    "CTRADER_REFRESH_TOKEN": "refresh",
+}
 
 
 def _write_config(path: Path, content: str) -> Path:
@@ -16,9 +24,12 @@ def _write_config(path: Path, content: str) -> Path:
 # ─── strict boolean parsing (CTRADER_DEMO must never implicitly select live) ──
 
 
-def test_parse_bool_env_missing_defaults_to_demo() -> None:
+def test_ctrader_credentials_missing_demo_defaults_to_demo() -> None:
     # Missing CTRADER_DEMO must stay True (demo), never implicitly live.
-    assert _parse_bool_env("CTRADER_DEMO", None, default=True) is True
+    credentials = _resolve_ctrader_credentials(dict(_CTRADER_CREDENTIALS))
+
+    assert credentials is not None
+    assert credentials[4] is True
 
 
 @pytest.mark.parametrize(
@@ -39,14 +50,26 @@ def test_parse_bool_env_missing_defaults_to_demo() -> None:
         ("off", False),
     ],
 )
-def test_parse_bool_env_recognized_tokens(value: str, expected: bool) -> None:
-    assert _parse_bool_env("CTRADER_DEMO", value, default=True) is expected
+def test_ctrader_credentials_recognized_demo_tokens(value: str, expected: bool) -> None:
+    credentials = _resolve_ctrader_credentials(
+        dict(_CTRADER_CREDENTIALS, CTRADER_DEMO=value)
+    )
+
+    assert credentials is not None
+    assert credentials[4] is expected
 
 
 @pytest.mark.parametrize("value", ["tru", "flase", "", "   ", "maybe", "2"])
-def test_parse_bool_env_garbage_raises_naming_var_and_valid_values(value: str) -> None:
+def test_ctrader_credentials_garbage_demo_raises_naming_var_and_valid_values(
+    value: str,
+) -> None:
     with pytest.raises(ValueError) as excinfo:
-        _parse_bool_env("CTRADER_DEMO", value, default=True)
+        _resolve_ctrader_credentials(dict(_CTRADER_CREDENTIALS, CTRADER_DEMO=value))
+
+    with pytest.raises(ValueError) as canonical:
+        parse_bool_env("CTRADER_DEMO", value, default=True)
+
+    assert str(excinfo.value) == str(canonical.value)
     message = str(excinfo.value)
     assert "CTRADER_DEMO" in message
     assert "true" in message

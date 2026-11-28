@@ -196,3 +196,55 @@ def test_flush_sentry_reports_a_failing_flush_instead_of_raising(
     monkeypatch.setattr(sentry_module, "_INITIALIZED", True)
 
     assert sentry_module.flush_sentry(2.0) is False
+
+
+# ─── its own strict boolean parser, deliberately not the live env parser ───
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        ("1", True),
+        ("true", True),
+        ("TRUE", True),
+        (" yes ", True),
+        ("on", True),
+        ("0", False),
+        ("false", False),
+        ("no", False),
+        (" off ", False),
+    ],
+)
+def test_sentry_reads_the_boolean_tokens_it_accepts(value, expected) -> None:
+    config = SentryConfig.from_env(
+        {"SENTRY_DSN": "https://public@example.com/1", "SENTRY_DEBUG": value}
+    )
+
+    assert config.debug is expected
+
+
+@pytest.mark.parametrize("value", ["", "ture", "maybe", "2"])
+def test_sentry_rejects_an_unrecognized_boolean_value(value) -> None:
+    with pytest.raises(SentryConfigError, match="SENTRY_DEBUG must be a boolean value"):
+        SentryConfig.from_env(
+            {"SENTRY_DSN": "https://public@example.com/1", "SENTRY_DEBUG": value}
+        )
+
+
+@pytest.mark.parametrize("value", ["y", "n"])
+def test_sentry_rejects_the_short_tokens_the_live_env_parsers_accept(value) -> None:
+    """``shared.sentry._parse_bool`` is NOT ``credential_env.parse_bool_env`` (G08).
+
+    Its token set is narrower, it answers ``SentryConfigError`` rather than a
+    bare ``ValueError``, and a missing value with no default is a configuration
+    error rather than a caller default. Pinned here so a later merge attempt
+    starts from the current behaviour.
+    """
+
+    with pytest.raises(SentryConfigError, match="SENTRY_DEBUG must be a boolean value"):
+        sentry_module._parse_bool(value, name="SENTRY_DEBUG", default=False)  # noqa: SLF001
+
+
+def test_sentry_requires_a_boolean_value_when_no_default_is_given() -> None:
+    with pytest.raises(SentryConfigError, match="SENTRY_ENABLED is required"):
+        sentry_module._parse_bool(None, name="SENTRY_ENABLED")  # noqa: SLF001

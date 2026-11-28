@@ -64,6 +64,7 @@ from live_runner.broker_reconciliation import run_broker_reconciliation_loop
 from live_runner.credential_env import (
     accounts_env_mtime,
     load_accounts_env_values,
+    parse_bool_env,
     resolve_accounts_env_path,
 )
 from live_runner.ctrader_adapter import CTraderAuthTerminalError, CTraderLiveAdapter
@@ -157,6 +158,8 @@ from risk import (
     RiskConfig,
     RiskEngine,
     TradeSignal,
+    coerce_setting_float,
+    coerce_setting_int,
     effective_max_notional_per_trade,
 )
 from risk.live import (
@@ -333,30 +336,6 @@ def _trailing_eligible_adapters(
     }
 
 
-def _parse_bool_env(value: str | None, *, default: bool = True) -> bool:
-    if value is None:
-        return default
-    return value.strip().lower() in {"1", "true", "yes", "on"}
-
-
-_TRUE_BOOL_TOKENS = {"1", "true", "yes", "y", "on"}
-_FALSE_BOOL_TOKENS = {"0", "false", "no", "n", "off"}
-
-
-def _parse_strict_bool_env(name: str, value: str | None, *, default: bool = True) -> bool:
-    if value is None:
-        return default
-    token = value.strip().lower()
-    if token in _TRUE_BOOL_TOKENS:
-        return True
-    if token in _FALSE_BOOL_TOKENS:
-        return False
-    valid = ", ".join(sorted(_TRUE_BOOL_TOKENS | _FALSE_BOOL_TOKENS))
-    raise ValueError(
-        f"Invalid boolean value for {name}: {value!r}. Valid values are: {valid}."
-    )
-
-
 def _raw_bool_text(value: object) -> str | None:
     """Normalize a config value to text for boolean parsing.
 
@@ -431,7 +410,7 @@ def _resolve_ctrader_credentials(
         return None
     raw_demo_value = env_values.get("CTRADER_DEMO")
     demo_value = raw_demo_value.strip() if isinstance(raw_demo_value, str) else None
-    demo = _parse_strict_bool_env("CTRADER_DEMO", demo_value, default=True)
+    demo = parse_bool_env("CTRADER_DEMO", demo_value, default=True)
     return app_id, app_secret, access_token, refresh_token, demo
 
 
@@ -499,96 +478,18 @@ def _block_ctrader_account(account_id: str, exc: BaseException | str) -> None:
     _CTRADER_AUTH_BLOCKED_REASONS[account_id] = reason
 
 
-def _coerce_live_float(
-    value: Any,
-    *,
-    field_name: str,
-    minimum: float | None = None,
-) -> float:
-    if isinstance(value, bool):
-        raise ValueError(f"Invalid {field_name}: {value!r}")
-    try:
-        parsed = float(value)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError(f"Invalid {field_name}: {value!r}") from exc
-    if not math.isfinite(parsed):
-        raise ValueError(f"{field_name} must be finite")
-    if minimum is not None and parsed < minimum:
-        raise ValueError(f"{field_name} must be >= {minimum}")
-    return parsed
-
-
-def _coerce_live_int(
-    value: Any,
-    *,
-    field_name: str,
-    minimum: int | None = None,
-) -> int:
-    if isinstance(value, bool):
-        raise ValueError(f"Invalid {field_name}: {value!r}")
-    try:
-        numeric = float(value)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError(f"Invalid {field_name}: {value!r}") from exc
-    if not math.isfinite(numeric) or not numeric.is_integer():
-        raise ValueError(f"{field_name} must be an integer")
-    parsed = int(numeric)
-    if minimum is not None and parsed < minimum:
-        raise ValueError(f"{field_name} must be >= {minimum}")
-    return parsed
-
-
 def _risk_config_for_deployment(deployment: LiveDeploymentConfig) -> RiskConfig:
-    settings = deployment.settings or {}
-    risk_per_trade_raw = settings.get(
-        "max_risk_per_trade",
-        settings.get("risk_per_trade_pct", 0.01),
-    )
-    max_total_exposure_raw = settings.get("max_total_exposure", 0.05)
-    max_positions_raw = settings.get("max_positions", 5)
-    sl_multiplier_raw = settings.get("default_sl_atr_multiplier", 2.0)
-    fallback_stop_pct_raw = settings.get("fallback_stop_pct", 0.02)
-    max_notional_raw = settings.get("max_notional_per_trade", 0.20)
-    allow_fallback_raw = settings.get("allow_fallback_stop", True)
-    reject_missing_raw = settings.get("reject_missing_stop", False)
-
-    return RiskConfig(
-        max_risk_per_trade=_coerce_live_float(
-            risk_per_trade_raw,
-            field_name="max_risk_per_trade",
-            minimum=0.0,
-        ),
-        max_total_exposure=_coerce_live_float(
-            max_total_exposure_raw,
-            field_name="max_total_exposure",
-            minimum=0.0,
-        ),
-        max_positions=_coerce_live_int(max_positions_raw, field_name="max_positions", minimum=1),
-        default_sl_atr_multiplier=_coerce_live_float(
-            sl_multiplier_raw,
-            field_name="default_sl_atr_multiplier",
-            minimum=0.0,
-        ),
-        fallback_stop_pct=_coerce_live_float(
-            fallback_stop_pct_raw,
-            field_name="fallback_stop_pct",
-            minimum=0.0,
-        ),
-        max_notional_per_trade=_coerce_live_float(
-            max_notional_raw,
-            field_name="max_notional_per_trade",
-            minimum=0.0,
-        ),
-        allow_fallback_stop=allow_fallback_raw,
-        reject_missing_stop=reject_missing_raw,
-    )
+    # Improvement-run G03: the settings -> RiskConfig mapping lives in
+    # ``RiskConfig.from_settings``, so the live defaults are the dataclass
+    # fields instead of a second copy of the literals here.
+    return RiskConfig.from_settings(deployment.settings)
 
 
 def _deployment_allows_short(deployment: LiveDeploymentConfig) -> bool:
     settings = deployment.settings or {}
     configured = deployment.signal_config or {}
     value = configured.get("allow_short", settings.get("allow_short", False))
-    return _parse_strict_bool_env("allow_short", _raw_bool_text(value), default=False)
+    return parse_bool_env("allow_short", _raw_bool_text(value), default=False)
 
 
 def _deployment_signal_timeframe(deployment: LiveDeploymentConfig) -> str:
@@ -682,7 +583,7 @@ def _validate_signal_age_before_wait(
     else:
         # Through the shared coercer: a boolean or a non-finite value is a config
         # error, not a budget. `float(True)` silently means one second.
-        max_age = _coerce_live_float(configured, field_name="max_signal_age_seconds")
+        max_age = coerce_setting_float(configured, field_name="max_signal_age_seconds")
     if max_age <= 0:
         raise ValueError("max_signal_age_seconds must be positive")
     age_seconds = (datetime.now(timezone.utc) - received_at).total_seconds()
@@ -737,7 +638,7 @@ def size_live_signal_for_submission(
     metadata.pop("current_positions", None)
     trusted_positions = 0
     if current_positions is not None:
-        trusted_positions = _coerce_live_int(
+        trusted_positions = coerce_setting_int(
             current_positions, field_name="current_positions", minimum=0
         )
         metadata["current_positions"] = trusted_positions
@@ -747,7 +648,7 @@ def size_live_signal_for_submission(
     resolved_pip = (
         1.0
         if pip_value is None
-        else _coerce_live_float(pip_value, field_name="pip_value", minimum=0.0)
+        else coerce_setting_float(pip_value, field_name="pip_value", minimum=0.0)
     )
 
     trade_signal = TradeSignal(
@@ -790,7 +691,7 @@ def size_live_signal_for_submission(
         else None
     )
     metadata["risk_timeframe"] = resolved_timeframe
-    sized_stop = sized_order.signal.stop_loss
+    sized_stop = sized_order.resolved_stop_loss
     if sized_stop is not None:
         metadata["resolved_stop_loss"] = float(sized_stop)
     else:
@@ -1130,9 +1031,9 @@ async def _resolve_live_pip_value(
     if not isinstance(resolved, LivePipValue):
         raise _refuse(f"adapter returned {type(resolved).__name__}, not LivePipValue")
     try:
-        value = _coerce_live_float(resolved.value, field_name="pip value")
-        units_per_qty = _coerce_live_float(resolved.units_per_qty, field_name="units per qty")
-        rate = _coerce_live_float(resolved.conversion_rate, field_name="conversion rate")
+        value = coerce_setting_float(resolved.value, field_name="pip value")
+        units_per_qty = coerce_setting_float(resolved.units_per_qty, field_name="units per qty")
+        rate = coerce_setting_float(resolved.conversion_rate, field_name="conversion rate")
     except ValueError as exc:
         raise _refuse(str(exc)) from exc
     if value <= 0 or units_per_qty <= 0 or rate <= 0:
@@ -2163,7 +2064,7 @@ async def prepare_order_with_risk(
     if pip_value is None:
         resolved_pip, pip_metadata = await _resolve_live_pip_value(adapter, deployment, signal)
     else:
-        resolved_pip = _coerce_live_float(pip_value, field_name="pip_value", minimum=0.0)
+        resolved_pip = coerce_setting_float(pip_value, field_name="pip_value", minimum=0.0)
         pip_metadata = _pip_value_record(resolved_pip, source="caller")
         # The override is a trusted channel that bypasses the broker lookup and
         # its freshness checks (#146); make every use visible in the logs.
@@ -2230,7 +2131,7 @@ async def prepare_order_with_risk(
     sized_stop = (
         None
         if sized_stop_raw is None
-        else _coerce_live_float(sized_stop_raw, field_name="resolved_stop_loss")
+        else coerce_setting_float(sized_stop_raw, field_name="resolved_stop_loss")
     )
     if stop_loss is None:
         stop_loss = sized_stop

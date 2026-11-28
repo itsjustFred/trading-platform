@@ -15,9 +15,9 @@ from runner.backtest_grid import get_engine as grid_get_engine
 from runner.cli import get_engine
 from runner.engines.base import (
     FROZEN_ENGINES,
-    BacktestConfig,
     warn_if_engine_frozen,
 )
+from tests.builders import make_backtest_config
 
 
 def _warnings_for(func, *args, **kwargs):
@@ -58,7 +58,7 @@ class TestEngineSelectionWarnings:
         from runner.engines.lean_adapter import LeanAdapter
 
         adapter = LeanAdapter(lean_project_dir=tmp_path)
-        config = BacktestConfig(
+        config = make_backtest_config(
             strategy_name="x",
             symbols=["SYM"],
             timeframe="1h",
@@ -104,7 +104,7 @@ class TestEngineSelectionWarnings:
             optimizer, "compute_stats_for_result", lambda result: {}
         )
 
-        config = BacktestConfig(
+        config = make_backtest_config(
             strategy_name="x",
             symbols=["SYM"],
             timeframe="1h",

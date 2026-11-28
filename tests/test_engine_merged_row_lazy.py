@@ -23,7 +23,7 @@ import pandas as pd
 import pytest
 
 from runner.engine import TradeEngine
-from runner.engines.base import BacktestConfig
+from tests.builders import make_backtest_config
 
 
 def _frame(rows: int = 400) -> pd.DataFrame:
@@ -120,7 +120,7 @@ def _dump(result) -> dict:
 
 def _run(signal_exit_fill: str, parameters: dict | None = None) -> tuple[dict, dict]:
     data = _frame()
-    cfg = BacktestConfig(
+    cfg = make_backtest_config(
         strategy_name="lazy-equiv",
         symbols=["TEST"],
         timeframe="1h",
@@ -157,7 +157,7 @@ def test_scenario_actually_trades():
     activity — the defect class this file exists for is an exit-only bar
     reusing a stale ``merged_row``."""
     data = _frame()
-    cfg = BacktestConfig(
+    cfg = make_backtest_config(
         strategy_name="lazy-equiv",
         symbols=["TEST"],
         timeframe="1h",
@@ -252,7 +252,7 @@ def test_intrabar_next_time_isolation():
     via intrabar data (a tp fill at 105, not the stop-first 95)."""
     data = _intrabar_frame()
     intrabar = _intrabar_for_bar2()
-    cfg = BacktestConfig(
+    cfg = make_backtest_config(
         strategy_name="lazy-equiv-intrabar",
         symbols=["TEST"],
         timeframe="1h",

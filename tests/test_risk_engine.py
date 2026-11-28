@@ -734,9 +734,9 @@ def test_a_non_finite_entry_price_is_refused_at_the_model():
 def test_a_non_finite_stop_is_refused_before_the_distance_is_computed():
     """A stop the fallback path rewrote to a non-finite value never gets sized.
 
-    The engine assigns ``signal.stop_loss`` itself when resolving a fallback, so
-    pin that it re-validates the price before the wrong-side distance maths
-    rather than reporting an ``inf`` risk distance.
+    A caller (or a bug) may still put a non-finite stop on the signal after
+    construction, so pin that the engine re-validates the price before the
+    wrong-side distance maths rather than reporting an ``inf`` risk distance.
     """
     signal = TradeSignal(
         action="buy",
@@ -784,13 +784,15 @@ def test_calculate_position_size_missing_stop_loss_uses_fallback():
         current_exposure=0.0,
     )
 
-    assert signal.stop_loss is not None
-    assert signal.metadata.get("resolved_stop_loss") == signal.stop_loss
+    assert sized.resolved_stop_loss == pytest.approx(signal.entry_price - 1.5 * 2.0)
+    # The engine returns the resolved stop; it does not write it back.
+    assert signal.stop_loss is None
+    assert "resolved_stop_loss" not in signal.metadata
     assert sized.position_size > 0.0
     assert sized.risk_amount == 100.0
     assert sized.decision is not None
     assert sized.decision.accepted is True
-    assert sized.decision.stop_price_used == signal.stop_loss
+    assert sized.decision.stop_price_used == sized.resolved_stop_loss
     assert sized.decision.metadata["stop_source"] == "fallback_atr"
     assert ":none:" in sized.decision.signal_id
 
@@ -916,6 +918,58 @@ def test_risk_decision_rejects_malformed_wire_values():
             stop_price_used=None,
             take_profit_used=None,
         )
+
+
+def _decision_with_accepted(**overrides: object) -> RiskDecision:
+    fields: dict[str, object] = {
+        "signal_id": "risk-1",
+        "accepted": True,
+        "quantity": 0.0,
+        "risk_amount": 0.0,
+        "risk_percent": 0.0,
+        "risk_distance": None,
+        "stop_price_used": None,
+        "take_profit_used": None,
+    }
+    fields.update(overrides)
+    return RiskDecision(**fields)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        (True, True),
+        (False, False),
+        ("true", True),
+        ("TRUE", True),
+        (" true ", True),
+        ("1", True),
+        ("yes", True),
+        ("false", False),
+        ("0", False),
+        ("no", False),
+        (1, True),
+        (0, False),
+    ],
+)
+def test_risk_decision_accepted_parses_its_own_wire_tokens(value, expected) -> None:
+    """``risk.models._parse_bool`` is NOT the env parser (G08).
+
+    It reads a decision payload that may already be a bool or an int, accepts
+    neither ``y``/``n`` nor ``on``/``off``, and answers a different error text.
+    Pinned here so a later merge attempt starts from the current behaviour.
+    """
+
+    assert _decision_with_accepted(accepted=value).accepted is expected
+
+
+@pytest.mark.parametrize(
+    "value",
+    [None, "", "ture", "y", "n", "on", "off", "maybe", 2, 1.5],
+)
+def test_risk_decision_rejects_a_value_its_bool_parser_does_not_know(value) -> None:
+    with pytest.raises(ValueError, match="accepted must be a boolean"):
+        _decision_with_accepted(accepted=value)
 
 
 @dataclass(slots=True)

@@ -21,6 +21,7 @@ import socket
 import subprocess
 import sys
 import threading
+import time
 import types
 from pathlib import Path
 
@@ -38,6 +39,7 @@ from tests.conftest import (
     TEST_DATA_DIR,
     TEST_LOG_DIR,
     diff_snapshots,
+    sandboxed_env,
     snapshot_tree,
 )
 
@@ -281,6 +283,39 @@ def test_the_suite_drops_an_inherited_accounts_env_override() -> None:
     # The one redirect that stays in play is the roster of module constants, so a test that patches
     # a module default still changes what the code reads.
     assert os.environ["DATA_DIR"] == str(TEST_DATA_DIR)
+
+
+def test_the_credential_sweep_knows_every_integration_prefix() -> None:
+    """Every broker, chat and monitoring family the platform integrates with.
+
+    A var under a prefix this tuple does not know survives the sweep and reaches tests,
+    where a test could pass against a real account. The families are pinned here so a
+    removal fails loudly; a new integration adds its own in the same change that reads it.
+    """
+    assert set(suite_conftest._EXTERNAL_ENV_NAMESPACES) == {
+        "ALPACA_",
+        "CTRADER_",
+        "DISCORD_",
+        "SENTRY_",
+    }
+
+
+def test_no_allowlist_prefix_can_carry_a_renamed_token() -> None:
+    """The CI context is allowed by exact name, so a renamed token has no way in.
+
+    ``GITHUB_TOKEN`` is dropped by the credential sweep; a renamed token (``GITHUB_PAT``)
+    would not match its marker, so the prefix that would carry it is not allowed at all -
+    the allowed names are the context variables the tests and the workflow steps read.
+    """
+    # Only the two true prefixes may be prefix-matched at all: every other allowed name is
+    # matched exactly, so GITHUB_REPOSITORY_EXTRA cannot ride in on GITHUB_REPOSITORY's stem.
+    assert set(suite_conftest._SANDBOX_ENV_ALLOWLIST_PREFIXES) == {"LC_", "PYTEST_XDIST"}
+    assert not suite_conftest._is_allowlisted_env("GITHUB_REPOSITORY_EXTRA")
+    assert suite_conftest._is_allowlisted_env("GITHUB_REPOSITORY")
+    assert "GITHUB_TOKEN" in suite_conftest._EXTERNAL_ENV_NAMES or (
+        suite_conftest._is_external_credential_env("GITHUB_TOKEN")
+    )
+    assert not suite_conftest._is_external_credential_env("GITHUB_REPOSITORY")
 
 
 @pytest.mark.parametrize(
@@ -802,7 +837,7 @@ def test_the_integration_module_makes_no_connection_while_importing() -> None:
         cwd=str(Path(__file__).resolve().parents[1]),
         capture_output=True,
         text=True,
-        env={**os.environ, "TP_INTEGRATION_BASE_URL": "http://127.0.0.1:5556"},
+        env=sandboxed_env(TP_INTEGRATION_BASE_URL="http://127.0.0.1:5556"),
         timeout=120,
         check=False,
     )
@@ -813,8 +848,6 @@ def test_the_integration_module_makes_no_connection_while_importing() -> None:
 
 def test_the_integration_module_is_skipped_without_the_opt_in() -> None:
     """No default port: an unset TP_INTEGRATION_BASE_URL skips the module instead of guessing."""
-    env = {k: v for k, v in os.environ.items() if k != "TP_INTEGRATION_BASE_URL"}
-    env.pop("BASE_URL", None)
     result = subprocess.run(
         [
             sys.executable,
@@ -829,8 +862,10 @@ def test_the_integration_module_is_skipped_without_the_opt_in() -> None:
         cwd=str(Path(__file__).resolve().parents[1]),
         capture_output=True,
         text=True,
-        env=env,
         timeout=300,
+        # The child runs the repo's suite as its own pytest process, so it builds its
+        # own sandbox instead of sharing this session.
+        env=sandboxed_env(shares_sandbox=False),
         check=False,
     )
     combined = result.stdout + result.stderr
@@ -881,7 +916,8 @@ def test_a_deselected_integration_test_makes_no_http_call() -> None:
             cwd=str(Path(__file__).resolve().parents[1]),
             capture_output=True,
             text=True,
-            env={**os.environ, "TP_INTEGRATION_BASE_URL": base_url},
+            # Same as the opt-in case above: a pytest child builds its own sandbox.
+            env=sandboxed_env(TP_INTEGRATION_BASE_URL=base_url, shares_sandbox=False),
             timeout=300,
             check=False,
         )
@@ -893,6 +929,777 @@ def test_a_deselected_integration_test_makes_no_http_call() -> None:
     combined = result.stdout + result.stderr
     assert hits == [], combined
     assert "deselected" in combined, combined
+
+
+# --- the inherited environment and the children a test spawns ---------------------------------- #
+
+
+def test_a_parent_env_var_outside_the_allowlist_never_reaches_a_test(tmp_path: Path) -> None:
+    """S16: the sandbox clears to an allowlist, so an inherited variable is gone.
+
+    The sandbox used to clear only credential-shaped names. Everything else a
+    developer exported (or a CI runner set) reached every test and every child a
+    test spawned, and a name the allowlist does not carry has no meaning inside
+    the suite: either a test sets it itself, or nothing may observe it. The child
+    is a real pytest process, so this pin covers the sweep itself and not only
+    the helper a test would use.
+    """
+    result = _run_throwaway_suite(
+        tmp_path,
+        "import os\n"
+        "from pathlib import Path\n"
+        "def test_sees_no_inherited_variable():\n"
+        "    assert 'TP_SANDBOX_PROBE' not in os.environ\n"
+        "def test_home_is_the_session_sandbox():\n"
+        "    session_root = Path(os.environ['DATA_DIR']).parent\n"
+        "    assert Path(os.environ['HOME']) == session_root / 'home'\n",
+        env_extra={"TP_SANDBOX_PROBE": "leaked"},
+    )
+
+    assert result.returncode == pytest.ExitCode.OK, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize(
+    "module_name",
+    ["live_runner.credential_env", "scripts.live_smoke"],
+    ids=lambda case: str(case),
+)
+def test_a_subprocess_resolves_the_accounts_env_into_the_session_sandbox(module_name: str) -> None:
+    """S16: a child resolves the accounts env to the session sandbox, not the checkout.
+
+    The sandbox patches the module constant in this process only, so a child
+    imported the real value and would read the checkout's real credential file.
+    The path is printed, never read, so the pin holds in a checkout with or
+    without that file. Both packages that define the constant today are pinned,
+    because a child's guard wraps modules by file, not by package name.
+    """
+    from tests.conftest import sandboxed_env
+
+    body = (
+        f"import {module_name}\n"
+        f"print({module_name}.DEFAULT_ACCOUNTS_ENV)\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", body],
+        cwd=str(_PROJECT_ROOT),
+        env=sandboxed_env(),
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    resolved = Path(result.stdout.strip())
+    assert resolved == ISOLATED_ACCOUNTS_ENV, (
+        f"a child resolved the accounts env to {resolved}, not the session sandbox"
+        f" {ISOLATED_ACCOUNTS_ENV}"
+    )
+    assert not resolved.exists(), "the session sandbox file must not exist"
+
+
+def test_a_child_guard_wraps_every_first_party_module() -> None:
+    """The child's accounts-env guard is not a package list.
+
+    The constant lives in ``live_runner`` and ``scripts`` today; a guard that only
+    wraps those two packages would resolve the checkout's real path for a constant
+    added in another package tomorrow. A module from a third package is pinned here:
+    its loader in a sandboxed child is the guard's wrapper, so a future constant in
+    that file is patched the day it appears.
+    """
+    from tests.conftest import sandboxed_env
+
+    expected = suite_conftest._ChildAccountsEnvLoader.__name__
+    body = (
+        "import shared.constants\n"
+        "print('LOADER', type(shared.constants.__loader__).__name__)\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", body],
+        cwd=str(_PROJECT_ROOT),
+        env=sandboxed_env(),
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert f"LOADER {expected}" in result.stdout, (
+        f"a child did not wrap a first-party module outside live_runner/scripts: "
+        f"{result.stdout}{result.stderr}"
+    )
+
+
+def test_a_subprocess_does_not_load_the_repo_dotenv() -> None:
+    """S16: a child importing ``shared.constants`` loads the session substitute.
+
+    ``shared.constants`` loads ``<repo>/.env`` at import time. This process
+    redirects that load; a child had no redirect and filled its environment from
+    the checkout's real file - broker credentials included. The redirect is what
+    the child reports, so the pin names the loader a sandboxed child gets rather
+    than the raw library call.
+    """
+    from tests.conftest import sandboxed_env
+
+    body = (
+        "import dotenv\n"
+        "print('LOADER', dotenv.load_dotenv.__name__)\n"
+        "import shared.constants\n"
+        "print('IMPORTED', bool(shared.constants.DATA_DIR))\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", body],
+        cwd=str(_PROJECT_ROOT),
+        env=sandboxed_env(),
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "IMPORTED True" in result.stdout, result.stdout + result.stderr
+    assert "LOADER _redirected_load_dotenv" in result.stdout, (
+        "a child loads .env through the raw loader: " + result.stdout + result.stderr
+    )
+
+
+def test_a_caller_sitecustomize_runs_after_the_guard(tmp_path: Path) -> None:
+    """A caller-provided ``sitecustomize`` runs, but never before the child's guard.
+
+    The shim is first on the child's PYTHONPATH so a stray one cannot pre-empt the audit
+    hook, the ``.env`` redirect or the accounts-env guard; a caller that provides one on
+    purpose (the golden run's fixture tree) still gets it, run after the guard is installed.
+    """
+    from tests.conftest import sandboxed_env
+
+    tree = tmp_path / "caller-tree"
+    tree.mkdir()
+    (tree / "sitecustomize.py").write_text(
+        "print('CALLER-SITECUSTOMIZE-RAN')\n",
+        encoding="utf-8",
+    )
+    body = (
+        "import dotenv\n"
+        "print('LOADER', dotenv.load_dotenv.__name__)\n"
+        "import shared.constants\n"
+        "print('IMPORTED', bool(shared.constants.DATA_DIR))\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", body],
+        cwd=str(_PROJECT_ROOT),
+        env=sandboxed_env(PYTHONPATH=str(tree)),
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "CALLER-SITECUSTOMIZE-RAN" in result.stdout, (
+        "a caller sitecustomize did not run in the sandboxed child: "
+        + result.stdout
+        + result.stderr
+    )
+    assert "LOADER _redirected_load_dotenv" in result.stdout, (
+        "a caller sitecustomize ran before the guard: " + result.stdout + result.stderr
+    )
+    assert "IMPORTED True" in result.stdout, result.stdout + result.stderr
+
+
+def test_a_child_keeps_the_overrides_its_parent_named() -> None:
+    """The child's own sweeps keep what the naming parent handed it.
+
+    ``SENTRY_*`` is credential-shaped, so the child's credential sweep drops it - and a
+    ``SENTRY_RELEASE`` a test names for its child (the golden run does) is the test's own
+    fixture value, not a developer's credential. A sweep that dropped it sent the child
+    into git detection to find a release, which is a subprocess the child's own guards
+    then refuse.
+    """
+    from tests.conftest import sandboxed_env
+
+    os.environ["SENTRY_DSN"] = "dummy-not-a-real-dsn"
+    try:
+        child_env = sandboxed_env(SENTRY_RELEASE="golden-fixture-release")
+    finally:
+        os.environ.pop("SENTRY_DSN", None)
+    # The unnamed one never reaches the child at all: the parent-side construction is the
+    # first sweep, and this is the variable the credential guard exists for.
+    assert "SENTRY_DSN" not in child_env
+
+    body = "import os\nprint('RELEASE', os.environ.get('SENTRY_RELEASE'))\n"
+    result = subprocess.run(
+        [sys.executable, "-c", body],
+        cwd=str(_PROJECT_ROOT),
+        env=child_env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "RELEASE golden-fixture-release" in result.stdout, (
+        "a child dropped an override its parent named: " + result.stdout + result.stderr
+    )
+
+
+def test_a_child_guard_covers_the_checkout_through_any_spelling(tmp_path: Path) -> None:
+    """The child's wrap follows the file, not the spelling of the path it was found through.
+
+    A child reaches the checkout through whatever path entry its PYTHONPATH names - a
+    symlink to the repo, an editable install - and a prefix comparison alone would miss
+    those, leaving a module's accounts-env constant resolved against the checkout.
+    """
+    from tests.conftest import sandboxed_env
+
+    link = tmp_path / "checkout-link"
+    link.symlink_to(_PROJECT_ROOT, target_is_directory=True)
+    expected = suite_conftest._ChildAccountsEnvLoader.__name__
+    body = (
+        "import shared.constants\n"
+        "print('LOADER', type(shared.constants.__loader__).__name__)\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", body],
+        cwd=str(_PROJECT_ROOT),
+        env=sandboxed_env(PYTHONPATH=str(link)),
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert f"LOADER {expected}" in result.stdout, (
+        f"a child importing through a symlinked checkout root was not guarded: "
+        f"{result.stdout}{result.stderr}"
+    )
+
+
+def test_sandboxed_env_marks_and_names_a_sharing_child_together() -> None:
+    """The marker and the session directory are one act of ``sandboxed_env()``.
+
+    A child that was marked but not named - or the reverse - would take the wrong branch
+    of the sandbox for a reason nobody can see, so the pair is pinned here as well as
+    asserted at child startup.
+    """
+    sharing = suite_conftest.sandboxed_env()
+    assert sharing[suite_conftest.CHILD_SANDBOX_ENV_VAR] == suite_conftest.CHILD_SANDBOX_FLAG_VALUE
+    assert sharing["TP_TEST_SESSION_ROOT"] == str(suite_conftest._SESSION_ROOT)
+    own = suite_conftest.sandboxed_env(shares_sandbox=False)
+    # A child that builds its own sandbox still carries the provenance (nonce, session root) -
+    # that is what marks it as a child of this session rather than a forged top level - but not
+    # the sharing flag, which is what would make it adopt this session's directories.
+    assert suite_conftest.CHILD_SANDBOX_ENV_VAR not in own
+    assert suite_conftest._child_markers_are_genuine(own)
+
+
+def test_no_allowlist_entry_is_credential_shaped() -> None:
+    """The allowlist must not become a way past the credential sweep.
+
+    An entry added to make a test pass that spells like a credential - a token, a key, a
+    DSN, a broker's prefix - would hand every test and every child the variable the sweep
+    exists to remove, and a test could then pass against a real account. The documented
+    entries are paths and flags; this fails the day one of them stops being one.
+    """
+    entries = (
+        *suite_conftest._SANDBOX_ENV_ALLOWLIST,
+        *suite_conftest._SANDBOX_ENV_ALLOWLIST_PREFIXES,
+    )
+    credential_shaped = [
+        name for name in entries if suite_conftest._is_external_credential_env(name)
+    ]
+    assert credential_shaped == [], (
+        "these allowlist entries spell like credentials and would defeat the sweep: "
+        + ", ".join(sorted(credential_shaped))
+    )
+
+
+def test_the_child_marker_is_one_spelling_everywhere() -> None:
+    """Builder, generated shim and teardown guard read one constant.
+
+    A single-site rename of the marker would leave a sharing child unrecorded - or, worse,
+    treated as a parent that removes a session directory still in use. The constant is shared,
+    and the shim's generated text is checked against it here.
+    """
+    marker = suite_conftest.CHILD_SANDBOX_ENV_VAR
+    value = suite_conftest.CHILD_SANDBOX_FLAG_VALUE
+    shim = (suite_conftest.CHILD_SANDBOX_SHIM_DIR / "sitecustomize.py").read_text(encoding="utf-8")
+    assert f'os.environ.get("{marker}") == "{value}"' in shim, (
+        "the generated shim reads a different marker than the constant that builds it"
+    )
+    assert suite_conftest.sandboxed_env()[marker] == value
+    assert marker not in suite_conftest.sandboxed_env(shares_sandbox=False)
+
+
+def test_the_documented_test_opt_ins_are_on_the_allowlist() -> None:
+    """Every variable the docs name as a test opt-in survives the sweep.
+
+    DATABASE_URL and the accounts env are cleared from the environment on purpose; these are
+    the opposite - paths and flags a maintainer chose, which the tests read and skip without.
+    Dropping one from the allowlist would turn a deliberate opt-in into a silent skip.
+    """
+    opt_ins = (
+        "TP_TEST_OHLCV_DIR",  # AGENTS.md: the dataset-backed strategy runs
+        "TP_INTEGRATION_BASE_URL",  # tests/integration: the live-pipeline opt-in
+        "TRADING_PRODUCTION_DB",  # the corpus checks against a production copy
+        "DIFFERENTIAL_REAL_SLICE_CSV",  # CI's differential slice cache
+        "REQUIRE_REAL_DATA_SLICE",  # CI turns a missing slice into a failure
+        "PLAYWRIGHT_BROWSERS_PATH",  # a browser install outside the sandbox HOME
+    )
+    for name in opt_ins:
+        assert suite_conftest._is_allowlisted_env(name), (
+            f"{name} is documented as a test opt-in but is no longer on the allowlist"
+        )
+
+
+def test_a_credential_shaped_override_needs_its_reason() -> None:
+    """A credential-shaped override is the shape a leaked real credential would take.
+
+    The redaction tests plant a dummy key in a child on purpose; anything else handing a
+    child a credential-shaped variable has to say why in the same call, so the exception is
+    a reviewed one and not a convenience.
+    """
+    from tests.conftest import sandboxed_env
+
+    with pytest.raises(AssertionError, match="credential_override_reason"):
+        sandboxed_env(ALPACA_API_KEY="not-a-real-key")
+    named = sandboxed_env(
+        ALPACA_API_KEY="not-a-real-key",
+        credential_override_reason="the leak-guard's own fixture key",
+    )
+    assert named["ALPACA_API_KEY"] == "not-a-real-key"
+
+
+def test_every_environment_variable_production_reads_is_accounted_for() -> None:
+    """Every env var the platform reads is swept, allowed, or named with its reason.
+
+    A variable that reaches production code reaches every test too. The three ways it can be
+    accounted for: the credential sweep clears it, the allowlist keeps it (the documented
+    opt-ins and the platform's own paths), or it is on this accepted list with the reason it
+    is safe to let through. A new reader adds a name here, and that is where the decision is
+    made deliberately rather than by finding out a test silently saw nothing.
+
+    Read from source, not from the environment: the point is the names production *can* read.
+    """
+    import re
+
+    readers: dict[str, str] = {}
+    pattern = re.compile(
+        r"(?:os\.environ\.get\(\s*|os\.getenv\(\s*|os\.environ\[\s*)"
+        r"([\"\'])([A-Za-z_][A-Za-z0-9_]*)\2"
+    )
+    packages = (
+        "data_tools",
+        "live_runner",
+        "risk",
+        "runner",
+        "scheduler",
+        "scripts",
+        "shared",
+        "signal_bots",
+        "validation",
+        "viewer",
+    )
+    for package in packages:
+        for path in sorted((_PROJECT_ROOT / package).rglob("*.py")):
+            if "__pycache__" in path.parts:
+                continue
+            source = path.read_text(encoding="utf-8")
+            for match in pattern.finditer(source):
+                readers.setdefault(match.group(3), f"{package}/{path.name}")
+    unaccounted = sorted(
+        f"{name} ({readers[name]})"
+        for name in readers
+        if not suite_conftest._is_external_credential_env(name)
+        and not suite_conftest._is_allowlisted_env(name)
+        and name not in _ACCEPTED_PRODUCTION_ENV_READS
+    )
+    assert unaccounted == [], (
+        "these production environment variables are neither swept nor allowed nor accepted "
+        "with a reason - add each to _ACCEPTED_PRODUCTION_ENV_READS in this file or to the "
+        "allowlist, or make it credential-shaped so the sweep clears it:\n  "
+        + "\n  ".join(unaccounted)
+    )
+
+
+#: Environment variables production reads that the suite lets through, each with the reason it
+#: is safe to: none of them carries a credential, and each is a path, a timeout, a model or
+#: tool selection, or a job input the tests set deliberately.
+_ACCEPTED_PRODUCTION_ENV_READS = frozenset(
+    {
+        "APP_ENV",  # the deployment's own name; tests set it where they test it
+        "BACKTEST_TIMEOUT_SECONDS",  # the CLI's own timeout
+        "COPILOT_CLI_EXECUTABLE",  # which copilot CLI to run
+        "COPILOT_CLI_PATH",  # ditto
+        "COPILOT_SDK_MODEL",  # model selection
+        "CTRADER_CONNECT_BACKOFF_S",  # retry tuning
+        "CTRADER_CONNECT_MAX_ATTEMPTS",  # retry tuning
+        "CTRADER_VERIFY_ACCOUNT_ID",  # a job's input for the verify script
+        "CTRADER_VERIFY_ORDER_ID",  # a job's input for the verify script
+        "DISCORD_AUTH_SCHEME",  # per-bot auth scheme selection
+        "DISCORD_CHANNEL_ID",  # a channel the tests set themselves
+        "DOLT_TIMEOUT_SECONDS",  # dolthub request timeout
+        "DUKASCOPY_JNLP_URL",  # the JForex bootstrap URL; the download edge is stubbed
+        "DUKASCOPY_LOGIN",  # a Dukascopy demo login; the download edge is stubbed
+        "DUKASCOPY_PASSWORD",  # see DUKASCOPY_LOGIN: same stubbing, never a live path
+        "DUKASCOPY_USERNAME",  # see DUKASCOPY_LOGIN: same stubbing, never a live path
+        "GIT_SHA",  # release detection metadata
+        "HF_INTRADAY_COVERAGE_END",  # a dataset's coverage bound
+        "JAVA_HOME",  # which JDK the JVM starts from
+        "JFOREX_ALLOW_CUSTOM_JVM",  # a 1/0 escape hatch for a custom JVM path
+        "JFOREX_CLASSPATH",  # the SDK's own classpath
+        "JFOREX_HOME",  # the SDK's home
+        "JFOREX_JARS",  # the SDK's jars
+        "JFOREX_JVM_PATH",  # which JVM to start
+        "JFOREX_TRUSTED_JAVA_HOME",  # the JDK roots a JVM may come from
+        "JFOREX_TRUSTED_JAVA_HOMES",  # ditto
+        "LEAN_PROJECT_DIR",  # the Lean engine's project directory
+        "LOG_LEVEL",  # the log level, which tests set per test
+        "MATRIX_ENGINE",  # the matrix runner's engine selection
+        "MATRIX_MAX_WORKERS",  # the matrix runner's worker count
+        "MATRIX_OUTPUT_DIR",  # the matrix runner's output directory
+        "MATRIX_TIMEOUT_SECONDS",  # the matrix runner's timeout
+        "PYTHON_BIN",  # which interpreter the matrix runner spawns
+        "TRADING_PLATFORM_REPO",  # the repo root the matrix runner works in
+        "TRADING_PLATFORM_VERSION",  # release detection metadata
+    }
+)
+
+
+def test_the_audit_hook_refuses_a_secret_file_opened_through_os_open(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``os.open``/``os.openat`` raise the same ``open`` audit event ``open()`` does.
+
+    The guard is on the event, not on the API, so a read that reaches for the lower-level call
+    is refused the same way - pinned here, because the event's argument shape is the contract
+    and a reader reaching around ``open`` is the obvious next attempt.
+    """
+    import os as _os
+
+    # An attempt is refused *and* recorded, so the deliberate one here goes into a list this
+    # test throws away - exactly as the symlink test below does. Without that the session-end
+    # guard would fail a green run for the attempt this pin made on purpose.
+    monkeypatch.setattr(suite_conftest, "_REPO_SECRET_OPENS", [])
+    with pytest.raises(suite_conftest.SuiteHermeticityViolation, match=r"\.accounts\.env"):
+        _os.open(str(REPO_ACCOUNTS_ENV), _os.O_RDONLY)
+
+
+def test_a_child_never_sees_a_credential_variable_the_sweep_removed() -> None:
+    """An allowlist prefix cannot re-admit what the credential sweep removed.
+
+    The CI job's context is allowed through by prefix (``GITHUB_*``), and a token in that
+    context - ``GITHUB_TOKEN`` - spells like the credentials the sweep exists to remove. The
+    credential sweep runs first, so the name is gone before any allowlist could carry it,
+    and this pins the interaction rather than trusting the order.
+    """
+    from tests.conftest import sandboxed_env
+
+    os.environ["GITHUB_TOKEN"] = "ghp_secret_probe"
+    try:
+        child_env = sandboxed_env(GITHUB_REPOSITORY="itsjustFred/trading-platform")
+    finally:
+        os.environ.pop("GITHUB_TOKEN", None)
+    # The allowed one the child needs, the credential-shaped one gone.
+    assert child_env["GITHUB_REPOSITORY"] == "itsjustFred/trading-platform"
+    assert "GITHUB_TOKEN" not in child_env
+    assert "GITHUB_TOKEN" not in os.environ
+
+    body = "import os\nprint('TOKEN', os.environ.get('GITHUB_TOKEN'))\n"
+    result = subprocess.run(
+        [sys.executable, "-c", body],
+        cwd=str(_PROJECT_ROOT),
+        env=child_env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert "TOKEN None" in result.stdout, result.stdout + result.stderr
+
+
+def test_a_grandchild_of_a_sandboxed_child_inherits_the_guard() -> None:
+    """A child that starts its own child hands the sandbox on, markers included.
+
+    The child's own sweep cleared the marker variables - they are not allowlist names - so a
+    grandchild started with the inherited environment (what production code does when a daemon
+    or a viewer worker starts one) lost the guard entirely: no ``.env`` redirect, no
+    accounts-env isolation, no network refusal. The markers survive the sweep in a child now,
+    and the grandchild runs under the same sandbox as its parent.
+    """
+    from tests.conftest import sandboxed_env
+
+    grandchild = (
+        "import live_runner.credential_env as credential_env\n"
+        "print('ACCOUNTS', credential_env.DEFAULT_ACCOUNTS_ENV)\n"
+        "import dotenv\n"
+        "print('LOADER', dotenv.load_dotenv.__name__)\n"
+        "import socket\n"
+        "try:\n"
+        "    socket.getaddrinfo('1.1.1.1', 443)\n"
+        "    print('NET', 'REACHED')\n"
+        "except Exception as exc:\n"
+        "    print('NET', type(exc).__name__)\n"
+    )
+    child = (
+        "import subprocess, sys\n"
+        "probe = " + repr(grandchild) + "\n"
+        "result = subprocess.run(\n"
+        "    [sys.executable, '-c', probe],\n"
+        "    capture_output=True, text=True, check=False,\n"
+        ")\n"
+        "print('GRANDCHILD', result.stdout)\n"
+        "raise SystemExit(result.returncode)\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", child],
+        cwd=str(_PROJECT_ROOT),
+        env=sandboxed_env(),
+        capture_output=True,
+        text=True,
+        timeout=300,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert f"ACCOUNTS {ISOLATED_ACCOUNTS_ENV}" in result.stdout, (
+        "a grandchild resolved the accounts env outside the session sandbox: "
+        + result.stdout
+        + result.stderr
+    )
+    assert "LOADER _redirected_load_dotenv" in result.stdout, (
+        "a grandchild loaded .env through the raw loader: " + result.stdout + result.stderr
+    )
+    assert "NET SuiteHermeticityViolation" in result.stdout, (
+        "a grandchild reached the network unguarded: " + result.stdout + result.stderr
+    )
+
+
+def test_a_forged_child_marker_does_not_adopt_the_named_session(tmp_path: Path) -> None:
+    """A caller can spell the marker variables; only ``sandboxed_env()`` can make them true.
+
+    ``TP_TEST_CHILD_SANDBOX=1 TP_TEST_SESSION_ROOT=<elsewhere> DATA_DIR=<prod>`` in the shell
+    would make a top-level run take the child branch, where the data roots are only filled in,
+    so the suite would write against a directory the caller named. The marker is genuine only
+    with the nonce ``sandboxed_env()`` wrote into the session directory it handed over.
+    """
+    forged = tmp_path / "forged-session"
+    forged.mkdir()
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            "tests/test_suite_isolation.py::test_env_data_dir_is_the_conftest_session_dir",
+        ],
+        cwd=str(_PROJECT_ROOT),
+        env={  # sandbox-env: deliberately forged env; the forge is what is under test
+            "PATH": os.environ["PATH"],
+            "PYTHONPATH": str(_PROJECT_ROOT),
+            "HOME": str(tmp_path / "home"),
+            "DATA_DIR": str(tmp_path / "prod-data"),
+            "TP_TEST_CHILD_SANDBOX": "1",
+            "TP_TEST_SESSION_ROOT": str(forged),
+        },
+        capture_output=True,
+        text=True,
+        timeout=300,
+        check=False,
+    )
+    assert result.returncode == pytest.ExitCode.OK, (
+        "a forged child marker made the run adopt the named session: "
+        + result.stdout
+        + result.stderr
+    )
+
+
+def test_a_forged_child_override_list_is_not_honoured(tmp_path: Path) -> None:
+    """The recorded-override list is a handoff, not a caller's input.
+
+    ``TP_TEST_CHILD_ENV=ALPACA_API_KEY ALPACA_API_KEY=dummyA pytest`` would carry the key
+    through the suite's own sweep into every test, because both sweeps skip names the list
+    records. The list means something only in a process ``sandboxed_env()`` started.
+    """
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            "tests/test_suite_isolation.py::test_no_external_credential_env_var_is_set",
+        ],
+        cwd=str(_PROJECT_ROOT),
+        env={  # sandbox-env: deliberately forged env; the forge is what is under test
+            "PATH": os.environ["PATH"],
+            "PYTHONPATH": str(_PROJECT_ROOT),
+            "HOME": str(tmp_path / "home"),
+            "TP_TEST_CHILD_ENV": "ALPACA_API_KEY",
+            "ALPACA_API_KEY": "dummy-not-a-real-key",
+        },
+        capture_output=True,
+        text=True,
+        timeout=300,
+        check=False,
+    )
+    assert result.returncode == pytest.ExitCode.OK, (
+        "a forged override list carried a credential into the suite: "
+        + result.stdout
+        + result.stderr
+    )
+
+
+def test_a_sandbox_sharing_child_must_be_finished_by_its_test(tmp_path: Path) -> None:
+    """The lifetime contract, enforced: a sharing child still alive at teardown fails.
+
+    A child that shares the session sandbox owns no lifetime of its own - the session
+    directory is removed when the pytest process exits - so a test that leaves one running
+    is reported rather than allowed to write into a directory about to disappear. The probe
+    child sleeps far longer than this test does.
+    """
+    from tests.conftest import sandboxed_env
+
+    marker = tmp_path / "child-started"
+    leak = (
+        "import time\n"
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text('started')\n"
+        "time.sleep(60)\n"
+    )
+    child = subprocess.Popen(
+        [sys.executable, "-c", leak],
+        cwd=str(_PROJECT_ROOT),
+        env=sandboxed_env(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    for _ in range(200):
+        if marker.exists():
+            break
+        time.sleep(0.05)
+    assert marker.exists(), "the probe child never started; this pin proves nothing"
+    with pytest.raises(pytest.fail.Exception, match="left sandbox-sharing child"):
+        suite_conftest.finish_shared_sandbox_children()
+    # The enforcement killed it, so this test's own teardown finds nothing left to report.
+    assert child.poll() is not None, "the enforcement did not finish the child it reported"
+
+
+def test_a_child_keeps_a_home_its_parent_named(tmp_path: Path) -> None:
+    """A sweep that clobbered a named HOME would fail the test that named it.
+
+    A config-step probe hands its child the HOME its fixture tree lives in; the child's
+    own sweep points HOME at the session sandbox by default, and has to step aside for
+    the name the parent recorded.
+    """
+    from tests.conftest import sandboxed_env
+
+    home = tmp_path / "child-home"
+    home.mkdir()
+    body = "import os\nprint('HOME', os.environ.get('HOME'))\n"
+    result = subprocess.run(
+        [sys.executable, "-c", body],
+        cwd=str(_PROJECT_ROOT),
+        env=sandboxed_env(HOME=str(home)),
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert f"HOME {home}" in result.stdout, (
+        "a child clobbered the HOME its parent named: " + result.stdout + result.stderr
+    )
+
+
+def test_a_self_sandboxing_child_keeps_the_overrides_it_named() -> None:
+    """``shares_sandbox=False`` records its overrides too - the child sweeps them itself.
+
+    Such a child runs the repo's suite (or imports this conftest) without the shim, and
+    its own sweep still runs: a variable the naming test meant it to see must survive that
+    sweep, not only survive the parent's environment construction.
+    """
+    from tests.conftest import sandboxed_env
+
+    body = (
+        "import tests.conftest  # noqa: F401 - importing it runs the sweep this pins\n"
+        "import os\n"
+        "print('PROBE', os.environ.get('TP_CHILD_PROBE_VAR'))\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", body],
+        cwd=str(_PROJECT_ROOT),
+        env=sandboxed_env(shares_sandbox=False, TP_CHILD_PROBE_VAR="named-for-this-child"),
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "PROBE named-for-this-child" in result.stdout, (
+        "a self-sandboxing child dropped an override its parent named: "
+        + result.stdout
+        + result.stderr
+    )
+
+
+def test_a_child_guard_patches_by_value_not_by_name() -> None:
+    """The child's guard matches the path an attribute holds, not the attribute's name.
+
+    A future rename of the accounts-env constant to a name without ``ACCOUNTS_ENV`` in it
+    would slip past a name filter and leave that child resolving the checkout's real
+    credential path. The loader is exercised directly here, on a module-shaped object: the
+    patch pass is the same one a real import runs.
+    """
+    probe = types.ModuleType("probe")
+    probe.CREDENTIALS_FILE = REPO_ACCOUNTS_ENV
+    probe.REPO_DOTENV = REPO_ENV_FILE
+    probe.UNRELATED_PATH = REPO_ACCOUNTS_ENV.parent / "notes.txt"
+    probe.NOT_A_PATH = "some string"
+
+    class _NoopLoader:
+        def create_module(self, spec: object) -> object:
+            return None
+
+        def exec_module(self, module: object) -> None:
+            return None
+
+    suite_conftest._ChildAccountsEnvLoader(_NoopLoader()).exec_module(probe)
+
+    assert probe.CREDENTIALS_FILE == ISOLATED_ACCOUNTS_ENV
+    assert probe.REPO_DOTENV == ISOLATED_DOTENV_FILE
+    assert probe.UNRELATED_PATH == REPO_ACCOUNTS_ENV.parent / "notes.txt"
+    assert probe.NOT_A_PATH == "some string"
+
+
+def test_a_subprocess_refuses_the_network() -> None:
+    """S16: the network guard covers a child too, or a call escapes the audit hook.
+
+    The hook is installed in the pytest process only; a child that resolved a
+    remote host did so unguarded. The child reports what its lookup raised, so
+    the pin holds without this machine (or CI) having network access.
+    """
+    from tests.conftest import sandboxed_env
+
+    body = (
+        "import socket\n"
+        "try:\n"
+        "    socket.getaddrinfo('api.alpaca.markets', 443)\n"
+        "    print('REACHED')\n"
+        "except Exception as exc:\n"
+        "    print('BLOCKED', type(exc).__name__)\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", body],
+        cwd=str(_PROJECT_ROOT),
+        env=sandboxed_env(),
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "BLOCKED SuiteHermeticityViolation" in result.stdout, result.stdout + result.stderr
 
 
 # --- end-to-end: the real pytest process must exit non-zero ----------------------------------- #
@@ -910,6 +1717,7 @@ def _run_throwaway_suite(
     test_source: str,
     extra_args: tuple[str, ...] = (),
     seed_files: dict[str, str] | None = None,
+    env_extra: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     project = tmp_path / "project"
     (project / "tests").mkdir(parents=True)
@@ -921,7 +1729,16 @@ def _run_throwaway_suite(
         Path(suite_conftest.__file__).read_text(encoding="utf-8"), encoding="utf-8"
     )
     (project / "tests" / "test_throwaway.py").write_text(test_source, encoding="utf-8")
-    env = {**os.environ, "PYTHONPATH": str(_PROJECT_ROOT)}
+    # Not sandboxed_env(): the throwaway project's own conftest is the copy under test, and a
+    # child shim would pre-load the repo's conftest into the child before pytest loads the
+    # copy - the run must exercise the copy exactly as a real run loads it. The inherited
+    # environment is already the swept one, and the copy sweeps it again.
+    # sandbox-env: throwaway suite loads its own copied conftest
+    env = {
+        **os.environ,
+        "PYTHONPATH": str(_PROJECT_ROOT),
+        **(env_extra or {}),
+    }
     return subprocess.run(
         [
             sys.executable,
@@ -934,7 +1751,7 @@ def _run_throwaway_suite(
             "tests/test_throwaway.py",
         ],
         cwd=project,
-        env=env,
+        env=env,  # sandbox-env: the throwaway suite loads its own copied conftest
         capture_output=True,
         text=True,
         timeout=300,

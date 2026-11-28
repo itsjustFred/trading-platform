@@ -65,6 +65,7 @@ from live_runner.shutdown import (
 from risk import TradeSignal
 from shared.database import get_live_deployment, list_live_deployment_submission_claims
 from shared.models import LiveDeploymentConfig
+from tests.conftest import sandboxed_env
 
 ACCOUNT_ID = "acc-1"
 DEPLOYMENT_ID = "22222222-2222-2222-2222-222222222222"
@@ -1406,8 +1407,7 @@ def test_real_sigterm_to_a_daemon_process_exits_cleanly(tmp_path: Path) -> None:
     """End to end through ``main()``: handler install, wake-up, exit code, logs."""
     data_dir = tmp_path / "data"
     data_dir.mkdir()
-    env = dict(os.environ)
-    env.update(
+    env = sandboxed_env(
         DATA_DIR=str(data_dir),
         LOG_DIR=str(tmp_path / "logs"),
         PYTHONPATH=str(Path(__file__).resolve().parents[1]),
@@ -1541,8 +1541,7 @@ def test_the_exit_path_survives_a_task_that_ignores_every_cancel(
     """
     data_dir = tmp_path / "data"
     data_dir.mkdir()
-    env = dict(os.environ)
-    env.update(
+    env = sandboxed_env(
         DATA_DIR=str(data_dir),
         LOG_DIR=str(tmp_path / "logs"),
         PYTHONPATH=str(Path(__file__).resolve().parents[1]),
@@ -1693,8 +1692,7 @@ def _run_the_cooperative_worker_program(tmp_path: Path, *, crash: bool) -> _Work
     data_dir = tmp_path / "data"
     data_dir.mkdir(exist_ok=True)
     marker = tmp_path / "worker-finished"
-    env = dict(os.environ)
-    env.update(
+    env = sandboxed_env(
         DATA_DIR=str(data_dir),
         LOG_DIR=str(tmp_path / "logs"),
         PYTHONPATH=str(Path(__file__).resolve().parents[1]),

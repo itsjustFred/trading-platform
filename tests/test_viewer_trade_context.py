@@ -7,14 +7,9 @@ out-of-window indicator point must be dropped instead of raising NameError.
 
 from __future__ import annotations
 
-import sys
-from pathlib import Path
-
 import pandas as pd
 
 from shared.models import BacktestMeta, BacktestResult, IndicatorSeries, Trade, TradeExit
-
-sys.path.insert(0, str(Path(__file__).parent.parent))
 
 
 def _trade(trade_id: int = 1) -> Trade:

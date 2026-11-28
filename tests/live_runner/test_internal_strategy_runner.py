@@ -2588,3 +2588,49 @@ def test_retired_discord_deployments_are_never_evaluated(tmp_path: Path) -> None
     )
 
     assert sent == []
+
+
+@pytest.mark.parametrize(
+    ("direction", "shift", "expected_multiplier"),
+    [
+        ("LONG", 0.0, 0.98),
+        ("SHORT", 0.0, 1.02),
+        ("LONG", 100.0, 0.98),
+        ("SHORT", 100.0, 1.02),
+    ],
+)
+def test_fallback_broker_stop_price_characterization(
+    tmp_path: Path, direction: str, shift: float, expected_multiplier: float
+) -> None:
+    """Pin the fallback broker stop this live call site submits (G03).
+
+    The stop is ``fallback_stop_pct`` of the entry close, below for a long and
+    above for a short, at more than one price level.
+    """
+
+    def strategy(df: pd.DataFrame, params: dict[str, Any]):
+        entries = pd.Series(False, index=df.index)
+        exits = pd.Series(False, index=df.index)
+        entries.iloc[-1] = True
+        indicators = _indicators(tp_price=[110.0] * 30, direction=[direction] * 30)
+        return entries, exits, indicators, []
+
+    frame = _bars()
+    frame[["open", "high", "low", "close"]] += shift
+    last_close = float(frame["close"].iloc[-1])
+    path = _strategy_file(tmp_path, META)
+    sent, submit = _collect()
+    runner = _runner(submit, path=path, module=_module_with(strategy))
+    deployment = _deployment(signal_config={"allow_short": True})
+
+    asyncio.run(
+        runner.run_once(
+            [deployment],
+            {"acct-1": FakeAdapter(frame)},
+            now=BASE + timedelta(seconds=70),
+        )
+    )
+
+    assert len(sent) == 1
+    assert sent[0].stop_loss == pytest.approx(last_close * expected_multiplier)
+    assert sent[0].metadata["internal_stop_source"] == "fallback_pct"

@@ -18,7 +18,8 @@ from live_runner.symbol_class import (
     canonical_crypto_symbol,
     classify_symbol,
 )
-from shared.models import LiveAccountConfig, LiveDeploymentConfig
+from shared.models import LiveAccountConfig
+from tests.builders import make_live_deployment
 
 
 @pytest.fixture
@@ -159,7 +160,7 @@ def test_refresh_routes_each_symbol_to_its_feed_and_skips_unclassifiable(monkeyp
         mds, "resolve_alpaca_credentials", lambda **_kw: ("key", "secret", True)
     )
     service = mds.LiveMarketDataStreamService()
-    deployment = LiveDeploymentConfig(
+    deployment = make_live_deployment(
         strategy_name="s",
         account_id="acc",
         symbols=["BTCUSD", "ETH-USD", "AAPL", "FOOBARUSD"],

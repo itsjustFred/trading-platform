@@ -22,6 +22,21 @@ def test_parse_bool_env_missing_value_returns_default() -> None:
     assert parse_bool_env("SOME_FLAG", None, default=False) is False
 
 
+def test_parse_bool_env_default_must_be_passed_explicitly() -> None:
+    """The caller decides the fallback, so ``default`` cannot become optional.
+
+    ``allow_short`` is ``False`` when unconfigured; a signature that defaults
+    it to ``True`` would let a caller that forgets it enable live short selling
+    with every existing test still green. Pre-mortem finding on PR #457.
+    """
+
+    with pytest.raises(TypeError):
+        parse_bool_env("SOME_FLAG", None)  # type: ignore[call-arg]
+
+    with pytest.raises(TypeError):
+        parse_bool_env("SOME_FLAG", None, True)  # type: ignore[call-arg]
+
+
 @pytest.mark.parametrize(
     ("raw", "expected"),
     [

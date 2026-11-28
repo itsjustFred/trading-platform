@@ -956,7 +956,7 @@ def test_ctrader_submit_stamps_order_timing(db, monkeypatch) -> None:
     monkeypatch.setattr(
         adapter,
         "_build_new_order_request",
-        lambda signal, symbol_id: SimpleNamespace(volume=500_000),
+        lambda signal, symbol_id, volume: SimpleNamespace(volume=volume),
     )
     monkeypatch.setattr(adapter, "_submit_new_order_request", _submit)
 
