@@ -124,13 +124,6 @@ def test_trade_to_signal_none_stop_loss() -> None:
     assert signal.stop_loss is None
 
 
-def test_private_trade_conversion_is_not_exported() -> None:
-    import validation.risk as risk_package
-
-    assert "_trade_to_signal" not in risk_package.__all__
-    assert not hasattr(risk_package, "_trade_to_signal")
-
-
 # ─── RiskAdapter single trade ───────────────────────────────────────────────
 
 

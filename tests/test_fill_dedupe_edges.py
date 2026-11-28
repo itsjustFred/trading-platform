@@ -28,6 +28,7 @@ import pytest
 from live_runner.ctrader_adapter import CTraderLiveAdapter
 from risk.models import TradeSignal
 from shared.models import LiveDeploymentConfig, LiveExecution, LiveSignal
+from tests.builders import make_live_deployment, make_live_signal
 from tests.conftest import seed_live_deployments
 
 T0 = datetime(2026, 7, 15, 10, 0, 0, tzinfo=timezone.utc)
@@ -46,7 +47,7 @@ def database(isolated_db):
 
 
 def _persist_signal(database, *, deployment_id: str = DEP_1, broker_order_id: str = "") -> str:
-    signal = LiveSignal(
+    signal = make_live_signal(
         deployment_id=deployment_id,
         symbol="EURUSD",
         action="buy",
@@ -376,7 +377,7 @@ def test_alpaca_execution_id_is_still_the_preferred_key(monkeypatch) -> None:
 
 
 def _deployment(deployment_id: str = DEP_1) -> LiveDeploymentConfig:
-    return LiveDeploymentConfig(
+    return make_live_deployment(
         id=deployment_id,
         strategy_name="demo",
         account_id="fixture-account",

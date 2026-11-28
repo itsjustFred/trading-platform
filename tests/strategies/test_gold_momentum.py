@@ -14,15 +14,12 @@ Wilder-RSI14, Wilder-ATR14, kein ATR-Stop).
 """
 
 import math
-import sys
 from pathlib import Path
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).parent.parent.parent))
-
-from runner.engines.base import BacktestConfig
 from runner.engines.vectorbt_adapter import VectorbtAdapter
+from tests.builders import make_backtest_config
 
 STRATEGY_PATH = str(Path(__file__).parent.parent.parent / "strategies" / "gold_momentum" / "gold_momentum.py")
 TEST_START = "2025-10-01"
@@ -36,7 +33,7 @@ EXPECTED_NET_PROFIT = 2503.90
 @pytest.fixture(scope="module")
 def backtest_result():
     engine = VectorbtAdapter()
-    config = BacktestConfig(signal_exit_fill="close", parameters={"fees": "zero"},
+    config = make_backtest_config(signal_exit_fill="close", parameters={"fees": "zero"},
         strategy_name="gold_momentum",
         symbols=[TEST_SYMBOL],
         timeframe=TEST_TIMEFRAME,

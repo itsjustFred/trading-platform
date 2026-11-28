@@ -17,6 +17,7 @@ import pytest
 from live_runner import account_discovery
 from scripts import verify_ctrader_order, wheel_smoke
 from scripts.sync_requirements_from_lock import requirements_drift
+from tests.conftest import sandboxed_env
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -85,6 +86,7 @@ assert 'ctrader_open_api' not in sys.modules
         capture_output=True,
         text=True,
         check=False,
+        env=sandboxed_env(),
     )
     assert result.returncode == 0, result.stderr
 
@@ -144,6 +146,7 @@ assert 'ctrader_open_api' not in sys.modules
         capture_output=True,
         text=True,
         check=False,
+        env=sandboxed_env(),
     )
     assert result.returncode == 0, result.stderr
 

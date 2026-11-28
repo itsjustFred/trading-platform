@@ -12,6 +12,7 @@ from typing import Any
 import pytest
 
 from shared.models import Trade, TradeExit
+from tests.conftest import sandboxed_env
 from validation import cli as validation_cli
 from validation.reference import ValidationReference
 
@@ -62,6 +63,7 @@ def _invoke_cli_subprocess(args: list[str]) -> subprocess.CompletedProcess:
         capture_output=True,
         text=True,
         cwd=Path(__file__).resolve().parents[2],
+        env=sandboxed_env(),
     )
 
 

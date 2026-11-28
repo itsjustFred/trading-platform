@@ -29,7 +29,8 @@ from shared.database import (
     get_session,
     list_live_deployment_open_position_lots,
 )
-from shared.models import LiveExecution, LiveSignal
+from shared.models import LiveExecution
+from tests.builders import make_live_signal
 from tests.conftest import seed_live_deployments
 
 DEP = "55555555-5555-4555-8555-555555555555"
@@ -65,7 +66,7 @@ def _persist_signal(
         "broker_order_id": order_id,
         **(metadata_extra or {}),
     }
-    signal = LiveSignal(
+    signal = make_live_signal(
         deployment_id=deployment_id,
         symbol=symbol,
         action=action,

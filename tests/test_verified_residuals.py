@@ -18,6 +18,7 @@ from runner.engines.vectorbt_adapter import (
 from runner.stats import compute_stats
 from runner.walkforward import _build_windows
 from shared.models import BacktestMeta, BacktestResult, EquityPoint, Trade, TradeExit
+from tests.builders import make_backtest_config
 
 
 def _config(tmp_path: Path, **overrides: object) -> BacktestConfig:
@@ -32,7 +33,7 @@ def _config(tmp_path: Path, **overrides: object) -> BacktestConfig:
         "data_dir": str(tmp_path),
     }
     values.update(overrides)
-    return BacktestConfig(**values)
+    return make_backtest_config(**values)
 
 
 def test_vectorbt_missing_stop_rejection_is_explicit(tmp_path: Path) -> None:
