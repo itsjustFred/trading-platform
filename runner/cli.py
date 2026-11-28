@@ -47,6 +47,7 @@ from runner.universe_provenance import (
     universe_provenance,
 )
 from runner.walkforward import run_walkforward
+from shared import ohlcv_store
 from shared.constants import DATA_DIR, normalize_timeframe
 from shared.database import save_result_to_sqlite
 from shared.logging import get_logger
@@ -97,7 +98,8 @@ def _detect_date_range(symbols: list[str], timeframe: str, data_dir: str = "") -
     per-symbol facet in ``runner.backtest_grid._detect_date_range``; both share
     the same loud-failure contract (F19) over the same parquet layout.
     """
-    ohlcv_root = Path(data_dir) / "ohlcv" if data_dir else DATA_DIR / "ohlcv"
+    data_root = Path(data_dir) if data_dir else DATA_DIR
+    ohlcv_root = ohlcv_store.store_root(data_root)
     normalized_timeframe = normalize_timeframe(timeframe)
     starts, ends = [], []
 
@@ -107,37 +109,29 @@ def _detect_date_range(symbols: list[str], timeframe: str, data_dir: str = "") -
         )
 
     for symbol in symbols:
-        matches = sorted(
-            ohlcv_root.rglob(f"**/{symbol}/{normalized_timeframe}.parquet"),
-            key=lambda path: path.as_posix(),
+        entries = ohlcv_store.list_datasets(
+            data_root, symbol=symbol, timeframe=normalized_timeframe
         )
-        if not matches:
-            # Try without exact timeframe match — find any parquet for symbol
-            matches = sorted(
-                ohlcv_root.rglob(f"**/{symbol}/*.parquet"),
-                key=lambda path: path.as_posix(),
-            )
-        if not matches:
+        if not entries:
+            # Same fallback as the old scan: any timeframe stored for the
+            # symbol still contributes a covered period.
+            entries = ohlcv_store.list_datasets(data_root, symbol=symbol)
+        if not entries:
             raise ValueError(
                 f"No OHLCV data found for {symbol}/{normalized_timeframe} under "
                 f"{ohlcv_root}; refusing to fabricate a backtest date range"
             )
-        try:
-            import pandas as pd
-
-            df = pd.read_parquet(matches[0])
-            df.columns = [c.lower() for c in df.columns]
-            if "timestamp" in df.columns:
-                ts = pd.to_datetime(df["timestamp"])
-                starts.append(ts.min().strftime("%Y-%m-%d"))
-                ends.append(ts.max().strftime("%Y-%m-%d"))
-            else:
-                logger.warning(
-                    "No timestamp column in %s; symbol %s cannot contribute a date range",
-                    matches[0], symbol,
-                )
-        except Exception as e:
-            logger.warning("Could not read date range from %s: %s", matches[0], e)
+        entry = min(entries, key=lambda item: item.path.as_posix())
+        bounds = ohlcv_store.dataset_bounds(entry)
+        if bounds is None:
+            logger.warning(
+                "No timestamp bounds in %s; symbol %s cannot contribute a "
+                "date range",
+                entry.path, symbol,
+            )
+            continue
+        starts.append(bounds[0].strftime("%Y-%m-%d"))
+        ends.append(bounds[1].strftime("%Y-%m-%d"))
 
     # A symbol whose file could not be read must not silently shrink the
     # intersection — every requested symbol has to contribute a range.

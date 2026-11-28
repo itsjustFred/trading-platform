@@ -38,6 +38,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 from data_tools.file_fingerprint import file_fingerprint
+from shared import ohlcv_store
 from shared.constants import DATA_DIR
 
 #: Bumped whenever the identity payload changes shape. An artifact stamped with
@@ -98,7 +99,8 @@ def strategy_source_sha256(strategy_path: str | Path) -> str | None:
 
 def data_root_for(data_dir: str = "") -> Path:
     """The OHLCV root a cell reads, resolved the same way everywhere."""
-    return Path(data_dir) / "ohlcv" if str(data_dir or "").strip() else Path(DATA_DIR) / "ohlcv"
+    data_root = Path(data_dir) if str(data_dir or "").strip() else Path(DATA_DIR)
+    return ohlcv_store.store_root(data_root)
 
 
 def _candidate_frames(
@@ -115,17 +117,19 @@ def _candidate_frames(
     change which file wins, so a cell computed from the previous winner is no
     longer the answer to the same question.
     """
-    root = data_root_for(data_dir)
-    normalized_symbol = str(symbol or "").strip().upper()
-    frames = [
-        str(timeframe or "").strip().lower(),
-        str(intrabar_timeframe or "").strip().lower(),
-    ]
+    data_root = Path(data_dir) if str(data_dir or "").strip() else DATA_DIR
+    frames = {
+        str(timeframe or "").strip(),
+        str(intrabar_timeframe or "").strip(),
+    }
     found: set[Path] = set()
     for frame in frames:
         if not frame:
             continue
-        found.update(root.rglob(f"**/{normalized_symbol}/{frame}.parquet"))
+        for entry in ohlcv_store.list_datasets(
+            data_root, symbol=symbol, timeframe=frame
+        ):
+            found.update(entry.segments or (entry.path,))
     return sorted(found, key=lambda path: path.as_posix())
 
 

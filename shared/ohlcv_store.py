@@ -36,6 +36,7 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "DatasetEntry",
     "data_path",
+    "dataset_bounds",
     "entry_for_path",
     "find_dataset",
     "list_datasets",
@@ -600,6 +601,43 @@ def timestamp_bounds(path: str | Path) -> tuple[pd.Timestamp, pd.Timestamp] | No
             highs.append(_utc_timestamp(stats.max))
     except (OSError, ValueError, IndexError, AttributeError):
         return None
+    if not lows:
+        return None
+    return min(lows), max(highs)
+
+
+def dataset_bounds(entry: DatasetEntry) -> tuple[pd.Timestamp, pd.Timestamp] | None:
+    """(first, last) coverage of a dataset as UTC timestamps.
+
+    The manifest's ``first``/``last`` win; when either is missing or
+    unparseable the row-group statistics of the segment files are used for
+    both bounds. None when no bound can be established.
+    """
+    parsed: list[pd.Timestamp | None] = []
+    for raw in (entry.first, entry.last):
+        timestamp: pd.Timestamp | None = None
+        if str(raw or "").strip():
+            try:
+                candidate = pd.Timestamp(raw)
+                timestamp = (
+                    candidate.tz_localize("UTC")
+                    if candidate.tzinfo is None
+                    else candidate.tz_convert("UTC")
+                )
+            except (ValueError, TypeError, OverflowError):
+                timestamp = None
+        parsed.append(timestamp)
+    if parsed[0] is not None and parsed[1] is not None:
+        return parsed[0], parsed[1]
+
+    lows: list[pd.Timestamp] = []
+    highs: list[pd.Timestamp] = []
+    for segment in entry.segments or (entry.path,):
+        bounds = timestamp_bounds(segment)
+        if bounds is None:
+            return None
+        lows.append(bounds[0])
+        highs.append(bounds[1])
     if not lows:
         return None
     return min(lows), max(highs)

@@ -46,6 +46,7 @@ from runner.grid_identity import (
 )
 from runner.slippage import SLIPPAGE_CAPABLE_ENGINES, assert_slippage_supported
 from runner.stats import merge_canonical_stats
+from shared import ohlcv_store
 from shared.constants import DATA_DIR, GRID_TIMEFRAME_ALIASES, normalize_timeframe
 from shared.database import save_result_to_sqlite
 from shared.logging import get_logger
@@ -234,37 +235,27 @@ def _detect_date_range(symbol: str, timeframe: str, data_dir: str) -> tuple[str,
     resolve dates without importing runner.cli; both share the loud-failure
     contract (F19): no fabricated range may ever flow into a backtest.
     """
-    root = Path(data_dir) / "ohlcv" if data_dir else DATA_DIR / "ohlcv"
-    matches = sorted(
-        root.rglob(f"**/{symbol}/{timeframe}.parquet"),
-        key=lambda path: path.as_posix(),
-    )
-    if not matches:
-        matches = sorted(
-            root.rglob(f"**/{symbol}/*.parquet"),
-            key=lambda path: path.as_posix(),
-        )
-    if not matches:
+    data_root = Path(data_dir) if data_dir else DATA_DIR
+    ohlcv_root = ohlcv_store.store_root(data_root)
+    entries = ohlcv_store.list_datasets(data_root, symbol=symbol, timeframe=timeframe)
+    if not entries:
+        # Same fallback as the old scan: any timeframe stored for the symbol.
+        entries = ohlcv_store.list_datasets(data_root, symbol=symbol)
+    if not entries:
         raise ValueError(
-            f"No OHLCV data found for {symbol}/{timeframe} under {root}; "
+            f"No OHLCV data found for {symbol}/{timeframe} under {ohlcv_root}; "
             "refusing to fabricate a backtest date range"
         )
-    df = pd.read_parquet(matches[0])
-    df.columns = [str(c).lower() for c in df.columns]
-    if "timestamp" not in df.columns:
-        # Same contract as runner.cli._detect_date_range: a file without a
-        # readable timestamp column cannot contribute a date range.
+    entry = min(entries, key=lambda item: item.path.as_posix())
+    bounds = ohlcv_store.dataset_bounds(entry)
+    if bounds is None:
+        # Same contract as runner.cli._detect_date_range: a dataset without
+        # readable timestamp bounds cannot contribute a date range.
         raise ValueError(
-            f"OHLCV data for {symbol}/{timeframe} under {root} has no "
-            "timestamp column; refusing to fabricate a backtest date range"
+            f"OHLCV data for {symbol}/{timeframe} under {ohlcv_root} has no "
+            "valid timestamps; refusing to fabricate a backtest date range"
         )
-    ts = pd.to_datetime(df["timestamp"], utc=True, errors="coerce").dropna()
-    if ts.empty:
-        raise ValueError(
-            f"OHLCV data for {symbol}/{timeframe} under {root} has no valid "
-            "timestamps; refusing to fabricate a backtest date range"
-        )
-    return ts.min().strftime("%Y-%m-%d"), ts.max().strftime("%Y-%m-%d")
+    return bounds[0].strftime("%Y-%m-%d"), bounds[1].strftime("%Y-%m-%d")
 
 
 def _resolve_dates_for_equity(
