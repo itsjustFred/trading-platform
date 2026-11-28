@@ -137,9 +137,10 @@ def test_env_loaded_for_fresh_interpreter_imports(tmp_path: Path) -> None:
         f"DATA_DIR={tmp_path / 'data'}\nWP_TEST_MARKER=loaded\n", encoding="utf-8"
     )
 
+    # sandbox-env: deliberately bare - what a fresh interpreter outside the suite
+    # resolves, which is the property under test (nothing may pre-seed DATA_DIR,
+    # or the .env load this pins stops being observable).
     env = {"PATH": "/usr/bin:/bin", "HOME": str(tmp_path)}
-    for name in ("DATA_DIR", "TRADING_DATA_DIR", "DATABASE_URL", "SENTRY_DSN", "SENTRY_ENABLED"):
-        env.pop(name, None)
 
     code = (
         "import json, os\n"
@@ -153,7 +154,7 @@ def test_env_loaded_for_fresh_interpreter_imports(tmp_path: Path) -> None:
     proc = subprocess.run(
         [sys.executable, "-c", code],
         cwd=str(sandbox),
-        env=env,
+        env=env,  # sandbox-env: deliberately bare; see the comment above the mapping
         capture_output=True,
         text=True,
         timeout=120,

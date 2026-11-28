@@ -53,6 +53,12 @@ from live_runner.symbol_class import (
     canonical_crypto_symbol,
     classify_symbol,
 )
+from risk.signal_levels import (
+    SL_METADATA_KEYS,
+    TP_METADATA_KEYS,
+    LevelParsing,
+    resolve_signal_level,
+)
 from shared import venue_calendar
 from shared.alpaca_symbols import classify_alpaca_symbol, crypto_pair_key
 from shared.constants import DATA_DIR
@@ -102,8 +108,6 @@ logger = get_logger("live-runner")
 
 _ALPACA_ACC_RE = re.compile(r"^ALPACA_API_KEY_ACC(?P<index>\d+)$")
 
-_SL_METADATA_KEYS = ("stop_loss", "sl_price", "stop_price", "resolved_stop_loss")
-_TP_METADATA_KEYS = ("take_profit", "tp_price")
 #: Overnight Reg T ceiling for marginable stocks: Alpaca's ``multiplier`` = 4
 #: is intraday buying power only, so positions that may be held overnight are
 #: capped at 2x equity. No platform order is marked intraday-only.
@@ -260,10 +264,10 @@ def _round_bracket_levels_in_place(
         )
     buy = signal.action == "buy"
     for canonical_key, keys in (
-        ("stop_loss", _SL_METADATA_KEYS),
-        ("take_profit", _TP_METADATA_KEYS),
+        ("stop_loss", SL_METADATA_KEYS),
+        ("take_profit", TP_METADATA_KEYS),
     ):
-        level = _resolve_optional_float(metadata, keys)
+        level = resolve_signal_level(metadata, keys, parsing=LevelParsing.ANY_FLOAT).price
         if level is None or not math.isfinite(level) or level <= 0:
             # Missing/invalid levels are refused by _resolve_broker_sl_tp.
             continue
@@ -940,14 +944,6 @@ def _alpaca_market_data_start(
     )
 
 
-def _parse_bool_env(name: str, value: str | None, *, default: bool = True) -> bool:
-    """Strict boolean parsing shared with live_runner.credential_env.
-
-    A typo'd value raises instead of silently selecting live/paper mode.
-    """
-    return parse_bool_env(name, value, default=default)
-
-
 def _display_float(value: Any) -> float:
     """Best-effort float for display-only payload fields.
 
@@ -1055,9 +1051,10 @@ def _resolve_fill_price(
 def _known_commission(order: Any) -> float | None:
     """``0.0`` for an equity order (commission-free on Alpaca), ``None`` (unknown) otherwise.
 
-    Alpaca reports no commission on the order or the trade update. Crypto fees are posted end of day
-    as ``CFEE`` activities and priced later by `AlpacaLiveAdapter.backfill_commissions`; options and
-    an unreadable asset class are unknown too. Maintainer decision on #124: ``0.0`` only for a known
+    Alpaca reports no commission on the order or the trade update. Crypto fees appear only as
+    ``CFEE`` account activities, posted in batches well after the fill (a ~51 h posting delay was
+    observed), and are priced later by `AlpacaLiveAdapter.backfill_commissions`; options and an
+    unreadable asset class are unknown too. Maintainer decision on #124: ``0.0`` only for a known
     zero, NULL for everything else.
     """
     raw = _order_attr(order, "asset_class", None)
@@ -1171,21 +1168,6 @@ def _is_flat(qty: float) -> bool:
     return math.isclose(qty, 0.0, rel_tol=0.0, abs_tol=1e-12)
 
 
-def _resolve_optional_float(metadata: Mapping[str, Any], keys: tuple[str, ...]) -> float | None:
-    for key in keys:
-        if key not in metadata:
-            continue
-        value = metadata.get(key)
-        if value is None:
-            continue
-        try:
-            parsed = float(value)
-        except (TypeError, ValueError, OverflowError) as exc:
-            raise ValueError(f"Invalid {key}: {value!r}") from exc
-        return parsed
-    return None
-
-
 _DATE_TIME_PREFIX = re.compile(r"^\d{4}-\d{2}-\d{2}[Tt ]\d{2}:\d{2}")
 
 
@@ -1242,12 +1224,12 @@ def _alpaca_fill_dedupe_key(
     return f"alpaca:order:{broker_order_id}:{event}:{stamp}:{filled_qty}"
 
 
-def _default_alpaca_credentials(values: Mapping[str, str]) -> tuple[str, str, bool] | None:
+def default_alpaca_credentials(values: Mapping[str, str]) -> tuple[str, str, bool] | None:
     api_key = str(values.get("ALPACA_API_KEY", "")).strip()
     secret_key = str(values.get("ALPACA_SECRET_KEY", "")).strip()
     if api_key and secret_key:
         raw_paper = values.get("ALPACA_PAPER")
-        paper = _parse_bool_env(
+        paper = parse_bool_env(
             "ALPACA_PAPER",
             str(raw_paper).strip() if raw_paper is not None else None,
             default=True,
@@ -1256,7 +1238,7 @@ def _default_alpaca_credentials(values: Mapping[str, str]) -> tuple[str, str, bo
     return None
 
 
-def _alpaca_acc_indexes(values: Mapping[str, str]) -> list[int]:
+def alpaca_acc_indexes(values: Mapping[str, str]) -> list[int]:
     return sorted(
         {
             int(match.group("index"))
@@ -1266,7 +1248,7 @@ def _alpaca_acc_indexes(values: Mapping[str, str]) -> list[int]:
     )
 
 
-def _alpaca_credential_block(
+def alpaca_credential_block(
     values: Mapping[str, str],
     idx: int,
 ) -> dict[str, str | bool] | None:
@@ -1285,7 +1267,7 @@ def _alpaca_credential_block(
         paper = "paper" in endpoint
     else:
         raw_paper = values.get(f"ALPACA_PAPER_ACC{idx}")
-        paper = _parse_bool_env(
+        paper = parse_bool_env(
             f"ALPACA_PAPER_ACC{idx}",
             str(raw_paper).strip() if raw_paper is not None else None,
             default=True,
@@ -1303,13 +1285,13 @@ def _alpaca_credential_block(
     }
 
 
-def _alpaca_credential_blocks(
+def alpaca_credential_blocks(
     values: Mapping[str, str],
     indexes: list[int],
 ) -> list[dict[str, str | bool]]:
     blocks: list[dict[str, str | bool]] = []
     for idx in indexes:
-        block = _alpaca_credential_block(values, idx)
+        block = alpaca_credential_block(values, idx)
         if block is not None:
             blocks.append(block)
     return blocks
@@ -1354,10 +1336,10 @@ def resolve_alpaca_credentials(
     """Resolve Alpaca credentials from env (default or ACC{N} blocks)."""
     values = dict(env) if env is not None else dict(os.environ)
 
-    indexes = _alpaca_acc_indexes(values)
+    indexes = alpaca_acc_indexes(values)
     blocks: list[dict[str, str | bool]] = []
     if indexes:
-        blocks = _alpaca_credential_blocks(values, indexes)
+        blocks = alpaca_credential_blocks(values, indexes)
 
     normalized_account_id = str(account_id or "").strip().lower()
     normalized_login = str(broker_login or "").strip().lower()
@@ -1398,7 +1380,7 @@ def resolve_alpaca_credentials(
         )
         return None
 
-    default_credentials = _default_alpaca_credentials(values)
+    default_credentials = default_alpaca_credentials(values)
     if default_credentials is not None:
         return default_credentials
 
@@ -1465,7 +1447,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 extra={"data": {"account_id": account_id}},
             )
         self.paper = (
-            _parse_bool_env(
+            parse_bool_env(
                 "ALPACA_PAPER",
                 resolve_env_value(env_values, "ALPACA_PAPER") or None,
                 default=True,
@@ -2746,8 +2728,15 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         opening orders only.
         """
         metadata = signal.metadata or {}
-        stop_loss = _resolve_optional_float(metadata, _SL_METADATA_KEYS)
-        take_profit = _resolve_optional_float(metadata, _TP_METADATA_KEYS)
+        # One allowlist and one resolver for both levels (G19). ANY_FLOAT keeps
+        # this adapter's own leniency: it refuses non-finite and non-positive
+        # levels itself, below, after the missing-level guard.
+        stop_loss = resolve_signal_level(
+            metadata, SL_METADATA_KEYS, parsing=LevelParsing.ANY_FLOAT
+        ).price
+        take_profit = resolve_signal_level(
+            metadata, TP_METADATA_KEYS, parsing=LevelParsing.ANY_FLOAT
+        ).price
         exit_only = (
             str(metadata.get("risk_sizing_mode") or "") == EXIT_ONLY_RISK_SIZING_MODE
         )
@@ -7158,8 +7147,9 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
 
             event_filled_qty = parse_optional(filled_qty_value)
             filled_qty = 0.0 if event_filled_qty is None else event_filled_qty
-            # alpaca-py has no commission field on TradeUpdate or Order; a crypto fee is posted end
-            # of day and backfilled, so here it is unknown unless it is a known zero (#124).
+            # alpaca-py has no commission field on TradeUpdate or Order; a crypto fee is only
+            # known once its ``CFEE`` activity posts (in delayed batches) and is backfilled,
+            # so here it is unknown unless it is a known zero (#124).
             commission = _known_commission(order)
             raw_fill_ts = getattr(data, "timestamp", None)
             fill_ts = _broker_fill_timestamp(

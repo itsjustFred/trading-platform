@@ -50,7 +50,7 @@ def test_take_profit_alias_resolves_the_canonical_spelling_first() -> None:
 
 
 def test_stop_loss_alias_resolves_the_canonical_spelling_first() -> None:
-    """The stop pair uses the same precedence as ``risk.live._LIVE_SL_KEYS``."""
+    """The stop pair uses the same precedence as ``risk.signal_levels.SL_METADATA_KEYS``."""
     canonical = _series([90.0, None, None])
     alias = _series([95.0, None, None])
     signals = pd.DataFrame({"entries": [True, False, False], "exits": [False, False, True]})

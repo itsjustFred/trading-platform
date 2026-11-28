@@ -42,7 +42,7 @@ from fastapi import (
     WebSocketDisconnect,
 )
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, ValidationError
 from pydantic import Field as PydanticField
 from sentry_sdk.integrations.fastapi import FastApiIntegration
@@ -188,6 +188,7 @@ from shared.models import (
 from shared.models import (
     PortfolioComponent as PortfolioComponentModel,
 )
+from shared.paths import PathContainmentError, safe_join
 from shared.sentry import initialize_sentry
 from signal_bots.registry import get_signal_processor, list_signal_processor_options
 
@@ -243,6 +244,7 @@ MATRIX_GRID_OVERVIEW_FILE = "matrix-grid-overview.json"
 MATRIX_GRID_OVERVIEW_PATH = PROJECT_ROOT / "frontend" / "public" / MATRIX_GRID_OVERVIEW_FILE
 LIVE_DEPLOYMENTS_PATH = "/api/live/deployments"
 TASK_NOT_FOUND_DETAIL = "Task not found"
+INVALID_TASK_LOG_PATH_DETAIL = "Invalid task log path"
 PARQUET_SUFFIX = ".parquet"
 NOT_FOUND_DETAIL = "Not found"
 SAVED_TO_PREFIX = "saved to:"
@@ -251,7 +253,7 @@ SERVICE_NOT_FOUND_DETAIL = "Service not found"
 PORTFOLIOS_DIR = DATA_DIR / "portfolios"
 STRATEGIES_DIR = DEFAULT_STRATEGIES_DIR
 REACT_DIST = PROJECT_ROOT / "frontend" / "dist"
-STATIC_DIR = REACT_DIST if REACT_DIST.exists() else Path(__file__).resolve().parent / "static"
+STATIC_DIR = REACT_DIST
 _STATIC_ASSET_SUFFIXES = {
     ".js",
     ".mjs",
@@ -1691,17 +1693,25 @@ def _contained_client_data_file(
     parquet under ``DATA_DIR / "ohlcv"``) and must carry the expected suffix,
     so requests can neither read arbitrary files nor point a subprocess at
     code outside the data directory. ``base_dir`` narrows the tree for
-    callers that manage a single subtree.
+    callers that manage a single subtree. Containment is
+    :func:`shared.paths.safe_join`'s decision; absolute paths are accepted
+    here because the client sends one, and are still checked against ``base``.
     """
     normalized = str(raw_path or "").strip()
     if not normalized:
         return None
-    base = (base_dir or DATA_DIR).resolve()
+    base = base_dir or DATA_DIR
     try:
-        candidate = Path(normalized).expanduser().resolve()
-    except (OSError, ValueError):
+        # Resolved first so the value keeps its old meaning: a relative path is
+        # relative to the viewer's cwd (never inside DATA_DIR), and an absolute
+        # one with a ``..`` that lands inside the tree is accepted. Containment
+        # is safe_join's decision.
+        resolved = Path(normalized).expanduser().resolve()
+    except (OSError, RuntimeError, ValueError):
         return None
-    if not candidate.is_relative_to(base):
+    try:
+        candidate = safe_join(base, resolved, allow_absolute=True)
+    except PathContainmentError:
         return None
     if candidate.suffix.lower() != allowed_suffix.lower():
         return None
@@ -1800,6 +1810,19 @@ def _is_static_asset_request(path: str) -> bool:
     return Path(path).suffix.lower() in _STATIC_ASSET_SUFFIXES
 
 
+def _static_asset_path(rel_path: str) -> Path | None:
+    """The static file ``rel_path`` names, or None when it is missing or escapes.
+
+    Containment is :func:`shared.paths.safe_join`'s decision; ``None`` keeps the
+    middleware's two answers (serve the file, or fall through) in one branch.
+    """
+    try:
+        candidate = safe_join(STATIC_DIR, rel_path)
+    except PathContainmentError:
+        return None
+    return candidate if candidate.is_file() else None
+
+
 @app.middleware("http")
 async def static_spa_middleware(request: Request, call_next):
     path = request.url.path
@@ -1812,8 +1835,8 @@ async def static_spa_middleware(request: Request, call_next):
     ):
         rel_path = path.strip("/")
         if rel_path:
-            candidate = (STATIC_DIR / rel_path).resolve()
-            if candidate.is_file() and candidate.is_relative_to(STATIC_DIR.resolve()):
+            candidate = _static_asset_path(rel_path)
+            if candidate is not None:
                 return FileResponse(candidate)
             if _is_static_asset_request(rel_path):
                 # Missing static asset must not fall back to index.html,
@@ -1822,6 +1845,14 @@ async def static_spa_middleware(request: Request, call_next):
         index_file = STATIC_DIR / "index.html"
         if index_file.exists():
             return FileResponse(index_file)
+        return HTMLResponse(
+            "<!doctype html><title>Trading Platform</title>"
+            "<h1>Frontend not built</h1>"
+            "<p>The React frontend has not been built. Run "
+            "<code>npm run build</code> in <code>frontend/</code>, or use the "
+            "Vite dev server for development.</p>",
+            status_code=503,
+        )
     return await call_next(request)
 
 
@@ -1942,16 +1973,12 @@ def _validated_task_id(task_id: str) -> str:
 
 def _validated_task_log_path(task_id: str) -> Path:
     normalized = _validated_task_id(task_id)
-    if TASK_LOGS_DIR.is_symlink():
-        raise HTTPException(status_code=400, detail="Invalid task log path")
-    root = TASK_LOGS_DIR.resolve()
-    raw_candidate = root / f"task_{normalized}.log"
-    if raw_candidate.is_symlink():
-        raise HTTPException(status_code=400, detail="Invalid task log path")
-    candidate = raw_candidate.resolve()
-    if candidate.parent != root or candidate.is_symlink():
-        raise HTTPException(status_code=400, detail="Invalid task log path")
-    return candidate
+    try:
+        # Symlinks are refused outright: this path is read and appended to, and
+        # a swap between check and use must not redirect either.
+        return safe_join(TASK_LOGS_DIR, f"task_{normalized}.log", refuse_symlinks=True)
+    except PathContainmentError:
+        raise HTTPException(status_code=400, detail=INVALID_TASK_LOG_PATH_DETAIL) from None
 
 
 def _task_for_log_access(task_id: str) -> tuple[str, dict[str, Any], Path]:
@@ -1969,13 +1996,13 @@ def _task_for_log_access(task_id: str) -> tuple[str, dict[str, Any], Path]:
             configured_raw = Path(str(configured_log))
             configured_path = configured_raw.resolve()
         except (OSError, ValueError) as exc:
-            raise HTTPException(status_code=400, detail="Invalid task log path") from exc
+            raise HTTPException(status_code=400, detail=INVALID_TASK_LOG_PATH_DETAIL) from exc
         if (
             configured_raw.is_symlink()
             or configured_path != log_file
             or configured_path.is_symlink()
         ):
-            raise HTTPException(status_code=400, detail="Invalid task log path")
+            raise HTTPException(status_code=400, detail=INVALID_TASK_LOG_PATH_DETAIL)
     return normalized, task, log_file
 
 
@@ -5060,7 +5087,11 @@ def install_legacy_task_hooks() -> None:
 
     Explicit injection (called from lifespan startup) instead of import-time
     attribute reassignment: behavior no longer depends on which module was
-    imported first and the wrapper chain is visible to static analysis.
+    imported first and the wrapper chain is visible to static analysis. It must
+    run before any helper that creates or updates task records — writes made
+    before installation land on the in-memory originals and never persist.
+    ``_resume_interrupted_tasks`` enforces this with a RuntimeError; the other
+    helpers rely on the lifespan calling this first.
     """
     global _LEGACY_HOOKS_INSTALLED
     if _LEGACY_HOOKS_INSTALLED:
@@ -9105,14 +9136,10 @@ async def list_signal_processors() -> list[dict[str, str]]:
 def _codegen_gate_strategy_path(relative_file: str) -> Path:
     """Resolve a strategy relative file inside the strategies dir (traversal-safe)."""
     normalized = str(relative_file or "").strip()
-    if not normalized or ".." in normalized or normalized.startswith("/"):
-        raise _invalid_strategy_file_path_error()
-    candidate = (STRATEGIES_DIR / normalized).resolve()
     try:
-        candidate.relative_to(STRATEGIES_DIR.resolve())
-    except ValueError:
+        return safe_join(STRATEGIES_DIR, normalized)
+    except PathContainmentError:
         raise _invalid_strategy_file_path_error() from None
-    return candidate
 
 
 def _invalid_strategy_file_path_error() -> HTTPException:
@@ -9224,30 +9251,28 @@ def _contained_in_results_dir(path: Path) -> bool:
     The directory itself is refused: it is contained, and handing it out would
     send a caller (or a response) at a directory instead of a file.
     """
-    base = MATRIX_RESULTS_DIR.resolve()
-    return path != base and path.is_relative_to(base)
+    try:
+        safe_join(MATRIX_RESULTS_DIR, path, allow_absolute=True)
+    except PathContainmentError:
+        return False
+    return True
 
 
 def _matrix_result_path(filename: str) -> Path:
     """Return the resolved path of a matrix result file inside MATRIX_RESULTS_DIR.
 
     Separator and drive forms are refused up front so the same input is rejected
-    on Linux, Windows and macOS alike. The candidate is then resolved (following
-    symlinks) and must stay inside the resolved results directory (#155).
+    on Linux, Windows and macOS alike; containment itself is
+    :func:`shared.paths.safe_join`'s decision, which resolves symlinks and keeps
+    the candidate inside the resolved results directory (#155).
     """
     normalized = str(filename or "").strip()
-    if (
-        not normalized
-        or ".." in normalized
-        or normalized.startswith("/")
-        or "\\" in normalized
-        or ":" in normalized
-    ):
+    if not normalized or "\\" in normalized or ":" in normalized:
         raise HTTPException(status_code=400, detail="Invalid matrix filename")
-    resolved = (MATRIX_RESULTS_DIR / normalized).resolve()
-    if not _contained_in_results_dir(resolved):
-        raise HTTPException(status_code=400, detail="Invalid matrix filename")
-    return resolved
+    try:
+        return safe_join(MATRIX_RESULTS_DIR, normalized)
+    except PathContainmentError:
+        raise HTTPException(status_code=400, detail="Invalid matrix filename") from None
 
 
 class _CheckedMatrixResult(NamedTuple):
@@ -16436,12 +16461,17 @@ async def get_log(
     if log_name == ALL_LOGS_NAME:
         paths = legacy_viewer._available_log_files()
     else:
+        # A NUL byte is an unparseable name rather than an escape: keep the
+        # 400 this endpoint has always answered for it, and the 403 for a
+        # name that resolves outside the log directory. safe_join refuses both
+        # with PathContainmentError, which the branch below maps to 403, so
+        # this guard is what preserves the historical 400 for the NUL case.
+        if "\x00" in log_name:
+            raise HTTPException(status_code=400, detail="Invalid log path")
         try:
-            path = (LOG_DIR / log_name).resolve()
-            if not path.is_relative_to(LOG_DIR.resolve()):
-                raise HTTPException(status_code=403, detail="Access denied")
-        except (OSError, ValueError) as exc:
-            raise HTTPException(status_code=400, detail="Invalid log path") from exc
+            path = safe_join(LOG_DIR, log_name)
+        except PathContainmentError:
+            raise HTTPException(status_code=403, detail="Access denied") from None
         paths = [path] if path.exists() else []
 
     if log_name != ALL_LOGS_NAME and not paths:

@@ -32,9 +32,10 @@ from pydantic import (
 )
 
 from shared.atomic_io import write_text_atomically
+from shared.paths import PathContainmentError, safe_join
 from shared.trailing import (
-    supertrend_flip_opted_in,
     validate_live_deployment_trailing_override,
+    validate_no_removed_flip_opt_in,
 )
 
 #: Validation-context flag set when a deployment is rehydrated from the DB.
@@ -261,7 +262,7 @@ class LiveDeploymentConfig(BaseModel):
     def _validate_trailing_mode_override(self, info: ValidationInfo) -> "LiveDeploymentConfig":
         # Issue #150 fail closed, first stage: only the account id is known
         # here, not its broker, so this rejects a trailing mode that NO live
-        # broker executes (unknown modes, supertrend_flip). Live support is
+        # broker executes (unknown or removed modes). Live support is
         # per broker (#167): the broker-aware stage runs where the account is
         # resolved (`create_live_deployment`, `update_live_deployment_account`,
         # `parse_live_deployments_config`) and again at signal time against
@@ -275,10 +276,13 @@ class LiveDeploymentConfig(BaseModel):
         # logs the row at load.
         if isinstance(info.context, dict) and info.context.get(STORED_ROW_CONTEXT):
             return self
+        validate_no_removed_flip_opt_in(
+            self.settings,
+            context=f"live deployment '{self.strategy_name}'",
+        )
         validate_live_deployment_trailing_override(
             self.signal_config,
             context=f"live deployment '{self.strategy_name}'",
-            flip_opted_in=supertrend_flip_opted_in(self.settings),
         )
         return self
 
@@ -451,8 +455,9 @@ class LiveExecution(BaseModel):
     # The fill's fee in account currency (USD), or ``None`` when it is not known (#124).
     #
     # ``0.0`` is a *known* zero (Alpaca equities are commission-free) and ``None`` is "the broker
-    # has not told us yet": Alpaca posts crypto fees end of day as ``CFEE`` account activities, so
-    # at fill time the fee is unknown and a later backfill fills it in. The field is required on
+    # has not told us yet": Alpaca reports crypto fees only as ``CFEE`` account activities
+    # posted in batches after the fill, so at fill time the fee is unknown and a later
+    # backfill fills it in. The field is required on
     # purpose - an adapter must decide which of the two it has, rather than inherit a default
     # zero that silently overstates net PnL. Readers treat ``None`` as "net PnL incomplete".
     #
@@ -1253,11 +1258,15 @@ class BacktestResult:
             # S8707: the unconfined branch is intentional — CLI callers pass
             # operator-chosen paths, and only viewer id-derived paths pass
             # root= to confine the read to their data directory (#230).
+            # Resolved first so a relative path keeps its old meaning (cwd-
+            # relative), then checked with the shared containment helper. The
+            # root itself is allowed here because the is_file() check below
+            # answers a directory with FileNotFoundError, as before.
             resolved = p.resolve()
-            if not resolved.is_relative_to(Path(root).resolve()):
-                raise ValueError(f"Backtest result path escapes root {root}: {path}")
-            # Read the canonical path the check just approved.
-            p = resolved
+            try:
+                p = safe_join(root, resolved, allow_absolute=True, allow_base=True)
+            except PathContainmentError as exc:
+                raise ValueError(f"Backtest result path escapes root {root}: {path}") from exc
         if not p.is_file():
             raise FileNotFoundError(f"Backtest result file not found: {path}")
         return cls.from_json(p.read_text(encoding="utf-8"))

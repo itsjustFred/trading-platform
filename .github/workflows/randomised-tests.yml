@@ -19,8 +19,8 @@ name: randomised-tests
 # input to replay a seed without touching the checkout; the seed fixes both the
 # collection order and every per-test random seed, so the replay is exact.
 #
-# Scope: ubuntu only. The matrix in `ci` already covers windows-latest for the
-# deterministic run; order dependence is a property of the suite, not the OS.
+# Scope: ubuntu only, matching `ci` - production and CI are Linux-only, so
+# order dependence is a property of the suite, not the OS.
 #
 # A red run notifies the last committer of this file (GitHub's scheduled-
 # workflow behaviour). Triage it like a `ci` failure: reproduce with the

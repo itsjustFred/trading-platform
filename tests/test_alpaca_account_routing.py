@@ -252,11 +252,11 @@ def test_resolve_alpaca_credentials_ambiguous_hints_refuse_even_with_default_pai
     assert credentials is None
 
 
-def test_alpaca_credential_blocks_strict_parse_preserves_sibling_blocks() -> None:
+def testalpaca_credential_blocks_strict_parse_preserves_sibling_blocks() -> None:
     """The strict block parser must still reject a typo'd ALPACA_PAPER_ACC{N}
     (fail-closed, shared with discovery), but only that block: incomplete
     key/secret pairs are skipped, complete ones are kept."""
-    from live_runner.alpaca_adapter import _alpaca_acc_indexes, _alpaca_credential_blocks
+    from live_runner.alpaca_adapter import alpaca_acc_indexes, alpaca_credential_blocks
 
     env = {
         "ALPACA_API_KEY_ACC1": "k1",
@@ -269,10 +269,10 @@ def test_alpaca_credential_blocks_strict_parse_preserves_sibling_blocks() -> Non
         "ALPACA_PAPER_ACC4": "tru",
     }
 
-    indexes = _alpaca_acc_indexes(env)
+    indexes = alpaca_acc_indexes(env)
     # ACC4 appears in the index via its paper key but has no key/secret pair:
     # the strict parse must not even be reached for it (skipped earlier).
-    assert _alpaca_credential_blocks(env, indexes) == [
+    assert alpaca_credential_blocks(env, indexes) == [
         {
             "source_index": "ACC1",
             "api_key": "k1",
@@ -292,6 +292,6 @@ def test_alpaca_credential_blocks_strict_parse_preserves_sibling_blocks() -> Non
     ]
 
     complete_env = dict(env, ALPACA_API_KEY_ACC4="k4", ALPACA_SECRET_KEY_ACC4="s4")
-    acc_indexes = _alpaca_acc_indexes(complete_env)
+    acc_indexes = alpaca_acc_indexes(complete_env)
     with pytest.raises(ValueError, match="ALPACA_PAPER_ACC4"):
-        _alpaca_credential_blocks(complete_env, acc_indexes)
+        alpaca_credential_blocks(complete_env, acc_indexes)

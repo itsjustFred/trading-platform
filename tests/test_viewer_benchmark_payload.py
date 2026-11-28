@@ -7,16 +7,10 @@ These tests pin the extracted pieces so the refactor stays behavior-preserving.
 
 from __future__ import annotations
 
-import sys
-from pathlib import Path
 from unittest.mock import patch
 
 import pandas as pd
 import pytest
-
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
-from fastapi import HTTPException  # noqa: E402
 
 from viewer.main import (  # noqa: E402
     _benchmark_equity_points,

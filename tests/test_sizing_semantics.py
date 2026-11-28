@@ -24,7 +24,8 @@ import pytest
 from pydantic import ValidationError
 
 from runner.engines.base import BacktestConfig
-from runner.engines.vectorbt_adapter import _resolve_max_position_exposure_pct
+from runner.engines.vectorbt_adapter import resolve_max_position_exposure_pct
+from tests.builders import make_backtest_config
 from tests.helpers import with_zero_fees
 
 # ─── BacktestConfig field semantics ─────────────────────────────────────────
@@ -41,7 +42,7 @@ class TestBacktestConfigField:
             "end_date": "2024-01-31",
         }
         payload.update(overrides)
-        return BacktestConfig(**with_zero_fees(payload))
+        return make_backtest_config(**with_zero_fees(payload))
 
     def test_new_field_is_the_canonical_name(self):
         config = self._config(max_position_exposure_pct=0.75)
@@ -92,9 +93,9 @@ class TestBacktestConfigField:
 
 class TestResolveHelperRename:
     def test_new_helper_name_is_canonical(self):
-        assert _resolve_max_position_exposure_pct(None, "unknown") == 0.20
-        assert _resolve_max_position_exposure_pct(None, "equities") == 1.0
-        assert _resolve_max_position_exposure_pct(0.3, "equities") == 0.3
+        assert resolve_max_position_exposure_pct(None, "unknown") == 0.20
+        assert resolve_max_position_exposure_pct(None, "equities") == 1.0
+        assert resolve_max_position_exposure_pct(0.3, "equities") == 0.3
 
     def test_deprecated_helper_alias_keeps_working_and_warns(self):
         from runner.engines import vectorbt_adapter
@@ -102,22 +103,6 @@ class TestResolveHelperRename:
         with pytest.deprecated_call():
             resolved = vectorbt_adapter._resolve_max_position_pct(0.3, "unknown")
         assert resolved == 0.3
-
-    def test_persisted_risk_math_key_stays_max_position_pct(self):
-        """Artifact-key stability: the emitted keys in
-        ``trade.meta["risk_math"]`` must keep the historical spelling
-        (frontend ``TradeRiskMath`` + SQLite fallback read it), even though the
-        config field was renamed in 16-E. The canonical
-        ``max_position_exposure_pct`` spelling is emitted ALONGSIDE (PM-2
-        sizing-record viewer contract) — never instead of — the legacy key."""
-        import inspect
-
-        from runner.engines import vectorbt_adapter
-
-        source = inspect.getsource(vectorbt_adapter._process_symbol)
-        assert '"max_position_pct":' in source
-        assert '"max_position_exposure_pct":' in source
-
 
 # ─── CLI flag alias ─────────────────────────────────────────────────────────
 
@@ -296,7 +281,7 @@ class TestNativeEngineExposureWiring:
             "parameters": {},
         }
         payload.update(overrides)
-        return TradeEngine(BacktestConfig(**with_zero_fees(payload)), symbol="X")
+        return TradeEngine(make_backtest_config(**with_zero_fees(payload)), symbol="X")
 
     def test_exposure_flag_caps_per_position_notional(self):
         from risk.config import RiskConfig

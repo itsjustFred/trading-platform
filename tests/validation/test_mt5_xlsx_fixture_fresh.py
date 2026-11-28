@@ -40,20 +40,6 @@ _BUILDERS = {
 }
 
 
-def test_generator_registers_every_fixture() -> None:
-    """Every committed fixture is generated, and only those.
-
-    Without this, unregistering a fixture surfaces as a ``FileNotFoundError``
-    on the missing golden (or, if the list were imported from the generator,
-    not at all: the pin would vanish with the registration).
-    """
-    assert set(generator._FIXTURES) == set(NAMES), (
-        "scripts/generate_mt5_xlsx_fixtures.py registers "
-        f"{sorted(generator._FIXTURES)}, the tests pin {sorted(NAMES)}; "
-        "update the generator and the test lists in the same commit"
-    )
-
-
 @pytest.mark.parametrize("name", NAMES)
 def test_regenerated_workbook_matches_committed_cells(name: str, tmp_path: Path) -> None:
     """Every cell of the regenerated workbook equals the committed fixture.

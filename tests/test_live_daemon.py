@@ -320,6 +320,43 @@ def test_allow_short_recognized_tokens() -> None:
     )
     assert daemon._deployment_allows_short(disabled) is False
 
+@pytest.mark.parametrize(
+    "configured,settings",
+    [
+        ({"allow_short": None}, {}),
+        ({}, {"allow_short": None}),
+    ],
+    ids=["signal_config-null", "settings-null"],
+)
+def test_allow_short_explicit_null_defaults_to_false(configured, settings) -> None:
+    """An explicit null is "not configured" and must mean "no shorts".
+
+    ``default=False`` is load-bearing: it is the value a null, a missing key
+    and every unconfigured deployment land on, so flipping it to True would
+    let a deployment short without ever asking for it.
+    """
+    deployment = _deployment_with_signal_config(configured, settings=settings)
+
+    assert daemon._deployment_allows_short(deployment) is False
+
+
+def test_wait_for_candle_close_blank_value_raises_instead_of_defaulting() -> None:
+    """A blank ``wait_candle_close`` is a configured value, not a missing one.
+
+    ``_raw_bool_text`` keeps "" as "" on purpose, so the strict parser refuses
+    it instead of applying the default - which would force immediate market
+    orders on a deployment that asked to wait for the candle close.
+    """
+    deployment = _deployment_with_signal_config({"wait_candle_close": ""})
+
+    with pytest.raises(ValueError, match="wait_candle_close"):
+        daemon._deployment_wait_for_candle_close(deployment, {})
+
+    with pytest.raises(ValueError, match="DISCORD_WAIT_FOR_CANDLE_CLOSE"):
+        daemon._deployment_wait_for_candle_close(
+            _deployment_with_signal_config({}), {"DISCORD_WAIT_FOR_CANDLE_CLOSE": ""}
+        )
+
 
 def test_ensure_adapter_skips_account_with_invalid_bool_config(monkeypatch) -> None:
     """A typo'd ALPACA_PAPER_ACC{N} raises ValueError inside adapter creation.
@@ -1312,7 +1349,7 @@ def test_a_paused_deployment_closes_a_plain_sell_that_cannot_be_a_short(
     """#126 review: the exit classification is per deployment, not per message.
 
     A plain SELL is a full exit on a deployment that cannot short and a short entry on
-    one that can, and which of the two is decided by `_trade_signal_to_live_signal` -
+    one that can, and which of the two is decided by `trade_signal_to_live_signal` -
     after the dispatch gates. Gate it from the raw message instead and the close on the
     can't-short deployment is dropped as an entry, leaving the position open.
     """

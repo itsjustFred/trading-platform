@@ -7,8 +7,9 @@ from types import SimpleNamespace
 import pytest
 
 import live_runner.account_discovery as account_discovery
-from live_runner.alpaca_adapter import _alpaca_acc_indexes, _alpaca_credential_blocks
+from live_runner.alpaca_adapter import alpaca_acc_indexes, alpaca_credential_blocks
 from shared.models import LiveAccount
+from tests.conftest import sandboxed_env
 
 
 def test_ctrader_account_name_prefers_resolved_account_label():
@@ -164,8 +165,8 @@ def test_iter_alpaca_credentials_share_adapter_block_semantics():
     }
 
     discovered = account_discovery._iter_alpaca_credentials(env)
-    indexes = _alpaca_acc_indexes(env)
-    blocks = _alpaca_credential_blocks(env, indexes)
+    indexes = alpaca_acc_indexes(env)
+    blocks = alpaca_credential_blocks(env, indexes)
 
     by_key = {block["key"]: block for block in discovered}
     # `strict=True` is the point of this test: the two lists must stay
@@ -194,9 +195,9 @@ def test_iter_alpaca_credentials_share_adapter_block_semantics():
         "ALPACA_SECRET_KEY_ACC4": "s4",
         "ALPACA_PAPER_ACC4": "tru",
     }
-    acc_indexes = _alpaca_acc_indexes(typo_env)
+    acc_indexes = alpaca_acc_indexes(typo_env)
     with pytest.raises(ValueError, match="ALPACA_PAPER_ACC4"):
-        _alpaca_credential_blocks(typo_env, acc_indexes)
+        alpaca_credential_blocks(typo_env, acc_indexes)
     # Discovery delegates to the adapter parser (asserted above on the valid
     # blocks), so refusing here follows from the same strict parse.
 
@@ -517,6 +518,7 @@ def _run_discovery_subprocess(body: str):
         text=True,
         timeout=60,
         cwd=str(Path(__file__).resolve().parents[1]),
+        env=sandboxed_env(),
     )
 
 
@@ -594,10 +596,9 @@ def test_without_installed_reactor_clears_every_platform_reactor_module():
 
     Twisted installs `epollreactor` on Linux, `pollreactor` on other POSIX and
     `selectreactor` on Windows and macOS, so hard-coding one name leaves the
-    platform reactor module behind on every other OS (AGENTS.md: portable across
-    Linux, Windows and macOS). Module entries that were already there before the
-    import, and `asyncioreactor` (whose import installs nothing and which the
-    adapter installs itself), must survive.
+    platform reactor module behind on every other OS. Module entries that were
+    already there before the import, and `asyncioreactor` (whose import installs
+    nothing and which the adapter installs itself), must survive.
     """
     result = _run_discovery_subprocess(
         """

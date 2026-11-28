@@ -7,12 +7,13 @@ from live_runner.daemon import size_live_signal_for_submission
 from risk.config import RiskConfig
 from risk.engine import RiskEngine
 from risk.models import TradeSignal
-from shared.models import LiveDeploymentConfig, LiveSignal
+from shared.models import LiveDeploymentConfig
+from tests.builders import make_live_deployment, make_live_signal
 
 
 def _live_deployment(**settings: object) -> LiveDeploymentConfig:
     """The deployment the daemon's live sizing reads its RiskConfig from."""
-    return LiveDeploymentConfig(
+    return make_live_deployment(
         strategy_name="parity",
         account_id="acc-1",
         symbols=["EURUSD"],
@@ -61,7 +62,7 @@ def test_risk_engine_and_live_size_match_for_valid_signals(
         symbol="EURUSD",
         timeframe="1h",
     )
-    live_signal = LiveSignal(
+    live_signal = make_live_signal(
         deployment_id="test-deployment",
         symbol="EURUSD",
         action=action,
@@ -97,7 +98,7 @@ def test_risk_engine_and_live_size_match_for_valid_signals(
 
 def test_live_size_rejects_wrong_stop_direction() -> None:
     """Test that live sizing rejects wrong stop direction."""
-    live_signal = LiveSignal(
+    live_signal = make_live_signal(
         deployment_id="test-deployment",
         symbol="EURUSD",
         action="buy",

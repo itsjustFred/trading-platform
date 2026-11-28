@@ -49,15 +49,15 @@ import pandas as pd
 
 from live_runner.base_adapter import BaseLiveAdapter, ProtectiveStop
 from live_runner.shutdown import BrokerMutationGate
-from live_runner.signal_sources.execution_timing import _timeframe_seconds
+from live_runner.signal_sources.execution_timing import timeframe_seconds
 from risk import RiskEngine, TradeSignal
 from shared.database import find_latest_filled_live_entry_signals
 from shared.logging import get_logger
 from shared.models import LiveDeploymentConfig
 from shared.sentry import capture_exception
 from shared.trailing import (
+    REMOVED_TRAILING_MODES,
     TRAILING_MODE_NONE,
-    TRAILING_MODE_SUPERTREND_FLIP,
     TRAILING_SL_CONFIG_METADATA_KEY,
     live_supported_trailing_modes,
     live_trailing_timeframes,
@@ -324,7 +324,7 @@ class LiveTrailingStopManager:
     ) -> bool:
         seconds = [
             value
-            for value in (_timeframe_seconds(_signal_timeframe(item)) for item in deployments)
+            for value in (timeframe_seconds(_signal_timeframe(item)) for item in deployments)
             if value
         ]
         # A deployment without a usable timeframe still has to be visited so
@@ -580,11 +580,15 @@ class LiveTrailingStopManager:
         if entry is None:
             return None
         trailing_cfg = (entry.get("metadata") or {}).get(TRAILING_SL_CONFIG_METADATA_KEY)
-        # ``supertrend_flip`` belongs to LiveSupertrendFlipManager (#168): the
-        # percent trail must never touch it, whatever the adapter supports.
+        # A persisted entry signal can still name a removed mode (e.g. a
+        # position opened before the workflow was deleted): the order is
+        # already at the broker, so there is nothing left to refuse — the
+        # position simply has no trailing, exactly as the removed
+        # ``supertrend_flip`` skip did on main. New signals naming a removed
+        # mode are still refused at submission and validation.
         if isinstance(trailing_cfg, Mapping) and normalize_trailing_mode(
             trailing_cfg.get("mode")
-        ) == TRAILING_MODE_SUPERTREND_FLIP:
+        ) in REMOVED_TRAILING_MODES:
             return None
         # A persisted signal whose mode this adapter cannot execute should
         # have been refused at submission; if one exists it is reported, never
@@ -636,7 +640,7 @@ class LiveTrailingStopManager:
             self._trails[key] = trail
 
         timeframe = _signal_timeframe(deployment)
-        bar_seconds = _timeframe_seconds(timeframe)
+        bar_seconds = timeframe_seconds(timeframe)
         if not bar_seconds:
             raise _TrailingFailure(
                 f"deployment timeframe {timeframe!r} has no bar length to trail on",

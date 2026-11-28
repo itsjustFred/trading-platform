@@ -6,7 +6,7 @@ drawdown of an open position was invisible (a 40 % crash inside one long hold
 reported ``max_drawdown_pct == 0``). Sizing is a separate concern and stays on
 realized cash (``tests/test_engine_behavior.py::TestSizingEquityExcludesUnrealizedPnl``).
 Only the native adapter is re-scoped: vectorbt, pynecore and the signal replay
-are frozen (ADR ``docs/adr/0001-native-single-strategy-engine.md``) and keep
+are frozen (ADR ``docs/adr/0002-native-single-strategy-engine.md``) and keep
 their existing realized-only curves until they are removed.
 
 Layout:
@@ -16,7 +16,7 @@ Layout:
 * ``TestStats*`` - ``compute_stats`` on the MTM curve vs the realized balance.
 * ``TestEnginePaths`` - the native adapter (single + multi symbol) on the same
   40 % mid-hold crash fixture. The frozen engines (vectorbt, pynecore, signal
-  replay) keep their realized-only curves per ADR 0001 and are not covered
+  replay) keep their realized-only curves per ADR 0002 and are not covered
   here.
 * ``TestPublishedDailySeries`` - ``stats.daily_returns`` / ``daily_equity_curve``
   describe the same equity path as the persisted curve.
@@ -44,6 +44,7 @@ from runner.engines.mtm_equity import (
 from runner.engines.native_adapter import NativeAdapter
 from runner.stats import compute_stats, compute_stats_for_result
 from shared.models import EquityPoint, Trade, TradeExit
+from tests.builders import make_backtest_config
 
 pytestmark = pytest.mark.filterwarnings("ignore::DeprecationWarning")
 
@@ -476,7 +477,7 @@ def _strategy(tmp_path: Path) -> Path:
 
 
 def _config(tmp_path: Path, symbols: list[str]) -> BacktestConfig:
-    return BacktestConfig(
+    return make_backtest_config(
         strategy_name="hold_through_crash",
         symbols=symbols,
         timeframe="1d",

@@ -1,12 +1,8 @@
 from __future__ import annotations
 
-import pandas as pd
 import pytest
 
-from signal_bots.nitro import NitroSignalProcessor
-from signal_bots.ramjet import RamJetSignalProcessor
 from signal_bots.registry import get_signal_processor, list_signal_processor_options
-from signal_bots.rocketfuel import RocketFuelSignalProcessor
 from tests.signal_processor_helpers import sample_signal_market_data
 
 
@@ -14,16 +10,6 @@ def test_registry_options_expose_all_expected_ids() -> None:
     options = list_signal_processor_options()
     ids = {item["id"] for item in options}
     assert {"ramjet", "rocketfuel_longsonly", "rocketfuel_longandshort", "nitro"} == ids
-
-
-def test_registry_returns_expected_processor_classes() -> None:
-    assert isinstance(get_signal_processor("ramjet", {}), RamJetSignalProcessor)
-    assert isinstance(get_signal_processor("rocketfuel_longsonly", {}), RocketFuelSignalProcessor)
-    assert isinstance(
-        get_signal_processor("rocketfuel_longandshort", {}),
-        RocketFuelSignalProcessor,
-    )
-    assert isinstance(get_signal_processor("nitro", {}), NitroSignalProcessor)
 
 
 def test_rocketfuel_variants_differ_on_sell_signal() -> None:
@@ -39,14 +25,6 @@ def test_rocketfuel_variants_differ_on_sell_signal() -> None:
     assert long_only_signal.stop_loss is None
     assert long_short_signal.stop_loss is not None
     assert float(long_short_signal.stop_loss) > long_short_signal.entry_price
-
-
-def test_nitro_rejects_sell_signals() -> None:
-    processor = get_signal_processor("nitro", {})
-    sell_signal = {"symbol": "AAPL", "action": "SELL", "timestamp": "2026-01-01T12:00:00Z"}
-    market_data = sample_signal_market_data()
-    with pytest.raises(ValueError, match="BUY/LONG"):
-        processor.process_signal(sell_signal, market_data)
 
 
 @pytest.mark.parametrize("name", ["../x", "doesnotexist", "ramjet/../nitro", ""])

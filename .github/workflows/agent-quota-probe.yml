@@ -1,0 +1,230 @@
+name: Agent Quota Probe
+
+# The one copy of the cheap quota probe the three agent workflows share. It
+# used to be a byte-identical `quota-probe` job in each of them; as a
+# reusable workflow the callers are three lines (`uses:` + `with:` +
+# `secrets:`) and the probe logic exists once.
+#
+# It still runs with no checkout and no token: the probe needs neither the
+# repository nor a credential - the free models take no key (the NVIDIA key
+# is the one exception, passed in as a secret and only read by the probe
+# step's env).
+
+on:
+  workflow_call:
+    inputs:
+      model:
+        description: "provider/model the probe pings (e.g. opencode/inkling-2-small-free)"
+        required: true
+        type: string
+      variant:
+        description: "model variant, appended as #variant when non-empty"
+        required: false
+        type: string
+        default: ""
+      opencode-version:
+        description: "pinned opencode release version"
+        required: true
+        type: string
+      opencode-sha256:
+        description: "sha256 of opencode-linux-x64.tar.gz for that release, pinned in the caller"
+        required: true
+        type: string
+    secrets:
+      ACTIONS_NVIDIA_API_KEY:
+        description: "NVIDIA API key, only read when model is nvidia/..."
+        required: false
+    # What the callers gate on: `needs.quota-probe.outputs.available`. Without
+    # this mapping the job output stays inside this workflow and every caller
+    # reads an empty string - which is not 'false', so the agent job would run
+    # even on a confirmed cap.
+    outputs:
+      available:
+        description: "'false' only on a positive quota signature; 'true' otherwise"
+        value: ${{ jobs.probe.outputs.available }}
+
+permissions: {}
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # No checkout and no token: the probe needs neither the repository nor a
+    # credential - the free models take no key.
+    permissions: {}
+    outputs:
+      available: ${{ steps.probe.outputs.available }}
+    env:
+      OPENCODE_VERSION: ${{ inputs.opencode-version }}
+      OPENCODE_SHA256: ${{ inputs.opencode-sha256 }}
+      MODEL: ${{ inputs.model }}
+      VARIANT: ${{ inputs.variant }}
+    steps:
+      # The GitHub release binary, verified against the sha256 the caller
+      # pins next to OPENCODE_VERSION - the same pinned-binary pattern as
+      # gitleaks and actionlint. npm's global install is not used: it resolves
+      # transitive dependencies with no lockfile. This is the inline copy of
+      # scripts/agents/install_opencode.sh - the probe runs without a
+      # checkout, so it cannot call it; the contract test asserts the two
+      # stay identical.
+      - name: Install opencode CLI
+        run: |
+          set -euo pipefail
+          : "${OPENCODE_VERSION:?OPENCODE_VERSION is required}"
+          : "${OPENCODE_SHA256:?OPENCODE_SHA256 is required}"
+          asset="opencode-linux-x64.tar.gz"
+          base="https://github.com/anomalyco/opencode/releases/download/v${OPENCODE_VERSION}"
+          dest="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/opencode"
+          mkdir -p "$dest"
+          curl -fsSL --proto '=https' --proto-redir '=https' -o "$dest/$asset" "$base/$asset"
+          echo "${OPENCODE_SHA256}  ${asset}" | (cd "$dest" && sha256sum -c -)
+          tar -xzf "$dest/$asset" -C "$dest" opencode
+          chmod +x "$dest/opencode"
+          if [[ -n "${GITHUB_PATH:-}" ]]; then
+            echo "$dest" >> "$GITHUB_PATH"
+          else
+            echo "::warning::GITHUB_PATH is unset; opencode is at $dest/opencode but not on PATH"
+          fi
+          "$dest/opencode" --version
+
+      # The probe agent lives in the global config, like the real one, so the
+      # ping exercises the same model resolution the agent run will.
+      # The agent is named `model-probe`, not `quota-probe`: opencode prints
+      # "> <agent> · <model>" on stderr, the probe greps stderr for `quota`, and
+      # with the old name every reply - "OK" included - read as a cap, so the
+      # agent job was skipped on every run the probe reached the model.
+      - name: Configure quota probe agent
+        run: |
+          conf="$HOME/.config/opencode"
+          mkdir -p "$conf/agents"
+          # A `kilo/...` model runs on Kilo's anonymous gateway (ai-gateway.kilo.ai, no key,
+          # like the Zen free models) and an `nvidia/...` model on NVIDIA's API (below);
+          # every other model gets the config it always had.
+          # The gateway URL and the model itself are declared, not left to opencode's
+          # catalog: with only `"kilo": {}` opencode 2.2.7 resolved the model in some fresh
+          # homes and in others silently ran its default model instead (run 45239957263
+          # pinged `nex-agi/nex-n2.6`, "You need to sign in"). Declared, 5 of 5 fresh homes
+          # reached the configured model.
+          # MODEL is provider/model; a bare or empty model id would only reach
+          # opencode as a model it cannot resolve, so it stops here with its name.
+          if [[ "${MODEL%%/*}" = "$MODEL" || -z "${MODEL#*/}" ]]; then
+            echo "::error::MODEL '${MODEL}' is not provider/model (e.g. nvidia/stepfun-ai/step-5-preview)."
+            exit 1
+          fi
+          if [[ "${MODEL%%/*}" = "kilo" ]]; then
+            jq -cn --arg model "${MODEL#kilo/}" '{"$schema": "https://opencode.ai/config.json", update: "disable", providers: {kilo: {settings: {baseURL: "https://ai-gateway.kilo.ai/api/v1"}, models: {($model): {}}}}}' > "$conf/opencode.json"
+          elif [[ "${MODEL%%/*}" = "nvidia" ]]; then
+            # An `nvidia/...` model runs on NVIDIA's API with the key from the
+            # ACTIONS_NVIDIA_API_KEY secret, which only the probe and agent steps
+            # receive (as NVIDIA_API_KEY, the variable opencode's built-in provider
+            # reads). The model is declared for the same reason as Kilo's.
+            jq -cn --arg model "${MODEL#nvidia/}" '{"$schema": "https://opencode.ai/config.json", update: "disable", providers: {nvidia: {models: {($model): {}}}}}' > "$conf/opencode.json"
+          else
+            # shellcheck disable=SC2016 # `$schema` is a literal JSON key
+            printf '{"$schema":"https://opencode.ai/config.json","update":"disable"}\n' > "$conf/opencode.json"
+          fi
+          model="$MODEL"
+          if [[ -n "$VARIANT" ]]; then model="${MODEL}#${VARIANT}"; fi
+          {
+            printf -- '---\n'
+            printf 'description: Read-only model quota probe (CI only)\n'
+            printf 'mode: primary\n'
+            printf 'model: "%s"\n' "$model"
+            # The ping needs no tool at all: deny everything, so a misbehaving
+            # model reply cannot make the probe act.
+            printf 'permissions:\n'
+            printf '  - { action: "*", resource: "*", effect: deny }\n'
+            printf -- '---\n'
+            printf 'Reply with the single word OK and nothing else.\n'
+          } > "$conf/agents/model-probe.md"
+
+      - name: Probe model quota
+        id: probe
+        env:
+          OPENCODE_DISABLE_PROJECT_CONFIG: "1"
+          NVIDIA_API_KEY: ${{ startsWith(env.MODEL, 'nvidia/') && secrets.ACTIONS_NVIDIA_API_KEY || '' }}
+        run: |
+          set -euo pipefail
+          # Without the secret an `nvidia/...` model can only fail with a 401; say why.
+          if [[ -n "${MODEL:-}" && "${MODEL%%/*}" == "nvidia" && -z "${NVIDIA_API_KEY:-}" ]]; then
+            echo "::error::MODEL is ${MODEL}, but the ACTIONS_NVIDIA_API_KEY secret is not set (Settings -> Secrets and variables -> Actions)."
+            exit 1
+          fi
+          probe_dir="$RUNNER_TEMP/quota-probe"
+          mkdir -p "$probe_dir"
+          # Over Kilo's OpenAI-compatible gateway a 429 reaches opencode only as the bare
+          # "Provider returned error": opencode retries it ("retrying (attempt N)") and, once
+          # it gives up, ends on the same line a 400 ends on without any retry. Only the
+          # retries tell a rate limit from a broken request, so a run that ended on that line
+          # after retrying gets a rate-limit line the quota classifier recognises; a run that
+          # retried and then went on is left alone.
+          note_exhausted_retries() {
+            local stream="$1"
+            local final_line
+            final_line=$(grep -v '^[[:space:]]*$' "$stream" | tail -n 1) || true
+            if grep -q 'retrying (attempt' "$stream" && [[ "$final_line" == *'rror: '*'Provider returned error'* ]]; then
+              echo 'rate limit: opencode gave up retrying a retryable provider error' >> "$stream"
+            fi
+          }
+          # opencode repeats the provider's error on every retry line ("retrying
+          # (attempt N): ... Too Many Requests"), also when a later retry succeeds.
+          # A cap only counts once all retries are through, so the quota classifier
+          # reads stderr without those lines (<file>.final); the final error line
+          # stays, and so does note_exhausted_retries' synthetic line, which must
+          # therefore never contain "retrying (attempt".
+          drop_retry_lines() {
+            local stream="$1"
+            grep -v 'retrying (attempt' "$stream" > "$stream.final" || true
+          }
+          # A failed probe whose last stderr line is a retry line was cut off mid-retry:
+          # that line is why it failed, so it goes back into the classifier's view (only
+          # for a failed probe - after a retry that cleared it must not count).
+          keep_last_retry_line() {
+            local stream="$1"
+            local final_line
+            final_line=$(grep -v '^[[:space:]]*$' "$stream" | tail -n 1) || true
+            case "$final_line" in
+              *'retrying (attempt'*) printf '%s\n' "$final_line" >> "$stream.final" ;;
+              *) : ;;
+            esac
+          }
+          # opencode has been seen exiting 0 on the cap for this tiny prompt,
+          # so the exit status alone cannot clear the model: the quota
+          # signature is grepped over BOTH streams whatever the status, and
+          # `available=true` is only claimed when the reply actually carries
+          # the OK token. Every other outcome - a non-quota failure, a zero
+          # exit with no OK, even a dead probe - fails open: the agent job runs
+          # and the genuine failure surfaces there.
+          status=0
+          raw=$(opencode run --standalone --archived --agent model-probe \
+            "Reply with the single word: OK" 2> "$probe_dir/stderr") || status=$?
+          printf '%s\n' "$raw" > "$probe_dir/stdout"
+          note_exhausted_retries "$probe_dir/stderr"
+          drop_retry_lines "$probe_dir/stderr"
+          [[ "$status" -eq 0 ]] || keep_last_retry_line "$probe_dir/stderr"
+          cat "$probe_dir/stdout" "$probe_dir/stderr" > "$probe_dir/combined"
+          # Always logged, bounded like the agent step's echo: run 44962236033
+          # passed this probe and hit "Free usage limit reached" 26 s later,
+          # and with the output unlogged there was no way to tell a real reach
+          # from a capped one - the success path used to log nothing at all.
+          echo "::group::Quota probe output (last 4000 bytes)"
+          tail -c 4000 "$probe_dir/combined"
+          echo "::endgroup::"
+          # Only a positive quota signature skips the agent job - on either
+          # stream, whatever the exit status. The pattern is the transient
+          # class the agent step below classifies with - a cap, a rate limit,
+          # an exhausted quota or a region refusal - and deliberately not the
+          # misconfiguration class (a model or variant that cannot be resolved
+          # at all): that is a genuine failure, and the agent job reports it.
+          if grep -qiE 'usage limit|rate.?limit|quota|insufficient credits|limit reached|not available in your country|service unavailable|overloaded|sign up for free to continue|too many requests' "$probe_dir/stdout" "$probe_dir/stderr.final"; then
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::The free model is capped, rate-limited, region-refused or unavailable; the agent job is skipped - not run: quota. Re-run the workflow after the quota resets."
+          elif [[ "$status" -eq 0 ]] && grep -qw 'OK' "$probe_dir/stdout"; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::Quota probe reached the model; the agent job will run."
+          else
+            # Inconclusive - a non-quota failure, or a zero exit whose reply
+            # carried no OK. Fail open, exactly as before the probe existed.
+            echo "available=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::The quota probe was inconclusive (exit ${status}, no OK token, no quota signature); the agent job will run and report the real failure."
+          fi

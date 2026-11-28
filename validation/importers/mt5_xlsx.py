@@ -611,10 +611,9 @@ class MT5XLSXImporter(BaseImporter):
         if col_order_id is None:
             return mapping
 
-        # DV-B44 + C4: locale detection scans the whole orders table —
-        # the same convention as the HTML importer. A per-column detector
-        # let the two importers disagree on one report (unified detector,
-        # single convention per report).
+        # DV-B44 + C4: locale detection scans the whole orders table.
+        # A per-column detector could let neighbouring tables disagree on one
+        # report; the XLSX importer keeps one unified convention per report.
         cell_values: list[str | None] = [
             str(value) for _, row in orders_df.iterrows() for value in row if pd.notna(value)
         ]

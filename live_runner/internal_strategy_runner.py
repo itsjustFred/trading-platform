@@ -90,8 +90,8 @@ Risk-policy notes (maintainer decision 2026-11-22):
   unfilled entries the broker still lists as working or holds a non-zero
   position for — and the total is
   capped at ``TRADE_ENGINE_MAX_POSITIONS``. A cap above 1 is refused
-  (entries disabled) on Alpaca accounts until #417 lands and on any
-  deployment carrying the live ``supertrend_flip`` opt-in, and a strategy
+  (entries disabled) on Alpaca accounts until #417 lands and on cTrader
+  accounts that cannot prove they hedge positions, and a strategy
   exit first cancels the deployment's still-working entry orders for the
   symbol.
 * **Session-bound symbols** (everything the venue calendar does not resolve
@@ -116,7 +116,7 @@ Risk-policy notes (maintainer decision 2026-11-22):
   delay, not a dropped signal (documented divergence).
 
 Submission: intents are handed to the daemon's ``submit_signal`` callback,
-which routes them through ``_trade_signal_to_live_signal`` and
+which routes them through ``trade_signal_to_live_signal`` and
 ``_prepare_claim_and_submit_signal`` — the same prepare/claim/submit path as
 Discord signals, so sizing, the SL/TP guard, promotion gate, submission lease
 and adapter persistence all apply unchanged.
@@ -146,7 +146,7 @@ from live_runner.promotion import (
     deployment_signal_processor_name,
     strategy_target,
 )
-from live_runner.signal_sources.execution_timing import _timeframe_seconds
+from live_runner.signal_sources.execution_timing import timeframe_seconds
 from live_runner.symbol_class import classify_symbol
 from risk.models import TradeSignal
 from runner.engine_pkg.trading_engine import TRADE_ENGINE_MAX_POSITIONS, TradeEngine
@@ -163,10 +163,6 @@ from shared.database import (
 from shared.logging import get_logger
 from shared.models import VALID_TIMEFRAMES, LiveDeploymentConfig
 from shared.strategy_registry import load_strategy_module
-from shared.trailing import (
-    FLIP_DEPLOYMENT_OPT_IN_KEY,
-    deployment_supertrend_flip_enabled,
-)
 
 logger = get_logger("live-runner")
 
@@ -355,7 +351,7 @@ def _max_open_per_symbol(
 
 
 async def _multi_lot_cap_refusal(
-    adapter: BaseLiveAdapter, deployment: LiveDeploymentConfig, cap: int
+    adapter: BaseLiveAdapter, cap: int
 ) -> str | None:
     """Why a per-symbol cap above 1 is refused on this account, or ``None``.
 
@@ -363,12 +359,10 @@ async def _multi_lot_cap_refusal(
     refused (entries disabled, exits keep flowing - the same fail-closed
     shape as an unusable cap) on Alpaca accounts until #417 lands, because a
     netted Alpaca book reserves bracket-leg quantity a second lot's exit
-    cannot prove; on cTrader accounts that cannot prove they hedge positions
-    (``ProtoOAAccountType`` NETTED or unreadable), because a netted cTrader
-    book merges several entries into one position whose per-lot exit cannot
-    be sized safely; and on any deployment carrying the live
-    ``supertrend_flip`` opt-in, because the flip manager requires exactly
-    one broker position per symbol.
+    cannot prove; and on cTrader accounts that cannot prove they hedge
+    positions (``ProtoOAAccountType`` NETTED or unreadable), because a netted
+    cTrader book merges several entries into one position whose per-lot exit
+    cannot be sized safely.
     """
     if cap <= 1:
         return None
@@ -392,14 +386,6 @@ async def _multi_lot_cap_refusal(
                 "deployment to a hedging account; entries are disabled, "
                 "exits still evaluated."
             )
-    if deployment_supertrend_flip_enabled(deployment):
-        return (
-            f"{MAX_OPEN_PER_SYMBOL_KEY}={cap} cannot be combined with the "
-            f"'{FLIP_DEPLOYMENT_OPT_IN_KEY}' opt-in: the live supertrend_flip "
-            "workflow manages exactly one position per symbol. Set the cap "
-            "to 1 or remove the opt-in; entries are disabled, exits still "
-            "evaluated."
-        )
     return None
 
 
@@ -1487,12 +1473,11 @@ class InternalStrategyRunner:
                     # Maintainer decision (a): a strategy without a stop gets
                     # a broker stop at the engine's fallback distance —
                     # fallback_stop_pct of the entry price, the same fallback
-                    # the engine uses for sizing. Live never runs unprotected.
-                    direction_sign = 1.0 if direction == "LONG" else -1.0
-                    fallback_pct = float(
-                        bundle.engine._risk_engine.config.fallback_stop_pct
+                    # the engine uses for sizing (one implementation, G03).
+                    # Live never runs unprotected.
+                    stop_loss = bundle.engine._risk_engine.fallback_stop(
+                        action=direction, entry_price=close_price
                     )
-                    stop_loss = close_price - direction_sign * close_price * fallback_pct
                     fallback_stop = True
                 symbol_key = symbol.upper()
                 open_count = int(open_entries.get(symbol_key, 0))
@@ -1660,7 +1645,7 @@ class InternalStrategyRunner:
                 timeframe = normalize_timeframe(deployment.timeframe)
                 if timeframe not in VALID_TIMEFRAMES:
                     raise ValueError(f"unsupported timeframe {deployment.timeframe!r}")
-                bar_seconds = _timeframe_seconds(timeframe)
+                bar_seconds = timeframe_seconds(timeframe)
                 if not bar_seconds:
                     raise ValueError(f"timeframe {timeframe!r} has no bar length")
                 symbols = _deployment_symbols(deployment)
@@ -1709,9 +1694,7 @@ class InternalStrategyRunner:
                 )
                 max_open_per_symbol = 0
             if max_open_per_symbol > 1:
-                refusal = await _multi_lot_cap_refusal(
-                    adapter, deployment, max_open_per_symbol
-                )
+                refusal = await _multi_lot_cap_refusal(adapter, max_open_per_symbol)
                 if refusal is not None:
                     self._report_once(
                         deployment_id,

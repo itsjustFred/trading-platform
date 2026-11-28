@@ -22,7 +22,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from live_runner.signal_sources.discord_source import _parse_trade_signal_from_message
+from live_runner.signal_sources.discord_source import parse_trade_signal_from_message
 
 
 def _parse(content: str):
@@ -33,7 +33,7 @@ def _parse(content: str):
         author=SimpleNamespace(id="bot-121", bot=True),
         created_at=datetime.now(timezone.utc),
     )
-    return _parse_trade_signal_from_message(message, default_timeframe="1h")
+    return parse_trade_signal_from_message(message, default_timeframe="1h")
 
 
 def _is_exit(signal) -> bool:

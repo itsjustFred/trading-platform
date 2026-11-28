@@ -26,7 +26,6 @@ from runner.engines.signal_replay_adapter import (
     _OpenPosition,
 )
 from runner.portfolio_optimizer import _portfolio_sharpe_from_weights
-from runner.stats import return_periods_per_year
 
 # ─── F36: portfolio sharpe is annualized ────────────────────────────────────
 
@@ -165,13 +164,10 @@ class TestAnnualizationCadenceCalibration:
             sharpe, _ = _portfolio_sharpe_from_weights(np.array([1.0]), equity.reshape(-1, 1))
             returns = np.diff(equity) / equity[:-1]
             per_obs = float(np.mean(returns) / (np.std(returns) + 1e-10))
-            expected_ppy = portfolio_optimizer._infer_portfolio_periods_per_year(
-                equity.reshape(-1, 1)
-            )
-            assert 360.0 < expected_ppy < 370.0, (
-                "calendar-daily curves must annualize at the measured "
-                "calendar-day density (~365), not the fixed 252 convention"
-            )
+            # 299 daily return observations stamped 2023-11-15 .. 2024-09-08:
+            # the span touches 2023 (365) and 2024 (366), so the measured
+            # density is the mean Gregorian year length, 365.5.
+            expected_ppy = 365.5
             assert sharpe == pytest.approx(per_obs * math.sqrt(expected_ppy), rel=1e-6)
         finally:
             portfolio_optimizer._LAST_PORTFOLIO_TIMESTAMPS.clear()
@@ -361,14 +357,6 @@ class TestMeasuredDensityAnnualization:
         returns = np.diff(equity) / equity[:-1]
         return float(np.mean(returns) / (np.std(returns) + 1e-10))
 
-    def _density_for_times(self, times: list[int]) -> float:
-        index = pd.DatetimeIndex(
-            pd.to_datetime(pd.Series(times), unit="s", utc=True).iloc[1:]
-        )
-        measured = return_periods_per_year(index)
-        assert measured is not None
-        return measured
-
     def test_crypto_only_calendar_daily_uses_measured_calendar_days(self):
         """A 24/7 crypto book measures calendar days: 366 in leap 2024,
         365 in common 2023 — the fixed 252 convention cannot produce either.
@@ -413,8 +401,10 @@ class TestMeasuredDensityAnnualization:
             sharpe, _ = _portfolio_sharpe_from_weights(np.array([1.0]), matrix)
         finally:
             portfolio_optimizer._LAST_PORTFOLIO_TIMESTAMPS.clear()
-        expected_ppy = self._density_for_times(times)
-        assert 250.0 < expected_ppy < 270.0
+        # 261 business-day return observations stamped 2024-01-03 ..
+        # 2025-01-01: 260 intervals over a 364-day span touching 2024 (366)
+        # and 2025 (365) -> 260 * 365.5 / 364 = 3655/14.
+        expected_ppy = 3655.0 / 14.0
         assert ppy == pytest.approx(expected_ppy, rel=1e-9)
         assert sharpe == pytest.approx(
             self._per_obs_sharpe(equity) * math.sqrt(expected_ppy), rel=1e-6

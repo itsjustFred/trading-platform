@@ -65,6 +65,7 @@ from live_runner.shutdown import (
 from risk import TradeSignal
 from shared.database import get_live_deployment, list_live_deployment_submission_claims
 from shared.models import LiveDeploymentConfig
+from tests.conftest import sandboxed_env
 
 ACCOUNT_ID = "acc-1"
 DEPLOYMENT_ID = "22222222-2222-2222-2222-222222222222"
@@ -608,7 +609,7 @@ def test_submit_order_with_risk_counts_itself_in_flight(
 
     async def _probe() -> tuple[int, int, int]:
         coordinator.bind(asyncio.get_running_loop())
-        live_signal = daemon._trade_signal_to_live_signal(_trade_signal(), deployment)
+        live_signal = daemon.trade_signal_to_live_signal(_trade_signal(), deployment)
         submission = asyncio.create_task(
             daemon.submit_order_with_risk(
                 adapter,  # type: ignore[arg-type]
@@ -647,7 +648,7 @@ def test_submit_order_with_risk_is_refused_on_shutdown(
     coordinator = _new_coordinator()
     monkeypatch.setattr(daemon, "_ACTIVE_SHUTDOWN", coordinator)
     adapter = _GateAdapter()
-    live_signal = daemon._trade_signal_to_live_signal(_trade_signal(), deployment)
+    live_signal = daemon.trade_signal_to_live_signal(_trade_signal(), deployment)
     coordinator.request("SIGTERM")
 
     with pytest.raises(SubmissionRefusedError, match="shutting down"):
@@ -860,48 +861,6 @@ def test_idle_daemon_stops_after_the_signal_and_exits_zero(isolated_db_sandbox: 
     # The gate closed behind the run: nothing may start an order any more.
     assert daemon._begin_submission() is False
     assert daemon._SHUTDOWN.requested is True
-
-
-def test_supertrend_flip_loop_is_wired_and_stops_with_the_daemon(
-    isolated_db_sandbox: Any,
-) -> None:
-    """#168: the flip loop runs under the daemon's lifecycle.
-
-    The loop existing is not the opt-in: with no deployment carrying
-    ``settings.live_supertrend_flip`` it manages nothing (the manager's own
-    tests pin that gate). This test only proves the daemon starts the loop
-    and drains it like every other broker-touching loop.
-    """
-    database, _, _ = isolated_db_sandbox
-    database.init_db()
-    coordinator = daemon._SHUTDOWN
-    seen: dict[str, Any] = {}
-
-    async def _probe() -> int:
-        task = asyncio.get_running_loop().create_task(
-            daemon.run_daemon(
-                accounts_env=ACCOUNTS_ENV,
-                install_signal_handlers=False,
-                drain_timeout_seconds=1.0,
-                cleanup_timeout_seconds=1.0,
-            )
-        )
-        await asyncio.sleep(0.3)
-        seen["running"] = any(
-            t.get_name() == "supertrend-flip-loop" for t in asyncio.all_tasks()
-        )
-        coordinator.request("SIGTERM")
-        code = await asyncio.wait_for(task, timeout=30)
-        seen["lingering"] = [
-            t.get_name()
-            for t in asyncio.all_tasks()
-            if t.get_name() == "supertrend-flip-loop"
-        ]
-        return code
-
-    assert asyncio.run(_probe()) == EXIT_OK
-    assert seen["running"] is True
-    assert seen["lingering"] == []
 
 
 def test_gate_follows_an_injected_coordinator(isolated_db_sandbox: Any) -> None:
@@ -1208,7 +1167,7 @@ def test_a_dropped_exit_is_logged_as_an_error_that_the_position_stays_open(
     monkeypatch.setattr(daemon, "_ACTIVE_SHUTDOWN", coordinator)
     coordinator.request("SIGTERM")
     adapter = _GateAdapter()
-    live_signal = daemon._trade_signal_to_live_signal(_trade_signal(), deployment)
+    live_signal = daemon.trade_signal_to_live_signal(_trade_signal(), deployment)
 
     async def _prepared(*_args: Any, **_kwargs: Any) -> tuple[Any, float]:
         return live_signal, 1.0
@@ -1473,8 +1432,7 @@ def test_real_sigterm_to_a_daemon_process_exits_cleanly(tmp_path: Path) -> None:
     """End to end through ``main()``: handler install, wake-up, exit code, logs."""
     data_dir = tmp_path / "data"
     data_dir.mkdir()
-    env = dict(os.environ)
-    env.update(
+    env = sandboxed_env(
         DATA_DIR=str(data_dir),
         LOG_DIR=str(tmp_path / "logs"),
         PYTHONPATH=str(Path(__file__).resolve().parents[1]),
@@ -1608,8 +1566,7 @@ def test_the_exit_path_survives_a_task_that_ignores_every_cancel(
     """
     data_dir = tmp_path / "data"
     data_dir.mkdir()
-    env = dict(os.environ)
-    env.update(
+    env = sandboxed_env(
         DATA_DIR=str(data_dir),
         LOG_DIR=str(tmp_path / "logs"),
         PYTHONPATH=str(Path(__file__).resolve().parents[1]),
@@ -1760,8 +1717,7 @@ def _run_the_cooperative_worker_program(tmp_path: Path, *, crash: bool) -> _Work
     data_dir = tmp_path / "data"
     data_dir.mkdir(exist_ok=True)
     marker = tmp_path / "worker-finished"
-    env = dict(os.environ)
-    env.update(
+    env = sandboxed_env(
         DATA_DIR=str(data_dir),
         LOG_DIR=str(tmp_path / "logs"),
         PYTHONPATH=str(Path(__file__).resolve().parents[1]),
