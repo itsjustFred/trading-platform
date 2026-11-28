@@ -185,7 +185,9 @@ def dataset_upload_plan(root: str | Path) -> tuple[list[str], str]:
 
 
 def _file_md5(path: Path) -> str:
-    digest = hashlib.md5()
+    # MD5 here only reproduces the S3 ETag of a single-part PUT — it is a
+    # content fingerprint for skip decisions, never a security control.
+    digest = hashlib.md5(usedforsecurity=False)
     with open(path, "rb") as fh:
         for chunk in iter(lambda: fh.read(1 << 20), b""):
             digest.update(chunk)

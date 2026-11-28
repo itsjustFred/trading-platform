@@ -547,7 +547,7 @@ class FakeR2:
         self.puts.append(key)
         data = local_path.read_bytes()
         self.sizes[key] = len(data)
-        self.etags[key] = hashlib.md5(data).hexdigest()
+        self.etags[key] = hashlib.md5(data, usedforsecurity=False).hexdigest()
         return self.sizes[key]
 
     def head(self, key: str) -> tuple[int | None, str | None]:
@@ -1297,7 +1297,9 @@ def test_upload_reuploads_when_remote_etag_is_not_single_part_md5(tmp_path):
     parquet = root / "EURUSD" / "EURUSD_M1.parquet"
     data = parquet.read_bytes()
     client.sizes["EURUSD/EURUSD_M1.parquet"] = len(data)
-    client.etags["EURUSD/EURUSD_M1.parquet"] = hashlib.md5(data).hexdigest() + "-2"
+    client.etags["EURUSD/EURUSD_M1.parquet"] = (
+        hashlib.md5(data, usedforsecurity=False).hexdigest() + "-2"
+    )
 
     upload.upload_dataset(root, client=client)
     # The unverifiable object was re-PUT; the rerun now skips it.

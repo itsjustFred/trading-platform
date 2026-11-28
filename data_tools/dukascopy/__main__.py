@@ -32,8 +32,8 @@ def _close_alert_sink() -> None:
         from shared.alerts import close_alert_sink
 
         close_alert_sink()
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception:  # noqa: BLE001 - alerting must never break the pipeline
+        logging.getLogger(__name__).debug("alert sink close failed", exc_info=True)
 
 
 def _emit_alert(message: str, **extra) -> None:
