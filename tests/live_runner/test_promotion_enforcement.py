@@ -690,36 +690,44 @@ def _paused_internal_deployment(database_module, *, strategy_name: str = STRATEG
 def _activate(monkeypatch: pytest.MonkeyPatch, did: str, *, broker_confirms_demo: bool):
     import viewer.main as viewer
 
-    async def _reverify(_account_id: str) -> bool:
+    broker_calls: list[str] = []
+
+    async def _reverify(account_id: str) -> bool:
+        broker_calls.append(account_id)
         return broker_confirms_demo
 
     monkeypatch.setattr(viewer, "_reverify_account_against_broker", _reverify)
-    return TestClient(viewer.app).put(
+    response = TestClient(viewer.app).put(
         f"/api/live/deployments/{did}/status",
         json={"status": "ACTIVE", "confirmation": {"confirmed_deployment_id": did}},
     )
+    return response, broker_calls
 
 
-def test_viewer_activation_on_demo_passes_without_promotion(
+def test_viewer_activation_of_an_internal_deployment_is_refused_before_the_broker(
+    strategies_dir: Path, isolated_db_sandbox, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Internal has no viewer arm path (main's behaviour, kept by the Discord
+    removal): the 409 lands before the broker round-trip, so promotion and
+    demo state are never consulted."""
+    database_module, _engine, _data_dir = isolated_db_sandbox
+    did = _paused_internal_deployment(database_module)
+    response, broker_calls = _activate(monkeypatch, did, broker_confirms_demo=True)
+    assert response.status_code == 409, response.text
+    assert "no live evaluator" in response.json()["detail"]
+    assert broker_calls == []
+    assert database_module.get_live_deployment(did).status == "PAUSED"
+
+
+def test_viewer_activation_refusal_is_audited_without_broker_contact(
     strategies_dir: Path, isolated_db_sandbox, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     database_module, _engine, _data_dir = isolated_db_sandbox
     did = _paused_internal_deployment(database_module)
-    response = _activate(monkeypatch, did, broker_confirms_demo=True)
-    assert response.status_code == 200, response.text
-    assert database_module.get_live_deployment(did).status == "ACTIVE"
-
-
-def test_viewer_activation_on_unconfirmed_account_names_the_promotion_refusal(
-    strategies_dir: Path, isolated_db_sandbox, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    database_module, _engine, _data_dir = isolated_db_sandbox
-    did = _paused_internal_deployment(database_module)
-    response = _activate(monkeypatch, did, broker_confirms_demo=False)
+    response, broker_calls = _activate(monkeypatch, did, broker_confirms_demo=False)
     assert response.status_code == 409
-    detail = response.json()["detail"]
-    assert "refusing to activate" in detail
-    assert "Promotion gate refused" in detail
+    assert "no live evaluator" in response.json()["detail"]
+    assert broker_calls == []
     assert database_module.get_live_deployment(did).status == "PAUSED"
 
     from shared.database import list_live_control_audit
@@ -729,21 +737,23 @@ def test_viewer_activation_on_unconfirmed_account_names_the_promotion_refusal(
         for item in list_live_control_audit()
         if item.get("target_id") == did and not item.get("succeeded")
     ]
-    assert "Promotion gate refused" in entry["detail"]["promotion_gate"]
+    assert "no live evaluator" in entry["detail"]["reason"]
 
 
-def test_viewer_demo_only_block_still_refuses_a_promoted_strategy_on_real_money(
+def test_viewer_activation_refusal_does_not_consult_promotion_state(
     strategies_dir: Path, isolated_db_sandbox, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Promotion is necessary, not sufficient: the demo-only block stays (#165)."""
+    """Promotion is still enforced at create/top-N; on the arm path the source
+    gate fires first, so a promoted strategy changes nothing."""
     database_module, _engine, _data_dir = isolated_db_sandbox
     promote_strategy_file(strategies_dir)
     did = _paused_internal_deployment(database_module)
-    response = _activate(monkeypatch, did, broker_confirms_demo=False)
+    response, broker_calls = _activate(monkeypatch, did, broker_confirms_demo=False)
     assert response.status_code == 409
     detail = response.json()["detail"]
-    assert "refusing to activate" in detail
+    assert "no live evaluator" in detail
     assert "Promotion gate" not in detail
+    assert broker_calls == []
     assert database_module.get_live_deployment(did).status == "PAUSED"
 
 
