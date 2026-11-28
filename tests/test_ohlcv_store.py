@@ -127,6 +127,25 @@ class TestManifest:
     def test_missing_manifest_is_empty_dict(self, tmp_path: Path) -> None:
         assert ohlcv_store.read_manifest(tmp_path, "nope") == {}
 
+    def test_corrupt_manifest_fails_loudly(self, tmp_path: Path) -> None:
+        """A present-but-corrupt manifest must not read as an empty store:
+        every declared dataset would silently vanish and backtests would run
+        on missing data."""
+        path = ohlcv_store.manifest_path(tmp_path, "testsrc")
+        path.parent.mkdir(parents=True)
+        path.write_text("{not json", encoding="utf-8")
+        with pytest.raises(ValueError, match="manifest"):
+            ohlcv_store.read_manifest(tmp_path, "testsrc")
+        with pytest.raises(ValueError, match="manifest"):
+            ohlcv_store.find_dataset(tmp_path, "TEST", "1h")
+
+    def test_non_object_manifest_fails_loudly(self, tmp_path: Path) -> None:
+        path = ohlcv_store.manifest_path(tmp_path, "testsrc")
+        path.parent.mkdir(parents=True)
+        path.write_text("[1, 2, 3]", encoding="utf-8")
+        with pytest.raises(ValueError, match="manifest"):
+            ohlcv_store.read_manifest(tmp_path, "testsrc")
+
     def test_extra_keys_tolerated(self, tmp_path: Path) -> None:
         path = ohlcv_store.write_manifest(
             tmp_path,
@@ -461,6 +480,19 @@ class TestReadFrame:
         )
         feb_path.unlink()
         entry = ohlcv_store.find_dataset(tmp_path, "SYM", "tick")
+        assert entry is not None
+        with pytest.raises(FileNotFoundError):
+            ohlcv_store.read_frame(entry)
+
+    def test_read_frame_missing_declared_file_fails_loudly(
+        self, tmp_path: Path
+    ) -> None:
+        """A manifest-declared file absent from disk is store corruption:
+        reading it as an empty frame would silently produce a wrong
+        backtest. Only bare-path probes may read a missing file as empty."""
+        path = _write(tmp_path, symbol="SYM", timeframe="1h")
+        path.unlink()
+        entry = ohlcv_store.find_dataset(tmp_path, "SYM", "1h")
         assert entry is not None
         with pytest.raises(FileNotFoundError):
             ohlcv_store.read_frame(entry)

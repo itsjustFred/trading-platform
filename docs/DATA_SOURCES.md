@@ -31,6 +31,9 @@ Examples:
 ```
 
 Parquet files the manifest does not declare are ignored by every reader.
+A missing `manifest.json` reads as an empty store, but a corrupt or
+non-object one fails loudly, as does a manifest-declared parquet file
+that is absent from disk — silent gaps would produce wrong backtests.
 Trees written in the pre-#471
 `ohlcv/{source}/{asset_class}/[{region}/]{symbol}/{timeframe}.parquet` layout
 are converted once with `scripts/migrate_ohlcv_layout.py`.

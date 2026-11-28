@@ -221,16 +221,23 @@ def parse_dataset_path(
 
 
 def read_manifest(data_root: str | Path, source: str) -> dict[str, Any]:
-    """The source's ``manifest.json`` as a dict; ``{}`` when absent/corrupt."""
+    """The source's ``manifest.json`` as a dict; ``{}`` only when absent.
+
+    A present-but-corrupt manifest raises: reading it as empty would
+    silently drop every declared dataset and produce wrong backtests.
+    """
     path = manifest_path(data_root, source)
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        raw = path.read_text(encoding="utf-8")
     except FileNotFoundError:
         return {}
-    except (OSError, json.JSONDecodeError):
-        logger.exception("Unreadable OHLCV manifest %s", path)
-        return {}
-    return payload if isinstance(payload, dict) else {}
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Corrupt OHLCV manifest {path}: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"OHLCV manifest {path} is not a JSON object")
+    return payload
 
 
 def write_manifest(
@@ -560,16 +567,18 @@ def segment_for_path(data_root: str | Path, path: str | Path) -> str:
     return ""
 
 
-def _read_segment_frames(paths: list[Path]) -> list[pd.DataFrame]:
+def _read_segment_frames(
+    paths: list[Path], *, declared: bool = False
+) -> list[pd.DataFrame]:
     frames: list[pd.DataFrame] = []
     for path in paths:
         try:
             frame = pd.read_parquet(path)
         except FileNotFoundError:
-            # A missing file reads as "no data" only when it is the whole
-            # dataset; among sibling segments it would silently shrink the
-            # frame, so it fails loudly like any other read error.
-            if len(paths) > 1:
+            # Manifest-declared segments are a promise: a missing file would
+            # silently shrink coverage, so it fails loudly like any other
+            # read error. Only a bare-path probe may read as "no data".
+            if declared or len(paths) > 1:
                 raise
             logger.warning("OHLCV parquet missing: %s", path)
             continue
@@ -688,10 +697,12 @@ def read_frame(
     """
     if isinstance(entry_or_path, DatasetEntry):
         paths = list(entry_or_path.segments) or [entry_or_path.path]
+        declared = True
     else:
         paths = [Path(entry_or_path)]
+        declared = False
 
-    frames = _read_segment_frames(paths)
+    frames = _read_segment_frames(paths, declared=declared)
     if not frames:
         return pd.DataFrame()
     frame = pd.concat(frames, ignore_index=True, sort=False)
