@@ -195,7 +195,8 @@ def test_agent_workflow_triggers_and_concurrency() -> None:
         "that changes the diff without any other event"
     )
     group = str(premortem["concurrency"]["group"])
-    assert "github.event.action == 'edited'" in group and "changes.base" in group, (
+    assert "github.event.action == 'edited'" in group
+    assert "changes.base" in group, (
         "a pre-mortem `edited` that changes no base must land in a bucket "
         "of its own: joining the analysed run's group would cancel it with "
         "no replacement and leave the head `pending`"

@@ -44,13 +44,13 @@ mkdir -p "$conf/agents"
 # reached the configured model.
 # MODEL is provider/model; a bare or empty model id would only reach
 # opencode as a model it cannot resolve, so it stops here with its name.
-if [ "${MODEL%%/*}" = "$MODEL" ] || [ -z "${MODEL#*/}" ]; then
+if [[ "${MODEL%%/*}" = "$MODEL" || -z "${MODEL#*/}" ]]; then
   echo "::error::MODEL '${MODEL}' is not provider/model (e.g. nvidia/stepfun-ai/step-5-preview)."
   exit 1
 fi
-if [ "${MODEL%%/*}" = "kilo" ]; then
+if [[ "${MODEL%%/*}" = "kilo" ]]; then
   jq -cn --arg model "${MODEL#kilo/}" '{"$schema": "https://opencode.ai/config.json", update: "disable", providers: {kilo: {settings: {baseURL: "https://ai-gateway.kilo.ai/api/v1"}, models: {($model): {}}}}}' > "$conf/opencode.json"
-elif [ "${MODEL%%/*}" = "nvidia" ]; then
+elif [[ "${MODEL%%/*}" = "nvidia" ]]; then
   # An `nvidia/...` model runs on NVIDIA's API with the key from the
   # ACTIONS_NVIDIA_API_KEY secret, which only the probe and agent steps
   # receive (as NVIDIA_API_KEY, the variable opencode's built-in provider
@@ -61,7 +61,7 @@ else
   printf '{"$schema":"https://opencode.ai/config.json","update":"disable"}\n' > "$conf/opencode.json"
 fi
 model="$MODEL"
-if [ -n "$VARIANT" ]; then model="${MODEL}#${VARIANT}"; fi
+if [[ -n "$VARIANT" ]]; then model="${MODEL}#${VARIANT}"; fi
 {
   printf -- '---\n'
   printf 'description: %s\n' "$description"
@@ -81,7 +81,7 @@ if [ -n "$VARIANT" ]; then model="${MODEL}#${VARIANT}"; fi
   awk 'BEGIN { n = 0 } /^---$/ && n < 2 { n++; next } n >= 2' "$RUNNER_TEMP/$stage/skill.md"
 } > "$conf/agents/$agent_id.md"
 # The system prompt must not be empty (e.g. a skill without frontmatter).
-if [ "$(awk 'BEGIN{n=0} /^---$/ && n<2 {n++; next} n>=2' "$conf/agents/$agent_id.md" | tr -d '[:space:]' | wc -c)" -eq 0 ]; then
+if [[ "$(awk 'BEGIN{n=0} /^---$/ && n<2 {n++; next} n>=2' "$conf/agents/$agent_id.md" | tr -d '[:space:]' | wc -c)" -eq 0 ]]; then
   echo "::error::${empty_noun} has an empty system prompt."
   exit 1
 fi

@@ -128,7 +128,6 @@ import os
 import re
 import shutil
 import subprocess
-import sys
 from pathlib import Path
 
 import pytest
@@ -307,7 +306,7 @@ def _strictness_failures(lines: list[str]) -> list[str]:
             'listing=$(git ls-tree "$BASE_SHA" -- "$SKILL_PATH")',
             "the base path lookup runs as an `if` condition, where a failure is a false branch",
         ),
-        ('if [ -n "$listing" ]', "the branch is not taken on the lookup's result"),
+        ('if [[ -n "$listing" ]]', "the branch is not taken on the lookup's result"),
         (
             'git show "${BASE_SHA}:${SKILL_PATH}" > "$skill"',
             "does not read the skill from the base branch first",
@@ -1273,7 +1272,8 @@ def test_the_agent_workflows_share_one_free_model_configuration() -> None:
         )
         _job_name, job = _agent_job(_load(name))
         bodies = _job_bodies([job])
-        assert "${MODEL" in bodies and "${VARIANT" in bodies, (
+        assert "${MODEL" in bodies
+        assert "${VARIANT" in bodies, (
             f"{name}: the agent is not configured from MODEL/VARIANT"
         )
 
@@ -1320,17 +1320,14 @@ def test_no_verdict_ever_reports_a_blocking_failure() -> None:
     assert "advisory" in body, "the description does not say the verdict is advisory"
 
 
-def test_the_verdict_regex_accepts_exactly_the_mapped_verdicts() -> None:
+def test_the_verdict_regex_accepts_exactly_the_mapped_verdicts(monkeypatch) -> None:
     """The parser decides what the workflow will post at all: a vocabulary wider
     than the map accepts a verdict the post job cannot place, and one that is
     narrower drops a documented verdict on the floor. The shared parser's stage
     vocabularies are pinned against the skill's own verdict line, so the three
     cannot drift apart silently."""
-    sys.path.insert(0, str(AGENTS_DIR))
-    try:
-        import parse_verdict
-    finally:
-        sys.path.remove(str(AGENTS_DIR))
+    monkeypatch.syspath_prepend(str(AGENTS_DIR))
+    import parse_verdict
     skill = (SKILLS / SKILL_DIR / "SKILL.md").read_text(encoding="utf-8")
     verdicts_line = re.search(r"^- Verdicts:.*$", skill, re.M)
     assert verdicts_line, f"{SKILL_DIR}: the skill documents no verdict line"
@@ -1439,9 +1436,8 @@ def test_a_superseded_result_does_not_overwrite_a_newer_comment() -> None:
     step = _find_step(post, r"^Post or update pre-mortem comment$")
     body = _run(step)
     assert "scripts/agents/post_comment.py" in body, "the post job does not call the shared poster"
-    assert "--stage premortem" in body and MARKER in body, (
-        "the poster call lost its stage or marker"
-    )
+    assert "--stage premortem" in body
+    assert MARKER in body, "the poster call lost its stage or marker"
     source = (AGENTS_DIR / "post_comment.py").read_text(encoding="utf-8")
     # The head is read before the comment list is fetched and again immediately
     # before the write: a synchronize inside that window still had a comment
@@ -1756,7 +1752,8 @@ def test_the_free_model_quota_is_a_skip_not_a_failure() -> None:
     assert 'echo "quota=true" >> "$GITHUB_OUTPUT"' in func_body, (
         "the agent step does not report the quota skip to the post job"
     )
-    assert '"$QUOTA_COMMENT"' in func_body and "--when midrun" in func_body, (
+    assert '"$QUOTA_COMMENT"' in func_body
+    assert "--when midrun" in func_body, (
         "the mid-run quota path writes no 'not run: quota' comment"
     )
     assert "exit 0" in func_body, "the mid-run quota path still fails the step"
@@ -2255,8 +2252,8 @@ def test_a_kilo_model_enables_the_kilo_provider_and_nothing_else_changes(name, t
 
 
 def _provider_choice(body: str) -> str:
-    """The `if [ "${MODEL%%/*}" = ... ]; then ... fi` block a config step writes."""
-    start = body.index('if [ "${MODEL%%/*}" = "kilo" ]; then\n')
+    """The `if [[ "${MODEL%%/*}" = ... ]]; then ... fi` block a config step writes."""
+    start = body.index('if [[ "${MODEL%%/*}" = "kilo" ]]; then\n')
     return body[start : body.index("\nfi\n", start) + 4]
 
 
@@ -2328,7 +2325,7 @@ def test_every_agent_config_step_writes_the_same_provider_choice() -> None:
     assert len(seen) == 1, f"the provider choice drifted between config steps: {seen}"
     choice = seen.pop()
     assert f"baseURL: \"{KILO_GATEWAY}\"" in choice, "the Kilo branch lost its gateway"
-    assert 'elif [ "${MODEL%%/*}" = "nvidia" ]; then' in choice, "no NVIDIA branch"
+    assert 'elif [[ "${MODEL%%/*}" = "nvidia" ]]; then' in choice, "no NVIDIA branch"
     assert f"printf '{ZEN_CONFIG}\\n' > \"$conf/opencode.json\"" in choice, "Zen config changed"
 
 
@@ -2596,7 +2593,8 @@ def test_a_quota_skip_does_not_overwrite_a_real_verdict_for_the_same_head(tmp_pa
 
     result, calls = _run_comment_post(tmp_path, quota_skip=True, prior_body=verdict_body)
     assert result.returncode == 0, f"comment post failed: {result.stderr}"
-    assert "PATCH" not in calls and "POST" not in calls, (
+    assert "PATCH" not in calls
+    assert "POST" not in calls, (
         "a quota skip overwrote a real verdict for the same head"
     )
     assert "::notice::" in result.stdout, "the skipped overwrite is silent"
@@ -2907,7 +2905,8 @@ def test_opencode_is_installed_as_a_checksum_verified_binary() -> None:
         assert "releases/download/v${OPENCODE_VERSION}" in body, (
             f"{name}: the binary is not fetched for the pinned OPENCODE_VERSION"
         )
-        assert "SHA256SUMS" in body and "sha256sum -c" in body, (
+        assert "SHA256SUMS" in body
+        assert "sha256sum -c" in body, (
             f"{name}: the downloaded binary is not checksum-verified"
         )
         assert '"$dest/opencode" --version' in body or "opencode --version" in body, (
@@ -2920,7 +2919,8 @@ def test_opencode_is_installed_as_a_checksum_verified_binary() -> None:
         line.lstrip().startswith("npm install") for line in probe_body.splitlines()
     )
     assert "releases/download/v${OPENCODE_VERSION}" in probe_body
-    assert "SHA256SUMS" in probe_body and "sha256sum -c" in probe_body
+    assert "SHA256SUMS" in probe_body
+    assert "sha256sum -c" in probe_body
 
 
 def _premortem_verdict(output: str, tmp_path) -> str:

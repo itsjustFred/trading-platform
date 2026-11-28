@@ -145,7 +145,7 @@ def _strictness_failures(lines: list[str], body: str) -> list[str]:
             'listing=$(git ls-tree "$BASE_SHA" -- "$SKILL_PATH")',
             "the base path lookup runs as an `if` condition, where a failure is a false branch",
         ),
-        ('if [ -n "$listing" ]', "the branch is not taken on the lookup's result"),
+        ('if [[ -n "$listing" ]]', "the branch is not taken on the lookup's result"),
         (
             'git show "${BASE_SHA}:${SKILL_PATH}" > "$skill"',
             "does not read the skill from the base branch first",
@@ -581,7 +581,8 @@ def test_the_quota_probe_gates_the_agent_job() -> None:
         assert "scripts/agents/quota_comment.py" in body, (
             f"{name}: the quota comment is not written by the shared script"
         )
-        assert f"--stage {_stage(name)}" in body and "--when probe" in body, (
+        assert f"--stage {_stage(name)}" in body
+        assert "--when probe" in body, (
             f"{name}: the quota comment call lost its stage or path"
         )
         # The shared script owns the title and the "Not run: quota" body; its
@@ -827,7 +828,8 @@ def test_the_mid_run_quota_skip_reports_instead_of_failing(tmp_path) -> None:
             f"{name}: the two zero-exit dead ends do not both classify the "
             "quota signature"
         )
-        assert "QUOTA_GREP=" in source and "rate.?limit" in source, (
+        assert "QUOTA_GREP=" in source
+        assert "rate.?limit" in source, (
             f"{name}: the shared classifier lost the transient signature"
         )
         # The cap has been seen arriving on a ZERO exit: with no report at all

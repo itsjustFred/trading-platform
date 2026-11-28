@@ -68,7 +68,7 @@ PARSE_VERDICT="$AGENTS_DIR/parse_verdict.py"
 QUOTA_COMMENT="$AGENTS_DIR/quota_comment.py"
 
 # Without the secret an `nvidia/...` model can only fail with a 401; say why.
-if [ -n "${MODEL:-}" ] && [ "${MODEL%%/*}" = "nvidia" ] && [ -z "${NVIDIA_API_KEY:-}" ]; then
+if [[ -n "${MODEL:-}" && "${MODEL%%/*}" == "nvidia" && -z "${NVIDIA_API_KEY:-}" ]]; then
   echo "::error::MODEL is ${MODEL}, but the ACTIONS_NVIDIA_API_KEY secret is not set (Settings -> Secrets and variables -> Actions)."
   exit 1
 fi
@@ -92,10 +92,11 @@ out="$RUNNER_TEMP/$stage/comment.md"
 # after retrying gets a rate-limit line the quota classifier recognises; a run that
 # retried and then went on is left alone.
 note_exhausted_retries() {
+  local stream="$1"
   local final_line
-  final_line=$(grep -v '^[[:space:]]*$' "$1" | tail -n 1) || true
-  if grep -q 'retrying (attempt' "$1" && [[ "$final_line" == *'rror: '*'Provider returned error'* ]]; then
-    echo 'rate limit: opencode gave up retrying a retryable provider error' >> "$1"
+  final_line=$(grep -v '^[[:space:]]*$' "$stream" | tail -n 1) || true
+  if grep -q 'retrying (attempt' "$stream" && [[ "$final_line" == *'rror: '*'Provider returned error'* ]]; then
+    echo 'rate limit: opencode gave up retrying a retryable provider error' >> "$stream"
   fi
 }
 # opencode repeats the provider's error on every retry line ("retrying
@@ -105,7 +106,8 @@ note_exhausted_retries() {
 # stays, and so does note_exhausted_retries' synthetic line, which must
 # therefore never contain "retrying (attempt".
 drop_retry_lines() {
-  grep -v 'retrying (attempt' "$1" > "$1.final" || true
+  local stream="$1"
+  grep -v 'retrying (attempt' "$stream" > "$stream.final" || true
 }
 # The agent has a shell and its stdout becomes a public PR comment and a
 # workflow artifact. An `nvidia/...` run holds the key in this step's env,
@@ -114,7 +116,7 @@ drop_retry_lines() {
 # steps only run on success), and the files are removed besides. Actions masks
 # the secret in the log on its own.
 refuse_leaked_key() {
-  if [ -n "${NVIDIA_API_KEY:-}" ] \
+  if [[ -n "${NVIDIA_API_KEY:-}" ]] \
     && grep -qF -- "$NVIDIA_API_KEY" "$out.raw" "$out.stderr" 2>/dev/null; then
     rm -f "$out" "$out.raw" "$out.stderr" "$out.stderr.final"
     echo "::error::The agent output contains the NVIDIA API key; nothing is posted or uploaded. Rotate ACTIONS_NVIDIA_API_KEY."
@@ -126,10 +128,12 @@ refuse_leaked_key() {
 # goes back into the classifier's view. Only for a failed run: after a retry that
 # cleared, the last stderr line can be that retry too, and it must not count.
 keep_last_retry_line() {
+  local stream="$1"
   local final_line
-  final_line=$(grep -v '^[[:space:]]*$' "$1" | tail -n 1) || true
+  final_line=$(grep -v '^[[:space:]]*$' "$stream" | tail -n 1) || true
   case "$final_line" in
-    *'retrying (attempt'*) printf '%s\n' "$final_line" >> "$1.final" ;;
+    *'retrying (attempt'*) printf '%s\n' "$final_line" >> "$stream.final" ;;
+    *) : ;;
   esac
 }
 # The transient class the classifiers below share: a cap, a rate limit, an
@@ -147,7 +151,7 @@ report_quota_skip() {
   # output is what keeps the post job from mapping an empty verdict to `error`.
   python3 "$QUOTA_COMMENT" --stage "$stage" --when midrun > "$out"
   echo "quota=true" >> "$GITHUB_OUTPUT"
-  if [ "$stage" = "review" ]; then
+  if [[ "$stage" = "review" ]]; then
     cat "$out" >> "$GITHUB_STEP_SUMMARY"
   fi
   exit 0
@@ -161,6 +165,10 @@ case "$stage" in
     ;;
   premortem)
     prompt="Pre-mortem PR #${PR_NUMBER}. Base ${BASE_SHA}, head ${HEAD_SHA}. PR metadata: $RUNNER_TEMP/premortem/meta.json. Rules loaded from: ${SKILL_SOURCE}."
+    ;;
+  *)
+    echo "::error::run_agent.sh: unknown stage '$stage'"
+    exit 1
     ;;
 esac
 echo "::notice::${notice_label} from: ${SKILL_SOURCE}."
@@ -210,7 +218,7 @@ drop_retry_lines "$out.stderr"
 refuse_leaked_key
 # stderr went to a file for the failure classifier; on success it
 # would otherwise never reach the log, so it is echoed bounded too.
-if [ -s "$out.stderr" ]; then
+if [[ -s "$out.stderr" ]]; then
   echo "::group::Agent stderr (last 4000 bytes)"
   tail -c 4000 "$out.stderr"
   echo "::endgroup::"
@@ -219,7 +227,7 @@ fi
 # which starts at the last "**Summary:**" line. Drop a closing code
 # fence the model may have wrapped around it.
 start=$(grep -n '^\*\*Summary:' "$out.raw" | tail -n 1 | cut -d: -f1 || true)
-if [ -z "$start" ]; then
+if [[ -z "$start" ]]; then
   # opencode has been seen exiting 0 on the cap, with the signature on
   # stdout: a zero exit is not a clean run, so this dead end is
   # classified before it fails. The grep covers the raw stream and
@@ -267,12 +275,11 @@ if ! verdict=$(python3 "$PARSE_VERDICT" verdict --stage "$stage" "$out" 2> /dev/
   cat "$out.raw"
   exit 1
 fi
-if [ "$stage" != "mutation" ]; then
-  if [ "$(git rev-parse HEAD)" != "$HEAD_SHA" ] || [ -n "$(git status --porcelain)" ]; then
-    echo "::error::The ${agent_noun} modified the checkout; not posting."
-    git status --porcelain
-    exit 1
-  fi
+if [[ "$stage" != "mutation" ]] \
+  && { [[ "$(git rev-parse HEAD)" != "$HEAD_SHA" ]] || [[ -n "$(git status --porcelain)" ]]; }; then
+  echo "::error::The ${agent_noun} modified the checkout; not posting."
+  git status --porcelain
+  exit 1
 fi
 case "$stage" in
   premortem)
@@ -280,6 +287,8 @@ case "$stage" in
     # environment and could otherwise append its own verdict.
     printf '%s\n' "$verdict" > "$RUNNER_TEMP/$stage/verdict.txt"
     ;;
+  *)
+    : ;;
 esac
 case "$footer_style" in
   review)
@@ -311,8 +320,10 @@ case "$footer_style" in
     # appends the footer like any other mutation result (or the empty-scope
     # variant when no agent ran).
     ;;
+  *)
+    : ;;
 esac
-if [ "$title_in_step" = "yes" ]; then
+if [[ "$title_in_step" = "yes" ]]; then
   # Title first, so the comment is recognisable among the other bots'.
   { printf '%s\n\n' "$comment_title"; cat "$out"; } > "$out.titled"
   mv "$out.titled" "$out"

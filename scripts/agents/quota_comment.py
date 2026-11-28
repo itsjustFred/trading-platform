@@ -27,6 +27,11 @@ _SUMMARY = (
     "refused or unavailable {when_clause}; {produced} for this commit.\n\n"
 )
 
+_WHEN_PROBE = "before the agent could start"
+_WHEN_MIDRUN = "while the agent ran"
+_RERUN_WORKFLOW = "Re-run the workflow after the quota resets."
+_RERUN_JOB = "Re-run the job after the quota resets."
+
 # stage -> per-(when) body parts. `title` is None for the untitled mid-run
 # mutation body (its Finish step titles every body the same way). `footer`
 # is a printf-style template taking either the skill directory name or the
@@ -37,14 +42,14 @@ _STAGES = {
         "produced": "no review was produced",
         "noun": "review",
         "probe": {
-            "when_clause": "before the agent could start",
-            "rerun": "Re-run the workflow after the quota resets.",
+            "when_clause": _WHEN_PROBE,
+            "rerun": _RERUN_WORKFLOW,
             "footer": "\n---\n_Automated review not run: quota (%s skill)_\n",
             "footer_arg": "skill",
         },
         "midrun": {
-            "when_clause": "while the agent ran",
-            "rerun": "Re-run the job after the quota resets.",
+            "when_clause": _WHEN_MIDRUN,
+            "rerun": _RERUN_JOB,
             "footer": "\n---\n_Automated review not run: quota (%s skill)_\n",
             "footer_arg": "skill",
         },
@@ -54,16 +59,16 @@ _STAGES = {
         "produced": "no mutation testing was produced",
         "noun": "mutation-testing",
         "probe": {
-            "when_clause": "before the agent could start",
-            "rerun": "Re-run the workflow after the quota resets.",
+            "when_clause": _WHEN_PROBE,
+            "rerun": _RERUN_WORKFLOW,
             "footer": "\n---\n_Automated mutation testing not run: quota (`%s` skill)_\n",
             "footer_arg": "skill",
         },
         "midrun": {
             # Untitled and footerless: the Finish comment step titles it and
             # appends the model footer like any other mutation result.
-            "when_clause": "while the agent ran",
-            "rerun": "Re-run the job after the quota resets.",
+            "when_clause": _WHEN_MIDRUN,
+            "rerun": _RERUN_JOB,
             "footer": None,
             "footer_arg": None,
         },
@@ -73,14 +78,14 @@ _STAGES = {
         "produced": "no pre-mortem was produced",
         "noun": "pre-mortem",
         "probe": {
-            "when_clause": "before the agent could start",
-            "rerun": "Re-run the workflow after the quota resets.",
+            "when_clause": _WHEN_PROBE,
+            "rerun": _RERUN_WORKFLOW,
             "footer": "\n---\n_Automated pre-mortem not run: quota (%s skill)_\n",
             "footer_arg": "skill",
         },
         "midrun": {
-            "when_clause": "while the agent ran",
-            "rerun": "Re-run the job after the quota resets.",
+            "when_clause": _WHEN_MIDRUN,
+            "rerun": _RERUN_JOB,
             # The mid-run body names the model that was capped, not the skill:
             # the agent job already ran, so the rules source is beside the point.
             "footer": "\n---\n_Automated pre-mortem not run: quota (%s)_\n",
@@ -103,12 +108,16 @@ def build_body(stage: str, when: str, env: dict[str, str]) -> str:
     # The mid-run mutation body is untitled; every other body opens with its
     # action title so the comment is recognisable among the other bots'.
     if not (when == "midrun" and stage == "mutation"):
-        parts.append(f"{title}\n\n")
-    parts.append(
-        _SUMMARY.format(when_clause=spec["when_clause"], produced=_STAGES[stage]["produced"])
+        parts.extend([f"{title}\n\n"])
+    parts.extend(
+        [
+            _SUMMARY.format(
+                when_clause=spec["when_clause"], produced=_STAGES[stage]["produced"]
+            ),
+            spec["rerun"] + "\n",
+            f"\n_Analysed base `{base_sha[:8]}` ... head `{head_sha[:8]}`._\n",
+        ]
     )
-    parts.append(spec["rerun"] + "\n")
-    parts.append(f"\n_Analysed base `{base_sha[:8]}` ... head `{head_sha[:8]}`._\n")
     if spec["footer"] is not None:
         if spec["footer_arg"] == "skill":
             skill_path = env.get("SKILL_PATH", "")

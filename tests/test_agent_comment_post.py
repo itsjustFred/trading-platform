@@ -34,7 +34,8 @@ def _load(name: str, filename: str):
     if str(AGENTS_DIR) not in sys.path:
         sys.path.insert(0, str(AGENTS_DIR))
     spec = importlib.util.spec_from_file_location(name, AGENTS_DIR / filename)
-    assert spec is not None and spec.loader is not None
+    assert spec is not None
+    assert spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
@@ -124,7 +125,9 @@ def test_a_quota_skip_still_overwrites_an_older_quota_comment(tmp_path) -> None:
     result = _run(env, work)
     assert result.returncode == 0, result.stderr
     writes = api.writes
-    assert len(writes) == 1 and "PATCH" in writes[0] and "comments/42" in writes[0]
+    assert len(writes) == 1
+    assert "PATCH" in writes[0]
+    assert "comments/42" in writes[0]
 
 
 def test_a_quota_skip_still_overwrites_a_verdict_for_another_head(tmp_path) -> None:
@@ -148,7 +151,8 @@ def test_a_real_result_overwrites_an_earlier_verdict_for_the_same_head(tmp_path)
     result = _run(env, work)
     assert result.returncode == 0, result.stderr
     writes = api.writes
-    assert len(writes) == 1 and "PATCH" in writes[0]
+    assert len(writes) == 1
+    assert "PATCH" in writes[0]
 
 
 # ---------------------------------------------------------------------------
@@ -158,6 +162,17 @@ def test_a_real_result_overwrites_an_earlier_verdict_for_the_same_head(tmp_path)
 
 def test_a_moved_head_before_the_write_posts_nothing(tmp_path) -> None:
     env, work, api = _setup(tmp_path, [OTHER_HEAD, OTHER_HEAD], [])
+    result = _run(env, work)
+    assert result.returncode == 0, result.stderr
+    assert api.writes == []
+    assert "head moved" in result.stdout
+
+
+def test_the_first_head_read_alone_stops_a_moved_head(tmp_path) -> None:
+    """The stub serves OTHER_HEAD on the first pulls read and HEAD on every
+    later one: the first guard alone must stop the post, so the second read
+    never gets to 'rescue' it into a write."""
+    env, work, api = _setup(tmp_path, [OTHER_HEAD, HEAD], ["42"])
     result = _run(env, work)
     assert result.returncode == 0, result.stderr
     assert api.writes == []
@@ -194,7 +209,9 @@ def test_a_pr_with_no_marker_comment_gets_a_post(tmp_path) -> None:
     result = _run(env, work)
     assert result.returncode == 0, result.stderr
     writes = api.writes
-    assert len(writes) == 1 and "POST" in writes[0] and "/issues/409/comments" in writes[0]
+    assert len(writes) == 1
+    assert "POST" in writes[0]
+    assert "/issues/409/comments" in writes[0]
 
 
 def test_the_marker_and_body_make_up_body_md(tmp_path) -> None:
@@ -204,3 +221,31 @@ def test_the_marker_and_body_make_up_body_md(tmp_path) -> None:
     body = (work / "body.md").read_text(encoding="utf-8")
     assert body.startswith(MARKER + "\n")
     assert "**Verdict: PASS**" in body
+
+
+# ---------------------------------------------------------------------------
+# input validation - every env/CLI value lands in a request path or body
+# ---------------------------------------------------------------------------
+
+
+def test_a_marker_that_is_not_a_single_line_html_comment_is_rejected(tmp_path) -> None:
+    env, work, api = _setup(tmp_path, [HEAD, HEAD], [])
+    result = _run(env, work, "--marker", '<!-- "bad" -->')
+    assert result.returncode == 1
+    assert api.writes == []
+
+
+def test_a_repository_that_is_not_owner_slash_name_is_rejected(tmp_path) -> None:
+    env, work, api = _setup(tmp_path, [HEAD, HEAD], [])
+    env["GITHUB_REPOSITORY"] = "not-a-repo"
+    result = _run(env, work)
+    assert result.returncode == 1
+    assert api.writes == []
+
+
+def test_a_non_numeric_pr_number_is_rejected(tmp_path) -> None:
+    env, work, api = _setup(tmp_path, [HEAD, HEAD], [])
+    env["PR_NUMBER"] = "abc"
+    result = _run(env, work)
+    assert result.returncode == 1
+    assert api.writes == []

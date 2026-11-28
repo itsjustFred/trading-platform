@@ -19,7 +19,8 @@ SCRIPT = REPO_ROOT / "scripts" / "agents" / "quota_comment.py"
 
 def _load():
     spec = importlib.util.spec_from_file_location("quota_comment", SCRIPT)
-    assert spec is not None and spec.loader is not None
+    assert spec is not None
+    assert spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
@@ -129,10 +130,15 @@ def test_premortem_midrun_body_without_variant() -> None:
     assert "(inkling-2-small-free)_" in body
 
 
-def test_unknown_stage_or_when_is_refused() -> None:
+def test_an_unknown_stage_is_refused() -> None:
     import pytest
 
     with pytest.raises(ValueError):
         quota_comment.build_body("bogus", "probe", _env())
+
+
+def test_an_unknown_when_is_refused() -> None:
+    import pytest
+
     with pytest.raises(ValueError):
         quota_comment.build_body("review", "bogus", _env())

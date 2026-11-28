@@ -26,7 +26,8 @@ PARSER_PATH = REPO_ROOT / "scripts" / "agents" / "parse_verdict.py"
 
 def _load_parser():
     spec = importlib.util.spec_from_file_location("parse_verdict", PARSER_PATH)
-    assert spec is not None and spec.loader is not None
+    assert spec is not None
+    assert spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
@@ -143,8 +144,17 @@ def test_parse_verdict_stage_vocabularies_differ() -> None:
 
 
 def test_parse_verdict_rejects_an_unknown_stage() -> None:
+    report = _report("**Verdict: PASS**")
     with pytest.raises(ValueError, match="unknown stage"):
-        parse_verdict.parse_verdict(_report("**Verdict: PASS**"), "bogus")
+        parse_verdict.parse_verdict(report, "bogus")
+
+
+def test_parse_verdict_fails_closed_when_no_line_can_be_a_verdict() -> None:
+    """A report whose every line is blank or the sign-off note leaves no
+    verdict candidate at all; the parser must return None, never a default
+    PASS - a missing verdict masquerading as success is the failure this
+    guards."""
+    assert parse_verdict.parse_verdict("\nHuman sign-off required.\n", "premortem") is None
 
 
 # ---------------------------------------------------------------------------

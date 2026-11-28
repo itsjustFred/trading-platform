@@ -115,6 +115,49 @@ def _marker_comments(repo: str, pr: str, marker: str) -> list[dict[str, str]]:
         page += 1
 
 
+def _validated_inputs(marker: str) -> tuple[str, str, str, bool]:
+    """The env values every request is built from, or exit 1.
+
+    Every value below lands in a request path or the posted body: anything
+    that is not the exact shape the workflow produces is refused first."""
+    repo = os.environ.get("GITHUB_REPOSITORY", "")
+    pr = os.environ.get("PR_NUMBER", "")
+    head = os.environ.get("HEAD_SHA", "")
+    quota_skip = os.environ.get("QUOTA_SKIP", "") == "true"
+    if not _REPO_RE.fullmatch(repo):
+        print("::error::GITHUB_REPOSITORY is not owner/name.", file=sys.stderr)
+        raise SystemExit(1)
+    if not pr.isdigit():
+        print("::error::PR_NUMBER is not a number.", file=sys.stderr)
+        raise SystemExit(1)
+    if not head:
+        print("::error::HEAD_SHA is required.", file=sys.stderr)
+        raise SystemExit(1)
+    if '"' in marker or "\n" in marker:
+        print("::error::the marker must be a single-line HTML comment.", file=sys.stderr)
+        raise SystemExit(1)
+    return repo, pr, head, quota_skip
+
+
+def _real_verdict_for_head(
+    existing: list[dict[str, str]], head: str, noun: str
+) -> bool:
+    """A quota skip must not overwrite a real verdict for this same head: a
+    manual re-run of an unchanged head after the cap resets is exactly the
+    case where the "not run: quota" body would replace a verdict that is
+    still current. A quota body over an older quota comment, or any real
+    verdict for another head, still writes."""
+    for comment in existing:
+        prior = comment["body"]
+        if "Verdict:" in prior and comment_names_head(prior, head):
+            _notice(
+                f"The existing {noun} comment is a real verdict for {head}; "
+                "the quota skip did not overwrite it."
+            )
+            return True
+    return False
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--stage", required=True, choices=sorted(_NOUN))
@@ -122,24 +165,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     noun = _NOUN[args.stage]
 
-    repo = os.environ.get("GITHUB_REPOSITORY", "")
-    pr = os.environ.get("PR_NUMBER", "")
-    head = os.environ.get("HEAD_SHA", "")
-    quota_skip = os.environ.get("QUOTA_SKIP", "") == "true"
-    # Every value below lands in a request path or the posted body: anything
-    # that is not the exact shape the workflow produces is refused first.
-    if not _REPO_RE.fullmatch(repo):
-        print("::error::GITHUB_REPOSITORY is not owner/name.", file=sys.stderr)
-        return 1
-    if not pr.isdigit():
-        print("::error::PR_NUMBER is not a number.", file=sys.stderr)
-        return 1
-    if not head:
-        print("::error::HEAD_SHA is required.", file=sys.stderr)
-        return 1
-    if '"' in args.marker or "\n" in args.marker:
-        print("::error::the marker must be a single-line HTML comment.", file=sys.stderr)
-        return 1
+    repo, pr, head, quota_skip = _validated_inputs(args.marker)
 
     body_path = Path("comment.md")
     body_text = body_path.read_text(encoding="utf-8") if body_path.exists() else ""
@@ -171,20 +197,8 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
 
-    # A quota skip must not overwrite a real verdict for this same head: a
-    # manual re-run of an unchanged head after the cap resets is exactly the
-    # case where the "not run: quota" body would replace a verdict that is
-    # still current. A quota body over an older quota comment, or any real
-    # verdict for another head, still writes.
-    if quota_skip:
-        for comment in existing:
-            prior = comment["body"]
-            if "Verdict:" in prior and comment_names_head(prior, head):
-                _notice(
-                    f"The existing {noun} comment is a real verdict for {head}; "
-                    "the quota skip did not overwrite it."
-                )
-                return 0
+    if quota_skip and _real_verdict_for_head(existing, head, noun):
+        return 0
 
     if existing:
         # More than one comment can carry the marker (a duplicate from an

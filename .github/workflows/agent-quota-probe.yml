@@ -96,13 +96,13 @@ jobs:
           # reached the configured model.
           # MODEL is provider/model; a bare or empty model id would only reach
           # opencode as a model it cannot resolve, so it stops here with its name.
-          if [ "${MODEL%%/*}" = "$MODEL" ] || [ -z "${MODEL#*/}" ]; then
+          if [[ "${MODEL%%/*}" = "$MODEL" || -z "${MODEL#*/}" ]]; then
             echo "::error::MODEL '${MODEL}' is not provider/model (e.g. nvidia/stepfun-ai/step-5-preview)."
             exit 1
           fi
-          if [ "${MODEL%%/*}" = "kilo" ]; then
+          if [[ "${MODEL%%/*}" = "kilo" ]]; then
             jq -cn --arg model "${MODEL#kilo/}" '{"$schema": "https://opencode.ai/config.json", update: "disable", providers: {kilo: {settings: {baseURL: "https://ai-gateway.kilo.ai/api/v1"}, models: {($model): {}}}}}' > "$conf/opencode.json"
-          elif [ "${MODEL%%/*}" = "nvidia" ]; then
+          elif [[ "${MODEL%%/*}" = "nvidia" ]]; then
             # An `nvidia/...` model runs on NVIDIA's API with the key from the
             # ACTIONS_NVIDIA_API_KEY secret, which only the probe and agent steps
             # receive (as NVIDIA_API_KEY, the variable opencode's built-in provider
@@ -113,7 +113,7 @@ jobs:
             printf '{"$schema":"https://opencode.ai/config.json","update":"disable"}\n' > "$conf/opencode.json"
           fi
           model="$MODEL"
-          if [ -n "$VARIANT" ]; then model="${MODEL}#${VARIANT}"; fi
+          if [[ -n "$VARIANT" ]]; then model="${MODEL}#${VARIANT}"; fi
           {
             printf -- '---\n'
             printf 'description: Read-only model quota probe (CI only)\n'
@@ -135,7 +135,7 @@ jobs:
         run: |
           set -euo pipefail
           # Without the secret an `nvidia/...` model can only fail with a 401; say why.
-          if [ -n "${MODEL:-}" ] && [ "${MODEL%%/*}" = "nvidia" ] && [ -z "${NVIDIA_API_KEY:-}" ]; then
+          if [[ -n "${MODEL:-}" && "${MODEL%%/*}" == "nvidia" && -z "${NVIDIA_API_KEY:-}" ]]; then
             echo "::error::MODEL is ${MODEL}, but the ACTIONS_NVIDIA_API_KEY secret is not set (Settings -> Secrets and variables -> Actions)."
             exit 1
           fi
@@ -148,10 +148,11 @@ jobs:
           # after retrying gets a rate-limit line the quota classifier recognises; a run that
           # retried and then went on is left alone.
           note_exhausted_retries() {
+            local stream="$1"
             local final_line
-            final_line=$(grep -v '^[[:space:]]*$' "$1" | tail -n 1) || true
-            if grep -q 'retrying (attempt' "$1" && [[ "$final_line" == *'rror: '*'Provider returned error'* ]]; then
-              echo 'rate limit: opencode gave up retrying a retryable provider error' >> "$1"
+            final_line=$(grep -v '^[[:space:]]*$' "$stream" | tail -n 1) || true
+            if grep -q 'retrying (attempt' "$stream" && [[ "$final_line" == *'rror: '*'Provider returned error'* ]]; then
+              echo 'rate limit: opencode gave up retrying a retryable provider error' >> "$stream"
             fi
           }
           # opencode repeats the provider's error on every retry line ("retrying
@@ -161,16 +162,19 @@ jobs:
           # stays, and so does note_exhausted_retries' synthetic line, which must
           # therefore never contain "retrying (attempt".
           drop_retry_lines() {
-            grep -v 'retrying (attempt' "$1" > "$1.final" || true
+            local stream="$1"
+            grep -v 'retrying (attempt' "$stream" > "$stream.final" || true
           }
           # A failed probe whose last stderr line is a retry line was cut off mid-retry:
           # that line is why it failed, so it goes back into the classifier's view (only
           # for a failed probe - after a retry that cleared it must not count).
           keep_last_retry_line() {
+            local stream="$1"
             local final_line
-            final_line=$(grep -v '^[[:space:]]*$' "$1" | tail -n 1) || true
+            final_line=$(grep -v '^[[:space:]]*$' "$stream" | tail -n 1) || true
             case "$final_line" in
-              *'retrying (attempt'*) printf '%s\n' "$final_line" >> "$1.final" ;;
+              *'retrying (attempt'*) printf '%s\n' "$final_line" >> "$stream.final" ;;
+              *) : ;;
             esac
           }
           # opencode has been seen exiting 0 on the cap for this tiny prompt,
@@ -186,7 +190,7 @@ jobs:
           printf '%s\n' "$raw" > "$probe_dir/stdout"
           note_exhausted_retries "$probe_dir/stderr"
           drop_retry_lines "$probe_dir/stderr"
-          [ "$status" -eq 0 ] || keep_last_retry_line "$probe_dir/stderr"
+          [[ "$status" -eq 0 ]] || keep_last_retry_line "$probe_dir/stderr"
           cat "$probe_dir/stdout" "$probe_dir/stderr" > "$probe_dir/combined"
           # Always logged, bounded like the agent step's echo: run 44962236033
           # passed this probe and hit "Free usage limit reached" 26 s later,
@@ -204,7 +208,7 @@ jobs:
           if grep -qiE 'usage limit|rate.?limit|quota|insufficient credits|limit reached|not available in your country|service unavailable|overloaded|sign up for free to continue|too many requests' "$probe_dir/stdout" "$probe_dir/stderr.final"; then
             echo "available=false" >> "$GITHUB_OUTPUT"
             echo "::warning::The free model is capped, rate-limited, region-refused or unavailable; the agent job is skipped - not run: quota. Re-run the workflow after the quota resets."
-          elif [ "$status" -eq 0 ] && grep -qw 'OK' "$probe_dir/stdout"; then
+          elif [[ "$status" -eq 0 ]] && grep -qw 'OK' "$probe_dir/stdout"; then
             echo "available=true" >> "$GITHUB_OUTPUT"
             echo "::notice::Quota probe reached the model; the agent job will run."
           else

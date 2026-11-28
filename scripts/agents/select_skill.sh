@@ -18,7 +18,10 @@
 # revision syntax - fell through to the PR's own copy under a prompt that
 # said the rules came from the base branch. Now only an empty listing (the
 # base genuinely has no skill at that path) takes that branch, and every
-# other failure stops the job.
+# other failure stops the job. The standalone `git cat-file -e` above is
+# load-bearing: deleting it (or folding it into the `if`) lets an unreadable
+# base commit silently fall through to the PR's own rules while the footer
+# still names the base branch - nothing catches that misattribution today.
 #
 # Usage: select_skill.sh <stage-dir> <missing-label>
 #   stage-dir    the $RUNNER_TEMP subdirectory (review|mutation|premortem)
@@ -32,10 +35,10 @@ mkdir -p "$RUNNER_TEMP/$stage_dir"
 skill="$RUNNER_TEMP/$stage_dir/skill.md"
 git cat-file -e "${BASE_SHA}^{commit}"
 listing=$(git ls-tree "$BASE_SHA" -- "$SKILL_PATH")
-if [ -n "$listing" ]; then
+if [[ -n "$listing" ]]; then
   git show "${BASE_SHA}:${SKILL_PATH}" > "$skill"
   echo "SKILL_SOURCE=base branch" >> "$GITHUB_ENV"
-elif [ -f "$SKILL_PATH" ]; then
+elif [[ -f "$SKILL_PATH" ]]; then
   cp "$SKILL_PATH" "$skill"
   echo "SKILL_SOURCE=this PR (not on the base branch yet)" >> "$GITHUB_ENV"
 else

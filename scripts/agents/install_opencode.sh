@@ -22,7 +22,7 @@ curl -fsSL --proto '=https' --proto-redir '=https' "$base/SHA256SUMS" |
   grep "  ${asset}\$" | (cd "$dest" && sha256sum -c -)
 tar -xzf "$dest/$asset" -C "$dest" opencode
 chmod +x "$dest/opencode"
-if [ -n "${GITHUB_PATH:-}" ]; then
+if [[ -n "${GITHUB_PATH:-}" ]]; then
   echo "$dest" >> "$GITHUB_PATH"
 else
   echo "::warning::GITHUB_PATH is unset; opencode is at $dest/opencode but not on PATH"
