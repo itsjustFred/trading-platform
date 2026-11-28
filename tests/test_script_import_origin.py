@@ -33,6 +33,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.conftest import sandboxed_env
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS_DIR = REPO_ROOT / "scripts"
 GUARD_START = "# --- import-origin guard ---"
@@ -57,12 +59,13 @@ def _run_guarded_script(
         if direct
         else [sys.executable, "-m", f"scripts.{name}", *args]
     )
-    env = dict(os.environ)
-    env.update(env_extra or {})
-    for dropped in ("BASE_URL", "PERMA_ALLOW_LIVE_VIEWER_WRITES"):
-        env.pop(dropped, None)
     return subprocess.run(
-        argv, capture_output=True, text=True, cwd=str(cwd or REPO_ROOT), env=env, timeout=600
+        argv,
+        capture_output=True,
+        text=True,
+        cwd=str(cwd or REPO_ROOT),
+        env=sandboxed_env(**(env_extra or {})),
+        timeout=600,
     )
 
 
@@ -88,18 +91,17 @@ def _divergent_site(tmp_path: Path) -> Path:
 
 
 def _probe_env(data_dir: Path) -> dict[str, str]:
-    """An environment that cannot reach the live platform.
+    """The sandboxed environment, pointed at ``data_dir``.
 
-    `BASE_URL` and `PERMA_ALLOW_LIVE_VIEWER_WRITES` are dropped rather than blanked, because an
-    empty value is still a value the viewer client may act on.
+    ``sandboxed_env()`` drops ``BASE_URL`` and ``PERMA_ALLOW_LIVE_VIEWER_WRITES``
+    rather than blanking them (an empty value is still a value the viewer client
+    may act on), along with everything else the suite's allowlist excludes.
     """
-    env = dict(os.environ)
-    for name in ("BASE_URL", "PERMA_ALLOW_LIVE_VIEWER_WRITES"):
-        env.pop(name, None)
-    env["DATA_DIR"] = str(data_dir)
-    env["TRADING_DATA_DIR"] = str(data_dir)
-    env["LOG_DIR"] = str(data_dir / "logs")
-    return env
+    return sandboxed_env(
+        DATA_DIR=str(data_dir),
+        TRADING_DATA_DIR=str(data_dir),
+        LOG_DIR=str(data_dir / "logs"),
+    )
 
 
 def _installed_shared_tree() -> Path | None:
@@ -345,18 +347,18 @@ def test_every_guarded_script_reaches_the_shared_guard_module(tmp_path: Path) ->
     dropped, the wrong helper name - fails here instead of in production.
     """
     site = _divergent_site(tmp_path)
-    env_extra = {"PYTHONPATH": os.pathsep.join([str(site), os.environ.get("PYTHONPATH", "")])}
+    # The divergent site goes first on the child's PYTHONPATH, ahead of the
+    # sandbox's own entries: that is the tree the child must refuse, and it has
+    # to win the resolution for the refusal to mean anything.
+    env_extra = {"PYTHONPATH": str(site)}
     offenders = []
     for name in _guarded_script_names():
-        env = dict(os.environ, **env_extra)
-        env.pop("BASE_URL", None)
-        env.pop("PERMA_ALLOW_LIVE_VIEWER_WRITES", None)
         result = subprocess.run(
             [sys.executable, str(SCRIPTS_DIR / f"{name}.py"), "--help"],
             capture_output=True,
             text=True,
             cwd=str(tmp_path),
-            env=env,
+            env=sandboxed_env(**env_extra),
             timeout=600,
         )
         if "refusing to run" not in result.stderr or result.returncode == 0:

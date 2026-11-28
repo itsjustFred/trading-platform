@@ -11,12 +11,13 @@ requires - it clears the latch AND re-bases the peak to the current equity.
 from __future__ import annotations
 
 import json
-import os
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
+
+from tests.conftest import sandboxed_env
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 ACCOUNT = "acc-cli"
@@ -26,21 +27,25 @@ DEP_ID = "11111111-2222-4333-8444-555555555555"
 
 
 def _child_env(data_dir: Path) -> dict[str, str]:
-    """An environment that cannot reach the live platform's database.
+    """The sandboxed environment, pointed at this test's data directory.
 
-    ``DATABASE_URL`` is dropped *and* pointed at the sandbox: the engine builder
-    prefers it over ``DATA_DIR``, so inheriting it would have a CLI subprocess
-    write real breaker state into a real live database.
+    ``sandboxed_env()`` gives the child the suite's own sandbox (no inherited
+    DATA_DIR, no ``BASE_URL``/``PERMA_ALLOW_LIVE_VIEWER_WRITES``, no accounts
+    env), and ``DATABASE_URL`` is set rather than merely dropped: the engine
+    builder prefers it over ``DATA_DIR``, so inheriting it would have a CLI
+    subprocess write real breaker state into a real live database.
     """
-    env = dict(os.environ)
-    for dropped in ("BASE_URL", "PERMA_ALLOW_LIVE_VIEWER_WRITES", "DATABASE_URL"):
-        env.pop(dropped, None)
     data_dir.mkdir(parents=True, exist_ok=True)
-    env["DATA_DIR"] = str(data_dir)
-    env["TRADING_DATA_DIR"] = str(data_dir)
-    env["LOG_DIR"] = str(data_dir / "logs")
-    env["DATABASE_URL"] = f"sqlite:///{(data_dir / 'backtests.db').as_posix()}"
-    return env
+    return sandboxed_env(
+        DATA_DIR=str(data_dir),
+        TRADING_DATA_DIR=str(data_dir),
+        LOG_DIR=str(data_dir / "logs"),
+        DATABASE_URL=f"sqlite:///{(data_dir / 'backtests.db').as_posix()}",
+        credential_override_reason=(
+            "the child script's own sandbox database, pointed at this test's tmp_path - "
+            "not a production URL"
+        ),
+    )
 
 
 def _run(argv: list[str], data_dir: Path) -> subprocess.CompletedProcess[str]:

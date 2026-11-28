@@ -28,6 +28,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.conftest import sandboxed_env
+
 REPO_ROOT = str(Path(__file__).parent.parent)
 
 # A process that started a JVM should exit almost immediately after its work.
@@ -53,11 +55,27 @@ requires_java = pytest.mark.skipif(
 )
 
 
-def _run(script: str) -> tuple[subprocess.CompletedProcess, float]:
+def _fixture_jar(tmp_path: Path) -> str:
+    """A classpath entry, so no test reaches the network for one.
+
+    The classpath used to come from the JNLP bootstrap, which downloads the JForex jars from
+    Dukascopy - the network edge the sandbox closes, in a child process the audit hook never
+    covered. ``JFOREX_JARS`` is the explicit source ``_resolve_jforex_classpath_details`` reads
+    first, so pointing it at a file under ``tmp_path`` resolves the classpath locally. Nothing
+    under test reads the jar's content: the JVM starts from whatever classpath it is handed,
+    which is the property these tests assert.
+    """
+    jar = tmp_path / "fixture-jforex.jar"
+    jar.write_bytes(b"test fixture: a classpath entry, not a real JForex jar")
+    return str(jar)
+
+
+def _run(script: str, **env_overrides: str) -> tuple[subprocess.CompletedProcess, float]:
     """Run ``script`` in a fresh interpreter and report its result and runtime.
 
     ``{repo}`` in the script is substituted with the repo root so the
     subprocess imports the checkout under test rather than an installed copy.
+    ``env_overrides`` are the child's own environment on top of the sandbox.
     """
     wrapped = textwrap.dedent(script).format(repo=REPO_ROOT)
     started = time.monotonic()
@@ -66,6 +84,7 @@ def _run(script: str) -> tuple[subprocess.CompletedProcess, float]:
         capture_output=True,
         text=True,
         timeout=EXIT_BUDGET_SECONDS + 60,
+        env=sandboxed_env(**env_overrides),
     )
     return result, time.monotonic() - started
 
@@ -96,7 +115,7 @@ def test_import_does_not_mutate_jpype_onexit():
 
 
 @requires_java
-def test_ensure_jvm_started_disables_onexit_before_start():
+def test_ensure_jvm_started_disables_onexit_before_start(tmp_path: Path):
     """Starting a JVM through the module must arm the guard; a started JVM too.
 
     Covers both branches of ``_ensure_jvm_started``: the start path arms
@@ -121,7 +140,8 @@ def test_ensure_jvm_started_disables_onexit_before_start():
         jforex_dl._ensure_jvm_started()
         assert jpype.config.onexit is False, "reuse path left onexit enabled"
         print("ONEXIT_ARMED_ON_BOTH_PATHS")
-        """
+        """,
+        JFOREX_JARS=_fixture_jar(tmp_path),
     )
     assert result.returncode == 0, (
         f"process did not exit cleanly (rc={result.returncode})\n"
@@ -161,7 +181,7 @@ def test_production_code_never_calls_jpype_shutdownjvm():
 
 
 @requires_java
-def test_process_with_started_jvm_exits_cleanly_and_promptly():
+def test_process_with_started_jvm_exits_cleanly_and_promptly(tmp_path: Path):
     """A process that started a JVM must exit 0 quickly, not hang.
 
     This is the exact failure mode that pinned the CI ``Python ubuntu-latest``
@@ -177,7 +197,8 @@ def test_process_with_started_jvm_exits_cleanly_and_promptly():
         jforex_dl._ensure_jvm_started()
         assert jforex_dl.jpype.isJVMStarted(), "JVM did not start; test is vacuous"
         print("JVM_STARTED")
-        """
+        """,
+        JFOREX_JARS=_fixture_jar(tmp_path),
     )
 
     assert result.returncode == 0, (
@@ -191,7 +212,7 @@ def test_process_with_started_jvm_exits_cleanly_and_promptly():
 
 
 @requires_java
-def test_viewer_lifespan_started_jvm_exits_cleanly():
+def test_viewer_lifespan_started_jvm_exits_cleanly(tmp_path: Path):
     """The path the suite takes: the viewer lifespan JForex prewarm.
 
     The lifespan prewarm starts the JVM through ``_ensure_jvm_started``; the
@@ -225,7 +246,8 @@ def test_viewer_lifespan_started_jvm_exits_cleanly():
         assert jforex_dl.JPYPE_AVAILABLE, "jpype missing; test env is incomplete"
         assert jforex_dl.jpype.isJVMStarted(), "lifespan prewarm did not start the JVM"
         print("LIFESPAN_JVM_STARTED")
-        """
+        """,
+        JFOREX_JARS=_fixture_jar(tmp_path),
     )
 
     assert result.returncode == 0, (
