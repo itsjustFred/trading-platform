@@ -45,6 +45,7 @@ from runner.engines.base import (
 )
 from runner.fees import resolve_fee_model
 from runner.stats import compute_stats_for_result
+from shared import ohlcv_store
 from shared.constants import DATA_DIR
 from shared.models import BacktestMeta, BacktestResult, EquityPoint, Trade, TradeExit
 
@@ -302,8 +303,9 @@ class PyneCoreAdapter(EngineAdapter):
             # mirroring the native adapter); trades are gated to start_date
             # after parsing.
             load_start = _effective_load_start(config)
-            df = _load_ohlcv(
-                data_root, symbol, config.timeframe, load_start, config.end_date
+            df, entry = _load_ohlcv(
+                data_root, symbol, config.timeframe, load_start, config.end_date,
+                data_source=config.data_source or "",
             )
             if df is None or df.empty:
                 # Same rule as the native/vectorbt adapters (F24): a symbol with
@@ -318,11 +320,7 @@ class PyneCoreAdapter(EngineAdapter):
             trades, symbol_stats = self._run_pyne_for_symbol(
                 config, strategy_path, symbol, df, context_builder, trade_counter
             )
-            asset_class = _infer_asset_class(
-                Path(config.data_dir) if config.data_dir else DATA_DIR,
-                symbol,
-                config.timeframe,
-            )
+            asset_class = _infer_asset_class(entry)
             asset_classes[str(symbol).upper()] = asset_class
             trade_counter += len(trades)
             all_trades.extend(trades)
@@ -1064,42 +1062,24 @@ def _load_ohlcv(
     timeframe: str,
     start_date: str,
     end_date: str,
-) -> pd.DataFrame | None:
-    """Find and load OHLCV parquet for a symbol."""
-    ohlcv_root = data_root / "ohlcv"
-    matches = sorted(
-        ohlcv_root.rglob(f"**/{symbol}/{timeframe}.parquet"),
-        key=lambda path: path.as_posix(),
+    *,
+    data_source: str = "",
+) -> tuple[pd.DataFrame | None, ohlcv_store.DatasetEntry | None]:
+    """Find and load OHLCV data for a symbol via the manifest store."""
+    entry = ohlcv_store.find_dataset(
+        data_root, symbol, timeframe, data_source=data_source
     )
-    if not matches:
-        return None
+    if entry is None:
+        return None, None
 
-    df = pd.read_parquet(matches[0])
-    df.columns = [c.lower() for c in df.columns]
-    df = contract.normalize_ohlcv_frame(df)
-
-    if "timestamp" in df.columns:
-        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
-        # Conformance (Cleanup 16-A, F9): shared date-filter convention — a
-        # date-only end boundary is inclusive of the full day.
-        df = contract.apply_date_filter(df, start=start_date, end=end_date)
-
-    return df.reset_index(drop=True)
+    df = ohlcv_store.read_frame(entry, start=start_date, end=end_date)
+    return df, entry
 
 
-def _infer_asset_class(data_root: Path, symbol: str, timeframe: str) -> str:
-    matches = sorted(
-        (data_root / "ohlcv").rglob(f"**/{symbol}/{timeframe}.parquet"),
-        key=lambda path: path.as_posix(),
-    )
-    if not matches:
+def _infer_asset_class(entry: ohlcv_store.DatasetEntry | None) -> str:
+    if entry is None:
         return "unknown"
-    parts = matches[0].parts
-    try:
-        ohlcv_idx = parts.index("ohlcv")
-        return parts[ohlcv_idx + 2].lower()
-    except (ValueError, IndexError):
-        return "unknown"
+    return entry.asset_class or "unknown"
 
 
 def _normalize_trade_exits(trades: list[Trade]) -> None:
