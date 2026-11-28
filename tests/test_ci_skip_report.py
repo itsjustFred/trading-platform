@@ -228,11 +228,18 @@ def test_is_money_path_covers_live_runner_and_engine_tests() -> None:
     # collect_ignore aimed at the fakes would hide every contract test just
     # as thoroughly. Pin the CI invocation and the root conftest.
     repo_root = Path(__file__).resolve().parents[1]
-    for workflow in sorted((repo_root / ".github" / "workflows").glob("*.yml")):
-        for line in workflow.read_text(encoding="utf-8").splitlines():
-            if "--ignore" in line or "--deselect" in line:
+    deselection_sources = sorted(
+        (repo_root / ".github" / "workflows").glob("*.yml")
+    ) + [
+        repo_root / name
+        for name in ("pytest.ini", "pyproject.toml", "setup.cfg", "tox.ini")
+        if (repo_root / name).is_file()
+    ]
+    for source_path in deselection_sources:
+        for line in source_path.read_text(encoding="utf-8").splitlines():
+            if "--ignore" in line or "--deselect" in line or "addopts" in line:
                 assert "fakes" not in line, (
-                    f"{workflow.name} deselects tests/fakes: {line.strip()}"
+                    f"{source_path.name} deselects tests/fakes: {line.strip()}"
                 )
     for line in (fakes_root.parent / "conftest.py").read_text(
         encoding="utf-8"
