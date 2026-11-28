@@ -227,13 +227,6 @@ _OHLCV_TIMEFRAME_RE = re.compile(r"^[A-Za-z0-9]{1,16}$")
 _OHLCV_MAX_MATCHES = 32
 _OHLCV_MAX_BYTES = 256 * 1024 * 1024
 _OHLCV_MAX_ROWS = 2_000_000
-_OHLCV_SOURCE_PRIORITY = {
-    "dukascopy": 0,
-    "yfinance": 1,
-    "huggingface": 2,
-    "alpaca": 3,
-    "dolthub": 4,
-}
 _OHLCV_DF_CACHE_LOCK = threading.RLock()
 _OHLCV_SOURCE_SIGNATURE = tuple[tuple[str, int, int], ...]
 _OHLCV_DF_CACHE: dict[
@@ -669,8 +662,10 @@ def _trade_to_viewer(trade) -> dict:
 def _ohlcv_candidates(root: Path, symbol: str, timeframe: str) -> list[Path]:
     """Manifest-declared parquet segments for ``symbol``/``timeframe``.
 
-    Only the highest-priority source that declares the dataset contributes
-    files, matching the historical single-source merge semantics (#471).
+    Only the dataset ``find_dataset`` would select contributes files —
+    the same ``ohlcv_store.selection_rank`` the engines use — so the chart
+    can never disagree with a backtest about which source a symbol reads
+    (#471).
     """
     normalized_timeframe = normalize_timeframe(timeframe)
     try:
@@ -680,7 +675,8 @@ def _ohlcv_candidates(root: Path, symbol: str, timeframe: str) -> list[Path]:
     except Exception as exc:
         logger.warning("Could not list OHLCV datasets for %s %s: %s", symbol, timeframe, exc)
         return []
-    by_source: dict[str, list[Path]] = {}
+    rank_symbol = str(symbol or "").strip().upper()
+    by_entry: dict[ohlcv_store.DatasetEntry, list[Path]] = {}
     for entry in entries:
         paths = [
             path
@@ -688,17 +684,14 @@ def _ohlcv_candidates(root: Path, symbol: str, timeframe: str) -> list[Path]:
             if path.is_file() and not path.is_symlink()
         ]
         if paths:
-            by_source.setdefault(entry.source, []).extend(paths)
-    if not by_source:
+            by_entry[entry] = paths
+    if not by_entry:
         return []
-    best_source = min(
-        by_source,
-        key=lambda source: (
-            _OHLCV_SOURCE_PRIORITY.get(source, len(_OHLCV_SOURCE_PRIORITY)),
-            source,
-        ),
+    best_entry = min(
+        by_entry,
+        key=lambda entry: ohlcv_store.selection_rank(entry, rank_symbol),
     )
-    paths = sorted(set(by_source[best_source]))
+    paths = sorted(set(by_entry[best_entry]))
     if len(paths) > _OHLCV_MAX_MATCHES:
         return []
     return paths

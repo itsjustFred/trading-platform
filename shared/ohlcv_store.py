@@ -50,6 +50,7 @@ __all__ = [
     "read_manifest",
     "register_file",
     "segment_for_path",
+    "selection_rank",
     "source_dir",
     "store_root",
     "tf_token",
@@ -136,7 +137,11 @@ def _source_name(source: str) -> str:
 
 
 def _symbol_name(symbol: str) -> str:
-    return _safe_component(symbol, what="symbol")
+    # One spelling store-wide, like asset_class/region: readers match
+    # symbols case-insensitively, so writers canonicalize to uppercase —
+    # "spy" and "SPY" must be one manifest entry, not two datasets whose
+    # coverage find_dataset could split.
+    return _safe_component(symbol, what="symbol").upper()
 
 
 def store_root(data_root: str | Path) -> Path:
@@ -463,8 +468,12 @@ def list_datasets(
     return entries
 
 
-def _selection_rank(entry: DatasetEntry, symbol: str) -> tuple[Any, ...]:
-    """The ``select_ohlcv_path`` ranking, now fed by manifest metadata."""
+def selection_rank(entry: DatasetEntry, symbol: str) -> tuple[Any, ...]:
+    """The ``select_ohlcv_path`` ranking, now fed by manifest metadata.
+
+    Public so non-engine readers (the viewer) pick the SAME dataset
+    ``find_dataset`` would — one ranking, one source of truth.
+    """
     # The retired path-based lookup compared lowercased components; manifest
     # values keep their case, so the plausibility checks lowercase here.
     asset_class = entry.asset_class.lower()
@@ -527,7 +536,7 @@ def find_dataset(
         ]
     if not candidates:
         return None
-    return min(candidates, key=lambda entry: _selection_rank(entry, normalized_symbol))
+    return min(candidates, key=lambda entry: selection_rank(entry, normalized_symbol))
 
 
 def entry_for_path(data_root: str | Path, path: str | Path) -> DatasetEntry | None:
@@ -632,7 +641,11 @@ def parse_date_bound(value: str, *, is_end: bool) -> pd.Timestamp:
         raise ValueError(f"Invalid date filter value: {value!r}") from exc
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
-    if is_end and "T" not in raw and ":" not in raw:
+    # Date-only means no TIME component. Strip a trailing zone first: its
+    # colon ("2024-01-15+00:00") must not masquerade as a time separator and
+    # silently turn an end-of-day bound into midnight.
+    zone_stripped = re.sub(r"(?:Z|[+-]\d{2}:?\d{2})$", "", raw)
+    if is_end and "T" not in zone_stripped and ":" not in zone_stripped:
         parsed = parsed + timedelta(days=1) - timedelta(microseconds=1)
     return pd.Timestamp(parsed)
 
@@ -955,6 +968,11 @@ def write_frame(
     sorted, unique, UTC timestamps. ``rows``/``first``/``last`` are recomputed
     from the frame, never trusted from the caller. The manifest is written
     after the data file, also atomically.
+
+    Single-writer assumption: the manifest update is a read-modify-write,
+    so writers for the same source must be serialized (downloaders,
+    resample and the migration script are); concurrent writers can drop
+    each other's entries.
     """
     src = _source_name(source)
     sym = _symbol_name(symbol)
@@ -1014,6 +1032,9 @@ def register_file(
     this for byte-identical copies (aliases) where re-writing the frame
     through :func:`write_frame` would be wasted I/O; ``write_frame`` remains
     the writer for frames held in memory.
+
+    Same single-writer assumption as :func:`write_frame`: manifest updates
+    are read-modify-write and must be serialized per source.
     """
     src = _source_name(source)
     sym = _symbol_name(symbol)

@@ -320,6 +320,26 @@ class TestWriteFrame:
         )
         assert path.is_file()
 
+    def test_symbol_is_stored_uppercased(self, tmp_path: Path) -> None:
+        """Writers canonicalize the symbol key: ``spy`` and ``SPY`` are one
+        dataset, not two manifest entries ``find_dataset`` could split a
+        symbol's coverage across."""
+        ohlcv_store.write_frame(
+            tmp_path, "src", "spy", "1h", _frame(), asset_class="equity"
+        )
+        manifest = ohlcv_store.read_manifest(tmp_path, "src")
+        assert set(manifest) == {"SPY"}
+        assert ohlcv_store.data_path(tmp_path, "src", "SPY", "1h").is_file()
+        entries = ohlcv_store.list_datasets(tmp_path, symbol="spy")
+        assert len(entries) == 1
+        # The other spelling updates the same entry, not a sibling.
+        ohlcv_store.write_frame(
+            tmp_path, "src", "SPY", "1h", _frame(periods=6), asset_class="equity"
+        )
+        manifest = ohlcv_store.read_manifest(tmp_path, "src")
+        assert set(manifest) == {"SPY"}
+        assert manifest["SPY"]["files"]["SPY_H1.parquet"]["rows"] == 6
+
 
 class TestListAndFind:
     def test_list_datasets_filters(self, tmp_path: Path) -> None:
@@ -427,6 +447,20 @@ class TestListAndFind:
             ohlcv_store.find_dataset(tmp_path, "AAA", "1h", data_source="nosuch")
             is None
         )
+
+
+class TestDateBounds:
+    def test_offset_without_time_component_is_still_end_of_day(self) -> None:
+        """``2024-01-15+00:00`` carries a zone but no time: it is a date-only
+        end bound and must cover the whole day, not truncate at midnight."""
+        bound = ohlcv_store.parse_date_bound("2024-01-15+00:00", is_end=True)
+        assert bound == pd.Timestamp("2024-01-15T23:59:59.999999Z")
+
+    def test_explicit_time_component_is_not_extended(self) -> None:
+        bound = ohlcv_store.parse_date_bound(
+            "2024-01-15T10:00:00+00:00", is_end=True
+        )
+        assert bound == pd.Timestamp("2024-01-15T10:00:00Z")
 
 
 class TestReadFrame:

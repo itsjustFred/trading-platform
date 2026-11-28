@@ -1069,6 +1069,30 @@ def test_viewer_ohlcv_loader_rejects_wildcard_identity_and_match_budget(monkeypa
     core._OHLCV_DF_CACHE.clear()
 
 
+def test_viewer_ohlcv_candidates_use_the_store_dataset_ranking(
+    monkeypatch, tmp_path
+):
+    """The viewer must display the same source the engines select: the
+    store's dataset ranking (asset-class plausibility, then source
+    priority), not a private table — a huggingface copy outranks dukascopy
+    for ``find_dataset``, so the chart must show huggingface too."""
+    from viewer import core
+
+    monkeypatch.setattr(core, "DATA_DIR", tmp_path)
+    core._OHLCV_DF_CACHE.clear()
+    _write_store_ohlcv(tmp_path, "dukascopy", "EURUSD", asset_class="forex")
+    _write_store_ohlcv(tmp_path, "huggingface", "EURUSD", asset_class="forex")
+
+    candidates = core._ohlcv_candidates(
+        (tmp_path / "ohlcv").resolve(),
+        "EURUSD",
+        "1h",
+    )
+    assert candidates
+    assert all("huggingface" in str(path) for path in candidates)
+    core._OHLCV_DF_CACHE.clear()
+
+
 def test_viewer_ohlcv_loader_enforces_byte_budget(monkeypatch, tmp_path):
     from viewer import core
 
