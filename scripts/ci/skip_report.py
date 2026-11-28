@@ -59,6 +59,9 @@ MUST_NOT_SKIP_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
         r"^tests\.test_credential",
         r"^tests\.test_market_data_stream",
         r"^tests\.test_shutdown_budget",
+        # Live signal-level resolution shared by the broker adapters
+        # (risk.signal_levels / risk.live).
+        r"^tests\.test_signal_levels",
         # risk/ engine and its parity/validation coverage.
         r"^tests\.test_risk",
         r"^tests\.validation\.test_.*risk",

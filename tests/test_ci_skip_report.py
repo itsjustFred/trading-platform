@@ -17,6 +17,7 @@ from scripts.ci.skip_report import (
     parse_junit,
     violations,
 )
+from tests.conftest import sandboxed_env
 
 
 def _junit(cases: list[tuple[str, str, str | None]]) -> str:
@@ -118,6 +119,7 @@ def test_parse_junit_collection_skip_uses_name_as_module(tmp_path: Path) -> None
         capture_output=True,
         text=True,
         cwd=proj,
+        env=sandboxed_env(),
         timeout=300,
     )
     assert result.returncode == 0, result.stdout + result.stderr
@@ -347,6 +349,10 @@ _MONEY_PATH_IMPORT = re.compile(
 )
 
 _NON_MONEY_PATH_MODULES = {
+    "tests.builders.test_builders": (
+        "fixture-builder contract tests; engine/model imports only "
+        "type-check builder output"
+    ),
     "tests.test_alerts": (
         "ops alert sink plumbing; touches live_runner.daemon only for "
         "control-plane wiring"
@@ -365,6 +371,10 @@ _NON_MONEY_PATH_MODULES = {
     "tests.test_service_discovery": "service/account discovery, not order math",
     "tests.test_stats_ruin_consumers": (
         "stats consumers; live_runner import covers promotion-score plumbing"
+    ),
+    "tests.test_strategy_registry_static": (
+        "static strategy-registry contract checks; the engine imports only "
+        "read alias/key tables, no trading math runs"
     ),
     "tests.test_suite_isolation": "suite hermeticity self-guard",
     "tests.test_symbol_class": "symbol classification / market-data plumbing",
