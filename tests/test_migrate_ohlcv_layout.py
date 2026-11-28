@@ -156,7 +156,8 @@ def test_equity_etf_collision_resolves_to_etf_with_longest_coverage(
 
     entry1 = ohlcv_store.find_dataset(tmp_path / "new", "ETF1", "1d", data_source="yfinance")
     assert entry1 is not None
-    assert entry1.first is not None and str(entry1.first).startswith("2020-01-01")
+    assert entry1.first is not None
+    assert str(entry1.first).startswith("2020-01-01")
     entry2 = ohlcv_store.find_dataset(tmp_path / "new", "ETF2", "1d", data_source="yfinance")
     assert entry2 is not None
     assert entry2.rows == 6

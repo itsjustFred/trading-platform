@@ -710,7 +710,6 @@ def _summary_with_cache(
 
 
 def _dataset_segment_entry(
-    dataset: DatasetEntry,
     parquet_path: Path,
     data_dir: Path,
     catalog_cache: dict[str, dict],
@@ -745,7 +744,6 @@ def _dataset_catalog_entry(
     segment_paths = list(dataset.segments) or [dataset.path]
     segments = [
         _dataset_segment_entry(
-            dataset,
             path,
             data_dir,
             catalog_cache,
