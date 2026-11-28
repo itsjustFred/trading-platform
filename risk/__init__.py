@@ -1,5 +1,7 @@
 from risk.config import (
     RiskConfig,
+    coerce_setting_float,
+    coerce_setting_int,
     effective_max_leverage,
     effective_max_notional_per_trade,
 )
@@ -12,6 +14,8 @@ __all__ = [
     "RiskEngine",
     "SizedOrder",
     "TradeSignal",
+    "coerce_setting_float",
+    "coerce_setting_int",
     "effective_max_leverage",
     "effective_max_notional_per_trade",
 ]

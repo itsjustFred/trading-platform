@@ -1,5 +1,9 @@
 # MT5 Backtest Alignment Plan
 
+> **Status:** historical planning note. MT5 report ingestion is now XLSX-only
+> (`validation/importers/mt5_xlsx.py`); HTML exports are human-readable artifacts
+> and are not parsed. The `.html` paths below are historical references.
+
 ## Purpose
 
 Make platform backtests comparable against the MT5 strategy reports in

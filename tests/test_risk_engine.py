@@ -734,9 +734,9 @@ def test_a_non_finite_entry_price_is_refused_at_the_model():
 def test_a_non_finite_stop_is_refused_before_the_distance_is_computed():
     """A stop the fallback path rewrote to a non-finite value never gets sized.
 
-    The engine assigns ``signal.stop_loss`` itself when resolving a fallback, so
-    pin that it re-validates the price before the wrong-side distance maths
-    rather than reporting an ``inf`` risk distance.
+    A caller (or a bug) may still put a non-finite stop on the signal after
+    construction, so pin that the engine re-validates the price before the
+    wrong-side distance maths rather than reporting an ``inf`` risk distance.
     """
     signal = TradeSignal(
         action="buy",
@@ -784,13 +784,15 @@ def test_calculate_position_size_missing_stop_loss_uses_fallback():
         current_exposure=0.0,
     )
 
-    assert signal.stop_loss is not None
-    assert signal.metadata.get("resolved_stop_loss") == signal.stop_loss
+    assert sized.resolved_stop_loss == pytest.approx(signal.entry_price - 1.5 * 2.0)
+    # The engine returns the resolved stop; it does not write it back.
+    assert signal.stop_loss is None
+    assert "resolved_stop_loss" not in signal.metadata
     assert sized.position_size > 0.0
     assert sized.risk_amount == 100.0
     assert sized.decision is not None
     assert sized.decision.accepted is True
-    assert sized.decision.stop_price_used == signal.stop_loss
+    assert sized.decision.stop_price_used == sized.resolved_stop_loss
     assert sized.decision.metadata["stop_source"] == "fallback_atr"
     assert ":none:" in sized.decision.signal_id
 
@@ -1072,11 +1074,11 @@ class TestIssueC1FallbackGuards:
                 current_exposure=0.0,
             )
 
-    def test_unsupported_trailing_mode_rejected(self) -> None:
+    def test_removed_trailing_mode_rejected(self) -> None:
         """#150 (decided behaviour change): the old warned no-op is gone.
 
-        supertrend_flip is a known mode no executing path supports yet (#168);
-        the engine refuses it instead of trading the signal untrailed.
+        supertrend_flip was removed; the engine refuses it — naming the
+        removed mode — instead of trading the signal untrailed.
         """
         signal = self._signal(trailing_sl_config={"mode": "supertrend_flip"})
         signal.stop_loss = 98.0
