@@ -1323,9 +1323,9 @@ class SignalReplayAdapter:
                 entry_price=fill_price,
                 signal_entry_price=float(effective_signal.entry_price),
                 quantity=quantity,
-                stop_loss=risk_signal.stop_loss,
+                stop_loss=sized.resolved_stop_loss,
                 take_profit=risk_signal.take_profit,
-                initial_stop_loss=risk_signal.stop_loss,
+                initial_stop_loss=sized.resolved_stop_loss,
                 initial_take_profit=risk_signal.take_profit,
                 # #84: store the realized stop-loss amount, not the policy
                 # figure (they differ on notional-cap).

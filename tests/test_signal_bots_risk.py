@@ -52,7 +52,7 @@ def test_signal_with_sl_sizes_from_stop_distance() -> None:
         pip_value=1.0,
         current_exposure=0.0,
     )
-    risk_distance = abs(signal.entry_price - float(signal.stop_loss))
+    risk_distance = abs(signal.entry_price - float(sized.resolved_stop_loss))
     assert risk_distance > 0
     assert sized.risk_amount == pytest.approx(1_000.0)
     notional_cap = 100_000.0 * engine.config.max_notional_per_trade
@@ -78,8 +78,10 @@ def test_signal_without_sl_uses_atr_fallback_stop() -> None:
         pip_value=1.0,
         current_exposure=0.0,
     )
-    assert signal.stop_loss is not None
-    assert signal.metadata["resolved_stop_loss"] == signal.stop_loss
+    assert sized.resolved_stop_loss is not None
+    # The resolved fallback is returned, not written back onto the signal.
+    assert signal.stop_loss is None
+    assert "resolved_stop_loss" not in signal.metadata
     assert sized.position_size > 0
 
 

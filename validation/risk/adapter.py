@@ -8,8 +8,9 @@ Behaviour with ``None`` stop-loss:
 - The adapter delegates to ``RiskEngine``, which synthesises a fallback
   stop distance (ATR-based if ``atr`` is present in metadata, otherwise
   ``fallback_stop_pct`` of the entry price).
-- The resolved stop is written back to the signal so that the caller can
-  inspect it in the resulting ``TradeRiskProfile``.
+- The resolved stop is returned on the sized order
+  (``SizedOrder.resolved_stop_loss``) and reflected in the resulting
+  ``TradeRiskProfile``; the input signal is left untouched.
 """
 
 from __future__ import annotations
@@ -152,8 +153,10 @@ class RiskAdapter:
             ),
         )
 
-        # After sizing the signal may contain a fallback-resolved stop.
-        resolved_stop = signal.stop_loss
+        # The engine returns the stop it sized on: the trade's own stop, or
+        # the fallback it resolved (G03; it no longer writes it onto the
+        # signal).
+        resolved_stop = sized_order.resolved_stop_loss
         stop_distance = (
             self._stop_distance(signal.entry_price, resolved_stop)
             if resolved_stop is not None
