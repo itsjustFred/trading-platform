@@ -98,7 +98,7 @@ def test_download_symbol_invalid_timeframes(monkeypatch):
         output_dir = Path(tmpdir)
         # monkeypatch restores the production module attribute when the test ends;
         # a bare assignment here leaks the mock for the rest of the pytest session.
-        monkeypatch.setattr(dl, "DukascopyNativeDownloader", MagicMock())
+        monkeypatch.setattr(dl, "DukascopyDownloader", MagicMock())
         result = download_symbol(
             requested_symbol="EURUSD",
             canonical_symbol="EURUSD",

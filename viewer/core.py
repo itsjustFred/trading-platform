@@ -3306,7 +3306,7 @@ def _start_dukascopy_task(
     name: str,
     description: str,
 ) -> dict[str, Any]:
-    from data_tools.downloaders.dukascopy_native import DownloadCancelled, DukascopyNativeDownloader
+    from data_tools.dukascopy.native import DownloadCancelled, DukascopyDownloader
 
     TASK_LOGS_DIR.mkdir(parents=True, exist_ok=True)
     log_file = _task_log_path(task_id)
@@ -3332,7 +3332,7 @@ def _start_dukascopy_task(
         command_display = redact_text(" ".join(str(part) for part in cmd))
         pause_event = record["pause_event"]
         stop_event = record["stop_event"]
-        downloader = DukascopyNativeDownloader()
+        downloader = DukascopyDownloader()
         refresh_needed = False
 
         try:
@@ -3536,9 +3536,9 @@ def _ensure_fallback_downloader(
 ) -> Any:
     """Create the native fallback downloader lazily."""
     if fallback_downloader is None:
-        from data_tools.downloaders.dukascopy_native import DukascopyNativeDownloader
+        from data_tools.dukascopy.native import DukascopyDownloader
 
-        return DukascopyNativeDownloader()
+        return DukascopyDownloader()
     return fallback_downloader
 
 
@@ -3584,7 +3584,7 @@ def _attempt_jforex_download(
     fallback_enabled: bool,
 ) -> _JForexAttempt:
     """Run one JForex download with optional native fallback; never raises."""
-    from data_tools.downloaders.dukascopy_native import DownloadCancelled
+    from data_tools.dukascopy.native import DownloadCancelled
 
     try:
         download = jforex_downloader.download(
@@ -3621,7 +3621,7 @@ def _attempt_native_fallback(
     fallback_reason: str,
 ) -> _JForexAttempt:
     """Run the Dukascopy-native fallback download for a failed JForex request."""
-    from data_tools.downloaders.dukascopy_native import DownloadCancelled
+    from data_tools.dukascopy.native import DownloadCancelled
 
     symbol = request.symbol
     timeframe = request.timeframe
@@ -3717,8 +3717,8 @@ def _start_jforex_task(
     name: str,
     description: str,
 ) -> dict[str, Any]:
-    from data_tools.downloaders.dukascopy_native import DukascopyNativeDownloader
     from data_tools.downloaders.jforex_dl import JForexDownloader
+    from data_tools.dukascopy.native import DukascopyDownloader
 
     TASK_LOGS_DIR.mkdir(parents=True, exist_ok=True)
     log_file = _task_log_path(task_id)
@@ -3745,7 +3745,7 @@ def _start_jforex_task(
         pause_event = record["pause_event"]
         stop_event = record["stop_event"]
         jforex_downloader = JForexDownloader()
-        fallback_downloader: DukascopyNativeDownloader | None = None
+        fallback_downloader: DukascopyDownloader | None = None
         fallback_enabled = (
             bool(allow_native_fallback)
             if allow_native_fallback is not None
@@ -3753,10 +3753,10 @@ def _start_jforex_task(
         )
         refresh_needed = False
 
-        def _get_fallback_downloader() -> DukascopyNativeDownloader:
+        def _get_fallback_downloader() -> DukascopyDownloader:
             nonlocal fallback_downloader
             if fallback_downloader is None:
-                fallback_downloader = DukascopyNativeDownloader()
+                fallback_downloader = DukascopyDownloader()
             return fallback_downloader
 
         try:

@@ -69,7 +69,7 @@ ALLOWED_UPWARD_EDGES: frozenset[tuple[str, str]] = frozenset(
     {
         # shared/venue_calendar.py resolves Dukascopy symbol shapes through a
         # lazy, failure-tolerant import of the downloader's SYMBOL_CONFIG.
-        ("shared.venue_calendar", "data_tools.downloaders.dukascopy_native"),
+        ("shared.venue_calendar", "data_tools.dukascopy.native"),
         # shared/database.py lazy-imports live-runner helpers inside functions
         # to avoid import cycles at module load time.
         ("shared.database", "live_runner.base_adapter"),

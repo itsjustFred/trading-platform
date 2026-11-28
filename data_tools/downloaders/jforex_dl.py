@@ -38,7 +38,7 @@ from urllib.request import urlopen
 import pandas as pd
 
 from data_tools.downloaders.base import Downloader, DownloadResult, SourceMeta
-from data_tools.downloaders.dukascopy_native import SYMBOL_CONFIG, _resolve_symbol_and_instrument
+from data_tools.dukascopy.native import SYMBOL_CONFIG, _resolve_symbol_and_instrument
 from data_tools.path_safety import build_dataset_path
 from data_tools.resample import assert_stored_weekly_file_current, resample_ohlcv
 from shared.constants import DATA_DIR, normalize_timeframe

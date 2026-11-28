@@ -25,7 +25,7 @@ from typing import Any
 
 import pandas as pd
 
-from data_tools.downloaders.dukascopy_native import DukascopyNativeDownloader
+from data_tools.dukascopy.native import DukascopyDownloader
 from data_tools.file_fingerprint import file_fingerprint, files_have_same_content
 from data_tools.path_safety import build_dataset_path
 from data_tools.resample import resample_file
@@ -251,7 +251,7 @@ def download_symbol(
     pause_ms: int,
     force: bool,
 ) -> dict[str, Any]:
-    downloader = DukascopyNativeDownloader()
+    downloader = DukascopyDownloader()
     asset_class = symbol_asset_class(canonical_symbol)
     canonical_dir = build_dataset_path(
         output_dir, "ohlcv", "dukascopy", asset_class, canonical_symbol

@@ -44,7 +44,7 @@ _guard.ensure_own_checkout("adaptive_harvester")
 # scripts that must carry the guard. Kept deliberately, and silenced rather than removed:
 # dropping it would take this script off the roster and out of the gate that keeps it alive.
 import shared  # noqa: F401
-from data_tools.downloaders.dukascopy_native import (
+from data_tools.dukascopy.native import (
     SYMBOL_CONFIG,
     decompress_bi5,
     generate_tick_urls,

@@ -30,7 +30,7 @@ def _empty_tick_frame() -> pd.DataFrame:
 
 def test_download_bi5_files_rejects_duplicate_batch_arguments():
     """DV-C1 seam: batch_size/pipeline_batches must be forwarded exactly once."""
-    import data_tools.downloaders.dukascopy_native as native
+    import data_tools.dukascopy.native as native
 
     with pytest.raises(TypeError):
         native.download_bi5_files(  # type: ignore[call-arg]
@@ -43,7 +43,7 @@ def test_download_bi5_files_rejects_duplicate_batch_arguments():
 
 def test_download_bi5_files_positional_params_are_batch_size_and_max_retries():
     """Locks the positional contract of download_bi5_files for call sites."""
-    import data_tools.downloaders.dukascopy_native as native
+    import data_tools.dukascopy.native as native
 
     code = native.download_bi5_files.__code__
     params = code.co_varnames[: code.co_argcount]
@@ -64,7 +64,7 @@ def test_merged_ticks_download_side_specific_urls():
     corrected pipeline downloads the shared tick file once and splits it by
     side instead of fetching the identical URL twice.
     """
-    import data_tools.downloaders.dukascopy_native as native
+    import data_tools.dukascopy.native as native
 
     start = datetime(2024, 1, 1, tzinfo=timezone.utc)
     end = datetime(2024, 1, 1, 2, tzinfo=timezone.utc)
@@ -87,7 +87,7 @@ def test_merged_ticks_download_side_specific_urls():
 
 
 def test_generate_tick_urls_rejects_unknown_price_type():
-    import data_tools.downloaders.dukascopy_native as native
+    import data_tools.dukascopy.native as native
 
     start = datetime(2024, 1, 1, tzinfo=timezone.utc)
     end = datetime(2024, 1, 1, 1, tzinfo=timezone.utc)
@@ -102,7 +102,7 @@ def test_merged_ticks_uses_single_fetch_and_single_batch_args(monkeypatch):
     fetches each file exactly once and derives bid and ask columns from the
     parsed records. Argument plumbing must contain no duplicates (DV-C1).
     """
-    import data_tools.downloaders.dukascopy_native as native
+    import data_tools.dukascopy.native as native
 
     start = datetime(2024, 1, 1, tzinfo=timezone.utc)
     end = datetime(2024, 1, 1, 1, tzinfo=timezone.utc)
@@ -166,7 +166,7 @@ def test_merged_ticks_uses_single_fetch_and_single_batch_args(monkeypatch):
 def test_merged_ticks_empty_shared_fetch_returns_empty_frame_with_columns(
     monkeypatch,
 ):
-    import data_tools.downloaders.dukascopy_native as native
+    import data_tools.dukascopy.native as native
 
     start = datetime(2024, 1, 1, tzinfo=timezone.utc)
     end = datetime(2024, 1, 1, 1, tzinfo=timezone.utc)
@@ -195,7 +195,7 @@ def test_merged_ticks_empty_shared_fetch_returns_empty_frame_with_columns(
 
 def test_merge_tick_sides_keeps_side_columns_when_one_side_is_empty():
     """Direct seam: no silent bid->ask substitution for missing sides (DV-C2)."""
-    import data_tools.downloaders.dukascopy_native as native
+    import data_tools.dukascopy.native as native
 
     bid_only = pd.DataFrame(
         {
@@ -230,7 +230,7 @@ def test_merge_tick_sides_keeps_side_columns_when_one_side_is_empty():
 
 
 def test_split_tick_sides_keeps_disjoint_values():
-    import data_tools.downloaders.dukascopy_native as native
+    import data_tools.dukascopy.native as native
 
     shared = pd.DataFrame(
         {
@@ -256,7 +256,7 @@ def test_merge_tick_sides_raises_on_schema_drift():
     frame without an ask/bid column and the post-merge check was unreachable;
     the explicit side-column validation makes the failure loud (DV-C2).
     """
-    import data_tools.downloaders.dukascopy_native as native
+    import data_tools.dukascopy.native as native
 
     drifted_bid = pd.DataFrame(
         {
@@ -281,7 +281,7 @@ def test_download_async_merged_tick_persists_bid_and_ask_columns(
     monkeypatch, tmp_path: Path
 ):
     """Full-path regression: merged tick download crashes (DV-C1) and must persist both sides."""
-    import data_tools.downloaders.dukascopy_native as native
+    import data_tools.dukascopy.native as native
 
     monkeypatch.setattr(native, "DATA_DIR", tmp_path)
     monkeypatch.setattr(native, "SOURCE_META_PATH", tmp_path / "source_meta.json")
@@ -313,7 +313,7 @@ def test_download_async_merged_tick_persists_bid_and_ask_columns(
     monkeypatch.setattr(native, "download_bi5_files", fake_download_bi5_files)
     monkeypatch.setattr(native, "_assemble_tick_dataframe", fake_assemble)
 
-    downloader = native.DukascopyNativeDownloader()
+    downloader = native.DukascopyDownloader()
     result = asyncio.run(
         downloader._download_async(
             "EURUSD",
@@ -346,10 +346,10 @@ def test_download_async_merged_tick_persists_bid_and_ask_columns(
 
 def test_dukascopy_event_smoke():
     """Cheap smoke guard: control-event plumbing types stay importable."""
-    import data_tools.downloaders.dukascopy_native as native
+    import data_tools.dukascopy.native as native
 
     assert Event() is not None
-    assert native.DukascopyNativeDownloader().source_name == "dukascopy"
+    assert native.DukascopyDownloader().source_name == "dukascopy"
 
 
 def test_generate_tick_urls_price_type_is_informational_for_tick_files():
@@ -361,7 +361,7 @@ def test_generate_tick_urls_price_type_is_informational_for_tick_files():
     changes tick output. If this test ever needs updating, update
     ``docs/DATA_SOURCES.md`` (offer-side semantics) in the same change.
     """
-    import data_tools.downloaders.dukascopy_native as native
+    import data_tools.dukascopy.native as native
 
     start = datetime(2024, 3, 4, 1, tzinfo=timezone.utc)
     end = datetime(2024, 3, 4, 5, tzinfo=timezone.utc)
@@ -373,7 +373,7 @@ def test_generate_tick_urls_price_type_is_informational_for_tick_files():
 
 def test_split_tick_sides_raises_on_schema_drift():
     """Missing side columns must surface at the split, not downstream (PM-2)."""
-    import data_tools.downloaders.dukascopy_native as native
+    import data_tools.dukascopy.native as native
 
     shared = pd.DataFrame(
         {
@@ -388,7 +388,7 @@ def test_split_tick_sides_raises_on_schema_drift():
 
 
 def test_split_tick_sides_returns_empty_sides_for_empty_input():
-    import data_tools.downloaders.dukascopy_native as native
+    import data_tools.dukascopy.native as native
 
     bid, ask = native._split_tick_sides(_empty_tick_frame())
     assert bid.empty

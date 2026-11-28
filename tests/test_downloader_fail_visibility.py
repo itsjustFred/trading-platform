@@ -102,7 +102,7 @@ class TestSourceMetaAtomicity:
     def test_source_meta_write_is_atomic(self, tmp_path, monkeypatch):
         """source_meta.json is read by every catalog scan; a partial write must
         never replace the previous content."""
-        import data_tools.downloaders.dukascopy_native as native
+        import data_tools.dukascopy.native as native
 
         meta_path = tmp_path / "source_meta.json"
         meta_path.write_text(json.dumps({"dukascopy/forex/EURUSD/1h": {"license": "free"}}))
@@ -249,7 +249,7 @@ class TestDukascopyMergedTickContract:
         pass pipeline_batches exactly once. The pre-fix call passed six
         positional args plus pipeline_batches as keyword, which raises
         TypeError at download time (never covered by a test until now)."""
-        import data_tools.downloaders.dukascopy_native as native
+        import data_tools.dukascopy.native as native
 
         signature = inspect.signature(native._download_and_assemble_merged_ticks)
         positional = [
@@ -279,7 +279,7 @@ class TestDukascopyMergedTickContract:
     def test_merged_tick_call_is_executable(self, tmp_path, monkeypatch):
         """The merged tick path must not raise TypeError when invoked with the
         arguments the download() method actually passes."""
-        import data_tools.downloaders.dukascopy_native as native
+        import data_tools.dukascopy.native as native
 
         captured: dict[str, object] = {}
 
@@ -297,7 +297,7 @@ class TestDukascopyMergedTickContract:
         monkeypatch.setattr(native, "_load_source_meta_index", lambda: {})
         monkeypatch.setattr(native, "_write_source_meta_index", lambda payload: None)
 
-        downloader = native.DukascopyNativeDownloader()
+        downloader = native.DukascopyDownloader()
         # Run the sync download wrapper in a dedicated thread: the e2e
         # playwright tests in this suite can leave the main thread's event
         # loop in a non-runnable state, which makes asyncio.run() raise.
