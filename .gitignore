@@ -28,6 +28,9 @@ Thumbs.db
 .commandcode/
 .claude/worktrees/
 .claude/settings.json
+# ...except the project hook config: the PreToolUse guard in
+# scripts/agents/guard_shell.py must be shared, not per-machine local state.
+!.claude/settings.json
 .claude/settings.local.json
 CLAUDE.local.md
 .codex/

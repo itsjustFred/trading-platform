@@ -43,7 +43,7 @@
 | `initial_capital` | `float` | Default `100_000.0` |
 | `data` | `dict` | timeframes, symbols, universe, source |
 
-**Lücke:** `BacktestMeta` kennt kein Feld für die **externe Quelle** des Validierungs-Reports (z.B. MT5-XLSX-Dateipfad, HTML-URL). `ValidationReference` übernimmt diese Provenienz-Information.
+**Lücke:** `BacktestMeta` kennt kein Feld für die **externe Quelle** des Validierungs-Reports (z.B. MT5-XLSX-Dateipfad oder Report-URL). `ValidationReference` übernimmt diese Provenienz-Information.
 
 #### `Trade` (dataclass)
 | Feld | Typ | Besonderheit |
@@ -214,7 +214,7 @@
 |------------|------------|
 | `ValidationReference` (Pydantic-Model) | Zentrales Aggregat mit Pflichtfeldern und Provenienz-Informationen |
 | `ValidationResult` / `Deviation` | Ergebnis des Vergleichs mit einzelnen Abweichungen |
-| `MT5XLSXConverter` / `MT5HTMLConverter` | Neue Converter für primäre Datenquelle |
+| `MT5XLSXConverter` | Neuer Converter für die primäre MT5-Datenquelle (XLSX) |
 | `BaseConverter` / `ConverterRegistry` | Gemeinsames Interface für alle Importer |
 | `ValidationEngine` | Orchestriert Laden, Paaren, Toleranzprüfung, Report |
 | `ToleranceConfig` | Toleranzregeln für Feldabweichungen |
@@ -222,10 +222,10 @@
 ### 4.3 Architektur-Skizze
 
 ```
-Externer Report (MT5-XLSX/HTML)
+Externer Report (MT5-XLSX; HTML wird nicht geparst)
         │
         ▼
-   [Parser/Converter]  ← MT5XLSXConverter, MT5HTMLConverter
+   [Parser/Converter]  ← MT5XLSXConverter
         │
         ▼
 ValidationReference (Pydantic)

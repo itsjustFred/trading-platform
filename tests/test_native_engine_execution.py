@@ -1685,7 +1685,7 @@ def test_native_engine_take_profit_alias_prefers_the_canonical_column():
     """Canonical ``take_profit`` wins over ``tp_price`` (#237).
 
     The precedence is the one every other resolver in the repo uses
-    (``risk.live._LIVE_TP_KEYS``, the comparison/extraction helpers), so a
+    (``risk.signal_levels.TP_METADATA_KEYS``, the comparison helpers), so a
     conflicting row resolves the same level here and in live.
     """
     engine = _engine()
