@@ -6044,6 +6044,61 @@ def test_ctrader_exit_submit_resolves_order_volume_once_and_sends_that_volume(
     assert saved[0].metadata["qty"] == pytest.approx(1.333)
 
 
+def test_ctrader_exit_submit_keeps_the_resolved_close_volume_when_the_scale_moves(
+    monkeypatch,
+) -> None:
+    """The exit variant of the mid-submit scale move - and the live one.
+
+    The daemon strips every pip-value key from an exit (``_PIP_VALUE_METADATA_KEYS``
+    in ``live_runner/daemon.py``: a close is sized from the broker book, so no
+    pip value can describe it), so a close is units-less and cannot fail closed on
+    a scale move. It must also not be resized by one. On main the close request
+    re-resolved its volume and read the moved scale, sending 200 broker units
+    against a position holding 2000 - closing a tenth of it; the close now carries
+    the volume resolved once, which is the position's own broker volume.
+    """
+    from live_runner import ctrader_adapter as module
+
+    _module, adapter, saved, _volumes = _ctrader_submit_harness(monkeypatch)
+    adapter._position_ids_by_symbol = {"EURUSD": (7,)}
+    close_volumes: list[int] = []
+
+    def _close_request(*, position_id: int, volume: int):
+        close_volumes.append(volume)
+        return SimpleNamespace(volume=volume)
+
+    monkeypatch.setattr(adapter, "_build_close_position_request", _close_request)
+
+    async def _refresh_then_resolve(symbol: str) -> int:
+        # A concurrent reconnect/props refresh lands during the submit's await:
+        # the cached scale moves from 1000 to 100 units per qty.
+        adapter._symbol_props["EURUSD"] = module.SymbolScale(
+            volume_per_qty=100.0,
+            price_digits=5,
+            min_volume=1,
+            lot_size=10_000.0,
+            source="broker",
+        )
+        return 1
+
+    monkeypatch.setattr(adapter, "_resolve_symbol_id", _refresh_then_resolve)
+    signal = LiveSignal(
+        deployment_id="dep-1",
+        symbol="EURUSD",
+        action="sell",
+        theoretical_price=1.1,
+        timestamp=datetime.now(timezone.utc),
+        metadata={"exit_only": True, "risk_sizing_mode": "exit_only"},
+    )
+
+    assert asyncio.run(adapter.submit_order(signal, qty=2.0)) == "777"
+
+    # The position's own broker volume (qty 2.0 at 1000 units per qty), NOT the
+    # 200 a re-resolution against the moved scale would have produced.
+    assert close_volumes == [2000]
+    assert saved[0].metadata["qty"] == pytest.approx(2.0)
+
+
 def test_ctrader_submit_refuses_a_volume_input_that_changes_after_normalization(
     monkeypatch,
 ) -> None:

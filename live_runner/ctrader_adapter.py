@@ -923,7 +923,7 @@ def _qty_to_broker_volume(qty: float, volume_per_qty: float = QTY_VOLUME_SCALE) 
 
 
 def _validate_broker_volume(volume: Any, *, field_name: str) -> int:
-    """Coerce the broker volume a request builder was handed, failing closed.
+    """Validate the broker volume a request builder was handed, failing closed.
 
     Both builders receive the volume ``submit_order`` resolved once, as a
     Python ``int`` count of whole broker volume units - the protocol fields are
