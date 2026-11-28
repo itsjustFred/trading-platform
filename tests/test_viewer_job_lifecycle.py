@@ -7,12 +7,8 @@ period, and a finished run must never leave a job record behind forever.
 
 from __future__ import annotations
 
-import sys
 import threading
 import time
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).parent.parent))
 
 
 def test_register_and_finish_job_are_lock_guarded():

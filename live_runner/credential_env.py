@@ -83,6 +83,13 @@ def parse_bool_env(name: str, value: str | None, *, default: bool) -> bool:
     Missing value -> default. Recognized true/false tokens (case-insensitive,
     stripped) parse accordingly. Anything else raises so a malformed value can
     never implicitly select live trading or disable a safety behaviour.
+
+    ``default`` stays a REQUIRED keyword-only argument on purpose. An optional
+    one with a ``True`` fallback would let a caller that forgets it silently opt
+    a deployment into short selling (``allow_short`` is ``False`` when
+    unconfigured), and no test would notice: every call site passes it
+    explicitly, so a signature change keeps the suite green. Pre-mortem finding
+    on PR #457.
     """
     if value is None:
         return default

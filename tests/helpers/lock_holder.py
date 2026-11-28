@@ -13,7 +13,6 @@ holder, which is the state a SIGKILLed daemon leaves behind.
 
 from __future__ import annotations
 
-import os
 import subprocess
 import sys
 import threading
@@ -28,15 +27,12 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 
 def spawn_holder(lock_path: Path, hold_seconds: float) -> Any:
     """Start a holder process that acquires ``lock_path`` and holds it for ``hold_seconds``."""
-    env = dict(os.environ)
-    existing = env.get("PYTHONPATH")
-    env["PYTHONPATH"] = (
-        str(REPO_ROOT) if not existing else os.pathsep.join([str(REPO_ROOT), existing])
-    )
+    from tests.conftest import sandboxed_env
+
     return subprocess.Popen(
         [sys.executable, "-m", "tests.helpers.lock_holder", str(lock_path), str(hold_seconds)],
         cwd=REPO_ROOT,
-        env=env,
+        env=sandboxed_env(),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,

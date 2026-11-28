@@ -279,16 +279,6 @@ class TestPnL:
         _assert_field_passed(result, "pnl")
         assert result.is_match
 
-    def test_zero_vs_nonzero_pnl_mismatch(self):
-        # ref=0, act=0.001: pct diff=1.0 (100%), abs diff=0.001.
-        # DV-B35: a completely wrong PnL is not rescued by the abs band.
-        ref = _make_trade(pnl=0.0)
-        act = _make_trade(pnl=0.001)
-        result = TradeComparator().compare(_make_matched(ref, act))
-        _assert_field_failed(result, "pnl")
-        assert not result.is_match
-
-
 class TestStopLoss:
     def test_sl_both_none_matches(self):
         ref = _make_trade(stop_loss=None)

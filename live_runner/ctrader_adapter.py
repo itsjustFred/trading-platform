@@ -40,6 +40,7 @@ from live_runner.base_adapter import (
     validate_live_quote_prices,
 )
 from live_runner.credential_env import (
+    parse_bool_env,
     read_accounts_env_file,
     resolve_accounts_env_path,
     resolve_env_value,
@@ -137,24 +138,6 @@ class _PendingCloseFillRetentionError(ValueError):
     listener - delaying every other fill on the account - for that whole
     window.
     """
-
-
-_TRUE_BOOL_TOKENS = {"1", "true", "yes", "y", "on"}
-_FALSE_BOOL_TOKENS = {"0", "false", "no", "n", "off"}
-
-
-def _parse_bool_env(name: str, value: str | None, *, default: bool) -> bool:
-    if value is None:
-        return default
-    token = value.strip().lower()
-    if token in _TRUE_BOOL_TOKENS:
-        return True
-    if token in _FALSE_BOOL_TOKENS:
-        return False
-    valid = ", ".join(sorted(_TRUE_BOOL_TOKENS | _FALSE_BOOL_TOKENS))
-    raise ValueError(
-        f"Invalid boolean value for {name}: {value!r}. Valid values are: {valid}."
-    )
 
 
 def _format_key_quantity(value: float) -> str:
@@ -1412,7 +1395,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             "CTRADER_DEMO" in os.environ
         )
         self.demo = (
-            _parse_bool_env(
+            parse_bool_env(
                 "CTRADER_DEMO",
                 resolve_env_value(env_values, "CTRADER_DEMO") if demo_configured else None,
                 default=True,

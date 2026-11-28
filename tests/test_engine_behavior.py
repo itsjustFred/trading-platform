@@ -24,6 +24,7 @@ import pytest
 
 from runner.engine import Position, TradeEngine
 from runner.engines.base import BacktestConfig
+from tests.builders import make_backtest_config
 from tests.helpers import with_zero_fees
 
 # ─── Fixtures ────────────────────────────────────────────────────────────────
@@ -43,7 +44,7 @@ def _config(tmp_path: Path, **overrides) -> BacktestConfig:
         "parameters": {},
     }
     payload.update(overrides)
-    return BacktestConfig(**with_zero_fees(payload))
+    return make_backtest_config(**with_zero_fees(payload))
 
 
 def _linear_frame(n: int = 5, start: float = 100.0) -> pd.DataFrame:

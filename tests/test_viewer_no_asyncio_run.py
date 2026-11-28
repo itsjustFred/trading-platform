@@ -8,10 +8,7 @@ explicit loop-free invocation instead.
 from __future__ import annotations
 
 import ast
-import sys
 from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).parent.parent))
 
 
 def test_viewer_main_does_not_call_asyncio_run_outside_dispatcher():
