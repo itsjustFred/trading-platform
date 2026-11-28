@@ -7,6 +7,7 @@ writes them into the raw cache exactly like ``fetch.fetch_bi5_range`` would.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import lzma
 import struct
@@ -17,7 +18,9 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from data_tools.dukascopy import calendar as duk_calendar
 from data_tools.dukascopy import convert, pipeline, upload, validate
+from data_tools.dukascopy import fetch as fetch_mod
 from data_tools.dukascopy.fetch import FetchStats
 
 UTC = timezone.utc
@@ -177,6 +180,22 @@ def test_decode_bi5_day_rejects_truncated_payload():
         convert.decode_bi5_day(b"\x00" * 7, date(2026, 1, 1), FACTOR)
 
 
+def test_load_m1_side_rejects_inconsistent_ohlc(tmp_path):
+    day = date(2026, 11, 20)
+    # factor=1 keeps the raw ticks readable: high (10) is below close (11).
+    _write_day(tmp_path, "SYM", "BID", day, _encode_bi5([(0, 10, 11, 9, 10, 1.0)]))
+    with pytest.raises(ValueError, match="inconsistent OHLC"):
+        convert.load_m1_side(tmp_path / "SYM" / "BID", 1)
+
+
+def test_load_m1_side_rejects_duplicate_timestamps(tmp_path):
+    day = date(2026, 11, 20)
+    record = (0, 10, 11, 9, 12, 1.0)
+    _write_day(tmp_path, "SYM", "BID", day, _encode_bi5([record, record]))
+    with pytest.raises(ValueError, match="duplicate timestamps"):
+        convert.load_m1_side(tmp_path / "SYM" / "BID", 1)
+
+
 # ─── resampling ──────────────────────────────────────────────────────────────
 
 
@@ -313,6 +332,35 @@ def test_validate_frame_accepts_valid():
     validate.validate_frame(_valid_frame(), context="T")
 
 
+# ─── market-closed calendar ──────────────────────────────────────────────────
+
+
+def test_market_closed_good_friday_fx_vs_indices():
+    day = duk_calendar.good_friday(2026)
+    assert duk_calendar.market_closed("EURUSD", day, set()) is False
+    assert duk_calendar.market_closed("SP500", day, set()) is True
+
+
+def test_market_closed_year_end_weekdays():
+    assert duk_calendar.market_closed("EURUSD", date(2026, 12, 24), set()) is True
+    assert duk_calendar.market_closed("EURUSD", date(2026, 12, 31), set()) is True
+
+
+def test_market_closed_easter_monday_only_for_listed_symbols():
+    day = duk_calendar.easter_monday(2026)
+    assert duk_calendar.market_closed("EURO50", day, set()) is True
+    assert duk_calendar.market_closed("BRENT", day, set()) is True
+    assert duk_calendar.market_closed("EURUSD", day, set()) is False
+    assert duk_calendar.market_closed("SP500", day, set()) is False
+
+
+def test_market_closed_recurring_weekday_holiday():
+    # May 1 was a weekday holiday in the surrounding years; one unrelated bar
+    # day keeps the recurrence window anchored before 2026.
+    bar_days = {date(2018, 1, 2)}
+    assert duk_calendar.market_closed("DAX", date(2026, 5, 1), bar_days) is True
+
+
 # ─── incremental update ──────────────────────────────────────────────────────
 
 
@@ -388,6 +436,36 @@ def test_incremental_update_is_idempotent_when_up_to_date(tmp_path):
     assert sym.status in {"up-to-date"}
     after = {p: p.read_bytes() for p in (root / "EURUSD").glob("*.parquet")}
     assert before == after
+
+
+def test_refetched_day_wins_over_stored_m1_on_timestamp_ties(tmp_path):
+    root = tmp_path / "dukascopy"
+    raw = tmp_path / "raw"
+    day = date(2026, 11, 16)
+    minutes = _trading_minutes(day)
+
+    def payloads(base: float) -> dict[str, bytes]:
+        bid_records = _minute_records(day, minutes, base=base)
+        ask_records = [
+            (s, o + FACTOR // 10, c + FACTOR // 10, low + FACTOR // 10, high + FACTOR // 10, v)
+            for s, o, c, low, high, v in bid_records
+        ]
+        return {"BID": _encode_bi5(bid_records), "ASK": _encode_bi5(ask_records)}
+
+    days = {day: payloads(1.10)}
+    fetcher = FakeFetcher(days)
+    pipeline.update_dataset(
+        root, symbols=["EURUSD"], start="2026-11-16", end="2026-11-17",
+        raw_dir=raw, fetcher=fetcher,
+    )
+    days[day] = payloads(1.11)
+    rep = pipeline.update_dataset(
+        root, symbols=["EURUSD"], end="2026-11-17", raw_dir=raw, fetcher=fetcher,
+    )
+    assert rep.ok
+    m1 = _read(root, "EURUSD", "M1")
+    ts = pd.Timestamp("2026-11-16 00:00", tz="UTC")
+    assert m1.loc[m1["timestamp"] == ts, "bid_open"].iloc[0] == pytest.approx(1.11)
 
 
 def test_failed_validation_publishes_nothing(tmp_path):
@@ -803,6 +881,29 @@ def test_full_refuses_rebuild_that_shrinks_the_published_span(tmp_path, monkeypa
         )
 
 
+def test_full_refuses_rebuild_below_coverage_floor(tmp_path, monkeypatch):
+    root = tmp_path / "dukascopy"
+    raw = tmp_path / "raw"
+    monkeypatch.setattr(pipeline, "DATASET_START", date(2026, 11, 16))
+    days = _fixture_days(date(2026, 11, 16), 3)
+    fetcher = FakeFetcher(days)
+    pipeline.update_dataset(
+        root, symbols=["EURUSD"], start="2026-11-16", end="2026-11-19",
+        raw_dir=raw, fetcher=fetcher,
+    )
+    m1 = _read(root, "EURUSD", "M1")
+    manifest = json.loads((root / "manifest.json").read_text())
+    # 1.5x rows puts the correct 0.9 floor above the rebuild while a 0.5 floor
+    # would still pass, so this pins both the guard and FULL_MIN_ROW_RATIO.
+    manifest["EURUSD"]["files"]["EURUSD_M1.parquet"]["rows"] = int(len(m1) * 1.5)
+    (root / "manifest.json").write_text(json.dumps(manifest))
+    with pytest.raises(pipeline.IncompleteFetchError, match="coverage floor"):
+        pipeline.update_dataset(
+            root, symbols=["EURUSD"], full=True, start="2026-11-16",
+            end="2026-11-19", raw_dir=raw, fetcher=fetcher,
+        )
+
+
 def test_start_after_manifest_last_is_rejected(tmp_path):
     root = tmp_path / "dukascopy"
     raw = tmp_path / "raw"
@@ -844,6 +945,58 @@ def test_stale_higher_tf_is_repaired_on_rerun(tmp_path):
     assert len(fixed) == len(h1)
 
 
+def test_drifted_higher_tf_is_fully_resampled_when_new_data_arrives(tmp_path):
+    """tf_rebuild must resample all M1, not just the incremental tail."""
+    root = tmp_path / "dukascopy"
+    raw = tmp_path / "raw"
+    days = _fixture_days(date(2026, 11, 16), 4)  # Mon 16 .. Thu 19
+    fetcher = FakeFetcher(days)
+    pipeline.update_dataset(
+        root, symbols=["EURUSD"], start="2026-11-16", end="2026-11-19",
+        raw_dir=raw, fetcher=fetcher,
+    )
+    h1_path = root / "EURUSD" / "EURUSD_H1.parquet"
+    h1 = pd.read_parquet(h1_path)
+    # Keep only Monday's H1 bins; rows/span drift makes the consistency check
+    # request tf_rebuild while the next fetch window stays incremental.
+    h1.loc[h1["timestamp"] < pd.Timestamp("2026-11-17", tz="UTC")].to_parquet(
+        h1_path, index=False
+    )
+    rep = pipeline.update_dataset(
+        root, symbols=["EURUSD"], end="2026-11-20", raw_dir=raw, fetcher=fetcher,
+    )
+    assert rep.ok
+    expected = _expected_frames(days)
+    pd.testing.assert_frame_equal(
+        _read(root, "EURUSD", "H1").reset_index(drop=True),
+        expected["H1"].reset_index(drop=True),
+        check_dtype=False,
+    )
+    assert pipeline.verify_manifest(root) == []
+
+
+def test_incremental_update_validates_rebuilt_higher_tfs(tmp_path):
+    """A corrupted stored H1 head must fail validation instead of publishing."""
+    root = tmp_path / "dukascopy"
+    raw = tmp_path / "raw"
+    days = _fixture_days(date(2026, 11, 16), 4)
+    fetcher = FakeFetcher(days)
+    pipeline.update_dataset(
+        root, symbols=["EURUSD"], start="2026-11-16", end="2026-11-19",
+        raw_dir=raw, fetcher=fetcher,
+    )
+    h1_path = root / "EURUSD" / "EURUSD_H1.parquet"
+    h1 = pd.read_parquet(h1_path)
+    # Same rows/timestamps (so the consistency check stays quiet) but the first
+    # bin's bid_high is below its open/close: invalid if it survives the merge.
+    h1.loc[h1.index[0], "bid_high"] = 0.5
+    h1.to_parquet(h1_path, index=False)
+    with pytest.raises(pipeline.IncompleteFetchError, match="OHLC inconsistent"):
+        pipeline.update_dataset(
+            root, symbols=["EURUSD"], end="2026-11-20", raw_dir=raw, fetcher=fetcher,
+        )
+
+
 def test_published_parquet_is_world_readable(tmp_path):
     import stat as stat_mod
 
@@ -876,6 +1029,29 @@ def test_fetch_uses_https():
     from data_tools.dukascopy import fetch as fetch_mod
 
     assert fetch_mod.URL.startswith("https://")
+
+
+def test_fetch_empty_body_is_confirmed_once_after_delay(monkeypatch, tmp_path):
+    calls: list[str] = []
+    sleeps: list[float] = []
+
+    async def fake_get_body(session, url: str) -> bytes:
+        calls.append(url)
+        return b"" if len(calls) == 1 else b"confirmed"
+
+    async def fake_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr(fetch_mod, "_get_body", fake_get_body)
+    monkeypatch.setattr(fetch_mod.asyncio, "sleep", fake_sleep)
+    out = tmp_path / "EURUSD" / "BID" / "2026" / "11" / "20.bi5"
+    stats = FetchStats()
+    asyncio.run(fetch_mod._fetch_one(object(), "https://example.test/day", out, stats))
+
+    assert calls == ["https://example.test/day"] * 2
+    assert out.read_bytes() == b"confirmed"
+    assert stats.ok == 1 and stats.empty == 0
+    assert sleeps == [3.0]
 
 
 def test_verify_manifest_checks_span_without_column_statistics(tmp_path):
