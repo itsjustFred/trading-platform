@@ -8,6 +8,7 @@ writes them into the raw cache exactly like ``fetch.fetch_bi5_range`` would.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import lzma
 import struct
@@ -534,19 +535,26 @@ def test_missing_day_files_are_recorded_in_manifest(tmp_path):
 
 
 class FakeR2:
+    """In-memory R2: stores size + MD5 ETag per key like a single-part PUT."""
+
     def __init__(self):
         self.puts: list[str] = []
         self.heads: list[str] = []
         self.sizes: dict[str, int] = {}
+        self.etags: dict[str, str] = {}
 
     def put_file(self, local_path: Path, key: str) -> int:
         self.puts.append(key)
-        self.sizes[key] = local_path.stat().st_size
+        data = local_path.read_bytes()
+        self.sizes[key] = len(data)
+        self.etags[key] = hashlib.md5(data).hexdigest()
         return self.sizes[key]
 
-    def head_size(self, key: str) -> int | None:
+    def head(self, key: str) -> tuple[int | None, str | None]:
         self.heads.append(key)
-        return self.sizes.get(key)
+        if key not in self.sizes:
+            return None, None
+        return self.sizes[key], self.etags.get(key)
 
 
 def _make_dataset(root: Path) -> list[str]:
@@ -586,8 +594,8 @@ def test_upload_size_mismatch_raises(tmp_path):
     _make_dataset(root)
 
     class BadHead(FakeR2):
-        def head_size(self, key):
-            return 1
+        def head(self, key):
+            return 1, None
 
     with pytest.raises(RuntimeError, match="size mismatch"):
         upload.upload_dataset(root, client=BadHead())
@@ -921,7 +929,7 @@ def test_start_after_manifest_last_is_rejected(tmp_path):
 
 
 def test_stale_higher_tf_is_repaired_on_rerun(tmp_path):
-    """Crash between M1 and manifest publish: rerun must rebuild higher TFs."""
+    """Stored higher TFs drifted behind the manifest: rerun rebuilds them."""
     root = tmp_path / "dukascopy"
     raw = tmp_path / "raw"
     days = _fixture_days(date(2026, 11, 16), 3)
@@ -943,6 +951,90 @@ def test_stale_higher_tf_is_repaired_on_rerun(tmp_path):
     assert pipeline.verify_manifest(root) == []
     fixed = pd.read_parquet(h1_path)
     assert len(fixed) == len(h1)
+
+
+def test_crash_after_m1_rename_is_repaired_without_full(tmp_path, monkeypatch):
+    """Crash after the M1 rename but before the manifest write must self-repair.
+
+    The publish loop renames M1 first and writes ``manifest.json`` last, so an
+    interrupted run leaves a stored M1 that is newer than the manifest. The
+    next run must adopt that M1 (it validates and strictly extends the
+    manifest span), rebuild the higher TFs and fix the manifest entry —
+    not demand ``--full``.
+    """
+    import os
+
+    root = tmp_path / "dukascopy"
+    raw = tmp_path / "raw"
+    days1 = _fixture_days(date(2026, 11, 16), 3)  # Mon 16 .. Wed 18
+    days2 = _fixture_days(date(2026, 11, 19), 3)  # Thu 19 .. Sat 21
+    fetcher = FakeFetcher({**days1, **days2})
+    pipeline.update_dataset(
+        root, symbols=["EURUSD"], start="2026-11-16", end="2026-11-19",
+        raw_dir=raw, fetcher=fetcher,
+    )
+
+    # Crash mid-publish: M1 (and M5/M15, staged before H1) are renamed, H1
+    # onwards and the manifest are not.
+    real_replace = os.replace
+    crash = {"armed": True}
+
+    def flaky_replace(src, dst, *args, **kwargs):
+        if crash["armed"] and Path(dst).name == "EURUSD_H1.parquet":
+            raise OSError("simulated crash mid-publish")
+        return real_replace(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(os, "replace", flaky_replace)
+    with pytest.raises(OSError, match="simulated crash"):
+        pipeline.update_dataset(
+            root, symbols=["EURUSD"], end="2026-11-22",
+            raw_dir=raw, fetcher=fetcher,
+        )
+    crash["armed"] = False
+
+    # The stored M1 is newer than the manifest; the rerun must repair, not fail.
+    rep = pipeline.update_dataset(
+        root, symbols=["EURUSD"], end="2026-11-22",
+        raw_dir=raw, fetcher=fetcher,
+    )
+    assert rep.ok
+    assert pipeline.verify_manifest(root) == []
+
+    manifest = json.loads((root / "manifest.json").read_text())
+    m1 = _read(root, "EURUSD", "M1")
+    entry = manifest["EURUSD"]["files"]["EURUSD_M1.parquet"]
+    assert entry["rows"] == len(m1)
+    assert entry["last"] == str(m1["timestamp"].iloc[-1])
+
+    expected = _expected_frames({**days1, **days2})
+    for tf in convert.TIMEFRAMES:
+        pd.testing.assert_frame_equal(
+            _read(root, "EURUSD", tf).reset_index(drop=True),
+            expected[tf].reset_index(drop=True),
+            check_dtype=False,
+        )
+
+
+def test_shrunk_or_invalid_stored_m1_still_requires_full(tmp_path):
+    """An M1 that does NOT extend the manifest must keep failing loudly."""
+    root = tmp_path / "dukascopy"
+    raw = tmp_path / "raw"
+    days = _fixture_days(date(2026, 11, 16), 3)
+    fetcher = FakeFetcher(days)
+    pipeline.update_dataset(
+        root, symbols=["EURUSD"], start="2026-11-16", end="2026-11-19",
+        raw_dir=raw, fetcher=fetcher,
+    )
+    # Truncate stored M1: fewer rows than the manifest claims -> not an
+    # extension, so the run must still refuse without --full.
+    m1_path = root / "EURUSD" / "EURUSD_M1.parquet"
+    m1 = pd.read_parquet(m1_path)
+    m1.iloc[:-10].to_parquet(m1_path, index=False)
+    with pytest.raises(pipeline.IncompleteFetchError, match="--full"):
+        pipeline.update_dataset(
+            root, symbols=["EURUSD"], end="2026-11-19",
+            raw_dir=raw, fetcher=fetcher,
+        )
 
 
 def test_drifted_higher_tf_is_fully_resampled_when_new_data_arrives(tmp_path):
@@ -1169,8 +1261,50 @@ def test_upload_is_idempotent_and_skips_matching_sizes(tmp_path):
     client.puts.clear()
     client.heads.clear()
     upload.upload_dataset(root, client=client)
-    # Data file size already matches -> only the manifest commit point re-PUTs.
+    # Data file size and ETag already match -> only the manifest commit
+    # point re-PUTs.
     assert client.puts == ["manifest.json"]
+
+
+def test_upload_reuploads_same_size_rewritten_file(tmp_path):
+    """A file rewritten to the same size must not be skipped on ETag grounds."""
+    root = tmp_path / "ds"
+    _seed_dataset(root)
+    client = FakeR2()
+    upload.upload_dataset(root, client=client)
+    client.puts.clear()
+    client.heads.clear()
+    # Rewrite the data file in place: identical size, different bytes. A
+    # size-only skip decision would wrongly treat the remote copy as current.
+    parquet = root / "EURUSD" / "EURUSD_M1.parquet"
+    size_before = parquet.stat().st_size
+    data = bytearray(parquet.read_bytes())
+    data[-1] ^= 0xFF
+    parquet.write_bytes(bytes(data))
+    assert parquet.stat().st_size == size_before
+
+    uploaded = upload.upload_dataset(root, client=client)
+    assert "EURUSD/EURUSD_M1.parquet" in client.puts
+    assert uploaded[0] == "EURUSD/EURUSD_M1.parquet"
+
+
+def test_upload_reuploads_when_remote_etag_is_not_single_part_md5(tmp_path):
+    """A multipart-style ETag cannot prove equality -> re-upload, then skip."""
+    root = tmp_path / "ds"
+    _seed_dataset(root)
+    client = FakeR2()
+    # Remote holds the same bytes but reports a multipart ETag.
+    parquet = root / "EURUSD" / "EURUSD_M1.parquet"
+    data = parquet.read_bytes()
+    client.sizes["EURUSD/EURUSD_M1.parquet"] = len(data)
+    client.etags["EURUSD/EURUSD_M1.parquet"] = hashlib.md5(data).hexdigest() + "-2"
+
+    upload.upload_dataset(root, client=client)
+    # The unverifiable object was re-PUT; the rerun now skips it.
+    assert client.puts.count("EURUSD/EURUSD_M1.parquet") == 1
+    client.puts.clear()
+    upload.upload_dataset(root, client=client)
+    assert "EURUSD/EURUSD_M1.parquet" not in client.puts
 
 
 def test_upload_never_sends_manifest_before_data(tmp_path):

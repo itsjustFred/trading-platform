@@ -375,7 +375,7 @@ configured.
 
 `R2_ENDPOINT`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKET`
 (`tp-ohlcv`), optional `R2_REGION` (default `auto`). Upload is only attempted
-with `--upload` or `"upload": true` in the job config.
+with `--upload`.
 
 ## Viewer integration
 

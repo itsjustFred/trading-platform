@@ -5,7 +5,9 @@ Reads ``R2_ENDPOINT``, ``R2_ACCESS_KEY_ID``, ``R2_SECRET_ACCESS_KEY`` and
 
 Ordering contract: data files are uploaded first and ``manifest.json`` last,
 so a reader never sees a manifest pointing at objects that are not there yet.
-Every uploaded object is verified with a HEAD request against the local size.
+Every uploaded object is verified with a HEAD request: size must match and,
+for single-part uploads, the ETag (the object's MD5) must match the local
+file's MD5 — a same-size rewrite is still re-uploaded.
 """
 
 from __future__ import annotations
@@ -150,14 +152,18 @@ class R2Client:
             )
         return size
 
-    def head_size(self, key: str) -> int | None:
+    def head(self, key: str) -> tuple[int | None, str | None]:
+        """``(size, etag)`` for ``key``; ``(None, None)`` when absent."""
         resp = self._request("HEAD", key)
         if resp.status_code == 404:
-            return None
+            return None, None
         if resp.status_code != 200:
             raise RuntimeError(f"R2 HEAD {key} failed: HTTP {resp.status_code}")
         length = resp.headers.get("Content-Length")
-        return int(length) if length is not None else None
+        return (
+            int(length) if length is not None else None,
+            resp.headers.get("ETag"),
+        )
 
 
 def dataset_upload_plan(root: str | Path) -> tuple[list[str], str]:
@@ -165,8 +171,8 @@ def dataset_upload_plan(root: str | Path) -> tuple[list[str], str]:
 
     Derived from ``manifest.json`` — every file it lists plus the manifest
     itself — so a rerun after a partial upload re-sends whatever is missing
-    or size-drifted instead of trusting a publish list that only covers the
-    latest run.
+    or content-drifted instead of trusting a publish list that only covers
+    the latest run.
     """
     root = Path(root)
     manifest = json.loads((root / MANIFEST_NAME).read_text())
@@ -178,6 +184,53 @@ def dataset_upload_plan(root: str | Path) -> tuple[list[str], str]:
     return sorted(data), MANIFEST_NAME
 
 
+def _file_md5(path: Path) -> str:
+    digest = hashlib.md5()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _etag_is_md5(etag: str | None, md5_hex: str) -> bool:
+    """True only when ``etag`` proves byte-equality with MD5 ``md5_hex``.
+
+    A single-part S3 PUT has an ETag equal to the object's MD5 (32 hex
+    chars, usually quoted). Multipart ETags (``<md5>-<n>``) and missing
+    ETags prove nothing about content, so they never match — the object is
+    re-uploaded, and the single-part PUT that follows replaces them.
+    """
+    if not etag:
+        return False
+    etag = etag.strip().strip('"')
+    if len(etag) != 32:
+        return False
+    try:
+        int(etag, 16)
+    except ValueError:
+        return False
+    return etag.lower() == md5_hex
+
+
+def _verify_remote(
+    client: R2Client,
+    key: str,
+    *,
+    size: int,
+    md5_hex: str,
+) -> None:
+    remote_size, remote_etag = client.head(key)
+    if remote_size != size:
+        raise RuntimeError(
+            f"R2 size mismatch for {key}: local {size} != remote {remote_size}"
+        )
+    if not _etag_is_md5(remote_etag, md5_hex):
+        raise RuntimeError(
+            f"R2 etag mismatch for {key}: remote etag {remote_etag} "
+            "does not match local content"
+        )
+
+
 def upload_dataset(
     root: str | Path,
     *,
@@ -187,12 +240,14 @@ def upload_dataset(
 ) -> list[str]:
     """Mirror the dataset to R2, decided from local vs remote state.
 
-    Every file listed in ``manifest.json`` is HEAD-checked against the remote
-    object size; missing or size-drifted objects are PUT and re-verified.
-    ``manifest.json`` is always uploaded last, after every data file it lists
-    is confirmed present — a reader never sees a manifest pointing at objects
-    that are not there. Safe to re-run: matching objects are skipped.
-    Returns the list of uploaded keys. Raises on the first failure.
+    Every file listed in ``manifest.json`` is HEAD-checked: a matching
+    object must have both the local size and — for single-part uploads —
+    the MD5 ETag of the local bytes, so a same-size rewrite is re-sent.
+    Missing or mismatched objects are PUT and re-verified. ``manifest.json``
+    is always uploaded last, after every data file it lists is confirmed
+    present — a reader never sees a manifest pointing at objects that are
+    not there. Safe to re-run: matching objects are skipped. Returns the
+    list of uploaded keys. Raises on the first failure.
     """
     root = Path(root)
     if client is None:
@@ -203,26 +258,28 @@ def upload_dataset(
     for rel in data_files:
         local = root / rel
         size = local.stat().st_size
-        if client.head_size(rel) == size:
-            log(f"unchanged {rel} ({size} bytes)")
-            continue
+        remote_size, remote_etag = client.head(rel)
+        md5_hex: str | None = None
+        if remote_size == size:
+            md5_hex = _file_md5(local)
+            if _etag_is_md5(remote_etag, md5_hex):
+                log(f"unchanged {rel} ({size} bytes)")
+                continue
         client.put_file(local, rel)
-        remote_size = client.head_size(rel)
-        if remote_size != size:
-            raise RuntimeError(
-                f"R2 size mismatch for {rel}: local {size} != remote {remote_size}"
-            )
+        if md5_hex is None:
+            md5_hex = _file_md5(local)
+        _verify_remote(client, rel, size=size, md5_hex=md5_hex)
         uploaded.append(rel)
         log(f"uploaded {rel} ({size} bytes)")
 
     manifest_local = root / manifest_key
     client.put_file(manifest_local, manifest_key)
-    remote_size = client.head_size(manifest_key)
-    if remote_size != manifest_local.stat().st_size:
-        raise RuntimeError(
-            f"R2 size mismatch for {manifest_key}: "
-            f"local {manifest_local.stat().st_size} != remote {remote_size}"
-        )
+    _verify_remote(
+        client,
+        manifest_key,
+        size=manifest_local.stat().st_size,
+        md5_hex=_file_md5(manifest_local),
+    )
     uploaded.append(manifest_key)
     log(f"uploaded {manifest_key}")
     return uploaded

@@ -7,7 +7,9 @@ Layout (mirrored to the ``tp-ohlcv`` R2 bucket)::
 
 Each run reads ``manifest.json``, verifies every published file still matches
 its manifest entry (a crash between renames and the manifest write is
-repaired, a missing M1 file fails the run), fetches bi5 day files from each
+repaired from the stored M1 when it validates and strictly extends the
+manifest span; a missing or shrunk M1 fails the run), fetches bi5 day files
+from each
 symbol's last M1 timestamp to the last complete UTC day, merges them into M1
 without duplicate bars at the seam, re-resamples the higher timeframes from
 the first affected bin, validates every frame — including the market-closed
@@ -759,6 +761,40 @@ def _clean_stale_tmps(root: Path) -> int:
     return removed
 
 
+def _stored_m1_extends_manifest(root: Path, symbol: str, entry: dict) -> bool:
+    """True when the on-disk M1 validates and strictly extends the manifest.
+
+    This is the shape an interrupted publish leaves behind: staged files are
+    renamed M1-first and ``manifest.json`` is written last, so a crash can
+    leave a stored M1 that is a superset of what the manifest describes.
+    Such an M1 is adopted as the new baseline (higher TFs are rebuilt from
+    it and the manifest entry is rewritten); anything else — missing,
+    unreadable, invalid, shrunk or span-shifted — still requires ``--full``.
+    """
+    info = (entry.get("files") or {}).get(f"{symbol}_M1.parquet") or {}
+    exp_rows = info.get("rows")
+    exp_first = _entry_ts(info.get("first"))
+    exp_last = _entry_ts(info.get("last"))
+    if exp_rows is None or exp_first is None or exp_last is None:
+        return False
+    try:
+        m1 = _read_parquet(root / symbol / f"{symbol}_M1.parquet")
+        if m1 is None or m1.empty:
+            return False
+        validate.validate_frame(m1, context=f"{symbol} stored M1")
+    except Exception:  # noqa: BLE001 - unreadable/invalid M1 is not repairable
+        return False
+    ts = pd.to_datetime(m1["timestamp"], utc=True)
+    got_first, got_last = ts.iloc[0], ts.iloc[-1]
+    rows = len(m1)
+    return (
+        got_first == exp_first
+        and got_last >= exp_last
+        and rows >= int(exp_rows)
+        and (rows > int(exp_rows) or got_last > exp_last)
+    )
+
+
 def _consistency_check(
     root: Path,
     symbol: str,
@@ -770,15 +806,19 @@ def _consistency_check(
 ) -> tuple[SymbolReport | None, bool]:
     """``(failed report or None, tf_rebuild)`` for stored-vs-manifest drift.
 
-    A missing/drifted M1 can only be fixed by ``--full``; drifted higher TFs
-    are rebuilt from the stored M1 (crash repair).
+    Drifted higher TFs are rebuilt from the stored M1 (crash repair). A
+    drifted M1 is only repairable when the stored file validates and
+    strictly extends the manifest span — the interrupted-publish shape —
+    in which case the same M1-driven rebuild also rewrites the manifest
+    entry; otherwise ``--full`` is required.
     """
     if full or not old_entry:
         return None, False
     problems = _entry_file_problems(root, symbol, old_entry)
     if not problems:
         return None, False
-    if any(fname.endswith("_M1.parquet") for fname, _ in problems):
+    m1_bad = any(fname.endswith("_M1.parquet") for fname, _ in problems)
+    if m1_bad and not _stored_m1_extends_manifest(root, symbol, old_entry):
         return (
             SymbolReport(
                 symbol=symbol,
@@ -791,10 +831,16 @@ def _consistency_check(
             ),
             False,
         )
-    log(
-        f"{symbol}: {len(problems)} published file(s) inconsistent; "
-        "will rebuild higher timeframes from M1"
-    )
+    if m1_bad:
+        log(
+            f"{symbol}: stored M1 is newer than the manifest "
+            "(interrupted publish); repairing from stored M1"
+        )
+    else:
+        log(
+            f"{symbol}: {len(problems)} published file(s) inconsistent; "
+            "will rebuild higher timeframes from M1"
+        )
     return None, True
 
 
