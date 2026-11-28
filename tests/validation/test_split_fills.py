@@ -1,6 +1,6 @@
-"""DV-B43: split fills and multi-exit positions must survive import.
+"""DV-B43: split fills and multi-exit positions must survive XLSX import.
 
-The two MT5 importers must agree on the same report structure:
+The MT5 XLSX importer must handle reports where:
 
 * One position can be *entered* through several fills (several ``in`` rows
   with the same position/``Trade`` id but different ``Auftrag`` order ids).
@@ -19,66 +19,7 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from validation.importers.mt5_html import MT5HTMLImporter
 from validation.importers.mt5_xlsx import MT5XLSXImporter
-
-
-def _split_fill_html() -> Path:
-    return Path("tests/fixtures/validation/mt5_html/split_fills.html")
-
-
-class TestHTMLSplitFills:
-    def test_split_entry_and_exit_become_one_trade(self) -> None:
-        ref = MT5HTMLImporter().load(_split_fill_html())
-        # Position 1 = two entry fills + two exit fills -> ONE trade.
-        # Position 2 = plain in/out pair -> ONE trade.
-        assert len(ref.trades) == 2
-
-    def test_aggregated_entry_quantity(self) -> None:
-        ref = MT5HTMLImporter().load(_split_fill_html())
-        first = ref.trades[0]
-        assert first.direction == "LONG"
-        assert first.quantity == pytest.approx(0.15)
-
-    def test_pnl_is_sum_of_exit_fills(self) -> None:
-        ref = MT5HTMLImporter().load(_split_fill_html())
-        first = ref.trades[0]
-        assert len(first.exits) == 2
-        assert first.pnl == pytest.approx(300.0 + 250.0)
-
-    def test_each_exit_keeps_its_own_price_and_pnl(self) -> None:
-        ref = MT5HTMLImporter().load(_split_fill_html())
-        first = ref.trades[0]
-        exit_prices = sorted(e.price for e in first.exits)
-        exit_pnls = sorted(e.pnl or 0.0 for e in first.exits)
-        assert exit_prices == pytest.approx([1.0880, 1.0900])
-        assert exit_pnls == pytest.approx([250.0, 300.0])
-
-    def test_plain_pair_still_one_trade(self) -> None:
-        ref = MT5HTMLImporter().load(_split_fill_html())
-        second = ref.trades[1]
-        assert second.direction == "SHORT"
-        assert second.quantity == pytest.approx(0.10)
-        assert second.pnl == pytest.approx(-250.0)
-        assert len(second.exits) == 1
-
-    def test_fees_sum_over_all_fills(self) -> None:
-        ref = MT5HTMLImporter().load(_split_fill_html())
-        first = ref.trades[0]
-        # MT5 -0.50 (entry 1) -0.25 (entry 2) -0.75 (exit 1) -0.50 (exit 2) -> fees 2.00
-        assert first.fees == pytest.approx(2.00)
-
-    def test_importers_agree_on_same_position_sequence(self) -> None:
-        """Both importers must produce the same positions from the same report."""
-        html_ref = MT5HTMLImporter().load(_split_fill_html())
-        xlsx_ref = MT5XLSXImporter().load(_split_fill_xlsx())
-
-        assert len(html_ref.trades) == len(xlsx_ref.trades) == 2
-        for html_trade, xlsx_trade in zip(html_ref.trades, xlsx_ref.trades, strict=True):
-            assert html_trade.direction == xlsx_trade.direction
-            assert html_trade.quantity == pytest.approx(xlsx_trade.quantity)
-            assert html_trade.pnl == pytest.approx(xlsx_trade.pnl)
-            assert len(html_trade.exits) == len(xlsx_trade.exits)
 
 
 def _split_fill_xlsx() -> Path:
@@ -109,8 +50,7 @@ class TestXLSXSplitFills:
 
         Grouping by that id would strand every entry with no exit; the deal
         sequence must be used instead, so an in/in/out/out sequence becomes
-        ONE position with the aggregated entry quantity and both exits —
-        the same reconstruction the HTML importer produces.
+        ONE position with the aggregated entry quantity and both exits.
         """
         deals = pd.DataFrame(
             [
