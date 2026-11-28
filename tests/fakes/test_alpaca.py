@@ -112,9 +112,10 @@ def test_a_raising_rejection_rule_surfaces_instead_of_accepting() -> None:
     client = FakeAlpacaTradingClient(
         mark_prices={AAPL: 100.0}, reject_submissions=_boom
     )
+    request = _buy()
 
     with pytest.raises(RuntimeError, match="rule bug"):
-        client.submit_order(_buy())
+        client.submit_order(request)
 
 
 def test_the_fill_lands_later_and_is_the_only_one() -> None:

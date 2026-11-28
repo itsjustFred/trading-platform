@@ -213,9 +213,10 @@ def test_a_raising_rejection_rule_surfaces_instead_of_accepting() -> None:
 
     m, _mm = _types()
     broker = _broker(reject_submissions=_boom)
+    request = _new_order(m)
 
     with pytest.raises(RuntimeError, match="rule bug"):
-        broker.handle(_new_order(m))
+        broker.handle(request)
 
 
 def test_a_sell_entry_opens_a_short_side_position() -> None:

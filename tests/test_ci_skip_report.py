@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 
 from scripts.ci.skip_report import (
+    ALLOWED_SKIPS,
     MUST_NOT_SKIP_PATTERNS,
     build_report,
     collect_skips,
@@ -188,6 +189,13 @@ def test_is_money_path_covers_live_runner_and_engine_tests() -> None:
     # Pin the pattern itself: dropping it while keeping is_money_path green
     # for other modules would silently un-gate the fakes.
     assert any(p.pattern == r"^tests\.fakes\." for p in MUST_NOT_SKIP_PATTERNS)
+    # No allowed-skip pair may match the fakes either: a reason-scoped
+    # exemption would let a flaky contract test skip silently.
+    assert not any(
+        module_pattern.search(module)
+        for module_pattern, _reason in ALLOWED_SKIPS
+        for module in ("tests.fakes.test_alpaca", "tests.fakes.test_ctrader")
+    )
     assert not is_money_path("tests.test_safe_path")
     assert not is_money_path("tests.strategies.test_channel_breakout")
 
