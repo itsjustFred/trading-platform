@@ -548,10 +548,9 @@ async def _broker_state(
     stops_supported = False
     list_stops = getattr(adapter, "list_protective_stops", None)
     # Only adapters that declare stop-amendment capability feed the
-    # reconciler's protective-stop view. cTrader keeps its flip-workflow stop
-    # primitives for opted-in demo deployments but deliberately declares no
+    # reconciler's protective-stop view: cTrader declares no
     # ``supports_stop_amendment``, so every cTrader account reconciles exactly
-    # as on main (#168 review: no silent capability leak).
+    # as before (#168 review: no silent capability leak).
     if callable(list_stops) and (
         getattr(adapter, "supports_stop_amendment", False) is True
     ):

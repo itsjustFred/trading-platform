@@ -13,15 +13,15 @@ ram_jet:
   tp1_multiplier: 3.0
   tp1_exit_percent: 0.50
 
-  # Supertrend (entry-bar context metadata; also the supertrend_flip trailing parameters)
+  # Supertrend (entry-bar context metadata)
   supertrend_period: 10
   supertrend_multiplier: 3.0
 
-  # Trailing stop mode (issue #150): none | percent | supertrend_flip.
+  # Trailing stop mode (issue #150): none | percent.
   # Default 'none' = initial ATR stop only. 'percent' (requires
   # trailing_percent in (0, 1)) runs in replay and live on Alpaca.
-  # 'supertrend_flip' (#168) runs in the replay backtest only; live rejects it
-  # on every broker, so it stays off as the default for live deployments.
+  # 'supertrend_flip' was removed; a config naming it is REJECTED at
+  # validation and signal time, never traded without its trailing.
   # Unsupported modes are REJECTED at validation and signal time, never traded
   # without their trailing.
   trailing_mode: "none"
