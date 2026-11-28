@@ -1127,10 +1127,11 @@ class SignalReplayAdapter:
                 slippage_params, asset_class=asset_class
             )
             self._slippage_models[replay_symbol] = model
-            # #130: same price-basis rule as the native adapter —
-            # "bid_ask" only when the bar-spread model can use the ask
-            # columns; fixed/none models fill on the canonical (bid)
-            # series even when ask columns happen to be present.
+            # #130: replay fills stay on the canonical (bid) series — unlike
+            # native (#472), which reports "bid_ask" whenever the frame
+            # carries usable ask columns. Here "bid_ask" means the resolved
+            # bar-spread model can actually use the ask columns; a fixed or
+            # none model on the same data fills on the bid.
             has_two_sided = any(
                 str(col).startswith("ask_") for col in replay_frame.columns
             )

@@ -221,7 +221,6 @@ def resolve_ask_price(row: Any, field: str, spread: float) -> float | None:
     return None
 
 
-
 def _trade_equity_basis(trade: Trade, initial_capital: float) -> float:
     """Equity the trade was sized from (per-unit coefficient denominator)."""
     meta = trade.meta or {}

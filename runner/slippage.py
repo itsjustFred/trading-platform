@@ -13,8 +13,12 @@ LEAN stays import-only).
   which has no ask-side fills — it still lifts buys by the quoted spread
   or falls back to a configured fixed-bps cost.
 - Stocks/crypto: a configurable fixed bps default per asset class.
-- ``slippage: "none"`` is the explicit parity opt-out that reproduces the
-  pre-#130 gross-fill behaviour bit-for-bit.
+- ``slippage: "none"`` is the explicit parity opt-out: on single-price
+  frames it reproduces the pre-#130 gross-fill behaviour bit-for-bit.
+  On two-sided frames it does NOT — since #472 the fills themselves are
+  ask/bid-denominated there (the quoted spread lives inside the fill
+  price), so ``none`` still diverges from the old gross fills by exactly
+  the quoted spread.
 
 Every run records the resolved model in ``meta.data["slippage"]`` — the
 recording is mandatory even when the resolved model is ``none``.
@@ -373,7 +377,10 @@ def _auto_model(params: dict[str, Any], asset_class: str) -> SlippageModel:
     if ac in FX_SPREAD_ASSET_CLASSES:
         bps = _class_default_bps(ac, params)
         # A run that already prices the spread through the legacy
-        # spread_price_col / ask_ohlc parameters must not pay it twice.
+        # spread_price_col parameter must not pay it twice. (On a
+        # two-sided frame the native engine strips spread_price_col before
+        # resolving — see TradeEngine._resolve_two_sided_slippage — so this
+        # degrade only fires on one-sided frames.)
         if any(params.get(key) for key in _EXTERNAL_SPREAD_PARAMS):
             return FixedBpsSlippage(bps=bps, asset_class=ac)
         return BarSpreadSlippage(default_bps=bps, asset_class=ac)
@@ -417,7 +424,8 @@ def _spread_model(
 ) -> SlippageModel:
     fallback = _spread_fallback_bps(params, asset_class, bps_override)
     # Same double-count guard as the auto model: a run that already prices
-    # the spread through spread_price_col / ask_ohlc must not pay it twice.
+    # the spread through spread_price_col must not pay it twice (native
+    # strips the param on two-sided frames before resolving).
     if any(params.get(key) for key in _EXTERNAL_SPREAD_PARAMS):
         return FixedBpsSlippage(bps=fallback, asset_class=asset_class)
     return BarSpreadSlippage(default_bps=fallback, asset_class=asset_class)

@@ -14,9 +14,11 @@ fill and trigger on the side of the book a real order would hit:
 | sell stop / sell limit entry | bid | bid |
 | signals / indicators | bid bars | - |
 
-Frames without ``ask_*`` columns (yfinance, Alpaca, ...) are unchanged: ask is
-the bid, so triggers stay on the bid and the only cost is the configured
-slippage model.
+Frames without ``ask_*`` columns derive the ask instead of stating it:
+``ask = bid + spread_price_col`` when that parameter is configured, else
+ask == bid — and the same table applies on that derived ask. On plain
+single-price frames (no spread column either) ask is the bid, so triggers
+stay on the bid and the only cost is the configured slippage model.
 
 Every test here asserts exact prices on a hand-built two-sided frame with a
 constant 0.5 spread; nothing depends on a generated golden.
@@ -417,11 +419,128 @@ def test_frames_without_ask_columns_trigger_short_stops_on_the_bid():
 
 
 def test_ask_ohlc_parameter_no_longer_changes_anything():
-    bars = [FLAT_BID, (100.0, 100.2, 99.8, 100.0), FLAT_BID, FLAT_BID]
+    # Bid high 100.7 stays below the 101 stop; ask high 101.2 reaches it, so
+    # the SHORT stop fires on the ask side — a bar where the parameter used
+    # to matter, so the equality assertion is not vacuous.
+    bars = [FLAT_BID, (100.0, 100.7, 99.8, 100.0), FLAT_BID, FLAT_BID]
     strategy = _strategy(4, direction="SHORT", stop=101.0)
 
     default = _single_trade(_run(_frame(bars), strategy))
-    opted_in = _single_trade(_run(_frame(bars), strategy, {"ask_ohlc": True}))
+    with pytest.warns(DeprecationWarning, match="ask_ohlc"):
+        opted_in = _single_trade(_run(_frame(bars), strategy, {"ask_ohlc": True}))
 
+    assert default.exits[0].reason == "stop_loss"
+    assert default.exits[0].price == pytest.approx(101.0)
     assert default.exits[0].price == opted_in.exits[0].price
     assert default.exits[0].reason == opted_in.exits[0].reason
+
+
+# ─── TP ladders on the ask side ─────────────────────────────────────────────
+
+
+def _short_tp_ladder_strategy(n: int, tp_levels: list[tuple[float, float]]):
+    """SHORT entry on bar 0 with ``[(price, fraction), ...]`` take-profit levels."""
+
+    def generate(df: pd.DataFrame, params: dict[str, Any]):
+        entries = pd.Series([i == 0 for i in range(n)], index=df.index)
+        exits = pd.Series(False, index=df.index)
+        indicators: dict[str, Any] = {
+            "direction": pd.Series(["SHORT"] + [None] * (n - 1), dtype=object),
+            "stop_loss": pd.Series([150.0] + [float("nan")] * (n - 1)),
+        }
+        for index, (price, fraction) in enumerate(tp_levels, start=1):
+            indicators[f"tp{index}"] = pd.Series(
+                [price] + [float("nan")] * (n - 1)
+            )
+            indicators[f"tp{index}_pct"] = pd.Series(
+                [fraction] + [float("nan")] * (n - 1)
+            )
+        return entries, exits, indicators, []
+
+    return generate
+
+
+def test_short_tp_ladder_second_level_bid_only_touch_does_not_fill():
+    # tp1 99.5 is reached by the ask low (99.3); tp2 99.0 is reached only by
+    # the bid low (98.8) — a SHORT buys back at the ask, so tp2 must not fill.
+    bars = [FLAT_BID, (100.0, 100.2, 98.8, 99.0), FLAT_BID, FLAT_BID]
+    trade = _single_trade(
+        _run(
+            _frame(bars),
+            _short_tp_ladder_strategy(4, [(99.5, 0.5), (99.0, 0.5)]),
+            {"slippage": "none"},
+        )
+    )
+
+    tp1_legs = [leg for leg in trade.exits if leg.reason == "tp1"]
+    assert len(tp1_legs) == 1
+    assert tp1_legs[0].price == pytest.approx(99.5)
+    assert all(leg.price != pytest.approx(99.0) for leg in trade.exits)
+
+
+def test_short_tp_ladder_mfe_caps_at_the_level_the_ask_reached():
+    # Same bar: MFE must be capped at tp1 (99.5), the only level the ask low
+    # reached — not at tp2 (99.0), which only the bid low touched.
+    bars = [FLAT_BID, (100.0, 100.2, 98.8, 99.0), FLAT_BID, FLAT_BID]
+    trade = _single_trade(
+        _run(
+            _frame(bars),
+            _short_tp_ladder_strategy(4, [(99.5, 0.5), (99.0, 0.5)]),
+            {"slippage": "none"},
+        )
+    )
+
+    assert trade.mfe == pytest.approx((trade.entry_price - 99.5) * trade.quantity)
+
+
+# ─── partial ask columns ────────────────────────────────────────────────────
+
+
+def test_partial_ask_open_prices_missing_high_low_off_the_quoted_spread():
+    # Only ask_open survives: the missing ask high/low fall back to the bid
+    # plus the spread the row itself quotes (ask_open - open = 0.5), so the
+    # SHORT stop at 101 triggers on ask high 101.2 and fills at the level.
+    frame = _frame(
+        [FLAT_BID, (100.0, 100.7, 99.8, 100.0), FLAT_BID, FLAT_BID]
+    ).drop(columns=["ask_high", "ask_low", "ask_close"])
+    trade = _single_trade(
+        _run(frame, _strategy(4, direction="SHORT", stop=101.0), {"slippage": "none"})
+    )
+
+    assert trade.exits[0].reason == "stop_loss"
+    assert trade.exits[0].price == pytest.approx(101.0)
+
+
+def test_partial_ask_high_low_prices_the_ask_open_off_the_quoted_spread():
+    # Only ask_high/ask_low survive: the ask open is the bid open plus the
+    # median quoted spread (0.5), so a LONG entry fills at 100.5.
+    frame = _frame([FLAT_BID] * 4).drop(columns=["ask_open", "ask_close"])
+    trade = _single_trade(_run(frame, _strategy(4), {"slippage": "none"}))
+
+    assert trade.entry_price == pytest.approx(FLAT_BID[0] + SPREAD)
+
+
+# ─── spread_price_col is ignored on two-sided frames ─────────────────────────
+
+
+def test_spread_price_col_does_not_add_fixed_bps_on_two_sided_data():
+    # With ask columns present the quoted spread already lives inside the
+    # fill prices, so ``spread_price_col`` must not also degrade the
+    # slippage model to fixed bps — entry is the ask open exactly.
+    frame = _frame([FLAT_BID] * 4)
+    frame["spread_price"] = SPREAD
+    engine = TradeEngine(
+        _config(
+            {
+                "slippage": "auto",
+                "spread_price_col": "spread_price",
+            }
+        ),
+        symbol="EURUSD",
+        asset_class="forex",
+    )
+
+    trade = _single_trade(engine.run(frame, _strategy(4, direction="LONG")))
+
+    assert trade.entry_price == pytest.approx(FLAT_BID[0] + SPREAD)
+    assert trade.exits[0].price == pytest.approx(FLAT_BID[3])

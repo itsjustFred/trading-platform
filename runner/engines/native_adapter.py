@@ -12,6 +12,7 @@ from runner.approval_gate import require_generated_strategy_approval
 from runner.engine import TradeEngine
 from runner.engines import contract
 from runner.engines._drawings import _normalize_drawings
+from runner.engines._shared import ASK_COLUMNS
 from runner.engines.base import (
     NATIVE_TRAILING_SL_PARAM,
     BacktestConfig,
@@ -221,11 +222,17 @@ class NativeAdapter(EngineAdapter):
             # #472: the fill basis is a property of the DATA, not the
             # slippage model — on a two-sided frame buys fill at the ask and
             # SHORT stops/TPs trigger on the ask whatever the resolved model
-            # is, so "bid_ask" whenever ask columns are present. The model
-            # only adds its own cost on top (fixed bps) or stands down
-            # (bar spread: the quoted spread is already inside the fill).
-            has_two_sided = any(
-                str(col).startswith("ask_") for col in data.columns
+            # is, so "bid_ask" whenever the frame carries usable ask quote
+            # columns (an ``ask_volume`` column or an all-NaN ask column
+            # does not make the fills two-sided). The model only adds its
+            # own cost on top (fixed bps) or stands down (bar spread: the
+            # quoted spread is already inside the fill).
+            column_by_lower = {str(col).lower(): col for col in data.columns}
+            ask_columns = [
+                column_by_lower[name] for name in ASK_COLUMNS if name in column_by_lower
+            ]
+            has_two_sided = bool(ask_columns) and bool(
+                data[ask_columns].notna().to_numpy().any()
             )
             price_basis = "bid_ask" if has_two_sided else "single_price"
             slippage_models[symbol] = {

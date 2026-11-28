@@ -837,6 +837,10 @@ _SHORT_SPREAD_CASES = [
     (105.0, None, (110.0, 112.0, 109.0, 111.0), 110.0 + _SPREAD),  # ask gaps stop
     (105.0, None, (101.0, 106.0, 100.5, 104.0), 105.0),  # ask touches stop
     (120.0, 90.0, (95.0, 96.0, 88.0, 89.0), 90.0),  # ask touches target
+    # Bid open 89.8 is past the 90 target but the ask open (90.2) is not —
+    # no gap on the ask side, the ask low reaches the level, fill is the
+    # level itself.
+    (120.0, 90.0, (89.8, 90.0, 88.0, 89.0), 90.0),  # bid gaps, ask does not
     (120.0, 90.0, (89.4, 90.0, 88.0, 89.0), 89.8),  # ask gaps target
 ]
 

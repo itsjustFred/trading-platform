@@ -183,9 +183,13 @@ ask-side stops/limits), sells at the bid, LONG SL/TP on the bid range,
 SHORT SL/TP on the ask range. The spread is therefore paid **once per
 round trip, inside the fill prices** — an implementer porting this must
 not add it again on top of an ask-denominated fill or it is charged
-twice. On a one-sided frame (no `ask_*` columns — yfinance, Alpaca, ...)
-ask == bid and the only cost is the configured model; the legacy
-`spread_price_col` parameter still derives `ask = bid + spread` there.
+twice. On a frame WITHOUT `ask_*` columns the ask is **derived**, not
+absent: `ask = bid + spread_price_col` when that parameter is configured,
+else `ask = bid` — and the same table applies on that derived ask (buys
+fill and trigger on it, sells stay on the bid, SHORT SL/TP trigger on it).
+This is a deliberate #472 semantics change on `spread_price_col` frames —
+the MT5-parity path — where previously a SHORT stop triggered on the bid
+and filled at level + spread; it is not "unchanged" behaviour.
 Scope per the maintainer decision: the **native** engine and **signal
 replay** only (the engines #318 keeps; LEAN stays import-only; vectorbt
 and pynecore do not model slippage and record that fact in
@@ -193,8 +197,11 @@ and pynecore do not model slippage and record that fact in
 
 - `runner.slippage.resolve_slippage_model` resolves one model per run (per
   symbol where asset classes differ) from engine params:
-  `slippage="none"|"zero"` is the explicit parity opt-out that reproduces
-  pre-#130 gross fills; `"spread"` uses the bar's bid/ask columns
+  `slippage="none"|"zero"` is the explicit parity opt-out: on
+  single-price frames it reproduces pre-#130 gross fills bit-for-bit;
+  on two-sided frames the #472 ask/bid fill prices still apply, so it
+  diverges from the old gross fills by exactly the quoted spread
+  (`"spread"` uses the bar's bid/ask columns
   (MT5-tester-like) with a fixed-bps fallback; `"bps"`/`slippage_bps` is a
   fixed-bps model; absent config picks the per-asset-class default
   (FX/CFD-like classes → bar spread, equities → 5 bps, crypto → 10 bps,
@@ -209,11 +216,14 @@ and pynecore do not model slippage and record that fact in
   reader never has to guess which cost model produced the numbers.
 - When a strategy already prices the spread through `spread_price_col`,
   the auto model degrades to fixed bps so the quoted spread is not
-  charged twice. On a two-sided frame `spread_price_col` is not consulted
-  at all — the `ask_*` columns state the ask exactly (#472). The legacy
-  `ask_ohlc` parameter is inert on the native engine (the ask side is
-  the default there); it remains a vectorbt-only opt-in for SHORT
-  stop/TP *triggers*, and those ask-triggered exits pass
+  charged twice — but ONLY on one-sided frames. On a two-sided frame the
+  `ask_*` columns state the ask exactly, so `spread_price_col` is ignored
+  entirely: it is not consulted for fills AND the native engine re-resolves
+  the slippage model without it (`TradeEngine._resolve_two_sided_slippage`),
+  so the model cannot switch to fixed bps on top of the ask (#472). The
+  legacy `ask_ohlc` parameter is inert on the native engine and passing it
+  truthy emits a `DeprecationWarning`; it remains a vectorbt-only opt-in
+  for SHORT stop/TP *triggers*, and those ask-triggered exits pass
   `fill_side="ask"` so the bar spread is not charged twice on them
   either.
 

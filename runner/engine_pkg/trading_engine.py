@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 import math
+import warnings
 from typing import Any, Callable
 
 import pandas as pd
@@ -30,6 +31,7 @@ from runner.engine_pkg.orders import Order, OrderType, Position
 from runner.engine_pkg.result import build_indicator_series, build_result
 from runner.engines import contract
 from runner.engines._shared import (
+    ASK_COLUMNS,
     bar_spread_units,
     has_ask_side,
     resolve_ask_high_low,
@@ -51,7 +53,7 @@ from runner.engines.contract import (
     usable_exit_price,
 )
 from runner.fees import resolve_fee_model
-from runner.slippage import resolve_slippage_model
+from runner.slippage import _EXTERNAL_SPREAD_PARAMS, resolve_slippage_model
 from shared.lot_grid import floor_qty_to_step
 from shared.models import (
     BacktestResult,
@@ -222,6 +224,16 @@ class TradeEngine:
         self.slippage_model = resolve_slippage_model(
             config.parameters, asset_class=self._slippage_asset_class
         )
+        if (config.parameters or {}).get("ask_ohlc"):
+            warnings.warn(
+                "The 'ask_ohlc' strategy parameter is deprecated on the "
+                "native engine: ask-side fills and triggers are the default "
+                "on two-sided data (#472), so the parameter changes nothing "
+                "here. It remains meaningful only for the frozen vectorbt "
+                "adapter.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
         self.equity = config.initial_capital
         self.positions: list[Position] = []
         self.pending_orders: list[Order] = []
@@ -1117,11 +1129,14 @@ class TradeEngine:
 
         #472: a frame that carries ``ask_*`` columns states the ask exactly,
         so the configured spread column is not consulted at all (and cannot
-        be charged on top of the ask). On a frame without ask columns the
-        column keeps its #130 role: it is the spread in PRICE units (e.g.
-        converted from MT5 spread points at ingest) that the ask side is
-        derived from — ``ask = bid + spread`` — and it defaults to 0.0, which
-        means ask == bid.
+        be charged on top of the ask — ``run`` also re-resolves the
+        slippage model without it on such frames). On a frame WITHOUT ask
+        columns the rule is: ``ask = bid + spread_price_col`` when the
+        column is configured, else ``ask = bid`` — and the same fill/trigger
+        table applies on that derived ask (buys on it, sells on the bid,
+        SHORT SL/TP trigger on it). This is a deliberate semantics change
+        on ``spread_price_col`` frames: previously a SHORT stop triggered
+        on the bid and filled at level + spread.
         """
         if has_ask_side(row):
             return 0.0
@@ -2089,11 +2104,12 @@ class TradeEngine:
 
         #472: MT5 (and a real book) triggers SHORT stops/TPs on the ASK, so
         the ask side is used whenever the frame can state it — explicit
-        ``ask_high``/``ask_low`` columns on a two-sided feed, else the bid
-        high/low plus ``spread_price_col``. A one-sided frame with no spread
-        column returns ``(None, None)``: ask == bid and the callers keep the
-        canonical (bid) series, which is what makes behaviour unchanged
-        there.
+        ``ask_high``/``ask_low`` columns on a two-sided feed. On a frame
+        without ask columns the ask is DERIVED, not absent: ``ask = bid +
+        spread_price_col`` when that column is configured, else ask == bid
+        (``(None, None)`` — the callers keep the canonical bid series).
+        Either way the same table applies: the derived ask is the side
+        buys and SHORT exits trade on.
         """
         spread = self._bar_spread(row)
         if not has_ask_side(row) and spread <= 0.0:
@@ -2660,12 +2676,43 @@ class TradeEngine:
             drawings=self.drawings,
         )
 
+    def _resolve_two_sided_slippage(self, frame: pd.DataFrame) -> None:
+        """#472: ``spread_price_col`` is ignored on a two-sided frame.
+
+        The ``ask_*`` columns state the ask exactly, so the legacy spread
+        column must not ALSO degrade the slippage model to fixed bps — that
+        would charge the spread on top of the ask-denominated fills. The
+        model is resolved in ``__init__`` before the data is known, so on a
+        frame that carries ``ask_*`` columns it is re-resolved here with the
+        external-spread params stripped. An explicit ``slippage_model``
+        object is the caller's own and is left untouched, and stripping can
+        never introduce a resolution error the ``__init__`` pass did not
+        already raise.
+        """
+        params = self.config.parameters or {}
+        if params.get("slippage_model") is not None:
+            return
+        columns = {str(col) for col in frame.columns}
+        if not any(col in columns for col in ASK_COLUMNS):
+            return
+        if not any(params.get(key) for key in _EXTERNAL_SPREAD_PARAMS):
+            return
+        stripped = {
+            key: value
+            for key, value in params.items()
+            if key not in _EXTERNAL_SPREAD_PARAMS
+        }
+        self.slippage_model = resolve_slippage_model(
+            stripped, asset_class=self._slippage_asset_class
+        )
+
     def run(self, data: pd.DataFrame, strategy_fn: Callable[..., Any]) -> BacktestResult:
         if data is None or data.empty:
             return self._build_result()
 
         frame = data.copy()
         frame.columns = [str(col).lower() for col in frame.columns]
+        self._resolve_two_sided_slippage(frame)
         if "timestamp" not in frame.columns:
             if isinstance(frame.index, pd.DatetimeIndex):
                 frame = frame.reset_index().rename(columns={"index": "timestamp"})
