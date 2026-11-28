@@ -73,6 +73,26 @@ def test_a_submission_is_acknowledged_and_is_not_a_fill() -> None:
     assert client.working_orders(), "the order is on the book while it is unfilled"
 
 
+def test_a_missing_mark_price_is_an_error_not_a_fabricated_price() -> None:
+    client = FakeAlpacaTradingClient()
+    client.submit_order(_buy())
+
+    with pytest.raises(KeyError, match="no mark price"):
+        client.advance(30.0)
+
+
+def test_a_nan_qty_is_recorded_not_zeroed() -> None:
+    # A poison quantity must survive onto the order row so the adapter's
+    # refusal path sees it; zeroing it here would hide the bug.
+    client = FakeAlpacaTradingClient(mark_prices={AAPL: 100.0})
+    request = _buy()
+    request.qty = float("nan")
+
+    order = client.submit_order(request)
+
+    assert math.isnan(order.qty)
+
+
 def test_the_fill_lands_later_and_is_the_only_one() -> None:
     client = FakeAlpacaTradingClient(mark_prices={AAPL: 100.0}, fill_seconds=1.0)
     order = client.submit_order(_buy())
@@ -111,7 +131,7 @@ def test_a_limit_order_rests_until_the_mark_reaches_it() -> None:
 
 
 def test_status_open_hides_terminal_orders_and_status_all_keeps_them() -> None:
-    client = FakeAlpacaTradingClient(mark_prices={AAPL: 100.0})
+    client = FakeAlpacaTradingClient(mark_prices={AAPL: 100.0, "MSFT": 100.0})
     working = client.submit_order(_buy(limit_price=105.0))
     filled = client.submit_order(_buy("MSFT"))
     client.advance(30.0)

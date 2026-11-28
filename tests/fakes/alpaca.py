@@ -275,7 +275,10 @@ class FakeAlpacaTradingClient:
         self.close_error = close_error
         self.submit_error = submit_error
         self.allow_shorting = allow_shorting
-        self.mark_prices: dict[str, float] = dict(mark_prices or {})
+        self.mark_prices: dict[str, float] = {
+            str(symbol).strip().upper(): float(price)
+            for symbol, price in (mark_prices or {}).items()
+        }
 
         self.now = datetime(2026, 1, 1, 14, 30, tzinfo=timezone.utc)
         self.orders: list[FakeAlpacaOrder] = list(orders or [])
@@ -637,7 +640,9 @@ class FakeAlpacaTradingClient:
             client_order_id=str(getattr(request, "client_order_id", "") or ""),
             symbol=str(getattr(request, "symbol", "") or "").strip().upper(),
             side=getattr(request, "side", OrderSide.BUY),
-            qty=_optional_float(getattr(request, "qty", None)) or 0.0,
+            # ``_float`` keeps a non-finite qty NaN rather than zeroing it, so
+            # a poison quantity still reaches the adapter's refusal path.
+            qty=_float(getattr(request, "qty", None)),
             notional=_optional_float(getattr(request, "notional", None)),
             order_type=getattr(request, "type", OrderType.MARKET),
             order_class=getattr(request, "order_class", OrderClass.SIMPLE),
@@ -800,7 +805,13 @@ class FakeAlpacaTradingClient:
         return False
 
     def _mark_price(self, symbol: str) -> float:
-        return self.mark_prices.get(symbol.upper(), 100.0)
+        key = symbol.upper()
+        if key not in self.mark_prices:
+            raise KeyError(
+                f"no mark price for {key}: pass mark_prices={{'{key}': ...}} "
+                "or call set_mark_price — the fake never invents a price"
+            )
+        return self.mark_prices[key]
 
     def _fill(
         self, order: FakeAlpacaOrder, qty: float, price: float

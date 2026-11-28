@@ -38,7 +38,9 @@ The adapter's crypto-bar path constructs `CryptoHistoricalDataClient`
 directly (`live_runner/alpaca_adapter.py`), so a test exercising crypto
 history would hit the real client — keep crypto coverage off this fake.
 
-Key knobs: `mark_prices`, `fill_seconds` (confirmation delay),
+Key knobs: `mark_prices` (every traded symbol needs one — a missing mark
+raises `KeyError` rather than silently filling at a fabricated price),
+`fill_seconds` (confirmation delay),
 `partial_fill_ratio`, `reject_submissions` (callable or list consumed in
 order), `reject_after_acknowledgement`, `cancel_settles`, `allow_shorting`,
 `page_size`. `client.advance(seconds)` is the only place fills happen — a

@@ -149,7 +149,12 @@ def _float(value: Any, default: float = 0.0) -> float:
 
 
 def _optional_float(value: Any) -> float | None:
-    """A proto price field: ``None`` when absent, zero or non-finite."""
+    """A proto price field: ``None`` when absent, zero or non-finite.
+
+    Every price field read off a request proto (``limitPrice``,
+    ``stopPrice``, ``stopLoss``, ``takeProfit``) must route through this —
+    ``_float(x) or None`` keeps NaN, which is truthy, as a real price.
+    """
     if value is None:
         return None
     try:
