@@ -92,6 +92,29 @@ def test_strategy_folder_auxiliary_dirs_are_not_strategies(tmp_path: Path) -> No
     assert entries[0].display_name == "Folded Strategy"
 
 
+def test_real_strategies_tree_nested_dirs_are_declared_auxiliary() -> None:
+    """Every directory nested inside a strategy folder must be ignored by name.
+
+    ``iter_strategy_files`` enumerates any ``<dir>/<dir>.py`` pair outside
+    ``_STRATEGY_IGNORED_DIRS``; a new auxiliary folder (``data/``,
+    ``fixtures/``, …) added without extending the set would be silently queued
+    as a runnable strategy. This pins the reserved names against the real
+    tree so adding one fails here instead of in a backtest queue.
+    """
+    from shared.strategy_registry import _STRATEGY_IGNORED_DIRS, DEFAULT_STRATEGIES_DIR
+
+    undeclared = sorted(
+        dirpath.name
+        for dirpath in DEFAULT_STRATEGIES_DIR.rglob("*")
+        if dirpath.is_dir()
+        and len(dirpath.relative_to(DEFAULT_STRATEGIES_DIR).parts) >= 2
+        and not dirpath.name.startswith((".", "__"))
+        and dirpath.name not in _STRATEGY_IGNORED_DIRS
+    )
+
+    assert undeclared == []
+
+
 def test_find_strategy_entry_does_not_execute_strategy_files(
     tmp_path: Path, no_strategy_imports
 ) -> None:
