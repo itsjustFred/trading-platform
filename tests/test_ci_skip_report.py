@@ -180,6 +180,10 @@ def test_is_money_path_covers_live_runner_and_engine_tests() -> None:
     assert is_money_path("tests.test_risk_engine.TestGrouping")
     assert is_money_path("tests.test_vectorbt_sizing_semantics")
     assert is_money_path("tests.test_live_daemon_sizing")
+    # The shared broker fakes' contract tests drive the real adapters; a skip
+    # there must fail CI, so the classification is pinned here.
+    assert is_money_path("tests.fakes.test_alpaca")
+    assert is_money_path("tests.fakes.test_ctrader")
     assert not is_money_path("tests.test_safe_path")
     assert not is_money_path("tests.strategies.test_channel_breakout")
 
