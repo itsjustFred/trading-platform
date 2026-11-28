@@ -120,18 +120,18 @@ against the deployment's own ledger, not against the count.
 
 Fail closed (entry refused, reason in the log `Pip value unavailable`): adapter without
 `get_pip_value`, error or timeout (`PIP_VALUE_FETCH_TIMEOUT_SECONDS` = 60 s,
-`live_runner/daemon.py:1223`), a value that is not finite and positive,
+`live_runner/daemon.py`), a value that is not finite and positive,
 `value != units_per_qty * conversion_rate`, a rate other than 1 without quotes, or a
 conversion quote that violates the entry gate's freshness rule (missing/invalid time,
 future, older than `max_entry_quote_age_seconds`). Exit-only orders need no pip value.
 
 Worst-case wait before an entry is submitted: the daemon bounds both broker fetches it
-makes on the entry path — 60 s for the pip value (`PIP_VALUE_FETCH_TIMEOUT_SECONDS`,
-`live_runner/daemon.py:1223`) and 20 s for the entry-gate quote
-(`ENTRY_QUOTE_FETCH_TIMEOUT_SECONDS` = 20.0, `live_runner/daemon.py:1086`). Pip value and
+makes on the entry path — 60 s for the pip value (`PIP_VALUE_FETCH_TIMEOUT_SECONDS`
+in `live_runner/daemon.py`) and 20 s for the entry-gate quote
+(`ENTRY_QUOTE_FETCH_TIMEOUT_SECONDS` = 20.0, `live_runner/daemon.py`). Pip value and
 sizing run before the entry-deviation gate, so an entry that times out on both waits about
 80 s before it is refused. The cTrader quote timeout of 5 s
-(`quote_timeout_seconds = 5.0`, `live_runner/ctrader_adapter.py:849`) is an
+(`quote_timeout_seconds = 5.0`, `live_runner/ctrader_adapter.py`) is an
 adapter-internal bound inside that 20 s.
 
 Persisted on the signal: `pip_value`, `pip_value_source`, `pip_value_units_per_qty`,
@@ -464,11 +464,11 @@ extended-hours brackets and crypto symbols (Alpaca has no bracket/OTO orders for
 
 Crypto consequence on main: every Alpaca crypto entry is refused before submission —
 `AlpacaLiveAdapter._normalize_bracket_entry` classifies the symbol and raises for
-`classify_alpaca_symbol(symbol) == "crypto"`
-(`live_runner/alpaca_adapter.py:1268-1273`). Even a plain (non-bracket) crypto entry as
+`classify_alpaca_symbol(symbol) == "crypto"` (`live_runner/alpaca_adapter.py`). Even a plain
+(non-bracket) crypto entry as
 proposed in #241 would be refused today by the entry-deviation gate, because that gate
 needs a quote and `AlpacaLiveAdapter.get_quote` requests only
-`StockLatestQuoteRequest(feed="iex")` (`live_runner/alpaca_adapter.py:1751`) — there is no
+`StockLatestQuoteRequest(feed="iex")` (`live_runner/alpaca_adapter.py`) — there is no
 crypto quote path. Crypto bars themselves are available (`get_market_data` uses
 `CryptoBarsRequest`), so the blockers are order submission and the gate quote, not market
 data. **Pending #241** (BTC on Alpaca as a plain order plus a separately managed stop) has

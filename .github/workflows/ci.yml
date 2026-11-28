@@ -67,7 +67,7 @@ jobs:
         # `tests/test_lint_family_ratchet.py` test asserts the two agree.
         run: >-
           uv run --no-sync --no-build ruff check --select
-          B,DTZ,PERF,PLE,PLW0120,PLW0602,PLW1510,RUF005,RUF006,RUF007,RUF012,RUF013,RUF015,RUF019,RUF021,RUF023,RUF036,RUF043,RUF046,RUF059,S307,PLC2701 .
+          B,DTZ,PERF,PLE,PLW0120,PLW0602,PLW1510,RUF005,RUF006,RUF007,RUF012,RUF013,RUF015,RUF019,RUF021,RUF023,RUF036,RUF043,RUF046,RUF059,S307,PLC2701,S110 .
       - name: Type check (mypy)
         # mypy is a dev dependency (`uv sync` installs it) and pinned there to
         # 2.4.1, so this is the same interpreter the developer gets from
@@ -108,11 +108,19 @@ jobs:
           REQUIRE_REAL_DATA_SLICE: ${{ steps.fetch-slice.outputs.download_failed == 'true' && '0' || '1' }}
         run: >-
           uv run --no-sync --no-build pytest -q -p no:cacheprovider -m "not slow"
-          --ignore=tests/strategies
+          --ignore=tests/strategies --junitxml=pytest-junit.xml
       - name: Strategy tests
         # Mostly dataset-gated skips today (#289); kept so a change that makes
         # them runnable cannot land without the step existing to run them.
-        run: uv run --no-sync --no-build pytest -q -p no:cacheprovider tests/strategies
+        run: uv run --no-sync --no-build pytest -q -p no:cacheprovider tests/strategies --junitxml=strategy-junit.xml
+      - name: Skip report
+        if: runner.os == 'Linux'
+        # Makes visible what CI never runs: skips grouped by reason in the job
+        # summary, and a failure when a money-path test skips for a reason that
+        # is not an allowed dataset gate (#289 tracks closing those gates).
+        run: >-
+          uv run --no-sync --no-build python scripts/ci/skip_report.py
+          pytest-junit.xml strategy-junit.xml
       - name: Harness gates
         run: |
           PYTHON="$(uv run --no-sync --no-build python -c 'import sys; print(sys.executable)')" \
@@ -138,16 +146,31 @@ jobs:
           cache-dependency-path: frontend/package-lock.json
       - name: Install frontend dependencies
         run: npm ci --ignore-scripts
-      - name: Frontend focused test lint
-        run: >-
-          ./node_modules/.bin/eslint
-          tests/frontendResilience.test.ts
-          tests/liveTerminal.test.ts
-          tests/optimizationEvidence.test.ts
-          tests/compareStats.test.ts
-          tests/livePositionMath.test.ts
-          tests/backtestListMetrics.test.ts
+      - name: Frontend test lint
+        run: ./node_modules/.bin/eslint tests/
       - name: Frontend focused tests
         run: npm run test:focused
       - name: Frontend TypeScript and production build
         run: npm run build
+
+  workflows:
+    name: Workflow lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # The agent workflows are ~1500 lines of YAML whose failure mode is a
+      # silent misroute (a skipped `if:`, a drifted reusable-call input), so
+      # they get a real linter, not just the contract tests. The binary is
+      # pinned by release version and verified against the published sha256,
+      # like gitleaks in secret-scan.yml.
+      - name: Install actionlint
+        run: |
+          set -euo pipefail
+          curl -fsSL --proto '=https' --proto-redir '=https' -o actionlint.tar.gz \
+            https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz
+          echo "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  actionlint.tar.gz" | sha256sum -c -
+          tar -xzf actionlint.tar.gz actionlint
+          ./actionlint --version
+      - name: Lint workflows
+        run: ./actionlint

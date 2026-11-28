@@ -642,8 +642,8 @@ def _run_backtest_in_process_body(request: CellRequest) -> dict[str, Any]:
     if save_sqlite:
         try:
             save_result_to_sqlite(backtest_result)
-        except Exception as exc:
-            logger.warning("Could not persist grid cell to SQLite: %s", exc)
+        except Exception as exc:  # except-kind: best-effort - SQLite persist is best-effort
+            logger.warning("Could not persist grid cell to SQLite: %s", exc, exc_info=True)
 
     return {
         "grid_identity": identity["fingerprint"],
@@ -669,7 +669,7 @@ def run_one_backtest_in_process(request: CellRequest, cell: dict[str, Any] | Non
         result.update({"status": "ok", "returncode": 0})
     except ValidationError as exc:
         result.update({"status": "failed", "returncode": 2, "error": str(exc)})
-    except Exception as exc:
+    except Exception as exc:  # except-kind: loop-survival - failure recorded as a failed row
         result.update({"status": "failed", "returncode": 1, "error": f"{exc}\n{traceback.format_exc()[-4000:]}"})
 
     result["finished_at"] = datetime.now(timezone.utc).isoformat()
@@ -959,7 +959,7 @@ def run_backtest_grid(
             for future in as_completed(futures):
                 try:
                     rows.append(future.result())
-                except Exception as exc:
+                except Exception as exc:  # except-kind: loop-survival - becomes a failed row
                     rows.append(
                         {
                             "status": "failed",

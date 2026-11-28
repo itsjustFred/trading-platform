@@ -1,264 +1,114 @@
-# ARCHITECTURE
+# Architecture
 
-This is the current "state of the union" for the trading-platform repository.
+Map of the top-level packages. Detail lives in the linked docs; decisions in
+`docs/adr/`.
 
-## Stack summary
+## Packages
 
-- **Backend API:** FastAPI (`viewer/main.py`)
-- **Frontend:** React + TypeScript + Vite (`frontend/`)
-- **Primary backtest engine:** native event-based engine (`runner/engines/native_adapter.py`)
-- **Additional engines:** vectorbt, PyneCore and LEAN adapters — all frozen
-  (bug fixes only) per `docs/adr/0002-native-single-strategy-engine.md` (#318);
-  native is the single strategy engine going forward, LEAN becomes
-  import-only, and pynecore is scheduled for deletion
-- **Performance/statistics:** `runner/stats.py`, QuantStats-derived metrics, custom p-value / PSR handling
-- **Persistence:** SQLite (`$DATA_DIR/backtests.db`) + JSON compatibility (`$DATA_DIR/backtests/*.trades.json`)
+- `runner/` — backtesting. `runner/engine.py` + `runner/engine_pkg/` is the
+  native event-based engine (`TradeEngine`); `runner/engines/` holds the
+  engine adapters (`native_adapter.py` is the single strategy engine going
+  forward per the native-single-strategy-engine ADR / #318; `vectorbt`, `pynecore`, `lean` and
+  `signal_replay` adapters are frozen). Also the CLI (`cli.py`), grid/matrix
+  runners, optimizer, walk-forward and `stats.py`. Contracts:
+  `docs/cross-engine-backtest-contract.md`, `docs/sizing-semantics.md`,
+  `docs/cleanup-16d1-money-path-semantics.md`.
+- `shared/` — canonical models (`models.py`), SQLite persistence
+  (`database.py`), constants (`DATA_DIR`, timeframes), money/fill-key/lot-grid
+  helpers, logging, Sentry, indicators. Largest and most depended-on package.
+- `data_tools/` — OHLCV data: `catalog_builder.py`, `validate.py`,
+  `resample.py`, `auto_download.py`, `dolthub_manager.py`,
+  `downloaders/`. Layout: `docs/DATA_SOURCES.md`.
+- `risk/` — position sizing and risk gating (`engine.py`, `live.py`,
+  `models.py`, `config.py`) shared by backtest and live paths.
+- `live_runner/` — live trading: `daemon.py`, broker adapters
+  (`alpaca_adapter.py`, `ctrader_adapter.py`, `base_adapter.py`),
+  reconciliation/kill-switch/loss-breaker, `signal_sources/`, preflight.
+  Semantics: `docs/live-risk-consistency.md`; ops:
+  `docs/live-deploy-runbook.md`, `docs/live-go-live-checklist.md`.
+- `viewer/` — FastAPI backend (`main.py` + `core.py`) serving the API,
+  WebSocket task/live streams, and the built frontend.
+- `frontend/` — React + TypeScript + Vite SPA (`src/`).
+- `validation/` — imports external backtest reports (MT5 XLSX/HTML,
+  QuantConnect) into `ValidationReference` and compares them against
+  `BacktestResult` (`importers/`, `comparison/`, `risk/`, `stats/`,
+  `readiness/`). Schemas: `docs/mt5_xlsx_schema.md`.
+- `signal_bots/` — Discord signal processors (`ramjet/`, `rocketfuel/`,
+  `nitro/`). See `docs/signal_bots.md`.
+- `scheduler/` — APScheduler jobs (`scheduler.py`, `jobs/`).
+- `strategies/` — strategy implementations; data for the runner, discovered
+  via `shared/strategy_registry.py` (see "Strategy layout" below).
+- `scripts/` — ops one-offs (no package). `tests/` — pytest suite.
+  `docs/` — this documentation.
 
 ## End-to-end flow
 
 ```text
-strategy source
-    |
-    v
-runner/cli.py
-    |
-    +--> vectorbt adapter
-    +--> pynecore adapter
-    +--> lean adapter
-    |
-    v
-shared.models.BacktestResult
-    |
-    v
-$DATA_DIR/backtests.db
-    |
-    v
-viewer/main.py
-    |
-    v
-frontend/src/api/client.ts
-    |
-    v
-React pages (backtests, strategies, portfolios, data, lab)
+strategy source -> runner/cli.py -> engine adapter -> shared.models.BacktestResult
+    -> $DATA_DIR/backtests.db -> viewer/main.py -> frontend/src/api/client.ts -> React pages
 ```
 
-## Backend layers
-
-### `shared/`
-
-Shared models and cross-cutting helpers.
-
-- `shared/models.py`
-  - canonical dataclasses for trades, exits, backtest metadata, equity points, stats
-- `shared/constants.py`
-  - resolves `DATA_DIR`, `LOG_DIR`, timeframe constants, executable lookup
-- `shared/logging.py`
-  - structured JSON logging
-- `shared/strategy_registry.py`
-  - strategy discovery, stable slugs, markdown lookup, and `STRATEGY_META` rename support
-
-### `runner/`
-
-Execution and conversion layer.
-
-- `runner/cli.py`
-  - constructs `BacktestConfig`
-  - dispatches to an engine adapter
-  - persists results to `$DATA_DIR/backtests` (JSON) and `$DATA_DIR/backtests.db` (SQLite)
-- `runner/stats.py`
-  - computes Sharpe, Sortino, Calmar, drawdown, PSR, p-value, and related metrics
-- `runner/backtest_grid.py`
-  - canonical grid execution engine: one strategy over a symbol × timeframe grid;
-    every cell runs through the same validation/statistics/risk/SQLite path as a
-    manual backtest
-- `runner/backtest_matrix.py`
-  - multi-strategy orchestration/aggregation wrapper over `backtest_grid`
-    (matrix CSVs, daily-equity export) plus the legacy single-strategy quick grid
-    (`run_strategy_grid`)
-- `runner/auto_agent.py`
-  - NVIDIA NIM / Kimi-backed strategy conversion worker (orchestration loop)
-  - companion modules: `runner/agent_prompts.py` (LLM prompts),
-    `runner/agent_response_parsing.py` (response extraction + STRATEGY_META
-    normalization), `runner/agent_backtest_target.py` (target resolution +
-    artifact paths), `runner/agent_process.py` (backtest subprocess control)
-  - writes screened draft assets into `strategies/<slug>/` and returns an awaiting-approval result
-  - leaves execution to `runner.auto_agent.run_validated_backtest` after human approval
-- `runner/engine.py` + `runner/engine_pkg/`
-  - `runner/engine.py` is the public import shim (`TradeEngine`,
-    `ExecutionModelSettings`, `OrderType`, `Order`, `Position`); the
-    implementation lives in `runner/engine_pkg/`:
-    `trading_engine.py` (bar loop, order lifecycle, risk sizing),
-    `execution_model.py` (fill/trigger assumptions recorded per trade),
-    `orders.py` (Order/Position dataclasses), `result.py`
-    (indicator presentation + `BacktestResult` assembly)
-  - refuses to overwrite an existing strategy slug
-  - generated drafts carry a provenance marker and are not executable until approved
-  - approved execution runs with an allowlisted child environment (no API keys) and a wall-clock timeout
-- `runner/codegen_safety.py`
-  - static screening of LLM-generated strategy code before it is written or executed
-  - denies process spawning, dynamic execution, network egress, untrusted deserialization, and reflection escape hatches
-- `runner/approval_gate.py`
-  - human review gate for generated strategy code (Decision Record 2026-08-31)
-  - approvals live beside the code as `<file>.approved.json` and are bound to the file's SHA256 hash
-  - any change to the file after approval invalidates the approval
-  - REST surface: `GET /api/strategies/{file}/approval` and `POST /api/strategies/{file}/approve`
-- `runner/engines/`
-  - `vectorbt_adapter.py`: bar-loop adapter kept in parity with native via
-    `tests/test_vectorbt_native_parity.py` (per-symbol processing in
-    `_process_symbol`, per-trade sizing in `_size_trade`; drawing and
-    indicator-series presentation shared via `_drawings.py`/`_indicator_series.py`); FROZEN per #318 — no `vectorbt` import, no vectorization
-  - `pynecore_adapter.py`: Pine-style strategies through PyneCore
-  - `lean_adapter.py`: QuantConnect LEAN result ingestion / execution bridge
-- Sizing semantics: `max_position_exposure_pct` (position-size), `risk_per_trade_pct`
-  (max loss per trade) and `max_total_exposure` (aggregate exposure limit) have one
-  documented meaning each — see `docs/sizing-semantics.md`. `max_position_pct` /
-  `--max-position-pct` remain as deprecated aliases.
-
-### Optimization and walk-forward artifacts
-
-Portfolio optimization normalizes each equity curve to its first observation
-before correlation, weighting, and OOS metrics. Persisted portfolio artifacts
-carry a UUID suffix to avoid same-second collisions. Walk-forward steps default
-to the test-window length; custom steps, purge windows, and embargo windows
-require explicit start and end boundaries so OOS folds cannot overlap silently.
-
-### `viewer/`
-
-Operational FastAPI application.
-
-- Lists backtests, strategies, portfolios, logs, and data catalog entries
-- Builds equity/drawdown payloads for charts
-- Reconstructs missing equity curves from trades when needed
-- Starts background jobs for:
-  - data downloads
-  - resampling
-  - strategy auto-conversion
-- Serves the built frontend from `frontend/dist`
-- Streams task logs over WebSocket (`/ws/tasks/{job_id}`)
-
-## Frontend structure
-
-The SPA lives in `frontend/src/`.
-
-### Routing
-
-- `App.tsx` registers page routes
-- `Sidebar.tsx` drives the left navigation
-
-### Main pages
-
-- `StrategiesPage.tsx`
-  - strategy catalog, filters, sort options
-- `StrategyDetailPage.tsx`
-  - strategy metadata, rendered markdown dossier, related backtests/portfolios
-- `BacktestsPage.tsx`
-  - sortable backtest list with quick stats and sparklines
-- `BacktestDetailPage.tsx`
-  - stats grid, equity curve, benchmark overlay, trade table
-- `PortfoliosPage.tsx` / `PortfolioDetailPage.tsx`
-  - combined portfolio analytics
-- `StrategyLabPage.tsx`
-  - raw-code input + live terminal for the autonomous conversion worker
-- `DataManagementPage.tsx`
-  - downloader, catalog, and resampling UI
-
-### API contract
-
-`frontend/src/api/client.ts` mirrors backend endpoints. When fields change in the
-backend, the following files must stay synchronized:
-
-- `viewer/main.py`
-- `viewer/core.py` (shared helper logic)
-- `frontend/src/api/client.ts`
-- `frontend/src/api/types.ts`
-
-## Data subsystem
-
-### Canonical data path
-
-```text
-$DATA_DIR/ohlcv/<source>/manifest.json
-$DATA_DIR/ohlcv/<source>/<SYMBOL>/<SYMBOL>_<TF>.parquet
-```
-
-`asset_class`/`region`/`source_symbol` live in each source's `manifest.json`
-(#471); all readers resolve datasets through `shared/ohlcv_store.py`.
-
-### Supporting tools
-
-- `data_tools/catalog_builder.py`
-  - scans the data directory and writes `catalog.json`
-- `data_tools/validate.py`
-  - validates parquet structure and dates
-- `data_tools/resample.py`
-  - derives higher timeframes from an existing parquet source
-- `data_tools/downloaders/*`
-  - source-specific importers / downloaders
-- `data_tools/dolthub_manager.py`
-  - syncs and exports Dolthub repos into canonical parquet files
+Live signals flow the other direction: `signal_bots/`/`live_runner/signal_sources/`
+-> `live_runner/daemon.py` -> broker adapter -> ledger in `shared/database.py`.
 
 ## Strategy layout
 
-Strategies are now grouped by folder:
-
 ```text
-strategies/
-  short_term_reversal/
-    short_term_reversal.py
-    README.md
-  pynecore_orb/
-    pynecore_orb.py
-    README.md
-    pynecore_orb.toml
-    pynecore_orb_context.py
+strategies/<slug>/<slug>.py   (+ optional README.md, helper context files)
 ```
 
-Conventions:
+The folder name is the stable slug; backtests store it in `meta.strategies`.
+Helper context files beside the main module may only import a fixed whitelist
+(`pandas`, `numpy`, `math`, `statistics`, `decimal`, `datetime`, `typing`,
+`collections`, `itertools`, `functools`, `dataclasses`, `__future__`) and
+define `build_trade_context` / `build_drawings` — they are compiled inside the
+runner process, so the whitelist in
+`runner/engines/pynecore_adapter.py` (`HELPER_ALLOWED_IMPORT_ROOTS`) is a
+security gate, not a style rule.
+LLM-generated strategy code is untrusted until a human approves it: drafts are
+statically screened (`runner/codegen_safety.py`), marked, and only runnable
+after a SHA256-bound approval (`runner/approval_gate.py`,
+`POST /api/strategies/{file}/approve`) — any change to the file after approval
+invalidates it. Any new execution route for generated
+strategy files MUST call `runner.approval_gate.require_generated_strategy_approval`
+(or `runner.auto_agent.run_validated_backtest`) before importing or executing
+the module. Engine adapters and grid entry points re-check the approval as a
+second layer (`require_generated_strategy_approval` in each adapter and
+`runner/backtest_grid.py`), which also re-runs the `codegen_safety` source
+screening — defence in depth; the auto-agent validation route runs the approved
+backtest in a subprocess with an allowlisted environment
+(`runner/agent_process.build_backtest_child_env` — no API keys) and a
+wall-clock timeout.
 
-- the folder name is the stable **slug**
-- the main Python file is `<slug>.py`
-- optional documentation lives in `README.md`
-- helper context files stay beside the main module
-- helper context files may only contain imports (pandas, numpy, math, statistics, decimal, datetime, typing, collections, itertools, functools, dataclasses) plus `build_trade_context` / `build_drawings` functions — they are compiled in the runner process
-- backtests usually store the slug in `meta.strategies`
+## Conventions worth knowing
 
-### LLM-generated strategies (trust boundary)
+- Sizing semantics (`max_position_exposure_pct`, `risk_per_trade_pct`,
+  `max_total_exposure`): `docs/sizing-semantics.md`.
+- Money-path decision records: `docs/cleanup-16d1-money-path-semantics.md`.
+- Reference-parity fixtures spec: `docs/reports/parity-reference-libraries.md`.
+- Grid/matrix backtest docs: `docs/backtest_grid.md`, `docs/backtest_matrix.md`.
+- Frontend↔backend contract: `frontend/src/api/client.ts` and `types.ts` mirror
+  `viewer/main.py`/`viewer/core.py` — keep them in sync when fields change.
+- Test sandbox and OHLCV-gated strategy tests: see `AGENTS.md`.
 
-Strategy code produced by the auto-conversion agent is untrusted until a human
-has reviewed it:
+## Optimization and walk-forward invariants
 
-1. the generated module is statically screened (`runner/codegen_safety.py`);
-   unscreenable or banned code never reaches disk,
-2. the module is written as a draft with a generated-strategy marker and no
-   approval file, so it is never runnable through an execution route,
-3. `POST /api/strategies/{file}/approve` records a SHA256-bound approval after
-   human review, and
-4. only then can the strategy run; if the file changes afterwards, the
-   approval is void and the gate refuses execution.
-
-The approved execution route is `runner.auto_agent.run_validated_backtest`.
-Engine and grid execution boundaries also reject marked drafts that lack a
-valid approval, and re-apply static screening as defense in depth. Any new
-execution route for generated strategy files MUST call
-`runner.approval_gate.require_generated_strategy_approval` (or
-`run_validated_backtest`) before importing or executing the module.
+- Portfolio optimization normalizes each equity curve to its first observation
+  before correlation, weighting and OOS metrics (`_normalize_equity_matrix` in
+  `runner/portfolio_optimizer.py`); persisted portfolio artifacts carry a UUID
+  suffix so same-second runs cannot collide.
+- Walk-forward steps default to the test-window length; custom step, purge or
+  embargo windows require explicit `start`/`end` boundaries so OOS folds
+  cannot overlap silently (`runner/walkforward.py` raises otherwise).
+- The optimizer's three-way split, embargo and result-payload contract:
+  `docs/walk_forward.md`. Its `diagnostics` block (plateau, selection-bias,
+  survivorship) never changes which trial wins — it reports how much the
+  selection should be trusted.
 
 ## Metrics and chart semantics
 
-- `runner/stats.py` keeps max drawdown as a decimal fraction
-- `/api/backtest/<id>/stats` converts drawdown to percentage points for the UI
-- p-value is computed from daily returns using a one-sided t-test against zero
-- the backtest equity endpoint normalizes timestamps, sorts points, and collapses duplicate timestamps before charting
-
-## Deployment / local runtime
-
-Typical local workflow:
-
-```bash
-.venv/bin/python -m pytest tests -q
-cd frontend && npm run build
-uvicorn viewer.main:app --host 0.0.0.0 --port 5556 --no-access-log
-```
-
-Frontend development uses Vite; production/runtime serving uses FastAPI with
-built `frontend/dist` assets, plus SPA/static middleware and WebSocket endpoints.
+- `runner/stats.py` keeps max drawdown as a decimal fraction;
+  `/api/backtest/<id>/stats` converts it to percentage points for the UI.
+- p-value is a one-sided t-test on daily returns against zero.
+- The backtest equity endpoint normalizes timestamps, sorts points and
+  collapses duplicate timestamps before charting.

@@ -382,8 +382,8 @@ def cmd_run(args):
     if not getattr(args, "skip_sqlite", False):
         try:
             save_result_to_sqlite(result)
-        except Exception as exc:
-            logger.warning("Could not persist backtest to SQLite: %s", exc)
+        except Exception as exc:  # except-kind: best-effort - SQLite persist is best-effort
+            logger.warning("Could not persist backtest to SQLite: %s", exc, exc_info=True)
     logger.info(
         "Result: %d trades, total PnL: $%.2f", len(result.trades), sum(t.pnl for t in result.trades)
     )

@@ -151,6 +151,103 @@ def test_agent_workflows_skip_drafts_and_keep_free_model_defaults() -> None:
         )
 
 
+AGENT_WORKFLOWS = (
+    "agent-code-review.yml",
+    "agent-mutation-testing.yml",
+    "agent-pre-mortem.yml",
+)
+
+
+def test_agent_workflow_triggers_and_concurrency() -> None:
+    """The agent workflows fire on the pushes that change the diff under
+    review - opened, synchronize, reopened - and on a draft's
+    ready_for_review. `edited` is the trap: it fires for title, body and
+    label edits too, and re-analysing for those spends model quota on a
+    verdict that is already current. Review and mutation must not subscribe
+    to it at all; the pre-mortem keeps it only because a base retarget
+    changes base...head with no other event, and its concurrency group
+    gives a non-base edit a bucket of its own so it cannot cancel the run
+    it would replace."""
+    for name in AGENT_WORKFLOWS:
+        workflow = _workflow(name)
+        on = _on_block(workflow)
+        types = set(on["pull_request"]["types"])
+        assert {"opened", "synchronize", "reopened"} <= types, (
+            f"{name}: a push that changes the diff must re-run the agent"
+        )
+        group = str(workflow["concurrency"]["group"])
+        assert "pull_request.number" in group or "inputs.pr_number" in group, (
+            f"{name}: the concurrency group is not per PR - pushes on "
+            "different PRs would cancel each other"
+        )
+
+    for name in ("agent-code-review.yml", "agent-mutation-testing.yml"):
+        types = set(_on_block(_workflow(name))["pull_request"]["types"])
+        assert "edited" not in types, (
+            f"{name}: `edited` fires for title/body/label edits and would "
+            "spend quota re-analysing an unchanged diff"
+        )
+
+    premortem = _workflow("agent-pre-mortem.yml")
+    types = set(_on_block(premortem)["pull_request"]["types"])
+    assert "edited" in types, (
+        "the pre-mortem needs `edited` for the base retarget, the one edit "
+        "that changes the diff without any other event"
+    )
+    group = str(premortem["concurrency"]["group"])
+    assert "github.event.action == 'edited'" in group
+    assert "changes.base" in group, (
+        "a pre-mortem `edited` that changes no base must land in a bucket "
+        "of its own: joining the analysed run's group would cancel it with "
+        "no replacement and leave the head `pending`"
+    )
+
+
+def test_agent_workflow_status_context_is_stable() -> None:
+    """The pre-mortem reports through a commit status, and branch protection
+    or a human reads that context by name: renaming it silently detaches the
+    verdict from the check it gates."""
+    env = _workflow("agent-pre-mortem.yml")["env"]
+    assert env.get("PREMORTEM_CONTEXT") == "agent/pre-mortem", (
+        f"the pre-mortem status context changed: {env.get('PREMORTEM_CONTEXT')!r}"
+    )
+
+
+def test_agent_workflow_actions_are_sha_pinned() -> None:
+    """Sonar S7637 and the drift the consolidation removed both say the same
+    thing: a `uses:` that names a tag can be re-pointed upstream without a
+    diff here. Every third-party action in the agent workflows - including
+    the shared quota probe - must be a full commit SHA with the tag kept as
+    a comment; local `./` reusable calls are exempt."""
+    for name in (*AGENT_WORKFLOWS, "agent-quota-probe.yml"):
+        for used in _uses_steps(_workflow(name)):
+            if used.startswith("./"):
+                continue
+            ref = used.split("@", 1)[1]
+            assert re.fullmatch(r"[0-9a-f]{40}", ref), (
+                f"{name}: {used} is not pinned to a full commit SHA"
+            )
+
+
+def test_quota_probe_output_is_declared_and_consumed() -> None:
+    """`needs.quota-probe.outputs.available` is the quota gate: the reusable
+    workflow must map it out through `on.workflow_call.outputs` (a job-level
+    output alone never reaches the caller - every read would be an empty
+    string, which is not 'false', and the agent job would run even on a
+    confirmed cap), and every agent workflow must actually read it."""
+    probe = _workflow("agent-quota-probe.yml")
+    on = _on_block(probe)
+    outputs = on["workflow_call"].get("outputs") or {}
+    assert "jobs.probe.outputs.available" in str(outputs.get("available", {})), (
+        "the probe's `available` is not mapped through workflow_call.outputs"
+    )
+    for name in AGENT_WORKFLOWS:
+        text = (WORKFLOWS / name).read_text(encoding="utf-8")
+        assert "needs.quota-probe.outputs.available" in text, (
+            f"{name} never reads the probe's available output"
+        )
+
+
 def test_secret_scan_covers_only_the_change_range() -> None:
     workflow = _workflow("secret-scan.yml")
     on = _on_block(workflow)

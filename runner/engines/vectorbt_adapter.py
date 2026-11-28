@@ -944,7 +944,7 @@ class VectorbtAdapter(EngineAdapter):
                         for tf in extra_tfs:
                             if tf not in used_timeframes:
                                 used_timeframes.append(tf)
-                    except Exception as exc:
+                    except Exception as exc:  # except-kind: propagate - collected, then re-raised
                         logger.exception("Failed processing symbol %s", sym)
                         symbol_errors.append((sym, exc))
             _raise_symbol_errors()
@@ -967,7 +967,7 @@ class VectorbtAdapter(EngineAdapter):
                         data_root,
                         **process_kwargs,
                     )
-                except Exception as exc:
+                except Exception as exc:  # except-kind: propagate - collected, then re-raised
                     logger.exception("Failed processing symbol %s", symbol)
                     symbol_errors.append((symbol, exc))
                     continue

@@ -6,7 +6,7 @@
 > and `live_runner/` have changed many times since (execution logic is no longer out of
 > bounds); and the external frameworks once listed as later extensions now have engine
 > adapters (`runner/engines/lean_adapter.py`, `runner/engines/pynecore_adapter.py`). Read
-> `docs/validation_architecture.md`, `docs/validation_inventory.md` and
+> the `validation/` package, `docs/validation_inventory.md` and
 > `docs/mt5_xlsx_schema.md` for the current state.
 
 **Datum:** 2026-06-24
@@ -19,7 +19,7 @@
 
 | Bereich | Beschreibung |
 |---------|--------------|
-| **Import & Normalisierung** | MT5-XLSX-Reports (primär) und MT5-HTML-Reports (Fallback) einlesen und in `ValidationReference` normalisieren. |
+| **Import & Normalisierung** | MT5-XLSX-Reports (einzige geparste MT5-Form; HTML-Reports bleiben Menschen-Artefakte) einlesen und in `ValidationReference` normalisieren. |
 | **Domänenmodell** | `ValidationReference` mit Pflichtfeldern: `strategy_name`, `source_framework`, `symbol`, `timeframe`, `settings`, `trades`, `stats`, `raw_metadata`. |
 | **Trade Matching** | Vergleich von Entry/Exit Time, Direction, Entry/Exit Price, Volume, Position Size, PnL, Stop Loss, Take Profit zwischen externer Referenz und internem `BacktestResult`. |
 | **Trade Anomalies** | Erkennung von Missing Trades, Extra Trades und Mismatches. |
@@ -47,7 +47,7 @@
 
 ## Annahmen
 
-1. MT5-Reports liegen als XLSX-Dateien vor; HTML ist Fallback.
+1. MT5-Reports liegen als XLSX-Dateien vor; HTML-Reports werden nicht geparst.
 2. XLSX-Reports enthalten mindestens Orders- und Trades/Deals-Tabellen mit den benötigten Spalten.
 3. Interne `BacktestResult`-Objekte können aus dem Vergleichs-Runner oder einer Datei geladen werden.
 4. Zeitzonen werden soweit möglich normalisiert (ISO 8601 UTC); bei fehlender Zeitzoneninfo wird Broker-Serverzeit angenommen.
@@ -58,7 +58,6 @@
 ## Akzeptanzkriterien
 
 - `docs/validation_scope.md` existiert und dokumentiert In-Scope/Out-of-Scope.
-- `docs/validation_architecture.md` dokumentiert Architektur und Reuse-vs-Neu-Entscheidung.
 - `docs/validation_inventory.md` listet bestehende relevante Module auf.
 - `docs/mt5_xlsx_schema.md` beschreibt das XLSX-Spaltenschema.
 - Offene Punkte aus der Verifikation sind in den GitHub-Issues getrackt.

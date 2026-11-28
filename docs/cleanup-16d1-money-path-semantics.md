@@ -128,7 +128,7 @@ compound into entries that the ledger had not received.
 (`fixed_risk_amount`, `tick_value`, `lot_step`, `min_lot`, `max_lot`,
 `cap_fixed_risk_by_leverage` read straight from `config.parameters`). That
 protocol is **deliberately untouched** here — it is a deliberate MT5-alignment
-interface (see `docs/mt5-backtest-alignment-plan.md`), documented rather than
+interface (see `validation/risk/` and `docs/mt5_xlsx_schema.md`), documented rather than
 removed; only the equity base it reads was wrong and is fixed.
 
 **Leverage/margin check moved to free margin (#347):** the maintainer

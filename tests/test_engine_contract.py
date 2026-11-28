@@ -1706,10 +1706,9 @@ def test_intrabar_resolution_equal_to_base_resolves_to_none():
 class TestProtectiveExitGapHelpers:
     """``level_gapped_at_open`` / ``level_fill_price`` / ``resolve_protective_exit``.
 
-    The replay flip workflow (#364) routes its stop/TP1 checks through these;
-    #208 ports the same helpers to the native engine, so they are pinned here
-    directly — including the SHORT mirror the flip tests cannot reach
-    (``test_flip_workflow_is_long_only``).
+    Both replay engines route their stop/TP checks through these; #208 ports
+    the same helpers to the native engine, so they are pinned here directly —
+    including the SHORT mirror the signal-replay tests cannot reach.
     """
 
     def test_long_stop_gap_and_tp_gap_at_the_open(self):
@@ -1795,3 +1794,21 @@ class TestProtectiveExitGapHelpers:
             take_profit_price=110.0,
         )
         assert (kind, gapped) == ("stop", False)
+
+
+def test_resolve_strategy_parameters_warns_when_meta_read_fails(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A strategy-meta read that raises must warn, not silently drop defaults."""
+    import logging
+
+    from runner.engines import base as engine_base
+
+    def _boom(*args: object, **kwargs: object) -> dict:
+        raise RuntimeError("meta exploded")
+
+    monkeypatch.setattr(engine_base, "load_strategy_meta", _boom)
+    with caplog.at_level(logging.WARNING):
+        params = engine_base.resolve_strategy_parameters(tmp_path / "strategy.py", {"x": 1})
+    assert params == {"x": 1}
+    assert "Could not load strategy meta" in caplog.text

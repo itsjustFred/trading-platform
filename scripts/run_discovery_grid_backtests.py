@@ -70,7 +70,7 @@ def wait_for_data(symbol: str, timeframe: str, timeout_seconds: int = 1800) -> t
                 df = pd.read_parquet(path)
                 if len(df) > 0:
                     return True, str(path)
-            except Exception:
+            except Exception:  # noqa: S110 - unreadable parquet is retried until the deadline
                 pass
         time.sleep(10)
     return False, str(path)
