@@ -108,11 +108,19 @@ jobs:
           REQUIRE_REAL_DATA_SLICE: ${{ steps.fetch-slice.outputs.download_failed == 'true' && '0' || '1' }}
         run: >-
           uv run --no-sync --no-build pytest -q -p no:cacheprovider -m "not slow"
-          --ignore=tests/strategies
+          --ignore=tests/strategies --junitxml=pytest-junit.xml
       - name: Strategy tests
         # Mostly dataset-gated skips today (#289); kept so a change that makes
         # them runnable cannot land without the step existing to run them.
-        run: uv run --no-sync --no-build pytest -q -p no:cacheprovider tests/strategies
+        run: uv run --no-sync --no-build pytest -q -p no:cacheprovider tests/strategies --junitxml=strategy-junit.xml
+      - name: Skip report
+        if: runner.os == 'Linux'
+        # Makes visible what CI never runs: skips grouped by reason in the job
+        # summary, and a failure when a money-path test skips for a reason that
+        # is not an allowed dataset gate (#289 tracks closing those gates).
+        run: >-
+          uv run --no-sync --no-build python scripts/ci/skip_report.py
+          pytest-junit.xml strategy-junit.xml
       - name: Harness gates
         run: |
           PYTHON="$(uv run --no-sync --no-build python -c 'import sys; print(sys.executable)')" \
@@ -138,15 +146,8 @@ jobs:
           cache-dependency-path: frontend/package-lock.json
       - name: Install frontend dependencies
         run: npm ci --ignore-scripts
-      - name: Frontend focused test lint
-        run: >-
-          ./node_modules/.bin/eslint
-          tests/frontendResilience.test.ts
-          tests/liveTerminal.test.ts
-          tests/optimizationEvidence.test.ts
-          tests/compareStats.test.ts
-          tests/livePositionMath.test.ts
-          tests/backtestListMetrics.test.ts
+      - name: Frontend test lint
+        run: ./node_modules/.bin/eslint tests/
       - name: Frontend focused tests
         run: npm run test:focused
       - name: Frontend TypeScript and production build
