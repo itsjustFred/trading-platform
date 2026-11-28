@@ -32,6 +32,7 @@ from typing import Any, Mapping
 
 import pandas as pd
 
+from shared import venue_calendar
 from shared.constants import OHLCV_COLUMNS, VALID_TIMEFRAMES, normalize_timeframe
 
 logger = logging.getLogger(__name__)
@@ -509,10 +510,15 @@ def selection_rank(entry: DatasetEntry, symbol: str) -> tuple[Any, ...]:
     elif len(symbol) == 6 and symbol.isalpha():
         asset_rank = 0 if asset_class == "forex" else 1
     else:
-        # Equity-like spellings — the same set slippage and the exposure
-        # resolver treat as equity — must not rank below "equity" copies.
-        equity_like = {"equity", "equities", "stock", "stocks", "etf", "etfs"}
-        asset_rank = 0 if asset_class in equity_like else 1
+        # Equity- and index-like spellings — exchange-session instruments —
+        # must not rank below "equity" copies. The spelling sets are the
+        # canonical ones in shared.venue_calendar, the same sets slippage
+        # and the exposure resolver read.
+        plausible = (
+            venue_calendar.US_EQUITY_ASSET_CLASSES
+            | venue_calendar.INDEX_ASSET_CLASSES
+        )
+        asset_rank = 0 if asset_class in plausible else 1
     source_rank = _SOURCE_PRIORITY.get(entry.source, 4)
     return (
         asset_rank,

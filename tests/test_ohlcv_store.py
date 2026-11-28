@@ -416,6 +416,23 @@ class TestListAndFind:
         assert entry.asset_class == "forex"
         assert entry.source == "aaa"
 
+    def test_find_dataset_ranking_treats_index_spellings_as_plausible(
+        self, tmp_path: Path
+    ) -> None:
+        """Index-classed copies must outrank implausible classes like forex.
+
+        NAS100 is index-shaped, not forex-shaped: an ``"indices"`` dataset
+        is the plausible one even from a lower-priority source. Without the
+        index spellings in the plausible set, the forex copy wins on source
+        rank and the run prices an index future with FX assumptions.
+        """
+        _write(tmp_path, source="huggingface", symbol="NAS100", asset_class="forex")
+        _write(tmp_path, source="dukascopy", symbol="NAS100", asset_class="indices")
+        entry = ohlcv_store.find_dataset(tmp_path, "NAS100", "1h")
+        assert entry is not None
+        assert entry.asset_class == "indices"
+        assert entry.source == "dukascopy"
+
     def test_find_dataset_source_priority(self, tmp_path: Path) -> None:
         # Same asset class: huggingface outranks dukascopy outranks yfinance.
         for source in ("yfinance", "dukascopy", "huggingface"):

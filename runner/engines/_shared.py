@@ -7,6 +7,7 @@ from typing import Any
 
 import pandas as pd
 
+from shared import venue_calendar
 from shared.models import EquityPoint, Trade
 
 
@@ -53,7 +54,10 @@ def resolve_max_position_exposure_pct(explicit: float | None, asset_class: str) 
     """Cap on notional as a fraction of equity; asset-class default 20% (100% equities)."""
     if explicit is not None and explicit > 0:
         return float(explicit)
-    if asset_class in {"equity", "equities", "etf", "etfs", "stocks"}:
+    # The canonical equity spellings live in shared.venue_calendar — the same
+    # set slippage and the OHLCV store ranking use, so "stock" cannot fall
+    # through to the 20% non-equity cap.
+    if str(asset_class).strip().lower() in venue_calendar.US_EQUITY_ASSET_CLASSES:
         return 1.0
     return 0.20
 

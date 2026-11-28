@@ -78,8 +78,10 @@ TIMEFRAME_MINUTES: dict[str, float] = {
 }
 SEGMENT_MIN_DENSITY = 0.95
 SEGMENT_MAX_GAP_MULTIPLIER = 3.0
-US_EQUITY_ASSET_CLASSES = frozenset(
-    {"equity", "equities", "stock", "stocks", "etf", "etfs", "index", "indices"}
+# Canonical spellings from shared.venue_calendar: index underlyings share
+# the US equity session calendar, so they belong in the same set.
+US_EQUITY_ASSET_CLASSES = (
+    venue_calendar.US_EQUITY_ASSET_CLASSES | venue_calendar.INDEX_ASSET_CLASSES
 )
 US_EQUITY_CALENDAR_SOURCES = frozenset(
     {"alpaca", "dolthub", "huggingface", "test", "yfinance"}

@@ -97,6 +97,17 @@ class TestResolveHelperRename:
         assert resolve_max_position_exposure_pct(None, "equities") == 1.0
         assert resolve_max_position_exposure_pct(0.3, "equities") == 0.3
 
+    def test_every_equity_spelling_sizes_at_full_exposure(self):
+        """The exposure cap must recognise the same spellings slippage does.
+
+        ``"stock"`` is a canonical manifest spelling
+        (``shared.venue_calendar.US_EQUITY_ASSET_CLASSES``); missing it here
+        silently sized equity positions at the 20% non-equity cap — a 5x
+        undersize on the money path.
+        """
+        for spelling in ("equity", "equities", "stock", "stocks", "etf", "etfs"):
+            assert resolve_max_position_exposure_pct(None, spelling) == 1.0, spelling
+
     def test_deprecated_helper_alias_keeps_working_and_warns(self):
         from runner.engines import vectorbt_adapter
 

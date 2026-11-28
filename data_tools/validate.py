@@ -29,6 +29,7 @@ import pandas as pd
 
 from data_tools.auto_download import TIMEFRAME_MINUTES, _nyse_holidays
 from data_tools.path_safety import ensure_dataset_path_within
+from shared import venue_calendar
 from shared.constants import DATA_DIR, normalize_timeframe
 from shared.ohlcv_store import DatasetEntry, entry_for_path, list_datasets
 
@@ -64,9 +65,12 @@ GAP_THRESHOLD_MINUTES = {
 
 #: Asset classes with exchange holidays (B3: gap skips apply to these only —
 #: FX/metals trade through most US holidays, so blanket skipping would hide
-#: real data holes there).
-_EQUITY_LIKE_ASSET_CLASSES = frozenset(
-    {"equity", "equities", "stock", "stocks", "etf", "etfs", "index", "indices"}
+#: real data holes there). Canonical spellings from shared.venue_calendar:
+#: equity + index asset classes share exchange sessions, so the holiday gap
+#: exemption applies to both — the same sets the store ranking and slippage
+#: read.
+_EQUITY_LIKE_ASSET_CLASSES = (
+    venue_calendar.US_EQUITY_ASSET_CLASSES | venue_calendar.INDEX_ASSET_CLASSES
 )
 _EXPECTED_GAP_CLASSIFICATIONS = frozenset({"overnight", "weekend", "holiday"})
 
