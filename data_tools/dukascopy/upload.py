@@ -115,21 +115,37 @@ class R2Client:
             ),
         }
 
-    def _request(self, method: str, key: str, *, body: bytes | None = None) -> requests.Response:
-        payload_hash = hashlib.sha256(body or b"").hexdigest()
+    def _request(
+        self,
+        method: str,
+        key: str,
+        *,
+        body=None,
+        payload_hash: str | None = None,
+    ) -> requests.Response:
+        if payload_hash is None:
+            payload_hash = hashlib.sha256(body or b"").hexdigest()
         headers = self._signed_headers(method, key, payload_hash)
         return self._session.request(
             method, self._url(key), data=body, headers=headers, timeout=120
         )
 
     def put_file(self, local_path: Path, key: str) -> int:
-        body = local_path.read_bytes()
-        resp = self._request("PUT", key, body=body)
+        digest = hashlib.sha256()
+        size = 0
+        with open(local_path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                digest.update(chunk)
+                size += len(chunk)
+        with open(local_path, "rb") as fh:
+            resp = self._request(
+                "PUT", key, body=fh, payload_hash=digest.hexdigest()
+            )
         if resp.status_code not in (200, 201):
             raise RuntimeError(
                 f"R2 PUT {key} failed: HTTP {resp.status_code} {resp.text[:200]}"
             )
-        return len(body)
+        return size
 
     def head_size(self, key: str) -> int | None:
         resp = self._request("HEAD", key)

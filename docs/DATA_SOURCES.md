@@ -84,7 +84,7 @@ shape and the optimizer's `survivorship` view reports `bias_direction:
 
 | Source | Primary entrypoint | Current role | Typical asset classes |
 | --- | --- | --- | --- |
-| Dukascopy | `python -m data_tools.downloaders.jforex_dl` (fallback: `dukascopy_native`) | Main downloader path for FX, metals, indices, energy | `forex`, `metals`, `indices`, `energy` |
+| Dukascopy | `python -m data_tools.downloaders.jforex_dl` (fallback: `data_tools.dukascopy.native`) | Main downloader path for FX, metals, indices, energy | `forex`, `metals`, `indices`, `energy` |
 | Dolthub | `python -m data_tools.dolthub_manager update` and `python -m data_tools.downloaders.dolthub_dl` | Repo sync plus targeted SQL exports | `equity`, `options`, fundamentals |
 | HuggingFace | `python -m data_tools.downloaders.huggingface_dl` | Direct parquet / dataset ingestion | `equity`, `crypto`, dataset-dependent |
 | HistData | `python -m data_tools.downloaders.histdata_dl` | Free historical FX import | `forex` |
@@ -93,7 +93,7 @@ shape and the optimizer's `survivorship` view reports `bias_direction:
 
 ## Dukascopy
 
-File: `data_tools/downloaders/dukascopy_native.py`
+File: `data_tools/dukascopy/native.py`
 
 ### What it uses
 
@@ -116,10 +116,10 @@ File: `data_tools/downloaders/dukascopy_native.py`
   downloader for one fixed purpose: generating the 600-bar EURUSD 15m real-data
   slice the differential engine tests run on (see
   `docs/cross-engine-backtest-contract.md`). It fetches the window through
-  `data_tools.downloaders.dukascopy_native.download_minute_candles`, which
+  `data_tools.dukascopy.native.download_minute_candles`, which
   returns the bars instead of writing them into the catalog, and caches the
   result under `$DATA_DIR/differential_reference/`.
-- The viewer download API launches `jforex_dl` for source `dukascopy` and falls back to `dukascopy_native` when JForex/JPype/JVM is unavailable.
+- The viewer download API launches `jforex_dl` for source `dukascopy` and falls back to `dukascopy.native` when JForex/JPype/JVM is unavailable.
 - Once the JForex JVM is started it is never explicitly shut down: the process
   exits and the OS reclaims it. JPype's interpreter-exit hook is disabled
   (`jpype.config.onexit = False`, armed by `jforex_dl` immediately before it
@@ -142,7 +142,7 @@ File: `data_tools/downloaders/dukascopy_native.py`
 ### Example
 
 ```bash
-python -m data_tools.downloaders.dukascopy_native \
+python -m data_tools.dukascopy.native \
   --symbols EURUSD,XAUUSD \
   --timeframes h1,d1 \
   --start 2024-01-01 \
@@ -303,12 +303,66 @@ side to pick the per-side URL set, so there `price_type` is load-bearing.
 python -m data_tools.migrate_csv --execute
 ```
 
+## Dukascopy dataset pipeline (R2 mirror)
+
+Separate from the on-demand downloader above, `data_tools/dukascopy/` contains
+the incremental pipeline that maintains the canonical two-sided OHLCV dataset
+mirrored to the `tp-ohlcv` R2 bucket:
+
+```
+<root>/manifest.json
+<root>/<SYM>/<SYM>_<TF>.parquet     TF in M1 M5 M15 H1 H4 D1 W1
+```
+
+Each symbol entry in `manifest.json` records `dukascopy_symbol`,
+`decimal_factor`, per-file `rows`/`first`/`last`, and `missing_days_bid` /
+`missing_days_ask`.
+
+### Layout
+
+- `data_tools/dukascopy/fetch.py` — daily `m1` `.bi5` candle download
+  (`BID`/`ASK`) into `<raw_dir>/<SYM>/<SIDE>/<YYYY>/<MM>/<DD>.bi5`; resumable,
+  404/empty body stored as a 0-byte file.
+- `data_tools/dukascopy/convert.py` — bi5 decode, flat-minute dropping,
+  M1 → higher-timeframe resampling (W1 bins run Sunday 00:00 UTC → Sunday,
+  left-labelled), and the outer bid/ask join into `bid_*`/`ask_*` columns.
+- `data_tools/dukascopy/validate.py` — dataset contract enforced before
+  anything is published: UTC `timestamp`, strictly increasing unique bars,
+  no NaN, `ask >= bid`, and `low <= open, close <= high` on both sides.
+- `data_tools/dukascopy/pipeline.py` — `update_dataset()`: reads `last` from
+  the manifest, fetches through the last complete UTC day, appends M1 without
+  seam duplicates, re-resamples higher timeframes from the first affected
+  bin, validates, then publishes staged files atomically with `manifest.json`
+  written last. `--full` rebuilds from 2015-01-01.
+- `data_tools/dukascopy/upload.py` — SigV4-signed S3 client for R2; uploads
+  changed files first and `manifest.json` last, HEAD-verifying sizes.
+
+### CLI and scheduling
+
+```bash
+python -m data_tools.dukascopy update --root /path/to/dukascopy [--upload]
+```
+
+`--symbols`, `--full`, `--start`, `--end`, `--raw-dir`, `--concurrency` are
+also supported. The weekly scheduler job `dukascopy_update`
+(`scheduler/jobs/dukascopy_update.py`) runs the same pipeline; configure it
+with a `dukascopy` section (`root`, optional `symbols`, `upload`, `raw_dir`).
+Failures and incomplete fetches emit `data.alert` records that reach the
+Discord ops webhook (`OPS_ALERT_WEBHOOK_URL`) when the alert sink is
+installed.
+
+### R2 upload environment
+
+`R2_ENDPOINT`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKET`
+(`tp-ohlcv`), optional `R2_REGION` (default `auto`). Upload is only attempted
+with `--upload` or `"upload": true` in the job config.
+
 ## Viewer integration
 
 The FastAPI viewer uses these source names in `/api/data/download`:
 
-- `dukascopy` -> `python -m data_tools.downloaders.jforex_dl` with automatic fallback to `data_tools.downloaders.dukascopy_native`
-- `jforex` -> `python -m data_tools.downloaders.jforex_dl` with automatic fallback to `data_tools.downloaders.dukascopy_native`
+- `dukascopy` -> `python -m data_tools.downloaders.jforex_dl` with automatic fallback to `data_tools.dukascopy.native`
+- `jforex` -> `python -m data_tools.downloaders.jforex_dl` with automatic fallback to `data_tools.dukascopy.native`
 - `dolthub` -> `python -m data_tools.dolthub_manager update`
 - `yfinance` -> `python -m data_tools.downloaders.yfinance_dl`
   (`YFinanceDownloader`; CSV archives are additionally migrated via

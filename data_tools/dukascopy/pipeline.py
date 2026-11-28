@@ -465,11 +465,19 @@ def verify_manifest(root: str | Path) -> list[str]:
                 problems.append(f"{symbol}/{fname}: no timestamp column")
                 continue
             idx = names.index("timestamp")
-            stats = md.row_group(0).column(idx).statistics
-            if stats is None or not getattr(stats, "has_min_max", False):
+            # Frames are written time-sorted: first/last live in the outer
+            # row groups, not necessarily row group 0.
+            first_stats = md.row_group(0).column(idx).statistics
+            last_stats = md.row_group(md.num_row_groups - 1).column(idx).statistics
+            if (
+                first_stats is None
+                or last_stats is None
+                or not getattr(first_stats, "has_min_max", False)
+                or not getattr(last_stats, "has_min_max", False)
+            ):
                 continue
-            first = str(pd.to_datetime(stats.min, utc=True))
-            last = str(pd.to_datetime(stats.max, utc=True))
+            first = str(pd.to_datetime(first_stats.min, utc=True))
+            last = str(pd.to_datetime(last_stats.max, utc=True))
             if first != info.get("first") or last != info.get("last"):
                 problems.append(
                     f"{symbol}/{fname}: span {first}..{last} != manifest "

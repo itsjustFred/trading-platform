@@ -27,13 +27,11 @@ def _alert_sink():
         return None
 
 
-def _close_alert_sink(sink) -> None:
-    if sink is None:
-        return
+def _close_alert_sink() -> None:
     try:
         from shared.alerts import close_alert_sink
 
-        close_alert_sink(sink)
+        close_alert_sink()
     except Exception:  # noqa: BLE001
         pass
 
@@ -51,11 +49,16 @@ def _emit_alert(message: str, **extra) -> None:
 def cmd_update(args: argparse.Namespace) -> int:
     from data_tools.dukascopy import pipeline, upload
 
-    sink = _alert_sink()
+    _alert_sink()
+    symbols = (
+        [s.strip() for s in args.symbols.split(",") if s.strip()]
+        if args.symbols
+        else None
+    )
     try:
         report = pipeline.update_dataset(
             args.root,
-            symbols=args.symbols,
+            symbols=symbols,
             full=args.full,
             start=args.start,
             end=args.end,
@@ -85,7 +88,7 @@ def cmd_update(args: argparse.Namespace) -> int:
         print(f"FAILED: {exc}", file=sys.stderr)
         return 1
     finally:
-        _close_alert_sink(sink)
+        _close_alert_sink()
 
 
 def build_parser() -> argparse.ArgumentParser:
