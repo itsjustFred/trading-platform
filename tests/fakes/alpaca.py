@@ -999,10 +999,9 @@ def _rule_text(
     if rule is None:
         return None
     if callable(rule):
-        try:
-            text = rule(request)
-        except Exception:  # pragma: no cover - a rejection rule must not break the broker
-            return None
+        # A raising rule is a test bug: surface it rather than silently
+        # accepting an order the test meant to refuse.
+        text = rule(request)
         return str(text) if text else None
     # ``__init__`` normalizes sequences to lists so the refusal is consumed
     # in order; a bare tuple reaches here only if the attribute was reassigned.

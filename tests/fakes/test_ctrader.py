@@ -186,6 +186,26 @@ def test_a_non_finite_order_price_is_recorded_as_absent() -> None:
     assert record.absolute_take is None
 
 
+def test_a_missing_mark_price_is_an_error_not_a_fabricated_price() -> None:
+    m, _mm = _types()
+    broker = _broker(mark_prices={})
+    broker.handle(_new_order(m))
+
+    with pytest.raises(KeyError, match="no mark price"):
+        broker.advance(1.0)
+
+
+def test_a_raising_rejection_rule_surfaces_instead_of_accepting() -> None:
+    def _boom(request):
+        raise RuntimeError("rule bug")
+
+    m, _mm = _types()
+    broker = _broker(reject_submissions=_boom)
+
+    with pytest.raises(RuntimeError, match="rule bug"):
+        broker.handle(_new_order(m))
+
+
 def test_a_sell_entry_opens_a_short_side_position() -> None:
     m, _mm = _types()
     broker = _broker()

@@ -317,7 +317,13 @@ class FakeCTraderBroker:
         self.mark_prices[str(symbol).strip().upper()] = float(price)
 
     def mark_price(self, symbol_name: str) -> float:
-        return self.mark_prices.get(symbol_name.strip().upper(), 100.0)
+        key = symbol_name.strip().upper()
+        if key not in self.mark_prices:
+            raise KeyError(
+                f"no mark price for {key}: pass mark_prices or call "
+                "set_mark_price — the fake never invents a price"
+            )
+        return self.mark_prices[key]
 
     def _symbol_for_id(self, symbol_id: int) -> FakeCTraderSymbol | None:
         return self._symbols.get(int(symbol_id))
@@ -404,10 +410,7 @@ class FakeCTraderBroker:
         # ORDER_REJECTED.
         reason = None
         if self.reject_after_acceptance is not None:
-            try:
-                reason = self.reject_after_acceptance(record.proto)
-            except Exception:  # pragma: no cover - a rule must not break the broker
-                reason = None
+            reason = self.reject_after_acceptance(record.proto)
         if reason:
             proto.orderStatus = _ORDER_STATUS_REJECTED
             proto.utcLastUpdateTimestamp = self.now_ms
@@ -886,10 +889,9 @@ class FakeCTraderBroker:
     def _req_NewOrderReq(self, request: Any) -> Any:
         reason = None
         if self.reject_submissions is not None:
-            try:
-                reason = self.reject_submissions(request)
-            except Exception:  # pragma: no cover
-                reason = None
+            # A raising rule is a test bug: surface it rather than silently
+            # accepting an order the test meant to refuse.
+            reason = self.reject_submissions(request)
         if reason:
             return self._order_error("ORDER_REJECTED", str(reason))
         spec = self._symbol_for_id(_int(getattr(request, "symbolId", 0)))

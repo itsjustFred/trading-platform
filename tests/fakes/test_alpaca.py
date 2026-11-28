@@ -93,6 +93,18 @@ def test_a_nan_qty_is_recorded_not_zeroed() -> None:
     assert math.isnan(order.qty)
 
 
+def test_a_raising_rejection_rule_surfaces_instead_of_accepting() -> None:
+    def _boom(request):
+        raise RuntimeError("rule bug")
+
+    client = FakeAlpacaTradingClient(
+        mark_prices={AAPL: 100.0}, reject_submissions=_boom
+    )
+
+    with pytest.raises(RuntimeError, match="rule bug"):
+        client.submit_order(_buy())
+
+
 def test_the_fill_lands_later_and_is_the_only_one() -> None:
     client = FakeAlpacaTradingClient(mark_prices={AAPL: 100.0}, fill_seconds=1.0)
     order = client.submit_order(_buy())

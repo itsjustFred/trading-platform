@@ -81,9 +81,12 @@ with fake_ctrader_transport(broker) as (_broker, client):
 Key knobs: `account_type` (`"netted"` merges opposite fills on a symbol,
 `"hedged"` opens a position per entry), `partial_fill_ratio`,
 `reject_submissions` / `reject_after_acceptance` (the latter produces the
-`ORDER_ACCEPTED` → `ORDER_REJECTED` shape), `fill_delay_ms`, `page_size`
+`ORDER_ACCEPTED` → `ORDER_REJECTED` shape; a rule that raises fails the
+test loudly rather than silently accepting), `fill_delay_ms`, `page_size`
 (order listings), `mark_prices` + `set_mark_price` drive stop/take-profit
-triggers on `advance()`. `GOOD_TILL_DATE` orders expire at their
+triggers on `advance()` — every traded symbol needs a mark, a missing one
+raises `KeyError` rather than silently filling at a fabricated price.
+`GOOD_TILL_DATE` orders expire at their
 `expirationTimestamp`; `IMMEDIATE_OR_CANCEL` unfilled orders cancel.
 Relative SL/TP on the entry becomes absolute position levels at fill time.
 
