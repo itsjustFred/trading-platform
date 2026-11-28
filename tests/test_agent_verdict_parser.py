@@ -63,6 +63,13 @@ def test_extract_report_drops_a_trailing_code_fence() -> None:
     assert parse_verdict.extract_report(raw) == "**Summary:** report\n**Verdict: PASS**\n"
 
 
+def test_extract_report_drops_a_fence_before_trailing_blank_lines() -> None:
+    """A model that closes its fence and then pads the stream with blank
+    lines still ends the report at the fence."""
+    raw = "**Summary:** report\n**Verdict: PASS**\n```\n\n\n"
+    assert parse_verdict.extract_report(raw) == "**Summary:** report\n**Verdict: PASS**\n"
+
+
 def test_extract_report_is_empty_without_a_summary_line() -> None:
     assert parse_verdict.extract_report("no report here\n**Verdict: PASS**\n") == ""
 
@@ -186,6 +193,25 @@ def test_comment_names_head_accepts_head_references(text: str) -> None:
 def test_comment_names_head_rejects_missing_or_wrong_head(text: str) -> None:
     assert not parse_verdict.comment_names_head(
         text, "def6789012345678901234567890123456789abcd"
+    )
+
+
+# ---------------------------------------------------------------------------
+# comment_is_real_verdict: the quota-overwrite guard's one predicate
+# ---------------------------------------------------------------------------
+
+
+def test_comment_is_real_verdict_needs_both_marker_and_head() -> None:
+    """A real verdict for a head carries the verdict tag AND the analysed-head
+    footer; either alone is not proof (a quota body can quote a verdict line,
+    and every footer - quota bodies included - names a head)."""
+    head = "def6789012345678901234567890123456789abcd"
+    footer = f"_Analysed base `abc12345` ... head `{head[:8]}`._"
+    assert parse_verdict.comment_is_real_verdict(f"**Verdict: PASS**\n{footer}", head)
+    assert not parse_verdict.comment_is_real_verdict("**Verdict: PASS**\n", head)
+    assert not parse_verdict.comment_is_real_verdict(footer, head)
+    assert not parse_verdict.comment_is_real_verdict(
+        f"**Verdict: PASS**\n{footer}", "0" * 40
     )
 
 

@@ -40,7 +40,7 @@ from pathlib import Path
 # `parse_verdict` sits next to this file; it is on sys.path both when the
 # workflow runs `python3 scripts/agents/post_comment.py` (the script's own
 # directory is sys.path[0]) and when the tests load this file by path.
-from parse_verdict import comment_names_head
+from parse_verdict import comment_is_real_verdict
 
 # The stage only names the comment kind in notices; the logic is identical.
 _NOUN = {"review": "review", "mutation": "mutation-testing", "premortem": "pre-mortem"}
@@ -149,7 +149,7 @@ def _real_verdict_for_head(
     verdict for another head, still writes."""
     for comment in existing:
         prior = comment["body"]
-        if "Verdict:" in prior and comment_names_head(prior, head):
+        if comment_is_real_verdict(prior, head):
             _notice(
                 f"The existing {noun} comment is a real verdict for {head}; "
                 "the quota skip did not overwrite it."

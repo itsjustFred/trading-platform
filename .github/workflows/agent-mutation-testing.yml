@@ -290,6 +290,11 @@ jobs:
         run: |
           out="$RUNNER_TEMP/mutation/comment.md"
           skill_name=$(basename "$(dirname "$SKILL_PATH")")
+          # The analysed pair is written by the workflow, not the model, on
+          # every mutation comment - the quota-overwrite guard's head check
+          # must not depend on report text.
+          # shellcheck disable=SC2016 # backticks are literal markdown
+          printf '\n_Analysed base `%s` ... head `%s`._\n' "${BASE_SHA:0:8}" "${HEAD_SHA:0:8}" >> "$out"
           if [ "$SCOPE_EMPTY" = "true" ]; then
             # shellcheck disable=SC2016 # backticks are literal markdown
             printf '\n\n---\n_Automated mutation testing: no agent run, empty scope (`%s` skill)_\n' "$skill_name" >> "$out"

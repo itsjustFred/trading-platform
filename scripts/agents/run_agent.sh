@@ -292,13 +292,17 @@ case "$stage" in
 esac
 case "$footer_style" in
   review)
-    # Footer: the model, its variant and the skill the review rules came
-    # from (the skill directory's name, not its path), plus whose rules
-    # actually ran, so a reader can map the verdict to the rules that
-    # produced it.
+    # Footer: the analysed pair first - written here, not left to the model,
+    # so the quota-overwrite guard's head check never depends on report text -
+    # then the model, its variant and the skill the review rules came from
+    # (the skill directory's name, not its path), plus whose rules actually
+    # ran, so a reader can map the verdict to the rules that produced it.
     skill_name=$(basename "$(dirname "$SKILL_PATH")")
-    printf '\n\n---\n_Automated review using %s with `%s` skill (rules from %s)_\n' \
-      "${MODEL#*/}${VARIANT:+ (${VARIANT})}" "$skill_name" "${SKILL_SOURCE}" >> "$out"
+    {
+      printf '\n_Analysed base `%s` ... head `%s`._\n' "${BASE_SHA:0:8}" "${HEAD_SHA:0:8}"
+      printf '\n---\n_Automated review using %s with `%s` skill (rules from %s)_\n' \
+        "${MODEL#*/}${VARIANT:+ (${VARIANT})}" "$skill_name" "${SKILL_SOURCE}"
+    } >> "$out"
     ;;
   premortem)
     # Footer: which diff was analysed, then the model, its variant and the skill

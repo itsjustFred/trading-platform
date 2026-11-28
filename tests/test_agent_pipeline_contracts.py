@@ -2850,6 +2850,37 @@ def test_the_selection_stops_on_what_it_cannot_read(probe_repo, tmp_path) -> Non
     assert not source, f"recorded a skill source on a failure: {source!r}"
 
 
+def test_every_posted_comment_names_the_analysed_pair() -> None:
+    """The quota-overwrite guard and the "current for this diff" reading both
+    key on the ``_Analysed base ... head ...`` footer, so every stage's
+    comment - a real verdict, the no-scope result and the quota body alike -
+    must carry it, written by the workflow and never left to model text."""
+    script = (AGENTS_DIR / "run_agent.sh").read_text(encoding="utf-8")
+    case_at = script.index('case "$footer_style" in')
+    headers = list(re.finditer(r"^  (\w+|\*)\)\n", script[case_at:], re.M))
+    arms = {}
+    for i, m in enumerate(headers):
+        end = (
+            headers[i + 1].start()
+            if i + 1 < len(headers)
+            else script.index("esac", case_at + m.end()) - case_at
+        )
+        arms[m.group(1)] = script[case_at + m.end() : case_at + end]
+    for style in ("review", "premortem"):
+        branch = arms[style]
+        assert "_Analysed base" in branch and "${HEAD_SHA:0:8}" in branch, (
+            f"run_agent.sh's {style} footer does not name the analysed pair"
+        )
+    _job_name, mutate = _agent_job(_load(MUTATION))
+    finish = _run(_find_step(mutate, r"^Finish comment$"))
+    assert "_Analysed base" in finish and "${HEAD_SHA:0:8}" in finish, (
+        "the mutation Finish comment step does not name the analysed pair"
+    )
+    assert "_Analysed base" in _script_source("scripts/agents/quota_comment.py"), (
+        "the quota body does not name the analysed pair"
+    )
+
+
 def test_the_comment_guards_live_in_one_shared_script() -> None:
     """The blocks that decide what gets posted - the summary-line extraction, the
     fence strip, the head-unchanged and tree-clean check, the output path - used

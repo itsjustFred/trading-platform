@@ -115,6 +115,18 @@ def test_a_quota_skip_does_not_overwrite_a_real_verdict_for_the_same_head(tmp_pa
     assert "did not overwrite it" in result.stdout
 
 
+def test_a_quota_skip_overwrites_a_verdict_that_names_no_head(tmp_path) -> None:
+    """The guard needs both halves of comment_is_real_verdict: a body with a
+    verdict line but no analysed-head footer is not provably about this
+    commit, so the quota body may refresh it."""
+    prior = f"{MARKER}\n**Summary:** real\n**Verdict: BLOCK**\n"
+    env, work, api = _setup(tmp_path, [HEAD, HEAD], ["42"], {"42": prior})
+    env["QUOTA_SKIP"] = "true"
+    result = _run(env, work)
+    assert result.returncode == 0, result.stderr
+    assert len(api.writes) == 1
+
+
 def test_a_quota_skip_still_overwrites_an_older_quota_comment(tmp_path) -> None:
     prior = (
         f"{MARKER}\n**Summary:** Not run: quota - earlier\n\n"

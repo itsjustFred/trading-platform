@@ -59,6 +59,10 @@ def extract_report(raw: str) -> str:
     if start < 0:
         return ""
     tail = lines[start:]
+    # A fence the model closed and then padded with blank lines still ends
+    # the report: drop the padding before looking for the closing fence.
+    while tail and not tail[-1].strip():
+        tail.pop()
     if tail and tail[-1].strip() == "```":
         tail = tail[:-1]
     return "\n".join(tail) + "\n"
@@ -102,6 +106,22 @@ def comment_names_head(text: str, head_sha: str) -> bool:
         if head_sha.startswith(found) or found.startswith(head_sha):
             return True
     return False
+
+
+# The verdict tag every posted comment carries, and the head reference its
+# footer writes. post_comment.py's quota-overwrite guard keys on both, so
+# they are defined once here rather than as stringly literals in each module.
+VERDICT_TAG = "Verdict:"
+
+
+def comment_is_real_verdict(text: str, head_sha: str) -> bool:
+    """True when a posted comment body carries a verdict and names ``head_sha``.
+
+    The marker substring alone is not enough (a quota body can quote it) and
+    the head reference alone is not either (an "Analysed" footer rides on
+    quota bodies too): a real verdict for this head has both.
+    """
+    return VERDICT_TAG in text and comment_names_head(text, head_sha)
 
 
 def _fail(message: str) -> int:
