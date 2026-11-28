@@ -166,7 +166,11 @@ def _build_result(result: dict[str, Any], prices: pd.DataFrame, *, start: str, e
                 "max_weight": 0.30,
             },
             tags=["qc-parity", "risk-parity"],
-            notes="Python reimplementation of strategies/risk_parity/reference/risk_parity_strategy.py using local daily parquet data.",
+            notes=(
+                "Python reimplementation of "
+                "strategies/risk_parity/reference/risk_parity_strategy.py "
+                "using local daily parquet data."
+            ),
         ),
         trades=trades,
         equity_curve=equity_curve,

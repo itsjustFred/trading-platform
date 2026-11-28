@@ -72,22 +72,23 @@ def build_comparison_matrix(
     platform_data_dir = (platform_data_dir or reports_dir.parent / "data" / "backtests").resolve()
     rows: list[dict[str, Any]] = []
 
+    ivb_reference_dir = strategies_dir / "intraday_volatility_breakout" / "reference"
     mt5_cases = [
         MT5ComparisonCase(
             case_id="intraday_volatility_breakout_sp500_m1",
-            reference_path=strategies_dir / "intraday_volatility_breakout" / "reference" / "SP500_M1.xlsx",
+            reference_path=ivb_reference_dir / "SP500_M1.xlsx",
             platform_path=platform_data_dir / "intraday_volatility_breakout_sp500_m1.json",
             broker_clock="dukascopy_mt5_index",
         ),
         MT5ComparisonCase(
             case_id="intraday_volatility_breakout_eurusd_h1",
-            reference_path=strategies_dir / "intraday_volatility_breakout" / "reference" / "EURUSD_H1.xlsx",
+            reference_path=ivb_reference_dir / "EURUSD_H1.xlsx",
             platform_path=platform_data_dir / "intraday_volatility_breakout_eurusd_h1.json",
             broker_clock="dukascopy_mt5_forex",
         ),
         MT5ComparisonCase(
             case_id="intraday_volatility_breakout_nas100_m15",
-            reference_path=strategies_dir / "intraday_volatility_breakout" / "reference" / "NAS100_M15.xlsx",
+            reference_path=ivb_reference_dir / "NAS100_M15.xlsx",
             platform_path=platform_data_dir / "intraday_volatility_breakout_nas100_m15.json",
             broker_clock="dukascopy_mt5_index",
         ),

@@ -242,6 +242,9 @@ explicit-preview-rules = true
 
 [tool.mypy]
 python_version = "3.12"
+# Frozen third-party reference material under strategies/*/reference is not
+# platform code; keep it out of the checked surface like the ruff excludes.
+exclude = "^strategies/[^/]+/reference/"
 # Scope is deliberately narrow: the packages whose type errors can become a
 # wrong order. Widen by adding paths here, not by loosening the flags.
 files = ["risk", "live_runner", "shared/models.py", "shared/market_calendar.py", "signal_bots", "strategies"]
