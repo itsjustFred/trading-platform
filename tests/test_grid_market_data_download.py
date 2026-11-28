@@ -109,7 +109,7 @@ def test_timeframe_sort_key_unknown_sorts_last():
 def test_download_symbol_isolates_unknown_timeframe(tmp_path: Path, monkeypatch):
     # An unsupported timeframe marks only that download failed and never raises,
     # so the surrounding batch keeps processing other symbols/timeframes.
-    monkeypatch.setattr(dl, "DukascopyNativeDownloader", lambda: object())
+    monkeypatch.setattr(dl, "DukascopyDownloader", lambda: object())
     result = dl.download_symbol(
         requested_symbol="EURUSD",
         canonical_symbol="EURUSD",

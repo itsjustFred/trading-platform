@@ -13,7 +13,7 @@ import pytest
 def test_native_downloader_accepts_control_events_and_reports_progress(
     monkeypatch, tmp_path: Path
 ):
-    import data_tools.downloaders.dukascopy_native as native
+    import data_tools.dukascopy.native as native
 
     monkeypatch.setattr(native, "DATA_DIR", tmp_path)
     monkeypatch.setattr(native, "SOURCE_META_PATH", tmp_path / "source_meta.json")
@@ -70,7 +70,7 @@ def test_native_downloader_accepts_control_events_and_reports_progress(
         ),
     )
 
-    downloader = native.DukascopyNativeDownloader()
+    downloader = native.DukascopyDownloader()
     pause_event = Event()
     stop_event = Event()
 
@@ -99,7 +99,7 @@ def test_native_downloader_accepts_control_events_and_reports_progress(
 
 
 def test_download_bi5_files_batches_and_increases_pause_on_throttle(monkeypatch):
-    import data_tools.downloaders.dukascopy_native as native
+    import data_tools.dukascopy.native as native
 
     class FakeConnector:
         def __init__(self, *args, **kwargs):
@@ -183,7 +183,7 @@ def test_download_bi5_files_batches_and_increases_pause_on_throttle(monkeypatch)
 
 
 def test_download_bi5_files_reports_custom_progress_unit(monkeypatch):
-    import data_tools.downloaders.dukascopy_native as native
+    import data_tools.dukascopy.native as native
 
     class FakeConnector:
         def __init__(self, *args, **kwargs):
@@ -251,7 +251,7 @@ def test_download_bi5_files_reports_custom_progress_unit(monkeypatch):
 
 
 def test_download_bi5_files_pipelines_multiple_batches_before_pause(monkeypatch):
-    import data_tools.downloaders.dukascopy_native as native
+    import data_tools.dukascopy.native as native
 
     class FakeConnector:
         def __init__(self, *args, **kwargs):
@@ -323,7 +323,7 @@ def test_download_bi5_files_pipelines_multiple_batches_before_pause(monkeypatch)
 
 
 def test_download_bi5_files_caps_backoff_and_resets_after_cooldown(monkeypatch):
-    import data_tools.downloaders.dukascopy_native as native
+    import data_tools.dukascopy.native as native
 
     class FakeConnector:
         def __init__(self, *args, **kwargs):
@@ -556,7 +556,7 @@ def test_zero_volume_buckets_kept_and_flagged() -> None:
     """C5: illiquid time stays visible (flagged), never filtered invisible."""
     import pandas as pd
 
-    from data_tools.downloaders.dukascopy_native import _ticks_to_ohlcv
+    from data_tools.dukascopy.native import _ticks_to_ohlcv
 
     ticks = pd.DataFrame(
         {

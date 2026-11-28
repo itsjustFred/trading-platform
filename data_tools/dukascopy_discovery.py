@@ -22,7 +22,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from data_tools.downloaders.dukascopy_native import (
+from data_tools.dukascopy.native import (
     DOWNLOAD_STRATEGY,
     TIMEFRAME_MAP,
     _resolve_symbol_and_instrument,

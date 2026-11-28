@@ -7,7 +7,7 @@ eliminating the Node.js CLI dependency.
 Output: Parquet files at ~/data/ohlcv/dukascopy/{asset_class}/{symbol}/{timeframe}.parquet
 
 Usage:
-    python -m data_tools.downloaders.dukascopy_native --symbols EURUSD --timeframes m1 \\
+    python -m data_tools.dukascopy.native --symbols EURUSD --timeframes m1 \\
         --start 2024-01-01 --end 2024-01-04
 
 Binary formats:
@@ -896,7 +896,7 @@ async def download_minute_candles(
     """Fetch raw 1m candle data for a window and return it as a frame.
 
     The public face of the minute-candle path, for callers that want the bars
-    and not a parquet file. ``DukascopyNativeDownloader.download`` can only
+    and not a parquet file. ``DukascopyDownloader.download`` can only
     write into the catalog (a ``{sym}/{tf}.parquet`` under the data dir, plus a
     ``source_meta.json`` entry and smart-resume merge), which is not what a
     one-off reference slice wants: it must be reproducible from a fixed window
@@ -1091,7 +1091,7 @@ def _resolve_requested_start(
 # ─── Downloader class ───────────────────────────────────────────────────────
 
 
-class DukascopyNativeDownloader(Downloader):
+class DukascopyDownloader(Downloader):
     """Pure Python async Dukascopy downloader — no Node.js dependency."""
 
     @property
@@ -1676,7 +1676,7 @@ def main() -> None:
         stream=sys.stdout,
     )
 
-    dl = DukascopyNativeDownloader()
+    dl = DukascopyDownloader()
 
     if args.list:
         for item in dl.list_available():

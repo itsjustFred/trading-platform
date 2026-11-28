@@ -780,7 +780,7 @@ def test_dukascopy_native_fetch_is_stubbed_in_tests(request) -> None:
     """``_fetch_one`` is the single aiohttp edge to ``datafeed.dukascopy.com``."""
     import asyncio
 
-    from data_tools.downloaders import dukascopy_native as native
+    from data_tools.dukascopy import native
 
     with pytest.raises(RuntimeError, match="must not fetch Dukascopy"):
         asyncio.run(

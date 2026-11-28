@@ -1297,7 +1297,8 @@ def _no_dukascopy_sdk_network():
     import-safe here: ``jforex_dl`` guards its ``jpype`` import and neither
     module touches the network or starts a JVM at import time.
     """
-    from data_tools.downloaders import dukascopy_native, jforex_dl
+    from data_tools.downloaders import jforex_dl
+    from data_tools.dukascopy import native as dukascopy_native
 
     def _blocked_urlopen(*args, **kwargs):
         _DUKASCOPY_STUB_HITS.append(

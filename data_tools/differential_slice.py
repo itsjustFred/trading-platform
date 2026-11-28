@@ -280,7 +280,7 @@ async def fetch_slice_frame(
 
     ``attempts`` is an *outer* bounded retry around the whole download, separate
     from the per-file retry/backoff inside
-    :func:`data_tools.downloaders.dukascopy_native.download_bi5_files`.
+    :func:`data_tools.dukascopy.native.download_bi5_files`.
     Dukascopy answers a burst of requests from one address with HTTP 429 for
     minutes at a time, which no per-file retry count can out-wait; the outer
     loop gives the whole window a fresh start instead of half a day of bars, and
@@ -292,7 +292,7 @@ async def fetch_slice_frame(
     but still violates the contract is corrupt data rather than a transient
     download, so it fails immediately instead of being retried into a skip.
     """
-    from data_tools.downloaders.dukascopy_native import download_minute_candles
+    from data_tools.dukascopy.native import download_minute_candles
 
     window = slice_window()
     last_error: Exception | None = None

@@ -48,7 +48,7 @@ from data_tools.differential_slice import (
     validate_slice_frame,
     write_slice,
 )
-from data_tools.downloaders import dukascopy_native
+from data_tools.dukascopy import native as dukascopy_native
 from scripts import fetch_differential_slice as fetch_script
 from tests.conftest import sandboxed_env
 from tests.helpers.differential_slice import slice_like_frame, violations, write_slice_like

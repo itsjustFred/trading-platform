@@ -964,7 +964,7 @@ def _dukascopy_symbol_config() -> Mapping[str, Any]:
     below instead of silently changing the venue.
     """
     try:
-        from data_tools.downloaders.dukascopy_native import SYMBOL_CONFIG
+        from data_tools.dukascopy.native import SYMBOL_CONFIG
     except Exception:
         logger.warning(
             "dukascopy SYMBOL_CONFIG unavailable; venue resolution uses "

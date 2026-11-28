@@ -1777,7 +1777,7 @@ def _is_forex_symbol(symbol: str) -> bool:
     if len(normalized) == 6 and normalized.isalpha():
         return True
     try:
-        from data_tools.downloaders.dukascopy_native import SYMBOL_CONFIG
+        from data_tools.dukascopy.native import SYMBOL_CONFIG
 
         return normalized in {
             key.upper()
@@ -1791,7 +1791,7 @@ def _is_forex_symbol(symbol: str) -> bool:
 def _is_dukascopy_symbol(symbol: str) -> bool:
     normalized = str(symbol or "").strip().upper()
     try:
-        from data_tools.downloaders.dukascopy_native import SYMBOL_CONFIG
+        from data_tools.dukascopy.native import SYMBOL_CONFIG
 
         return normalized in {key.upper() for key in SYMBOL_CONFIG}
     except Exception:
@@ -1961,9 +1961,9 @@ def _download_missing_ohlcv_data(
         return
 
     if selected_source in {"dukascopy", "jforex"}:
-        from data_tools.downloaders.dukascopy_native import DukascopyNativeDownloader
+        from data_tools.dukascopy.native import DukascopyDownloader
 
-        DukascopyNativeDownloader().download(
+        DukascopyDownloader().download(
             symbol=normalized_symbol,
             timeframe=normalized_timeframe,
             output_dir=data_root,
