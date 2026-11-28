@@ -107,6 +107,14 @@ def _float(raw: Any) -> float:
         return 0.0
 
 
+def _mark_price_value(symbol: Any, price: Any) -> float:
+    """A mark price must be finite: NaN would fill orders at a poison price."""
+    value = float(price)
+    if not math.isfinite(value):
+        raise ValueError(f"mark price for {symbol} must be finite, got {price!r}")
+    return value
+
+
 def _optional_float(raw: Any) -> float | None:
     if raw is None:
         return None
@@ -278,7 +286,7 @@ class FakeAlpacaTradingClient:
         self.submit_error = submit_error
         self.allow_shorting = allow_shorting
         self.mark_prices: dict[str, float] = {
-            str(symbol).strip().upper(): float(price)
+            str(symbol).strip().upper(): _mark_price_value(symbol, price)
             for symbol, price in (mark_prices or {}).items()
         }
 
@@ -300,7 +308,7 @@ class FakeAlpacaTradingClient:
 
     def set_mark_price(self, symbol: str, price: float) -> None:
         """Move a symbol's mark price, which is what a limit/stop fills against."""
-        self.mark_prices[str(symbol).strip().upper()] = float(price)
+        self.mark_prices[str(symbol).strip().upper()] = _mark_price_value(symbol, price)
 
     def advance(self, seconds: float = 0.0) -> list[FakeAlpacaTradeUpdate]:
         """Run the broker forward and return the trade updates it emitted.
@@ -645,7 +653,9 @@ class FakeAlpacaTradingClient:
             # ``_float`` keeps a non-finite qty NaN rather than zeroing it, so
             # a poison quantity still reaches the adapter's refusal path.
             qty=_float(getattr(request, "qty", None)),
-            notional=_optional_float(getattr(request, "notional", None)),
+            # ``_float`` keeps a non-finite notional (NaN is truthy, so ``or
+            # None`` keeps it) while absent/zero still map to None.
+            notional=_float(getattr(request, "notional", None)) or None,
             order_type=getattr(request, "type", OrderType.MARKET),
             order_class=getattr(request, "order_class", OrderClass.SIMPLE),
             time_in_force=getattr(request, "time_in_force", TimeInForce.GTC),
@@ -719,9 +729,12 @@ class FakeAlpacaTradingClient:
         orders leave unreserved, is refused before acceptance. Notional
         orders are skipped - the fake cannot price them into shares.
         """
+        qty = _float(order.qty)
+        if not math.isfinite(qty):
+            # NaN fails every comparison below; refuse it like the exchange.
+            return f"invalid qty for order ({order.qty!r})"
         if self.allow_shorting:
             return None
-        qty = _float(order.qty)
         if qty <= 0.0 or order.notional is not None:
             return None
         row = self.positions.get(order.symbol)

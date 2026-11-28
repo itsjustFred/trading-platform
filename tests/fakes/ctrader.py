@@ -166,6 +166,14 @@ def _optional_float(value: Any) -> float | None:
     return parsed
 
 
+def _mark_price_value(symbol: Any, price: Any) -> float:
+    """A mark price must be finite: NaN would fill orders at a poison price."""
+    value = float(price)
+    if not math.isfinite(value):
+        raise ValueError(f"mark price for {symbol} must be finite, got {price!r}")
+    return value
+
+
 def _has(msg: Any, name: str) -> bool:
     has_field = getattr(msg, "HasField", None)
     if has_field is None:
@@ -291,7 +299,8 @@ class FakeCTraderBroker:
         for spec in symbols:
             self.add_symbol(spec)
         self.mark_prices: dict[str, float] = {
-            str(k).strip().upper(): float(v) for k, v in (mark_prices or {}).items()
+            str(k).strip().upper(): _mark_price_value(k, v)
+            for k, v in (mark_prices or {}).items()
         }
 
         self.now_ms = 1_767_225_600_000  # 2026-01-01T00:00:00Z
@@ -314,7 +323,7 @@ class FakeCTraderBroker:
         self._symbol_by_name[spec.name.strip().upper()] = spec
 
     def set_mark_price(self, symbol: str, price: float) -> None:
-        self.mark_prices[str(symbol).strip().upper()] = float(price)
+        self.mark_prices[str(symbol).strip().upper()] = _mark_price_value(symbol, price)
 
     def mark_price(self, symbol_name: str) -> float:
         key = symbol_name.strip().upper()

@@ -8,7 +8,6 @@ so a fake that silently stopped modelling Alpaca breaks here first.
 from __future__ import annotations
 
 import asyncio
-import math
 from datetime import timedelta
 from types import SimpleNamespace
 
@@ -81,16 +80,26 @@ def test_a_missing_mark_price_is_an_error_not_a_fabricated_price() -> None:
         client.advance(30.0)
 
 
-def test_a_nan_qty_is_recorded_not_zeroed() -> None:
-    # A poison quantity must survive onto the order row so the adapter's
-    # refusal path sees it; zeroing it here would hide the bug.
+def test_a_non_finite_mark_price_is_rejected_at_the_boundary() -> None:
+    with pytest.raises(ValueError, match="must be finite"):
+        FakeAlpacaTradingClient(mark_prices={AAPL: float("nan")})
+
+    client = FakeAlpacaTradingClient(mark_prices={AAPL: 100.0})
+    with pytest.raises(ValueError, match="must be finite"):
+        client.set_mark_price(AAPL, float("inf"))
+
+
+def test_a_nan_qty_is_refused_at_submit_not_zeroed() -> None:
+    # A poison quantity must reach a refusal, not be zeroed into a resting
+    # order the adapter's checks never see.
     client = FakeAlpacaTradingClient(mark_prices={AAPL: 100.0})
     request = _buy()
     request.qty = float("nan")
 
-    order = client.submit_order(request)
+    with pytest.raises(APIError, match="invalid qty"):
+        client.submit_order(request)
 
-    assert math.isnan(order.qty)
+    assert client.orders == []
 
 
 def test_a_raising_rejection_rule_surfaces_instead_of_accepting() -> None:
@@ -452,20 +461,6 @@ def test_a_partially_filled_order_rests_for_the_remainder() -> None:
         "partial_fill",
         "fill",
     ], "every chunk of a partial fill is its own trade update"
-
-
-def test_a_nan_fill_price_is_not_erased_by_the_next_fill() -> None:
-    # alpaca-py hands back whatever the wire carried; the fake must not zero a
-    # non-finite stored price, or a NaN mark silently becomes a clean average.
-    client = FakeAlpacaTradingClient(mark_prices={AAPL: 100.0}, partial_fill_ratio=0.5)
-    order = client.submit_order(_buy(qty=4.0))
-
-    client.set_mark_price(AAPL, float("nan"))
-    client.advance(30.0)
-    client.set_mark_price(AAPL, 100.0)
-    client.advance(30.0)
-
-    assert math.isnan(order.filled_avg_price)
 
 
 def test_a_partial_fill_never_exceeds_the_requested_quantity() -> None:
