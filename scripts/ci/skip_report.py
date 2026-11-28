@@ -13,6 +13,8 @@ below; the allowed skips are ``ALLOWED_SKIPS`` — ``(module, reason)`` pairs fo
 gates that can never open in CI, each scoped to the module that emits it.
 XFail outcomes (``<skipped type="pytest.xfail">``) are reported separately and
 never count as violations: an xfail is an expected outcome, not a hidden skip.
+The exception is ``tests.fakes`` — its contract tests must actually run, so an
+xfail there counts as a violation like any other skip.
 """
 
 from __future__ import annotations
@@ -62,6 +64,10 @@ MUST_NOT_SKIP_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
         # Live signal-level resolution shared by the broker adapters
         # (risk.signal_levels / risk.live).
         r"^tests\.test_signal_levels",
+        # tests/fakes/** — shared broker fakes with contract tests that drive
+        # the real live adapters; a silent skip would hide adapter breakage.
+        # ``(\.|$)`` also matches the bare package classname.
+        r"^tests\.fakes(\.|$)",
         # risk/ engine and its parity/validation coverage.
         r"^tests\.test_risk",
         r"^tests\.validation\.test_.*risk",
@@ -170,11 +176,28 @@ class SkippedTest:
         return f"{self.module}::{self.name}"
 
 
+#: Dotted prefix of the shared broker fakes' contract tests. Single source
+#: for the carve-outs below — the never-allowable skip rule and the xfail
+#: rule key off this package; the money-path regex is pinned by
+#: ``tests/test_ci_skip_report.py``.
+FAKES_MODULE_PREFIX = "tests.fakes"
+
+
+def _is_fakes_module(module: str) -> bool:
+    return module == FAKES_MODULE_PREFIX or module.startswith(
+        FAKES_MODULE_PREFIX + "."
+    )
+
+
 def is_money_path(module: str) -> bool:
     return any(pattern.search(module) for pattern in MUST_NOT_SKIP_PATTERNS)
 
 
 def is_allowed_skip(module: str, reason: str) -> bool:
+    # The broker fakes' contract tests are the money path's tripwire: no
+    # reason-scoped exemption may ever cover them.
+    if _is_fakes_module(module):
+        return False
     return any(
         module_pattern.search(module) and reason_pattern.search(reason)
         for module_pattern, reason_pattern in ALLOWED_SKIPS
@@ -262,19 +285,23 @@ def collect_skips(paths: list[Path]) -> tuple[list[SkippedTest], list[str]]:
     return skipped, missing
 
 
-def violations(skipped: list[SkippedTest]) -> list[SkippedTest]:
-    """Money-path skips whose (module, reason) pair is not on the allowed list.
+def _is_violation(test: SkippedTest) -> bool:
+    """Whether one skipped testcase fails the money-path gate.
 
-    XFail outcomes are excluded: ``pytest.xfail`` is an expected result the
-    suite already reports, not a hidden skip.
+    XFail outcomes are excluded everywhere except ``tests.fakes``: an
+    expected-failure there would hide the adapter breakage the contract
+    tests exist to catch.
     """
-    return [
-        test
-        for test in skipped
-        if test.kind != "pytest.xfail"
-        and is_money_path(test.module)
-        and not is_allowed_skip(test.module, test.reason)
-    ]
+    if not is_money_path(test.module) or is_allowed_skip(test.module, test.reason):
+        return False
+    # An xfail on tests.fakes hides the adapter breakage the contract tests
+    # exist to catch — keep the fakes carve-out.
+    return test.kind != "pytest.xfail" or _is_fakes_module(test.module)
+
+
+def violations(skipped: list[SkippedTest]) -> list[SkippedTest]:
+    """Money-path skips whose (module, reason) pair is not on the allowed list."""
+    return [test for test in skipped if _is_violation(test)]
 
 
 def _truncate(text: str, limit: int = 160) -> str:
@@ -296,12 +323,7 @@ def _reason_table(
     for reason in sorted(groups, key=lambda r: (-len(groups[r]), r)):
         members = groups[reason]
         money = [t for t in members if is_money_path(t.module)]
-        bad = [
-            t
-            for t in money
-            if t.kind != "pytest.xfail"
-            and not is_allowed_skip(t.module, t.reason)
-        ]
+        bad = [t for t in money if _is_violation(t)]
         if not money_markers:
             marker = ""
         elif bad:
@@ -330,7 +352,11 @@ def build_report(skipped: list[SkippedTest], sources: list[str]) -> str:
     lines.append(f"JUnit input: {', '.join(sources)}")
     lines.append(f"Skipped tests: {len(skips)}")
     if xfails:
-        lines.append(f"XFailed tests: {len(xfails)} (expected outcomes, not counted)")
+        fakes_xfails = sum(1 for t in xfails if _is_fakes_module(t.module))
+        note = "expected outcomes, not counted"
+        if fakes_xfails:
+            note += f"; {fakes_xfails} tests.fakes xfail(s) DO count as violations"
+        lines.append(f"XFailed tests: {len(xfails)} ({note})")
     if not skipped:
         lines.append("")
         lines.append("No skips.")

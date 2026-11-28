@@ -8,6 +8,8 @@ import sys
 from pathlib import Path
 
 from scripts.ci.skip_report import (
+    ALLOWED_SKIPS,
+    MUST_NOT_SKIP_PATTERNS,
     build_report,
     collect_skips,
     is_allowed_skip,
@@ -168,6 +170,20 @@ def test_parse_junit_xfail_is_not_a_violation(tmp_path: Path) -> None:
     assert "### XFail by reason" in report
 
 
+def test_a_fakes_xfail_is_a_violation(tmp_path: Path) -> None:
+    # An expected-failure on the broker fakes would hide the adapter
+    # breakage their contract tests exist to catch.
+    path = tmp_path / "junit.xml"
+    path.write_text(
+        '<testsuite><testcase classname="tests.fakes.test_alpaca" name="t">'
+        '<skipped type="pytest.xfail" message="flaky"/>'
+        "</testcase></testsuite>",
+        encoding="utf-8",
+    )
+    (test,) = parse_junit(path)
+    assert violations([test]) == [test]
+
+
 def test_collect_skips_warns_on_missing_files(tmp_path: Path) -> None:
     present = _write(tmp_path, "a.xml", [("tests.test_a", "t", "why")])
     skipped, missing = collect_skips([present, tmp_path / "absent.xml"])
@@ -180,6 +196,75 @@ def test_is_money_path_covers_live_runner_and_engine_tests() -> None:
     assert is_money_path("tests.test_risk_engine.TestGrouping")
     assert is_money_path("tests.test_vectorbt_sizing_semantics")
     assert is_money_path("tests.test_live_daemon_sizing")
+    # The shared broker fakes' contract tests drive the real adapters; a skip
+    # there must fail CI, so the classification is pinned here.
+    assert is_money_path("tests.fakes.test_alpaca")
+    assert is_money_path("tests.fakes.test_ctrader")
+    # Pin the pattern itself: dropping it while keeping is_money_path green
+    # for other modules would silently un-gate the fakes.
+    assert any(p.pattern == r"^tests\.fakes(\.|$)" for p in MUST_NOT_SKIP_PATTERNS)
+    # No allowed-skip pair may match the fakes either: a reason-scoped
+    # exemption would let a flaky contract test skip silently.
+    assert not any(
+        module_pattern.search(module)
+        for module_pattern, _reason in ALLOWED_SKIPS
+        for module in ("tests.fakes.test_alpaca", "tests.fakes.test_ctrader")
+    )
+    # A ``slow`` marker or ``collect_ignore`` would deselect fakes tests
+    # under ``-m "not slow"`` — invisible to the JUnit skip gate — so no
+    # file under tests/fakes (conftest.py included) may carry either.
+    fakes_root = Path(__file__).resolve().parents[1] / "tests" / "fakes"
+    for path in sorted(fakes_root.rglob("*.py")):
+        source = path.read_text(encoding="utf-8")
+        assert "mark.slow" not in source, (
+            f"{path.name} must not be slow-marked: deselected tests never "
+            "reach the skip report"
+        )
+        assert "collect_ignore" not in source, (
+            f"{path.name} must not ignore collection: deselected tests "
+            "never reach the skip report"
+        )
+    # Deselection can also come from outside tests/fakes: an --ignore, a
+    # collect_ignore, a collection hook or a pytest-config knob aimed at the
+    # fakes would hide every contract test just as thoroughly. Scan whole
+    # files with whitespace collapsed so a YAML line-fold, a split flag or
+    # an env-var route cannot smuggle the deselection past a per-line check.
+    _DESELECT_TOKENS = (
+        "--ignore",
+        "--deselect",
+        "addopts",
+        "norecursedirs",
+        "python_files",
+        "python_classes",
+        "python_functions",
+        "pytest_ignore_collect",
+        "pytest_collection_modifyitems",
+        "collect_ignore",
+        "PYTEST_ADDOPTS",
+        "-k",
+        "--keyword",
+        "--ignore-glob",
+    )
+    repo_root = Path(__file__).resolve().parents[1]
+    deselection_sources = (
+        sorted((repo_root / ".github" / "workflows").glob("*.y*ml"))
+        + [
+            repo_root / name
+            for name in ("pytest.ini", "pyproject.toml", "setup.cfg", "tox.ini")
+            if (repo_root / name).is_file()
+        ]
+        + [fakes_root.parent / "conftest.py"]
+        + sorted(fakes_root.rglob("*.py"))
+        + sorted((repo_root / "scripts").rglob("*.sh"))
+    )
+    for source_path in deselection_sources:
+        squashed = re.sub(r"\s+", "", source_path.read_text(encoding="utf-8"))
+        for token in _DESELECT_TOKENS:
+            for match in re.finditer(re.escape(token), squashed):
+                window = squashed[match.start() : match.start() + 200]
+                assert "fakes" not in window, (
+                    f"{source_path.name} may deselect tests/fakes via {token!r}"
+                )
     assert not is_money_path("tests.test_safe_path")
     assert not is_money_path("tests.strategies.test_channel_breakout")
 
