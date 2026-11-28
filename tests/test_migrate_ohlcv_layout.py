@@ -236,6 +236,30 @@ def test_non_equity_etf_index_collision_still_fails_loudly(tmp_path: Path) -> No
     assert not (dst / "testsrc" / "BADMIX").exists()
 
 
+def test_collision_winner_refuses_unreadable_parquet(tmp_path: Path) -> None:
+    """An unreadable colliding parquet must fail loudly, not skew the pick.
+
+    ``_parquet_first_rows`` used to return ``Timestamp.max`` for a file it
+    could not read, which silently disqualified that copy from "longest
+    coverage" — the readable-but-shorter copy won and the migration wrote
+    the wrong canonical dataset. Coverage that cannot be measured must
+    abort the run instead.
+    """
+    src = tmp_path / "old" / "ohlcv"
+    _write_old(
+        src, "yfinance", "equity", "US", "BAD", "1d.parquet",
+        frame=_frame(periods=2, start="2020-01-01", freq="D"),
+    )
+    corrupt = _write_old(
+        src, "yfinance", "etf", "US", "BAD", "1d.parquet",
+        frame=_frame(periods=5, start="2024-01-01", freq="D"),
+    )
+    corrupt.write_bytes(b"this is not a parquet file")
+
+    with pytest.raises(ValueError, match="BAD"):
+        migrate(src, tmp_path / "new" / "ohlcv", sources=["yfinance"])
+
+
 def test_collisions_and_skips_reported(old_tree: Path, tmp_path: Path) -> None:
     dst = tmp_path / "new" / "ohlcv"
     report = migrate(old_tree, dst)

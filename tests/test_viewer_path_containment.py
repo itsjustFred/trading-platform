@@ -292,6 +292,40 @@ def test_delete_symbol_data_manifest_write_precedes_unlink(
     assert "EURUSD" in manifest
 
 
+def test_delete_symbol_data_restores_manifest_when_unlink_fails(
+    security_client, tmp_path, monkeypatch
+):
+    """A failed unlink must not strand an undeclared orphan parquet.
+
+    The endpoint rewrites the manifest BEFORE unlinking; if the unlink then
+    fails, the manifest entry is rolled back so the dataset on disk stays
+    resolvable instead of silently disappearing from every reader.
+    """
+    import viewer.main as viewer_app_module
+    from shared import ohlcv_store
+
+    target = _write_store_ohlcv(tmp_path, "dukascopy", "EURUSD", "1h")
+    monkeypatch.setattr(viewer_app_module, "_refresh_catalog", lambda: None)
+    monkeypatch.setattr(
+        viewer_app_module.cache_manager, "invalidate_cache", lambda *a, **k: None
+    )
+    monkeypatch.setattr(viewer_app_module, "_invalidate_data_views_cache", lambda: None)
+
+    def _boom_unlink(self, *args, **kwargs):
+        raise OSError("unlink failed")
+
+    monkeypatch.setattr(Path, "unlink", _boom_unlink)
+
+    response = security_client.delete(f"/api/data/symbol?path={target}")
+
+    assert response.status_code == 500
+    assert target.exists()
+    manifest = ohlcv_store.read_manifest(tmp_path, "dukascopy")
+    assert "EURUSD" in manifest
+    entry = ohlcv_store.find_dataset(tmp_path, "EURUSD", "1h")
+    assert entry is not None
+
+
 def test_asset_class_categories_cover_canonical_spellings():
     """Every canonical equity/index spelling must have a viewer category.
 

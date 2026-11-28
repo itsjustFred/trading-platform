@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures.thread
+import copy
 import errno
 import json
 import logging
@@ -16366,14 +16367,20 @@ async def delete_symbol_data(path: str = Query(default="")) -> dict[str, Any]:
     try:
         # Keep the source manifest consistent: a deleted parquet must not
         # stay declared or every store reader would keep resolving it. The
-        # manifest is rewritten BEFORE the unlink, inside the source lock:
-        # a crash between the two then leaves an undeclared orphan file
-        # (harmless — readers only resolve declared segments) instead of a
-        # manifest entry pointing at a missing parquet.
+        # manifest is rewritten BEFORE the unlink, inside the source lock,
+        # and rolled back if the unlink fails: an error then leaves the
+        # file on disk still declared (recoverable) instead of a manifest
+        # entry pointing at a missing parquet. A hard crash between the
+        # manifest write and the unlink still leaves an undeclared orphan —
+        # the unavoidable residue of a two-file commit.
         entry = ohlcv_store.entry_for_path(DATA_DIR, file_path)
         if entry is not None:
             with ohlcv_store.manifest_update_lock(DATA_DIR, entry.source):
                 manifest = ohlcv_store.read_manifest(DATA_DIR, entry.source)
+                # Snapshot for rollback: if the unlink below fails, the
+                # parquet is still on disk and must stay declared or the
+                # dataset silently disappears from every store reader.
+                manifest_snapshot = copy.deepcopy(manifest)
                 meta = manifest.get(entry.symbol)
                 files = meta.get("files") if isinstance(meta, dict) else None
                 if isinstance(files, dict):
@@ -16383,7 +16390,14 @@ async def delete_symbol_data(path: str = Query(default="")) -> dict[str, Any]:
                     else:
                         manifest.pop(entry.symbol, None)
                         ohlcv_store.write_manifest(DATA_DIR, entry.source, manifest)
-                file_path.unlink()
+                try:
+                    file_path.unlink()
+                except OSError:
+                    with suppress(OSError):
+                        ohlcv_store.write_manifest(
+                            DATA_DIR, entry.source, manifest_snapshot
+                        )
+                    raise
         else:
             file_path.unlink()
         cache_manager.invalidate_cache(DATA_DIR, reason="manual")

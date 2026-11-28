@@ -299,8 +299,10 @@ def _parquet_first_rows(path: Path) -> tuple[pd.Timestamp, int]:
         return bounds[0], rows
     try:
         frame = pd.read_parquet(path, columns=["timestamp"])
-    except (OSError, ValueError):
-        return pd.Timestamp.max, rows
+    except Exception as exc:
+        # Coverage that cannot be measured must not silently disqualify this
+        # copy from the collision winner pick — abort the migration loudly.
+        raise ValueError(f"cannot read timestamps from {path}: {exc}") from exc
     first = pd.Timestamp(frame["timestamp"].min())
     if first.tzinfo is None:
         first = first.tz_localize("UTC")
