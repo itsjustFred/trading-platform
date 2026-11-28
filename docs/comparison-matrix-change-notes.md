@@ -9,15 +9,14 @@ committed comparison cases, plus the remaining limitations.
 ## #228 — MT5 importers store fees as a positive cost
 
 - Changed behavior, protected files:
-  - `validation/importers/mt5_xlsx.py`, `validation/importers/mt5_html.py`:
+  - `validation/importers/mt5_xlsx.py` and the then-current HTML importer:
     `fees = -(Kommission + Swap)` (MT5 signs costs negative), so `fees` is a
     positive cost, a net swap credit a negative fee, and `net_pnl = pnl - fees`
     no longer adds costs to the net. `meta.commission` / `meta.swap` keep the raw
     signed MT5 values. An unparsable fee cell counts as 0 like an empty cell
     (pre-existing behaviour, maintainer decision: no fee-cell guard).
-  - Tests: `tests/validation/test_mt5_xlsx_importer.py`,
-    `tests/validation/test_mt5_html_importer.py`,
-    `tests/validation/test_golden_reconciliation.py` (now also pins the goldens'
+  - Tests: `tests/validation/test_mt5_xlsx_importer.py`, the then-current HTML
+    importer tests, and `tests/validation/test_golden_reconciliation.py` (now also pins the goldens'
     money fields to a fresh import of the tracked reports).
 - Why: before, every MT5 cost was added to the trade net instead of subtracted.
 - Before/after: Σ trade `net_pnl` of the three committed goldens now equals MT5

@@ -1,5 +1,9 @@
 # Handoff Prompt: Plan MT5 Backtest Alignment Work
 
+> **Status:** historical handoff note. MT5 report ingestion is now XLSX-only
+> (`validation/importers/mt5_xlsx.py`); HTML exports are human-readable artifacts
+> and are not parsed. The `.html` paths below are historical references.
+
 You are starting a new coding/planning session in `/home/ubuntu/Desktop/trading-platform` on branch `codex_rewrite`.
 
 Your task is to create an implementation plan for the changes needed so platform backtests can be effectively compared against MT5 strategy reports in `strategy-comparisons/`.
