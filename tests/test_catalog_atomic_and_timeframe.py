@@ -1,4 +1,10 @@
-"""Tests for atomic catalog metadata writes and path-parse fail-closed (DV-B11)."""
+"""Tests for atomic catalog metadata writes and manifest-driven OHLCV scans.
+
+Pre-#471 this file also covered ``parse_ohlcv_path`` fail-closed behaviour on
+the legacy ``ohlcv/<source>/<asset_class>/...`` layout. The manifest store has
+no path parsing left to get wrong: files the manifest does not declare are
+invisible to the catalog, which is the stronger guarantee the tests below pin.
+"""
 
 from __future__ import annotations
 
@@ -9,18 +15,12 @@ import pandas as pd
 import pytest
 
 import data_tools.catalog_builder as catalog_builder
-from data_tools.catalog_builder import build_catalog, parse_ohlcv_path
+from data_tools.catalog_builder import build_catalog
+from shared import ohlcv_store
 
 
-@pytest.fixture
-def symbol_dir(tmp_path):
-    ohlcv = tmp_path / "ohlcv" / "test_source" / "equity" / "AAPL"
-    ohlcv.mkdir(parents=True)
-    return ohlcv
-
-
-def _write_bars(path: Path, periods: int = 5) -> None:
-    frame = pd.DataFrame(
+def _bars_frame(periods: int = 5) -> pd.DataFrame:
+    return pd.DataFrame(
         {
             "timestamp": pd.date_range("2024-01-01", periods=periods, freq="h", tz="UTC"),
             "open": range(periods),
@@ -30,15 +30,19 @@ def _write_bars(path: Path, periods: int = 5) -> None:
             "volume": range(periods),
         }
     )
-    frame.to_parquet(path, index=False)
+
+
+def _write_unmanifested_bars(path: Path, periods: int = 5) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _bars_frame(periods).to_parquet(path, index=False)
 
 
 class TestAtomicCatalogWrite:
     def test_catalog_output_write_is_atomic(self, tmp_path, monkeypatch):
         """A crash while serializing must not truncate an existing catalog.json."""
-        output = tmp_path / "ohlcv" / "test_source" / "equity" / "AAPL" / "1h.parquet"
-        output.parent.mkdir(parents=True)
-        _write_bars(output)
+        ohlcv_store.write_frame(
+            tmp_path, "test_source", "AAPL", "1h", _bars_frame(), asset_class="equity"
+        )
 
         first = build_catalog(tmp_path)
         catalog_path = tmp_path / "catalog.json"
@@ -78,48 +82,31 @@ class TestAtomicCatalogWrite:
         assert observed["payload"] == {"generated_at": "x"}
 
 
-class TestTimeframeFailClosed:
-    def test_unparseable_filename_is_rejected_not_defaulted_to_1d(self, tmp_path):
-        """Regression DV-B11: a file whose timeframe cannot be parsed must not
-        silently enter the catalog as a 1d dataset."""
-        flat = tmp_path / "ohlcv" / "dolthub" / "equity" / "US"
-        flat.mkdir(parents=True)
-        _write_bars(flat / "AAPL_2020_snapshot.parquet")
+class TestManifestDrivenCatalog:
+    def test_unmanifested_parquet_is_not_listed(self, tmp_path):
+        """A parquet the manifest does not declare cannot leak into the catalog.
 
-        entry = parse_ohlcv_path(flat / "AAPL_2020_snapshot.parquet", tmp_path / "ohlcv")
-        if entry is not None:
-            assert entry["timeframe"] != "1d", (
-                "unparseable timeframe must not be silently reported as 1d"
-            )
-
-    def test_parse_ohlcv_path_returns_none_for_unknown_stem(self, tmp_path):
-        """Stems that are neither a timeframe nor symbol_timeframe are skipped."""
-        flat = tmp_path / "ohlcv" / "dolthub" / "equity" / "US"
-        flat.mkdir(parents=True)
-        weird = flat / "not-a-timeframe-or-symbol.parquet"
-        _write_bars(weird)
-
-        entry = parse_ohlcv_path(weird, tmp_path / "ohlcv")
-
-        assert entry is None or entry["timeframe"] != "1d"
-
-    def test_catalog_does_not_list_unparseable_file_as_1d(self, tmp_path):
-        flat = tmp_path / "ohlcv" / "dolthub" / "equity" / "US"
-        flat.mkdir(parents=True)
-        _write_bars(flat / "AAPL_2020_snapshot.parquet")
+        This is the manifest-store successor of the DV-B11 fail-closed rule:
+        there is no filename stem left to misparse as ``1d`` — undeclared
+        files are simply invisible.
+        """
+        stray = (
+            tmp_path / "ohlcv" / "dolthub" / "AAPL" / "AAPL_D1_2020_snapshot.parquet"
+        )
+        _write_unmanifested_bars(stray)
 
         catalog = build_catalog(tmp_path)
 
-        timeframes = [entry.get("timeframe") for entry in catalog["ohlcv"]]
-        assert "1d" not in timeframes, f"silent 1d default leaked into catalog: {catalog['ohlcv']}"
+        assert catalog["ohlcv"] == []
 
-    def test_legacy_flat_symbol_file_still_resolves_to_1d(self, tmp_path):
-        """The documented flat export layout {symbol}.parquet keeps its 1d mapping."""
-        flat = tmp_path / "ohlcv" / "dolthub" / "equity" / "US"
-        flat.mkdir(parents=True)
-        _write_bars(flat / "AAPL.parquet")
+    def test_manifest_declared_dataset_is_listed(self, tmp_path):
+        ohlcv_store.write_frame(
+            tmp_path, "dolthub", "AAPL", "1d", _bars_frame(), asset_class="equity"
+        )
 
         catalog = build_catalog(tmp_path)
 
-        assert catalog["ohlcv"][0]["timeframe"] == "1d"
-        assert catalog["ohlcv"][0]["symbol"] == "AAPL"
+        assert len(catalog["ohlcv"]) == 1
+        entry = catalog["ohlcv"][0]
+        assert entry["symbol"] == "AAPL"
+        assert entry["timeframe"] == "1d"

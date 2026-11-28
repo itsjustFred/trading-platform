@@ -38,33 +38,36 @@ _guard.ensure_own_checkout("regenerate_qc_risk_parity_artifact")
 # dropping it would take this script off the roster and out of the gate that keeps it alive.
 import shared  # noqa: F401
 from scripts import run_risk_parity_backtest as risk_parity
+from shared import ohlcv_store
 from shared.constants import DATA_DIR
 from shared.models import BacktestMeta, BacktestResult, EquityPoint, Trade, TradeExit
 
 DEFAULT_OUTPUT = Path("data/backtests/risk_parity_quantconnect_reimplementation.json")
-DEFAULT_SOURCE = Path("ohlcv/yfinance/equity/US")
+DEFAULT_SOURCE = "yfinance"
 # Statistics convention of the checked-in QC reference (risk_parity_reference.json note):
 # LEAN calendar-day returns, Sharpe/Sortino net of the average 2016-2024 risk-free rate.
 PARITY_RISK_FREE_RATE = 0.025
 
 
-def _load_local_prices(data_dir: Path, source: Path, start: str, end: str) -> tuple[pd.DataFrame, pd.DataFrame]:
-    root = data_dir / source
+def _load_local_prices(data_dir: Path, source: str, start: str, end: str) -> tuple[pd.DataFrame, pd.DataFrame]:
     close_columns: dict[str, pd.Series] = {}
     open_columns: dict[str, pd.Series] = {}
     start_ts = pd.Timestamp(start, tz="UTC")
     end_ts = pd.Timestamp(end, tz="UTC")
 
     for ticker in risk_parity.TICKERS:
-        path = root / ticker / "1d.parquet"
-        if not path.exists():
-            raise FileNotFoundError(f"Missing local Risk Parity data for {ticker}: {path}")
-        frame = pd.read_parquet(path)
+        entry = ohlcv_store.find_dataset(data_dir, ticker, "1d", data_source=source)
+        if entry is None:
+            raise FileNotFoundError(
+                f"Missing local Risk Parity data for {ticker} "
+                f"(source={source!r}, timeframe=1d) under {data_dir}"
+            )
+        frame = ohlcv_store.read_frame(entry)
         frame.columns = [str(col).lower() for col in frame.columns]
         required = {"timestamp", "close", "open"}
         missing = required.difference(frame.columns)
         if missing:
-            raise ValueError(f"{path} missing columns: {', '.join(sorted(missing))}")
+            raise ValueError(f"{entry.path} missing columns: {', '.join(sorted(missing))}")
         timestamps = pd.to_datetime(frame["timestamp"], utc=True, errors="coerce")
         closes = pd.to_numeric(frame["close"], errors="coerce")
         opens = pd.to_numeric(frame["open"], errors="coerce")
@@ -73,7 +76,7 @@ def _load_local_prices(data_dir: Path, source: Path, start: str, end: str) -> tu
         close_series = close_series[(close_series.index >= start_ts) & (close_series.index <= end_ts)]
         open_series = open_series[(open_series.index >= start_ts) & (open_series.index <= end_ts)]
         if close_series.empty:
-            raise ValueError(f"No usable local Risk Parity rows for {ticker}: {path}")
+            raise ValueError(f"No usable local Risk Parity rows for {ticker}: {entry.path}")
         close_columns[ticker] = close_series
         open_columns[ticker] = open_series
 
@@ -93,7 +96,7 @@ def _to_iso(value: Any) -> str:
     return ts.isoformat()
 
 
-def _build_result(result: dict[str, Any], prices: pd.DataFrame, *, start: str, end: str, output: Path, source: Path) -> BacktestResult:
+def _build_result(result: dict[str, Any], prices: pd.DataFrame, *, start: str, end: str, output: Path, source: str) -> BacktestResult:
     trades: list[Trade] = []
     for idx, raw in enumerate(result["trades"], start=1):
         entry_price = float(raw["entry_price"])
@@ -174,7 +177,7 @@ def _build_result(result: dict[str, Any], prices: pd.DataFrame, *, start: str, e
     )
 
 
-def regenerate(*, data_dir: Path, source: Path, output: Path, start: str, end: str,
+def regenerate(*, data_dir: Path, source: str, output: Path, start: str, end: str,
                history_start: str = "2015-08-04") -> BacktestResult:
     prices, open_prices = _load_local_prices(
         data_dir, source, risk_parity.price_history_start(start, history_start), end
@@ -204,7 +207,7 @@ def regenerate(*, data_dir: Path, source: Path, output: Path, start: str, end: s
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-dir", type=Path, default=DATA_DIR)
-    parser.add_argument("--source", type=Path, default=DEFAULT_SOURCE)
+    parser.add_argument("--source", default=DEFAULT_SOURCE)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--start", default="2016-01-01")
     parser.add_argument("--end", default="2024-12-31")

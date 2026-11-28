@@ -23,6 +23,7 @@ from pathlib import Path
 import pandas as pd
 
 from data_tools.path_safety import build_dataset_path, ensure_dataset_path_within
+from shared import ohlcv_store
 from shared.atomic_io import write_parquet_atomically, write_text_atomically
 from shared.constants import DATA_DIR
 
@@ -43,10 +44,12 @@ def migrate_dukascopy_xauusd(dry_run: bool, force: bool = False) -> int:
     }
     for pattern, tf in patterns.items():
         for csv_path in LEAN_DATA.glob(pattern):
-            dest = build_dataset_path(
-                DATA_DIR, "ohlcv", "dukascopy", "forex", "XAUUSD", f"{tf}.parquet"
+            dest = ohlcv_store.data_path(DATA_DIR, "dukascopy", "XAUUSD", tf)
+            count += _convert_ohlcv(
+                csv_path, dest, dry_run, force=force, timestamp_col="timestamp",
+                source="dukascopy", symbol="XAUUSD", timeframe=tf,
+                asset_class="forex", region="GLOBAL",
             )
-            count += _convert_ohlcv(csv_path, dest, dry_run, force=force, timestamp_col="timestamp")
     return count
 
 
@@ -55,10 +58,12 @@ def migrate_lean_equities_h1(dry_run: bool, force: bool = False) -> int:
     count = 0
     for csv_path in LEAN_DATA.glob("*_H1_730d.csv"):
         symbol = csv_path.name.split("_")[0]
-        dest = build_dataset_path(
-            DATA_DIR, "ohlcv", "yfinance", "equity", "US", symbol, "1h.parquet"
+        dest = ohlcv_store.data_path(DATA_DIR, "yfinance", symbol, "1h")
+        count += _convert_ohlcv(
+            csv_path, dest, dry_run, force=force, timestamp_col="timestamp",
+            source="yfinance", symbol=symbol, timeframe="1h",
+            asset_class="equity", region="US",
         )
-        count += _convert_ohlcv(csv_path, dest, dry_run, force=force, timestamp_col="timestamp")
     return count
 
 
@@ -70,10 +75,12 @@ def migrate_lean_equities_m15(dry_run: bool, force: bool = False) -> int:
         if name.startswith("XAUUSD"):
             continue  # handled by dukascopy migration
         symbol = name.split("_")[0]
-        dest = build_dataset_path(
-            DATA_DIR, "ohlcv", "yfinance", "equity", "US", symbol, "15m.parquet"
+        dest = ohlcv_store.data_path(DATA_DIR, "yfinance", symbol, "15m")
+        count += _convert_ohlcv(
+            csv_path, dest, dry_run, force=force, timestamp_col="timestamp",
+            source="yfinance", symbol=symbol, timeframe="15m",
+            asset_class="equity", region="US",
         )
-        count += _convert_ohlcv(csv_path, dest, dry_run, force=force, timestamp_col="timestamp")
     return count
 
 
@@ -85,10 +92,12 @@ def migrate_lean_equities_daily(dry_run: bool, force: bool = False) -> int:
         return 0
     for csv_path in equity_dir.glob("*_daily.csv"):
         symbol = csv_path.name.replace("_daily.csv", "")
-        dest = build_dataset_path(
-            DATA_DIR, "ohlcv", "yfinance", "equity", "US", symbol, "1d.parquet"
+        dest = ohlcv_store.data_path(DATA_DIR, "yfinance", symbol, "1d")
+        count += _convert_ohlcv(
+            csv_path, dest, dry_run, force=force,
+            source="yfinance", symbol=symbol, timeframe="1d",
+            asset_class="equity", region="US",
         )
-        count += _convert_ohlcv(csv_path, dest, dry_run, force=force)
     return count
 
 
@@ -102,10 +111,12 @@ def migrate_stockkit_5m(dry_run: bool, force: bool = False) -> int:
         symbol = csv_path.stem
         if not re.match(r"^[A-Z]{1,5}$", symbol):
             continue
-        dest = build_dataset_path(
-            DATA_DIR, "ohlcv", "yfinance", "equity", "US", symbol, "5m.parquet"
+        dest = ohlcv_store.data_path(DATA_DIR, "yfinance", symbol, "5m")
+        count += _convert_ohlcv(
+            csv_path, dest, dry_run, force=force, datetime_col="Datetime",
+            source="yfinance", symbol=symbol, timeframe="5m",
+            asset_class="equity", region="US",
         )
-        count += _convert_ohlcv(csv_path, dest, dry_run, force=force, datetime_col="Datetime")
     return count
 
 
@@ -198,6 +209,11 @@ def _convert_ohlcv(
     timestamp_col: str | None = None,
     datetime_col: str | None = None,
     force: bool = False,
+    source: str | None = None,
+    symbol: str | None = None,
+    timeframe: str | None = None,
+    asset_class: str = "",
+    region: str = "",
 ) -> int:
     """Convert a single OHLCV CSV to Parquet."""
     dest = ensure_dataset_path_within(dest.parent, dest.name)
@@ -295,6 +311,12 @@ def _convert_ohlcv(
             logger.info("Backed up %s → %s", dest, backup)
         source_fingerprint = _source_fingerprint(csv_path)
         write_parquet_atomically(dest, df)
+        if source and symbol and timeframe:
+            ohlcv_store.register_file(
+                DATA_DIR, source, symbol, timeframe, dest,
+                asset_class=asset_class, region=region,
+                extra_meta={"source_fingerprint": source_fingerprint},
+            )
         _write_migration_metadata(
             dest,
             csv_path=csv_path,

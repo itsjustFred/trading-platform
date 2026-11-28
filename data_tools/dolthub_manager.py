@@ -8,6 +8,7 @@ from pathlib import Path
 import pandas as pd
 
 from data_tools.path_safety import build_dataset_path
+from shared import ohlcv_store
 from shared.atomic_io import atomic_replace, write_parquet_atomically
 from shared.constants import DATA_DIR
 from shared.sql import quote_identifier, quote_literal
@@ -188,16 +189,23 @@ def _export_table_csv(repo_path: Path, table: str, output_csv: Path):
 
 
 def _stock_export_path(target_dir: Path, symbol: str) -> Path:
-    """Return the canonical OHLCV output path and migrate legacy flat exports."""
-    legacy_path = build_dataset_path(target_dir, f"{symbol}.parquet")
-    canonical_path = build_dataset_path(target_dir, symbol, "1d.parquet")
+    """Return the manifest-store output path for a daily equity export.
 
-    if legacy_path.exists() and not canonical_path.exists():
-        canonical_path.parent.mkdir(parents=True, exist_ok=True)
-        legacy_path.replace(canonical_path)
-        logger.info("Migrated legacy Dolthub export %s -> %s", legacy_path, canonical_path)
+    ``target_dir`` is only used to locate the data root (the ``ohlcv``
+    parent's parent); the file itself lands at
+    ``ohlcv/dolthub/<SYMBOL>/<SYMBOL>_D1.parquet``.
+    """
+    del target_dir
+    return ohlcv_store.data_path(DATA_DIR, "dolthub", symbol, "1d")
 
-    return canonical_path
+
+def _write_stock_frame(symbol: str, df: pd.DataFrame) -> None:
+    """Write one exported symbol frame through the OHLCV store."""
+    df = df.sort_values("timestamp").drop_duplicates(subset=["timestamp"])
+    ohlcv_store.write_frame(
+        DATA_DIR, "dolthub", symbol, "1d", df,
+        asset_class="equity", region="US",
+    )
 
 
 def _stocks_table_name(stocks_repo: Path) -> str | None:
@@ -298,7 +306,7 @@ def _export_symbol_csv(
         if not df.empty:
             df.rename(columns={"date": "timestamp"}, inplace=True)
             df["timestamp"] = pd.to_datetime(df["timestamp"])
-            write_parquet_atomically(out_parquet, df)
+            _write_stock_frame(symbol, df)
     except Exception as e:
         logger.warning(f"Failed to export {symbol}: {e}")
     finally:
@@ -405,7 +413,7 @@ def export_data():
                     if not df.empty:
                         df.rename(columns={"date": "timestamp"}, inplace=True)
                         df["timestamp"] = pd.to_datetime(df["timestamp"])
-                        write_parquet_atomically(out_parquet, df)
+                        _write_stock_frame(symbol, df)
                 except Exception as e:
                     logger.warning(f"Failed to export {symbol}: {e}")
                 finally:

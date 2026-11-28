@@ -551,7 +551,7 @@ def timeframe_nominal_days(timeframe: str | None) -> float:
     # sizing `s1` and `tick` as *one day* when they are one second. That silently
     # loosened their gap threshold 3x (1.0 -> 3.0 days), so a two-day hole in tick
     # data was reported as `ok` rather than as a warning. These are real labels:
-    # `KNOWN_TIMEFRAMES` in consolidate_parquets and the viewer both spell them this
+    # `VALID_TIMEFRAMES` in shared.ohlcv_store and the viewer both spell them this
     # way, and the grid downloader lists them by name in UNSUPPORTED_TIMEFRAMES.
     #
     # Not a backtest hazard on its own - `TIMEFRAME_MINUTES` has no entry for either,

@@ -409,7 +409,7 @@ def book_asset_class(
     """Best-effort book-level asset class for the Sharpe convention (#229).
 
     Explicit ``asset_class`` metadata wins. Otherwise the class is recovered
-    from the documented ``ohlcv/{source}/{asset_class}/...`` layout via
+    from the manifest OHLCV store's dataset entry via
     ``runner.engines.contract`` — the same classification the data path
     itself carries. A book only gets a class when EVERY symbol resolves to
     the same one; a mixed or partially unresolvable book returns ``None``

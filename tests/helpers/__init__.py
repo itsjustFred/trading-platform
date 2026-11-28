@@ -96,37 +96,16 @@ def deterministic_ohlcv_frame(*, periods: int = 300, start: float = 100.0) -> pd
     )
 
 
-def write_ohlcv_legacy(
-    data_dir, symbol: str, frame: pd.DataFrame, *, timeframe: str = "1h",
-    source: str = "test_source", asset_class: str = "equities",
-) -> None:
-    """Write ``frame`` in the pre-#471 layout for phase-2 readers.
-
-    ``data_tools.auto_download`` coverage gates and the viewer's
-    ``_load_ohlcv_df``/``_ohlcv_candidates`` still scan
-    ``ohlcv/<source>/<asset_class>/<symbol>/<timeframe>.parquet`` until the
-    phase-2 migration lands, so fixtures that feed those readers need the
-    legacy file alongside the manifest-layout one.
-    """
-    symbol_dir = data_dir / "ohlcv" / source / asset_class / symbol
-    symbol_dir.mkdir(parents=True, exist_ok=True)
-    frame.to_parquet(symbol_dir / f"{timeframe}.parquet", index=False)
-
-
 def write_ohlcv(
     data_dir, symbol: str, frame: pd.DataFrame, *, timeframe: str = "1h",
     source: str = "test_source", asset_class: str = "equities",
-    legacy: bool = True,
 ) -> None:
     """Write ``frame`` as the OHLCV dataset for ``symbol`` under ``data_dir``.
 
     Routes through ``ohlcv_store.write_frame`` so fixtures land in the
     manifest layout (``ohlcv/<source>/<SYMBOL>/<SYMBOL>_<TF>.parquet``).
     The frame is normalised to the store's write contract first — sorted,
-    unique, UTC timestamps — matching what the old free-form parquet write
-    let readers cope with. ``legacy=True`` (the default while phase-2
-    readers remain) also writes the pre-#471 path so coverage gates and
-    the viewer keep seeing the fixture.
+    unique, UTC timestamps.
     """
     from shared import ohlcv_store
 
@@ -143,11 +122,6 @@ def write_ohlcv(
     ohlcv_store.write_frame(
         data_dir, source, symbol, timeframe, prepared, asset_class=asset_class
     )
-    if legacy:
-        write_ohlcv_legacy(
-            data_dir, symbol, prepared, timeframe=timeframe,
-            source=source, asset_class=asset_class,
-        )
 
 
 def with_zero_fees(payload: dict) -> dict:

@@ -55,6 +55,7 @@ from data_tools import cache_manager
 from data_tools.auto_download import reload_coverage_windows
 from data_tools.catalog_builder import merge_ohlcv_entries
 from data_tools.signal_import import load_signals_from_csv
+from shared import ohlcv_store
 from shared.atomic_io import write_text_atomically
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -7912,66 +7913,6 @@ def _infer_symbol_category(path_value: str, fallback_asset_class: str) -> str:
     return (fallback_asset_class or "other").lower()
 
 
-_TIMEFRAME_REGEX = r"(?:tick|mn1|(?:\d+)?(?:s|sec|m|min|h|d|w|mo)|[smhdw]\d+)"
-_TIMEFRAME_PATTERN = re.compile(rf"^{_TIMEFRAME_REGEX}$", re.IGNORECASE)
-_SEGMENTED_TIMEFRAME_PATTERN = re.compile(
-    rf"^(?P<timeframe>{_TIMEFRAME_REGEX})(?:[_-].+)$",
-    re.IGNORECASE,
-)
-_SYMBOL_PREFIXED_TIMEFRAME_PATTERN = re.compile(
-    rf"^(?P<symbol>.+?)[_-](?P<timeframe>{_TIMEFRAME_REGEX})(?:[_-](?P<segment>.+))?$",
-    re.IGNORECASE,
-)
-
-
-def _looks_like_timeframe(value: str) -> bool:
-    normalized = str(value or "").strip().lower()
-    return bool(normalized) and bool(_TIMEFRAME_PATTERN.match(normalized))
-
-
-def _extract_timeframe_and_segment(stem: str) -> tuple[str | None, str | None]:
-    normalized = str(stem or "").strip()
-    if not normalized:
-        return None, None
-    if _looks_like_timeframe(normalized):
-        return normalize_timeframe(normalized), None
-
-    segmented_match = _SEGMENTED_TIMEFRAME_PATTERN.match(normalized)
-    if segmented_match is None:
-        return None, None
-
-    timeframe = normalize_timeframe(str(segmented_match.group("timeframe") or ""))
-    separator_index = len(timeframe)
-    segment = (
-        normalized[separator_index + 1 :].strip()
-        if len(normalized) > separator_index + 1
-        else ""
-    )
-    return timeframe, (segment or None)
-
-
-def _extract_symbol_timeframe_and_segment(
-    stem: str,
-) -> tuple[str | None, str | None, str | None]:
-    normalized = str(stem or "").strip()
-    if not normalized:
-        return None, None, None
-
-    timeframe, segment = _extract_timeframe_and_segment(normalized)
-    if timeframe is not None:
-        return None, timeframe, segment
-
-    prefixed_match = _SYMBOL_PREFIXED_TIMEFRAME_PATTERN.match(normalized)
-    if prefixed_match is None:
-        return None, None, None
-
-    symbol = str(prefixed_match.group("symbol") or "").strip()
-    timeframe_value = normalize_timeframe(str(prefixed_match.group("timeframe") or "").strip())
-    segment_value = str(prefixed_match.group("segment") or "").strip()
-    if not symbol or not timeframe_value:
-        return None, None, None
-    return symbol, timeframe_value, (segment_value or None)
-
 
 def _format_catalog_date(value: object) -> str | None:
     if value is None:
@@ -8090,63 +8031,6 @@ def _read_parquet_summary(parquet_path: Path) -> dict[str, Any]:
     return summary
 
 
-def _parse_ohlcv_path(parquet_path: Path, ohlcv_root: Path) -> dict[str, Any] | None:
-    try:
-        rel = parquet_path.relative_to(ohlcv_root)
-    except ValueError:
-        return None
-
-    parts = rel.parts
-    if len(parts) < 3:
-        return None
-
-    source = parts[0]
-    asset_class = parts[1]
-    stem = parquet_path.stem
-    stem_symbol, timeframe, segment = _extract_symbol_timeframe_and_segment(stem)
-    region: str | None = None
-
-    if len(parts) >= 5:
-        region = parts[-3]
-        symbol = parts[-2]
-        timeframe_value = timeframe or "1d"
-    elif len(parts) == 4:
-        parent = parts[-2]
-        if timeframe:
-            timeframe_value = timeframe
-            if stem_symbol and stem_symbol.lower() != parent.lower():
-                region = parent
-                symbol = stem_symbol
-            else:
-                symbol = parent
-        else:
-            region = parent
-            symbol = stem
-            timeframe_value = "1d"
-    else:
-        if timeframe and stem_symbol:
-            symbol = stem_symbol
-            timeframe_value = timeframe
-        elif timeframe:
-            return None
-        else:
-            symbol = stem
-            timeframe_value = "1d"
-
-    entry: dict[str, Any] = {
-        "source": source,
-        "asset_class": asset_class,
-        "symbol": symbol,
-        "timeframe": normalize_timeframe(timeframe_value),
-        "path": str(parquet_path),
-    }
-    if region:
-        entry["region"] = region
-    if segment:
-        entry["segment"] = segment
-    return entry
-
-
 def _scan_single_file_ohlcv_entries(
     metadata_by_path: dict[str, dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
@@ -8158,46 +8042,65 @@ def _scan_single_file_ohlcv_entries(
         catalog_entries, _ = _load_catalog_ohlcv_entries()
         metadata_by_path = _catalog_metadata_by_path(catalog_entries)
 
+    try:
+        datasets = ohlcv_store.list_datasets(DATA_DIR)
+    except Exception as exc:
+        logger.warning("Could not list OHLCV datasets: %s", exc)
+        return []
+
     entries: list[dict[str, Any]] = []
-    for parquet_path in sorted(ohlcv_root.rglob("*.parquet")):
-        parsed = _parse_ohlcv_path(parquet_path, ohlcv_root)
-        if parsed is None:
-            continue
+    for dataset in datasets:
+        for parquet_path in sorted(dataset.segments):
+            if not parquet_path.is_file() or parquet_path.is_symlink():
+                continue
+            segment = ohlcv_store.segment_for_path(DATA_DIR, parquet_path)
+            parsed: dict[str, Any] = {
+                "source": dataset.source,
+                "asset_class": dataset.asset_class,
+                "symbol": dataset.symbol,
+                "timeframe": dataset.timeframe,
+                "path": str(parquet_path),
+            }
+            if dataset.region:
+                parsed["region"] = dataset.region
+            if segment:
+                parsed["segment"] = segment
 
-        path_key = str(parquet_path)
-        cached_entry = metadata_by_path.get(path_key)
+            path_key = str(parquet_path)
+            cached_entry = metadata_by_path.get(path_key)
 
-        try:
-            file_mtime = os.path.getmtime(parquet_path)
-        except OSError:
-            file_mtime = None
-
-        used_cached_summary = False
-        if (
-            file_mtime is not None
-            and _should_reuse_cached_parquet_entry(cached_entry, file_mtime)
-            and isinstance(cached_entry, dict)
-        ):
-            for key in ("rows", "size_bytes", "columns", "start", "end", "last_updated"):
-                if cached_entry.get(key) is not None:
-                    parsed[key] = cached_entry.get(key)
-            used_cached_summary = True
-
-        if not used_cached_summary:
             try:
-                parsed.update(_read_parquet_summary(parquet_path))
-            except (OSError, ValueError, KeyError) as exc:
-                logger.warning("Could not read date range from %s: %s", parquet_path, exc)
-
-        if parsed.get("size_bytes") is None:
-            try:
-                parsed["size_bytes"] = os.path.getsize(parquet_path)
+                file_mtime = os.path.getmtime(parquet_path)
             except OSError:
-                parsed["size_bytes"] = 0
+                file_mtime = None
 
-        entries.append(parsed)
+            used_cached_summary = False
+            if (
+                file_mtime is not None
+                and _should_reuse_cached_parquet_entry(cached_entry, file_mtime)
+                and isinstance(cached_entry, dict)
+            ):
+                for key in ("rows", "size_bytes", "columns", "start", "end", "last_updated"):
+                    if cached_entry.get(key) is not None:
+                        parsed[key] = cached_entry.get(key)
+                used_cached_summary = True
+
+            if not used_cached_summary:
+                try:
+                    parsed.update(_read_parquet_summary(parquet_path))
+                except (OSError, ValueError, KeyError) as exc:
+                    logger.warning("Could not read date range from %s: %s", parquet_path, exc)
+
+            if parsed.get("size_bytes") is None:
+                try:
+                    parsed["size_bytes"] = os.path.getsize(parquet_path)
+                except OSError:
+                    parsed["size_bytes"] = 0
+
+            entries.append(parsed)
 
     return entries
+
 
 
 def _cached_catalog_ohlcv_entries() -> list[dict[str, Any]]:
@@ -16406,6 +16309,20 @@ async def delete_symbol_data(path: str = Query(default="")) -> dict[str, Any]:
 
     try:
         file_path.unlink()
+        # Keep the source manifest consistent: a deleted parquet must not
+        # stay declared or every store reader would keep resolving it.
+        entry = ohlcv_store.entry_for_path(DATA_DIR, file_path)
+        if entry is not None:
+            manifest = ohlcv_store.read_manifest(DATA_DIR, entry.source)
+            meta = manifest.get(entry.symbol)
+            files = meta.get("files") if isinstance(meta, dict) else None
+            if isinstance(files, dict):
+                files.pop(file_path.name, None)
+                if files:
+                    ohlcv_store.write_manifest(DATA_DIR, entry.source, manifest)
+                else:
+                    manifest.pop(entry.symbol, None)
+                    ohlcv_store.write_manifest(DATA_DIR, entry.source, manifest)
         cache_manager.invalidate_cache(DATA_DIR, reason="manual")
         _invalidate_data_views_cache()
         _refresh_catalog()

@@ -65,6 +65,7 @@ _guard.ensure_own_checkout("regenerate_backtests")
 # scripts that must carry the guard. Kept deliberately, and silenced rather than removed:
 # dropping it would take this script off the roster and out of the gate that keeps it alive.
 import shared  # noqa: F401
+from shared import ohlcv_store
 from runner.cli import get_engine
 from runner.engines.base import BacktestConfig, resolve_strategy_parameters
 from runner.engines.contract import default_signal_exit_fill_for_engine
@@ -98,7 +99,6 @@ DATA_DIR = (
 )
 BACKTESTS_DIR = DATA_DIR / "backtests"
 TIMEFRAME_PRIORITY = ["1h", "4h", "1d", "15m", "5m", "30m", "1m"]
-TIMEFRAME_PATTERN = re.compile(r"^(?:tick|s1|mn1|\d+[smhdw])$", re.IGNORECASE)
 
 _SQLITE_BACKUP_TABLES = (
     "backtests",
@@ -109,46 +109,14 @@ _SQLITE_BACKUP_TABLES = (
 )
 
 
-def _looks_like_timeframe(value: str) -> bool:
-    return bool(TIMEFRAME_PATTERN.match(str(value or "").strip().lower()))
-
-
-def _parse_symbol_timeframe(parquet_path: Path, ohlcv_root: Path) -> tuple[str, str] | None:
-    try:
-        rel = parquet_path.relative_to(ohlcv_root)
-    except ValueError:
-        return None
-    parts = rel.parts
-    if len(parts) < 4:
-        return None
-
-    stem = parquet_path.stem
-    if len(parts) >= 5:
-        symbol = parts[-2]
-        timeframe = stem if _looks_like_timeframe(stem) else "1d"
-        return symbol.upper(), timeframe.lower()
-
-    if _looks_like_timeframe(stem):
-        symbol = parts[-2]
-        timeframe = stem
-        return symbol.upper(), timeframe.lower()
-
-    return stem.upper(), "1d"
-
-
 def _build_symbol_index(data_dir: Path) -> dict[str, dict[str, list[Path]]]:
-    ohlcv_root = data_dir / "ohlcv"
     index: dict[str, dict[str, list[Path]]] = {}
-    if not ohlcv_root.exists():
-        return index
-
-    for parquet_path in sorted(ohlcv_root.rglob("*.parquet")):
-        parsed = _parse_symbol_timeframe(parquet_path, ohlcv_root)
-        if parsed is None:
-            continue
-        symbol, timeframe = parsed
-        index.setdefault(symbol, {}).setdefault(timeframe, []).append(parquet_path)
+    for entry in ohlcv_store.list_datasets(data_dir):
+        index.setdefault(entry.symbol.upper(), {}).setdefault(
+            entry.timeframe, []
+        ).extend(entry.segments)
     return index
+
 
 
 ASSET_CLASS_CANDIDATES: list[tuple[tuple[str, ...], list[str]]] = [

@@ -17,6 +17,8 @@ from typing import Any
 
 import pandas as pd
 
+from shared import ohlcv_store
+
 from runner.agent_process import build_backtest_child_env
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -38,7 +40,7 @@ def load_trials() -> list[dict[str, Any]]:
 
 
 def data_path(symbol: str, timeframe: str) -> Path:
-    return DATA_DIR / "ohlcv" / "yfinance" / "crypto" / "USDT" / symbol / f"{timeframe}.parquet"
+    return ohlcv_store.data_path(DATA_DIR, "yfinance", symbol, timeframe)
 
 
 def wait_for_data(symbol: str, timeframe: str, timeout_seconds: int = 1800) -> tuple[bool, str]:

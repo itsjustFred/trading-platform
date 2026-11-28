@@ -5,11 +5,11 @@ Given M1 (or any source timeframe) data, generate M5, M15, M30, H1, H4, D1.
 OHLCV rules: Open=first, High=max, Low=min, Close=last, Volume=sum.
 
 Usage:
-    python -m data_tools.resample --source ~/data/ohlcv/dukascopy/forex/EURUSD/1h.parquet \
+    python -m data_tools.resample --source ~/data/ohlcv/dukascopy/EURUSD/EURUSD_H1.parquet \
         --timeframes 4h,1d
-    python -m data_tools.resample --source ~/data/ohlcv/dukascopy/forex/EURUSD/1m.parquet \
+    python -m data_tools.resample --source ~/data/ohlcv/dukascopy/EURUSD/EURUSD_M1.parquet \
         --timeframes 5m,15m,30m,1h,4h,1d
-    python -m data_tools.resample --source-dir ~/data/ohlcv/dukascopy/forex/ \
+    python -m data_tools.resample --source-dir ~/data/ohlcv/dukascopy/ \
         --from 1h --timeframes 4h,1d
 """
 

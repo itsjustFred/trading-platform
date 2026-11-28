@@ -1554,8 +1554,8 @@ def test_unit_first_sub_daily_labels_are_not_sized_as_daily_bars():
     days, and a two-day hole in tick data was reported as `ok` instead of as a
     warning - a coverage report nobody should believe.
 
-    These are the repo's own labels, not hypotheticals: `KNOWN_TIMEFRAMES` in
-    `consolidate_parquets.py` and the viewer's timeframe list both spell them this
+    These are the repo's own labels, not hypotheticals: `VALID_TIMEFRAMES` in
+    `shared.ohlcv_store` and the viewer's timeframe list both spell them this
     way, and the grid downloader names them in `UNSUPPORTED_TIMEFRAMES`.
 
     The unparseable fallback is asserted too, because the fix must not turn a

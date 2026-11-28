@@ -666,32 +666,41 @@ def _trade_to_viewer(trade) -> dict:
 
 
 def _ohlcv_candidates(root: Path, symbol: str, timeframe: str) -> list[Path]:
-    normalized_symbol = symbol.casefold()
-    normalized_timeframe = normalize_timeframe(timeframe).casefold()
-    candidates: list[tuple[int, str, Path]] = []
-    for path in root.rglob("*.parquet"):
-        try:
-            relative = path.relative_to(root)
-            parts = relative.parts
-            if len(parts) < 2 or path.is_symlink() or not path.is_file():
-                continue
-            if parts[-2].casefold() != normalized_symbol:
-                continue
-            file_timeframe = path.stem
-            if normalize_timeframe(file_timeframe).casefold() != normalized_timeframe:
-                continue
-            source = parts[0].casefold()
-            priority = _OHLCV_SOURCE_PRIORITY.get(source, len(_OHLCV_SOURCE_PRIORITY))
-            candidates.append((priority, source, path))
-            if len(candidates) > _OHLCV_MAX_MATCHES:
-                return []
-        except (OSError, ValueError):
-            continue
-    if not candidates:
+    """Manifest-declared parquet segments for ``symbol``/``timeframe``.
+
+    Only the highest-priority source that declares the dataset contributes
+    files, matching the historical single-source merge semantics (#471).
+    """
+    normalized_timeframe = normalize_timeframe(timeframe)
+    try:
+        entries = ohlcv_store.list_datasets(
+            root.parent, symbol=symbol, timeframe=normalized_timeframe
+        )
+    except Exception as exc:
+        logger.warning("Could not list OHLCV datasets for %s %s: %s", symbol, timeframe, exc)
         return []
-    candidates.sort(key=lambda item: (item[0], item[1], str(item[2])))
-    selected_source = candidates[0][1]
-    return [item[2] for item in candidates if item[1] == selected_source]
+    by_source: dict[str, list[Path]] = {}
+    for entry in entries:
+        paths = [
+            path
+            for path in entry.segments
+            if path.is_file() and not path.is_symlink()
+        ]
+        if paths:
+            by_source.setdefault(entry.source, []).extend(paths)
+    if not by_source:
+        return []
+    best_source = min(
+        by_source,
+        key=lambda source: (
+            _OHLCV_SOURCE_PRIORITY.get(source, len(_OHLCV_SOURCE_PRIORITY)),
+            source,
+        ),
+    )
+    paths = sorted(set(by_source[best_source]))
+    if len(paths) > _OHLCV_MAX_MATCHES:
+        return []
+    return paths
 
 
 def _parquet_row_count(path: Path) -> int:
@@ -886,23 +895,12 @@ def ohlcv_asset_class(symbol: str, timeframe: str) -> str:
     if not matches or len(matches) > _OHLCV_MAX_MATCHES:
         return ""
     # ``_load_ohlcv_df`` merges every selected match, so the class is only
-    # well-defined when all of them agree on one asset class. The manifest
-    # layout resolves each stored path back to its dataset entry (#471);
-    # paths the store cannot resolve contribute "" like an unclassed path.
+    # well-defined when all of them agree on one asset class. Each stored
+    # path resolves back to its manifest dataset entry (#471).
     asset_classes = set()
     for path in matches:
         entry = ohlcv_store.entry_for_path(DATA_DIR, path)
         asset_classes.add(entry.asset_class if entry is not None else "")
-    if asset_classes == {""} and len(matches) == 1:
-        # The single match is a legacy-layout file the store cannot resolve
-        # (#471 phase 1: ``_ohlcv_candidates`` still scans the old tree).
-        # Defer to the manifest dataset for the same symbol/timeframe when
-        # one exists; phase 2 rewrites this lookup against the store.
-        entry = ohlcv_store.find_dataset(
-            DATA_DIR, normalized_symbol, normalized_timeframe
-        )
-        if entry is not None:
-            asset_classes = {entry.asset_class}
     if len(asset_classes) != 1:
         return ""
     return asset_classes.pop()

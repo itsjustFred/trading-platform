@@ -4,7 +4,8 @@ JForex Downloader — Dukascopy historical data via JForex Java SDK (JPype bridg
 This downloader connects to Dukascopy through the JForex SDK, requests historical
 bars/ticks, and stores data under the canonical OHLCV path:
 
-    {output_dir}/ohlcv/dukascopy/{asset_class}/{symbol}/{timeframe}.parquet
+    {output_dir}/ohlcv/dukascopy/{SYMBOL}/{SYMBOL}_{TF}.parquet
+    (asset_class/region live in the source manifest, not the path)
 
 Supported output timeframes:
     tick, 1m, 5m, 15m, 30m, 1h, 4h, 1d, 1w

@@ -42,6 +42,33 @@ def _make_parquet(path: Path) -> None:
     frame.to_parquet(path, index=False)
 
 
+def _write_store_ohlcv(
+    data_dir: Path,
+    source: str,
+    symbol: str,
+    timeframe: str = "1h",
+    *,
+    asset_class: str = "forex",
+    frame: pd.DataFrame | None = None,
+    segment: str = "",
+) -> Path:
+    """Write ``frame`` (or the tiny default) as a manifest-store dataset."""
+    from shared import ohlcv_store
+
+    if frame is None:
+        path = ohlcv_store.data_path(data_dir, source, symbol, timeframe, segment=segment)
+        _make_parquet(path)
+    else:
+        path = ohlcv_store.data_path(data_dir, source, symbol, timeframe, segment=segment)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        frame.to_parquet(path, index=False)
+    ohlcv_store.register_file(
+        data_dir, source, symbol, timeframe, path,
+        asset_class=asset_class, segment=segment,
+    )
+    return path
+
+
 @pytest.fixture
 def security_client(monkeypatch, tmp_path) -> TestClient:
     """Viewer client with DATA_DIR pointed at an isolated tmp tree."""
@@ -1019,12 +1046,12 @@ def test_viewer_ohlcv_loader_rejects_wildcard_identity_and_match_budget(monkeypa
 
     monkeypatch.setattr(core, "DATA_DIR", tmp_path)
     core._OHLCV_DF_CACHE.clear()
-    _make_parquet(tmp_path / "ohlcv" / "dukascopy" / "forex" / "EURUSD" / "1h.parquet")
+    _write_store_ohlcv(tmp_path, "dukascopy", "EURUSD", asset_class="forex")
 
     assert core._load_ohlcv_df("*", "1h") is None
     assert core._load_ohlcv_df("EURUSD", "*") is None
 
-    _make_parquet(tmp_path / "ohlcv" / "yfinance" / "EURUSD" / "1h.parquet")
+    _write_store_ohlcv(tmp_path, "yfinance", "EURUSD", asset_class="forex")
     candidates = core._ohlcv_candidates(
         (tmp_path / "ohlcv").resolve(),
         "EURUSD",
@@ -1033,7 +1060,9 @@ def test_viewer_ohlcv_loader_rejects_wildcard_identity_and_match_budget(monkeypa
     assert candidates
     assert all("dukascopy" in str(path) for path in candidates)
 
-    _make_parquet(tmp_path / "ohlcv" / "dukascopy" / "archive" / "EURUSD" / "1h.parquet")
+    _write_store_ohlcv(
+        tmp_path, "dukascopy", "EURUSD", asset_class="forex", segment="extra"
+    )
     monkeypatch.setattr(core, "_OHLCV_MAX_MATCHES", 1)
 
     assert core._load_ohlcv_df("EURUSD", "1h") is None
@@ -1046,7 +1075,7 @@ def test_viewer_ohlcv_loader_enforces_byte_budget(monkeypatch, tmp_path):
     monkeypatch.setattr(core, "DATA_DIR", tmp_path)
     monkeypatch.setattr(core, "_OHLCV_MAX_BYTES", 1)
     core._OHLCV_DF_CACHE.clear()
-    _make_parquet(tmp_path / "ohlcv" / "dukascopy" / "forex" / "EURUSD" / "1h.parquet")
+    _write_store_ohlcv(tmp_path, "dukascopy", "EURUSD", asset_class="forex")
 
     assert core._load_ohlcv_df("EURUSD", "1h") is None
     core._OHLCV_DF_CACHE.clear()
@@ -1057,19 +1086,23 @@ def test_viewer_ohlcv_loader_reads_only_canonical_columns(monkeypatch, tmp_path)
 
     monkeypatch.setattr(core, "DATA_DIR", tmp_path)
     core._OHLCV_DF_CACHE.clear()
-    path = tmp_path / "ohlcv" / "dukascopy" / "forex" / "EURUSD" / "1h.parquet"
-    path.parent.mkdir(parents=True)
-    pd.DataFrame(
-        {
-            "timestamp": pd.date_range("2024-01-01", periods=2, freq="h", tz="UTC"),
-            "open": [1.0, 1.1],
-            "high": [1.2, 1.3],
-            "low": [0.9, 1.0],
-            "close": [1.1, 1.2],
-            "volume": [2, 3],
-            "untrusted_extra": ["x" * 1000, "y" * 1000],
-        }
-    ).to_parquet(path, index=False)
+    _write_store_ohlcv(
+        tmp_path,
+        "dukascopy",
+        "EURUSD",
+        asset_class="forex",
+        frame=pd.DataFrame(
+            {
+                "timestamp": pd.date_range("2024-01-01", periods=2, freq="h", tz="UTC"),
+                "open": [1.0, 1.1],
+                "high": [1.2, 1.3],
+                "low": [0.9, 1.0],
+                "close": [1.1, 1.2],
+                "volume": [2, 3],
+                "untrusted_extra": ["x" * 1000, "y" * 1000],
+            }
+        ),
+    )
     observed: dict[str, object] = {}
     original = core.pq.ParquetFile.iter_batches
 
@@ -1092,18 +1125,22 @@ def test_viewer_ohlcv_loader_rejects_noncanonical_schema_before_read(monkeypatch
 
     monkeypatch.setattr(core, "DATA_DIR", tmp_path)
     core._OHLCV_DF_CACHE.clear()
-    path = tmp_path / "ohlcv" / "dukascopy" / "forex" / "BAD" / "1h.parquet"
-    path.parent.mkdir(parents=True)
-    pd.DataFrame(
-        {
-            "timestamp": pd.date_range("2024-01-01", periods=2, freq="h", tz="UTC"),
-            "open": [1.0, 1.1],
-            "high": [1.2, 1.3],
-            "low": [0.9, 1.0],
-            "close": [1.1, 1.2],
-            "untrusted_extra": ["x" * 1000, "y" * 1000],
-        }
-    ).to_parquet(path, index=False)
+    _write_store_ohlcv(
+        tmp_path,
+        "dukascopy",
+        "BAD",
+        asset_class="forex",
+        frame=pd.DataFrame(
+            {
+                "timestamp": pd.date_range("2024-01-01", periods=2, freq="h", tz="UTC"),
+                "open": [1.0, 1.1],
+                "high": [1.2, 1.3],
+                "low": [0.9, 1.0],
+                "close": [1.1, 1.2],
+                "untrusted_extra": ["x" * 1000, "y" * 1000],
+            }
+        ),
+    )
 
     def fail_iter_batches(*_args, **_kwargs):
         raise AssertionError("noncanonical parquet must be rejected before batching")
@@ -1119,19 +1156,23 @@ def test_viewer_ohlcv_loader_maps_mixed_case_columns_to_canonical_names(monkeypa
 
     monkeypatch.setattr(core, "DATA_DIR", tmp_path)
     core._OHLCV_DF_CACHE.clear()
-    path = tmp_path / "ohlcv" / "dukascopy" / "forex" / "EURUSD" / "1h.parquet"
-    path.parent.mkdir(parents=True)
-    pd.DataFrame(
-        {
-            "Timestamp": pd.date_range("2024-01-01", periods=2, freq="h", tz="UTC"),
-            "Open": [1.0, 1.1],
-            "HIGH": [1.2, 1.3],
-            "low": [0.9, 1.0],
-            "Close": [1.1, 1.2],
-            "Volume": [2, 3],
-            "untrusted_extra": ["x", "y"],
-        }
-    ).to_parquet(path, index=False)
+    _write_store_ohlcv(
+        tmp_path,
+        "dukascopy",
+        "EURUSD",
+        asset_class="forex",
+        frame=pd.DataFrame(
+            {
+                "Timestamp": pd.date_range("2024-01-01", periods=2, freq="h", tz="UTC"),
+                "Open": [1.0, 1.1],
+                "HIGH": [1.2, 1.3],
+                "low": [0.9, 1.0],
+                "Close": [1.1, 1.2],
+                "Volume": [2, 3],
+                "untrusted_extra": ["x", "y"],
+            }
+        ),
+    )
     observed: dict[str, object] = {}
     original = core.pq.ParquetFile.iter_batches
 
@@ -1158,17 +1199,21 @@ def test_viewer_ohlcv_loader_rejects_mixed_case_schema_missing_canonical_column(
 
     monkeypatch.setattr(core, "DATA_DIR", tmp_path)
     core._OHLCV_DF_CACHE.clear()
-    path = tmp_path / "ohlcv" / "dukascopy" / "forex" / "MIXED" / "1h.parquet"
-    path.parent.mkdir(parents=True)
-    pd.DataFrame(
-        {
-            "Timestamp": pd.date_range("2024-01-01", periods=2, freq="h", tz="UTC"),
-            "Open": [1.0, 1.1],
-            "High": [1.2, 1.3],
-            "Low": [0.9, 1.0],
-            "Close": [1.1, 1.2],
-        }
-    ).to_parquet(path, index=False)
+    _write_store_ohlcv(
+        tmp_path,
+        "dukascopy",
+        "MIXED",
+        asset_class="forex",
+        frame=pd.DataFrame(
+            {
+                "Timestamp": pd.date_range("2024-01-01", periods=2, freq="h", tz="UTC"),
+                "Open": [1.0, 1.1],
+                "High": [1.2, 1.3],
+                "Low": [0.9, 1.0],
+                "Close": [1.1, 1.2],
+            }
+        ),
+    )
 
     def fail_iter_batches(*_args, **_kwargs):
         raise AssertionError("incomplete mixed-case parquet must be rejected before batching")
@@ -1186,17 +1231,21 @@ def test_viewer_ohlcv_loader_defers_footer_reads_to_signature_cache_misses(
 
     monkeypatch.setattr(core, "DATA_DIR", tmp_path)
     core._OHLCV_DF_CACHE.clear()
-    path = tmp_path / "ohlcv" / "dukascopy" / "forex" / "INCOMPLETE" / "1h.parquet"
-    path.parent.mkdir(parents=True)
-    pd.DataFrame(
-        {
-            "timestamp": pd.date_range("2024-01-01", periods=2, freq="h", tz="UTC"),
-            "open": [1.0, 1.1],
-            "high": [1.2, 1.3],
-            "low": [0.9, 1.0],
-            "close": [1.1, 1.2],
-        }
-    ).to_parquet(path, index=False)
+    _write_store_ohlcv(
+        tmp_path,
+        "dukascopy",
+        "INCOMPLETE",
+        asset_class="forex",
+        frame=pd.DataFrame(
+            {
+                "timestamp": pd.date_range("2024-01-01", periods=2, freq="h", tz="UTC"),
+                "open": [1.0, 1.1],
+                "high": [1.2, 1.3],
+                "low": [0.9, 1.0],
+                "close": [1.1, 1.2],
+            }
+        ),
+    )
 
     assert core._load_ohlcv_df("INCOMPLETE", "1h") is None
 
@@ -1214,8 +1263,7 @@ def test_viewer_ohlcv_loader_rechecks_signature_when_source_changes(monkeypatch,
 
     monkeypatch.setattr(core, "DATA_DIR", tmp_path)
     core._OHLCV_DF_CACHE.clear()
-    path = tmp_path / "ohlcv" / "dukascopy" / "forex" / "EURUSD" / "1h.parquet"
-    _make_parquet(path)
+    path = _write_store_ohlcv(tmp_path, "dukascopy", "EURUSD", asset_class="forex")
 
     first = core._load_ohlcv_df("EURUSD", "1h")
 
@@ -1268,7 +1316,7 @@ def test_viewer_ohlcv_loader_rejects_row_budget_before_materialization(monkeypat
     monkeypatch.setattr(core, "DATA_DIR", tmp_path)
     monkeypatch.setattr(core, "_OHLCV_MAX_ROWS", 3)
     core._OHLCV_DF_CACHE.clear()
-    _make_parquet(tmp_path / "ohlcv" / "dukascopy" / "forex" / "EURUSD" / "1h.parquet")
+    _write_store_ohlcv(tmp_path, "dukascopy", "EURUSD", asset_class="forex")
     def fail_materialization(*_args):
         raise AssertionError("rows were materialized")
 

@@ -1311,21 +1311,21 @@ class TestViewerOhlcvAssetClass:
         assert core.ohlcv_asset_class("MISSING", "1h") == ""
         assert core.ohlcv_asset_class("*", "1h") == ""
 
-    def test_mixed_asset_class_matches_are_unclassified(
+    def test_best_source_wins_when_sources_disagree(
         self, monkeypatch, tmp_path: Path
     ) -> None:
-        """``_load_ohlcv_df`` merges every selected match; when they span
-        more than one asset class there is no single correct class, so the
-        symbol must classify as ``""`` (explicit ``none`` downstream)."""
+        """``_load_ohlcv_df`` merges only the best-priority source's matches;
+        the class must come from that same source, not from a competing
+        dataset the loader never reads (#471 manifest store)."""
         from tests.helpers import write_ohlcv
         from viewer import core
 
         monkeypatch.setattr(core, "DATA_DIR", tmp_path)
         frame = _engine_frame()
-        write_ohlcv(tmp_path, "MIXED", frame, asset_class="equities")
-        write_ohlcv(tmp_path, "MIXED", frame, asset_class="crypto")
+        write_ohlcv(tmp_path, "MIXED", frame, source="aaa_src", asset_class="equities")
+        write_ohlcv(tmp_path, "MIXED", frame, source="zzz_src", asset_class="crypto")
 
-        assert core.ohlcv_asset_class("MIXED", "1h") == ""
+        assert core.ohlcv_asset_class("MIXED", "1h") == "equities"
 
 
 class TestViewerSlippageWiring:

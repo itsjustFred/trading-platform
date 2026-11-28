@@ -18,6 +18,8 @@ from typing import Any
 import pandas as pd
 import yfinance as yf
 
+from shared import ohlcv_store
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DISCOVERY_PATH = Path("/mnt/block-volume-data/discovered_strategies/discovery_20260618_0752.json")
 DATA_DIR = PROJECT_ROOT / "data"
@@ -39,7 +41,7 @@ def load_trials() -> list[dict[str, Any]]:
 
 
 def out_path(symbol: str, timeframe: str) -> Path:
-    return DATA_DIR / "ohlcv" / "yfinance" / "crypto" / "USDT" / symbol / f"{timeframe}.parquet"
+    return ohlcv_store.data_path(DATA_DIR, "yfinance", symbol, timeframe)
 
 
 def existing_is_sufficient(path: Path, timeframe: str) -> bool:
@@ -108,8 +110,10 @@ def download_one(symbol: str, timeframe: str, retries: int = 4) -> dict[str, Any
             if df.empty:
                 raise RuntimeError(f"yfinance returned only empty/NaN rows for {yf_symbol}/{timeframe}")
 
-            path.parent.mkdir(parents=True, exist_ok=True)
-            df.to_parquet(path, index=False)
+            ohlcv_store.write_frame(
+                DATA_DIR, "yfinance", symbol, timeframe, df,
+                asset_class="crypto", region="USDT",
+            )
             return {"symbol": symbol, "timeframe": timeframe, "status": "downloaded", "rows": len(df), "path": str(path)}
         except Exception as exc:
             last_error = str(exc)
