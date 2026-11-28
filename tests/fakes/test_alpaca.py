@@ -80,11 +80,14 @@ def test_a_missing_mark_price_is_an_error_not_a_fabricated_price() -> None:
         client.advance(30.0)
 
 
-def test_a_non_finite_mark_price_is_rejected_at_the_boundary() -> None:
+def test_a_non_finite_mark_price_is_rejected_at_construction() -> None:
     with pytest.raises(ValueError, match="must be finite"):
         FakeAlpacaTradingClient(mark_prices={AAPL: float("nan")})
 
+
+def test_a_non_finite_mark_price_is_rejected_by_set_mark_price() -> None:
     client = FakeAlpacaTradingClient(mark_prices={AAPL: 100.0})
+
     with pytest.raises(ValueError, match="must be finite"):
         client.set_mark_price(AAPL, float("inf"))
 

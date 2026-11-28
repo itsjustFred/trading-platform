@@ -186,11 +186,14 @@ def test_a_non_finite_order_price_is_recorded_as_absent() -> None:
     assert record.absolute_take is None
 
 
-def test_a_non_finite_mark_price_is_rejected_at_the_boundary() -> None:
+def test_a_non_finite_mark_price_is_rejected_at_construction() -> None:
     with pytest.raises(ValueError, match="must be finite"):
         _broker(mark_prices={"EURUSD": float("nan")})
 
+
+def test_a_non_finite_mark_price_is_rejected_by_set_mark_price() -> None:
     broker = _broker()
+
     with pytest.raises(ValueError, match="must be finite"):
         broker.set_mark_price("EURUSD", float("inf"))
 
