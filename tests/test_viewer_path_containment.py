@@ -292,6 +292,23 @@ def test_delete_symbol_data_manifest_write_precedes_unlink(
     assert "EURUSD" in manifest
 
 
+def test_asset_class_categories_cover_canonical_spellings():
+    """Every canonical equity/index spelling must have a viewer category.
+
+    ``_ASSET_CLASS_CATEGORIES`` is a parallel spelling set; without this pin
+    a new spelling added to ``shared.venue_calendar`` (or this map) silently
+    falls back to path-based categorisation in the overview.
+    """
+    import viewer.main as viewer_app_module
+    from shared import venue_calendar
+
+    canonical = (
+        venue_calendar.US_EQUITY_ASSET_CLASSES | venue_calendar.INDEX_ASSET_CLASSES
+    )
+    missing = canonical - set(viewer_app_module._ASSET_CLASS_CATEGORIES)
+    assert not missing, f"asset-class spellings without a viewer category: {missing}"
+
+
 # ---------------------------------------------------------------------------
 # Seam 5: bulk-delete id containment
 # ---------------------------------------------------------------------------

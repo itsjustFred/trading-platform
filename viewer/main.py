@@ -8922,6 +8922,7 @@ _ASSET_CLASS_CATEGORIES = {
     "metal": "Metals",
     "indices": "Indices",
     "index": "Indices",
+    "idx": "Indices",
     "energy": "Energy",
     "crypto": "Crypto",
     "rates": "Rates",
