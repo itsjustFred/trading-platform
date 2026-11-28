@@ -10,6 +10,7 @@ from typing import Any, Awaitable, Callable
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
+from scheduler.jobs.dukascopy_update import run as run_dukascopy_update
 from scheduler.jobs.signal_bot_health_check import run as run_signal_bot_health_check
 from scheduler.jobs.weekly_data_refresh import run as run_weekly_data_refresh
 from shared.database import (
@@ -31,6 +32,7 @@ logger = get_logger("scheduler")
 _SCHEDULED_JOB_HANDLERS: dict[str, Callable[..., Awaitable[Any]]] = {
     "weekly_data_refresh": run_weekly_data_refresh,
     "signal_bot_health_check": run_signal_bot_health_check,
+    "dukascopy_update": run_dukascopy_update,
 }
 
 

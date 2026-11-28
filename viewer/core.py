@@ -3716,8 +3716,8 @@ def _start_jforex_task(
     name: str,
     description: str,
 ) -> dict[str, Any]:
-    from data_tools.dukascopy.native import DukascopyDownloader
     from data_tools.downloaders.jforex_dl import JForexDownloader
+    from data_tools.dukascopy.native import DukascopyDownloader
 
     TASK_LOGS_DIR.mkdir(parents=True, exist_ok=True)
     log_file = _task_log_path(task_id)

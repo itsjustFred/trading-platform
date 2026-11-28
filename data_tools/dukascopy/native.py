@@ -25,7 +25,7 @@ import lzma
 import struct
 import sys
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Event
 from typing import Any, Callable
@@ -438,7 +438,9 @@ async def _fetch_one(
                         if attempt < max_retries:
                             await _sleep_with_control(2 ** attempt, pause_event, stop_event)
                             continue
-                        logger.warning("HTTP %d for %s after %d retries", resp.status, url, max_retries)
+                        logger.warning(
+                            "HTTP %d for %s after %d retries", resp.status, url, max_retries
+                        )
                         return FetchResult(
                             dt=dt,
                             data=b"",
@@ -1146,7 +1148,9 @@ class DukascopyDownloader(Downloader):
         sym, instrument, asset_class = _resolve_symbol_and_instrument(symbol)
         out_path = self._make_output_path(output_dir, asset_class, sym, out_tf)
         effective_start = self._resolve_resume_start(out_path, start)
-        offer_side = _normalize_offer_side(kwargs.get("offer_side", kwargs.get("price_type", "bid")))
+        offer_side = _normalize_offer_side(
+            kwargs.get("offer_side", kwargs.get("price_type", "bid"))
+        )
         price_type = "bid" if offer_side == "both" else offer_side
 
         merge_tick = bool(kwargs.get("merge_tick", False))
@@ -1171,11 +1175,15 @@ class DukascopyDownloader(Downloader):
         log_callback = kwargs.get("log_callback")
 
         genesis_index = _load_genesis_index()
-        requested_start = _resolve_requested_start(sym, normalized_tf, effective_start, genesis_index)
+        requested_start = _resolve_requested_start(
+            sym, normalized_tf, effective_start, genesis_index
+        )
         requested_end = end or datetime.now(timezone.utc).date().isoformat()
 
         start_dt = datetime.fromisoformat(requested_start).replace(tzinfo=timezone.utc)
-        end_dt = _end_of_day_inclusive(datetime.fromisoformat(requested_end).replace(tzinfo=timezone.utc))
+        end_dt = _end_of_day_inclusive(
+            datetime.fromisoformat(requested_end).replace(tzinfo=timezone.utc)
+        )
 
         decimal_factor = get_decimal_factor(instrument)
         strategy = DOWNLOAD_STRATEGY[normalized_tf]
@@ -1202,32 +1210,11 @@ class DukascopyDownloader(Downloader):
         )
         _report_progress(report_progress, 0.0, "Preparing download")
 
-        request = _TickRequest(
-            instrument=instrument,
-            sym=sym,
-            normalized_tf=normalized_tf,
-            price_type=price_type,
-            offer_side=offer_side,
-            decimal_factor=decimal_factor,
-            start_dt=start_dt,
-            end_dt=end_dt,
-            requested_start=requested_start,
-            requested_end=requested_end,
-        )
-        options = _TickDownloadOptions(
-            batch_size=batch_size,
-            pipeline_batches=pipeline_batches,
-            pause_ms=pause_ms,
-            max_retries=max_retries,
-            stop_event=stop_event,
-            pause_event=pause_event,
-            report_progress=report_progress,
-            log_callback=log_callback,
-        )
-
         if strategy == "tick":
             if merge_bid_ask:
-                _emit_log_message("Downloading merged hourly tick files...", log_callback=log_callback)
+                _emit_log_message(
+                    "Downloading merged hourly tick files...", log_callback=log_callback
+                )
                 df = await _download_and_assemble_merged_ticks(
                     instrument,
                     start_dt,
@@ -1274,7 +1261,9 @@ class DukascopyDownloader(Downloader):
                 warnings = [f"offer_side:{offer_side}", f"price_type:{price_type}"]
 
             if df.empty:
-                raise RuntimeError(f"No tick data for {sym} in range {requested_start} → {requested_end}")
+                raise RuntimeError(
+                    f"No tick data for {sym} in range {requested_start} → {requested_end}"
+                )
 
             if normalized_tf == "tick":
                 pass  # keep raw ticks
@@ -1296,7 +1285,11 @@ class DukascopyDownloader(Downloader):
                     pause_ms=pause_ms,
                     max_retries=max_retries,
                     report_progress=(
-                        (lambda pct, msg: _report_progress(report_progress, pct * 0.45, f"Bid {msg}"))
+                        (
+                            lambda pct, msg: _report_progress(
+                                report_progress, pct * 0.45, f"Bid {msg}"
+                            )
+                        )
                         if report_progress
                         else None
                     ),
@@ -1330,7 +1323,8 @@ class DukascopyDownloader(Downloader):
                 _report_progress(report_progress, 95.0, "Merging bid/ask candle data")
                 if bid_df.empty or ask_df.empty:
                     raise RuntimeError(
-                        f"No bid/ask candle data for {sym} in range {requested_start} → {requested_end}"
+                        f"No bid/ask candle data for {sym} "
+                        f"in range {requested_start} → {requested_end}"
                     )
                 bid_prefixed = _prefix_ohlcv_columns(bid_df, "bid")
                 ask_prefixed = _prefix_ohlcv_columns(ask_df, "ask")
@@ -1432,7 +1426,9 @@ class DukascopyDownloader(Downloader):
         merge_bid_ask: bool,
     ) -> tuple[pd.DataFrame, list[str]]:
         if merge_bid_ask:
-            _emit_log_message("Downloading merged hourly tick files...", log_callback=options.log_callback)
+            _emit_log_message(
+                "Downloading merged hourly tick files...", log_callback=options.log_callback
+            )
             df = await _download_and_assemble_merged_ticks(
                 request.instrument,
                 request.start_dt,
@@ -1478,7 +1474,6 @@ class DukascopyDownloader(Downloader):
             urls,
             options.batch_size,
             options.max_retries,
-            batch_size=options.batch_size,
             pipeline_batches=options.pipeline_batches,
             pause_ms=options.pause_ms,
             report_progress=(
@@ -1560,7 +1555,11 @@ class DukascopyDownloader(Downloader):
             pause_ms=options.pause_ms,
             max_retries=options.max_retries,
             report_progress=(
-                (lambda pct, msg: _report_progress(options.report_progress, pct * 0.45, f"Bid {msg}"))
+                (
+                    lambda pct, msg: _report_progress(
+                        options.report_progress, pct * 0.45, f"Bid {msg}"
+                    )
+                )
                 if options.report_progress
                 else None
             ),
