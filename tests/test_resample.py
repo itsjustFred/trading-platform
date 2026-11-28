@@ -819,3 +819,28 @@ class TestMergeRefusesLegacyWeeklyLabels:
         with pytest.raises(LegacyWeeklyLabelError):
             assert_stored_weekly_file_current(stored)
         assert_stored_weekly_file_current(tmp_path / "missing.parquet")  # no file, no error
+
+
+class TestResampleCli:
+    def test_source_mode_resamples_through_the_store(
+        self, sample_1h_df, tmp_path
+    ) -> None:
+        """``--source`` must call resample_file with keyword-only args — the
+        old positional ``output_dir`` call raised TypeError (Sonar S930)."""
+        from data_tools import resample as resample_module
+
+        src = _store_source(tmp_path, sample_1h_df)
+        resample_module.main(["--source", str(src), "--timeframes", "4h"])
+
+        assert (tmp_path / "ohlcv" / "test" / "AAPL" / "AAPL_H4.parquet").is_file()
+
+    def test_output_flag_is_rejected(self, sample_1h_df, tmp_path) -> None:
+        """``--output`` has no meaning in the manifest store: outputs always
+        land next to their source dataset, so the CLI fails loudly."""
+        from data_tools import resample as resample_module
+
+        src = _store_source(tmp_path, sample_1h_df)
+        with pytest.raises(SystemExit):
+            resample_module.main(
+                ["--source", str(src), "--timeframes", "4h", "--output", "out"]
+            )

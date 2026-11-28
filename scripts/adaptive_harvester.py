@@ -489,7 +489,6 @@ def _assemble_tick_dataframe(
 
 async def _download_month(
     symbol: str,
-    asset_class: str,
     instrument: str,
     month_start: date,
     month_end_exclusive: date,
@@ -720,7 +719,6 @@ def _run(
             result = asyncio.run(
                 _download_month(
                     symbol=symbol,
-                    asset_class=asset_class,
                     instrument=instrument,
                     month_start=month_start,
                     month_end_exclusive=month_end,

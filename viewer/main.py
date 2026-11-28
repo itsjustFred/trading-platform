@@ -276,6 +276,7 @@ _STATIC_ASSET_SUFFIXES = {
 }
 LOGS_DIR = LOG_DIR
 TASK_LOGS_DIR = LOG_DIR / "tasks"
+_INVALID_TASK_LOG_DETAIL = "Invalid task log path"
 OPTIMIZATIONS_DIR = legacy_viewer.OPTIMIZATIONS_DIR
 JSON_FILE_GLOB = legacy_viewer.JSON_FILE_GLOB
 ALL_LOGS_NAME = legacy_viewer.ALL_LOGS_NAME
@@ -1952,14 +1953,14 @@ def _validated_task_id(task_id: str) -> str:
 def _validated_task_log_path(task_id: str) -> Path:
     normalized = _validated_task_id(task_id)
     if TASK_LOGS_DIR.is_symlink():
-        raise HTTPException(status_code=400, detail="Invalid task log path")
+        raise HTTPException(status_code=400, detail=_INVALID_TASK_LOG_DETAIL)
     root = TASK_LOGS_DIR.resolve()
     raw_candidate = root / f"task_{normalized}.log"
     if raw_candidate.is_symlink():
-        raise HTTPException(status_code=400, detail="Invalid task log path")
+        raise HTTPException(status_code=400, detail=_INVALID_TASK_LOG_DETAIL)
     candidate = raw_candidate.resolve()
     if candidate.parent != root or candidate.is_symlink():
-        raise HTTPException(status_code=400, detail="Invalid task log path")
+        raise HTTPException(status_code=400, detail=_INVALID_TASK_LOG_DETAIL)
     return candidate
 
 
@@ -1978,13 +1979,13 @@ def _task_for_log_access(task_id: str) -> tuple[str, dict[str, Any], Path]:
             configured_raw = Path(str(configured_log))
             configured_path = configured_raw.resolve()
         except (OSError, ValueError) as exc:
-            raise HTTPException(status_code=400, detail="Invalid task log path") from exc
+            raise HTTPException(status_code=400, detail=_INVALID_TASK_LOG_DETAIL) from exc
         if (
             configured_raw.is_symlink()
             or configured_path != log_file
             or configured_path.is_symlink()
         ):
-            raise HTTPException(status_code=400, detail="Invalid task log path")
+            raise HTTPException(status_code=400, detail=_INVALID_TASK_LOG_DETAIL)
     return normalized, task, log_file
 
 

@@ -345,13 +345,15 @@ class TestListAndFind:
         for source in ("yfinance", "dukascopy", "huggingface"):
             _write(tmp_path, source=source, symbol="AAPL", asset_class="equity")
         entry = ohlcv_store.find_dataset(tmp_path, "AAPL", "1h")
-        assert entry is not None and entry.source == "huggingface"
+        assert entry is not None
+        assert entry.source == "huggingface"
 
     def test_find_dataset_explicit_source(self, tmp_path: Path) -> None:
         _write(tmp_path, source="alpha", symbol="AAA", asset_class="equity")
         _write(tmp_path, source="beta", symbol="AAA", asset_class="equity")
         entry = ohlcv_store.find_dataset(tmp_path, "AAA", "1h", data_source="beta")
-        assert entry is not None and entry.source == "beta"
+        assert entry is not None
+        assert entry.source == "beta"
         assert ohlcv_store.find_dataset(tmp_path, "AAA", "1h", data_source="gamma") is None
 
     def test_find_dataset_missing(self, tmp_path: Path) -> None:
@@ -362,7 +364,8 @@ class TestListAndFind:
     def test_find_dataset_timeframe_alias(self, tmp_path: Path) -> None:
         _write(tmp_path, symbol="AAA", timeframe="1h")
         entry = ohlcv_store.find_dataset(tmp_path, "AAA", "h1")
-        assert entry is not None and entry.timeframe == "1h"
+        assert entry is not None
+        assert entry.timeframe == "1h"
 
 
 class TestReadFrame:
@@ -389,7 +392,8 @@ class TestReadFrame:
         assert out["open"].tolist() == frame_in["bid_open"].tolist()
         assert out["close"].tolist() == frame_in["bid_close"].tolist()
         assert out["volume"].tolist() == frame_in["bid_volume"].tolist()
-        assert "ask_open" in out.columns and "bid_open" in out.columns
+        assert "ask_open" in out.columns
+        assert "bid_open" in out.columns
 
     def test_read_frame_plain_columns_win_over_bid(self, tmp_path: Path) -> None:
         frame_in = _frame()

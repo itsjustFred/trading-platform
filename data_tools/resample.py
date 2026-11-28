@@ -393,20 +393,13 @@ def resample_file(
         raise ValueError(f"Missing columns: {missing}")
 
     target_symbol = str(symbol or src_symbol)
-    target_asset_class = (
-        str(asset_class)
-        if asset_class is not None
-        else (entry.asset_class if entry is not None else "")
-    )
-    target_region = (
-        str(region)
-        if region is not None
-        else (entry.region if entry is not None else "")
-    )
+    entry_asset_class = entry.asset_class if entry is not None else ""
+    entry_region = entry.region if entry is not None else ""
+    entry_source_symbol = entry.source_symbol if entry is not None else ""
+    target_asset_class = str(asset_class) if asset_class is not None else entry_asset_class
+    target_region = str(region) if region is not None else entry_region
     target_source_symbol = (
-        str(source_symbol)
-        if source_symbol is not None
-        else (entry.source_symbol if entry is not None else "")
+        str(source_symbol) if source_symbol is not None else entry_source_symbol
     )
 
     results = []
@@ -513,7 +506,7 @@ def update_catalog(data_dir: Path | None = None):
         logger.warning("Could not update catalog: %s", e)
 
 
-def main():
+def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Resample OHLCV data to higher timeframes")
     parser.add_argument("--source", type=str, help="Source parquet file path")
     parser.add_argument(
@@ -527,21 +520,31 @@ def main():
         required=True,
         help="Comma-separated target timeframes (5m,15m,30m,1h,4h,1d)",
     )
-    parser.add_argument("--output", type=str, help="Output directory (default: next to source)")
+    parser.add_argument(
+        "--output",
+        type=str,
+        help="(unsupported) resampled datasets are always written into the "
+        "OHLCV store next to their source",
+    )
     parser.add_argument(
         "--update-catalog", action="store_true", help="Update catalog.json after resampling"
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     timeframes = [t.strip() for t in args.timeframes.split(",")]
+
+    if args.output:
+        parser.error(
+            "--output is not supported: resampled datasets are written into the "
+            "OHLCV store next to their source dataset"
+        )
 
     if args.source:
         source = Path(args.source)
         if not source.exists():
             parser.error(f"Source file not found: {source}")
-        output_dir = Path(args.output) if args.output else None
         logger.info("Resampling %s → %s", source, timeframes)
-        resample_file(source, timeframes, output_dir)
+        resample_file(source, timeframes)
 
     elif args.source_dir:
         source_dir = Path(args.source_dir)

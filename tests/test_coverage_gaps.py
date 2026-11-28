@@ -972,7 +972,8 @@ def test_monthly_spaced_bars_under_the_coarsest_timeframe_are_reported(tmp_path)
         asset_class="metals",
     )
     gaps = find_internal_gaps(tmp_path, "GOLD1", "1w")
-    assert gaps and gaps[0]["gap_days"] > 21, (
+    assert gaps, f"30-day spacing under a weekly label must be reported: {gaps}"
+    assert gaps[0]["gap_days"] > 21, (
         f"30-day spacing under a weekly label must be reported: {gaps}"
     )
 
@@ -1779,7 +1780,8 @@ def test_a_tick_segmented_dataset_is_still_recognised(tmp_path):
     )
 
     entry = ohlcv_store.entry_for_path(tmp_path, path)
-    assert entry is not None and entry.timeframe == "tick"
+    assert entry is not None
+    assert entry.timeframe == "tick"
     assert ohlcv_store.segment_for_path(tmp_path, path) == "2024_01"
 
     result = validate_parquet(path, ohlcv_root=tmp_path / "ohlcv")

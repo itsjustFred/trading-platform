@@ -117,7 +117,7 @@ def _detect_storage(parquet_path: Path, data_dir: Path) -> str:
 
 
 def _run_validation(
-    parquet_path: Path, symbol: str, timeframe: str, data_dir: Path | None = None
+    parquet_path: Path, data_dir: Path | None = None
 ) -> dict | None:
     """Run data validation checks and return summary dict."""
     try:
@@ -728,9 +728,7 @@ def _dataset_segment_entry(
     entry.update(_summary_with_cache(parquet_path, data_dir, catalog_cache))
 
     if include_validation:
-        validation = _run_validation(
-            parquet_path, dataset.symbol, dataset.timeframe, data_dir=data_dir
-        )
+        validation = _run_validation(parquet_path, data_dir=data_dir)
         if validation:
             entry["validation"] = validation
     return entry

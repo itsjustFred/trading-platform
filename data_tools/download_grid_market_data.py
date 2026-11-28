@@ -227,23 +227,26 @@ def ensure_alias_copy(
     """
     alias_path = ohlcv_store.data_path(output_dir, "dukascopy", requested_symbol, timeframe)
     canonical_fingerprint = file_fingerprint(canonical_path)
-    if alias_path.exists() and canonical_fingerprint is not None:
-        if (
+    if (
+        alias_path.exists()
+        and canonical_fingerprint is not None
+        and (
             file_fingerprint(alias_path) == canonical_fingerprint
             or files_have_same_content(canonical_path, alias_path)
-        ):
-            # Refresh the manifest entry (idempotent) so a fresh file is
-            # always manifest-declared even if the manifest was rebuilt.
-            ohlcv_store.register_file(
-                output_dir,
-                "dukascopy",
-                requested_symbol,
-                timeframe,
-                alias_path,
-                asset_class=asset_class,
-                source_symbol=source_symbol,
-            )
-            return alias_path
+        )
+    ):
+        # Refresh the manifest entry (idempotent) so a fresh file is
+        # always manifest-declared even if the manifest was rebuilt.
+        ohlcv_store.register_file(
+            output_dir,
+            "dukascopy",
+            requested_symbol,
+            timeframe,
+            alias_path,
+            asset_class=asset_class,
+            source_symbol=source_symbol,
+        )
+        return alias_path
     alias_path.parent.mkdir(parents=True, exist_ok=True)
     atomic_replace(alias_path, lambda target: shutil.copy2(canonical_path, target))
     ohlcv_store.register_file(

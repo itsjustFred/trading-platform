@@ -1439,7 +1439,15 @@ class JForexDownloader(Downloader):
 
             # One two-sided file (bid_*/ask_* columns): the manifest layout
             # has no _bid/_ask sibling files (#471).
-            result_df = bid_result_df.merge(ask_result_df, on="timestamp", how="outer")
+            result_df = (
+                bid_result_df.drop_duplicates(subset=["timestamp"])
+                .merge(
+                    ask_result_df.drop_duplicates(subset=["timestamp"]),
+                    on="timestamp",
+                    how="outer",
+                    validate="one_to_one",
+                )
+            )
             result_df = (
                 result_df.sort_values("timestamp")
                 .drop_duplicates(subset=["timestamp"])

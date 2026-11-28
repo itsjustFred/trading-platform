@@ -198,7 +198,8 @@ class TestCtraderStorageLayout:
         from shared import ohlcv_store
 
         datasets = ohlcv_store.list_datasets(tmp_path, source="ctrader", symbol="XAUUSD")
-        assert datasets and datasets[0].asset_class == "metals"
+        assert datasets
+        assert datasets[0].asset_class == "metals"
 
 
 class TestHistdataFailureVisibility:

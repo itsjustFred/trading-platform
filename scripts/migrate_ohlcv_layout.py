@@ -64,6 +64,7 @@ from shared import ohlcv_store
 from shared.constants import GRID_TIMEFRAME_ALIASES, VALID_TIMEFRAMES, normalize_timeframe
 
 _OHLCV_COLUMNS = ("open", "high", "low", "close", "volume")
+_PARQUET_SUFFIX = ".parquet"
 
 #: Old on-disk timeframe spellings → platform timeframe. Covers the canonical
 #: VALID_TIMEFRAMES stems plus every alias the downloaders ever wrote
@@ -147,13 +148,13 @@ def _classify_old_file(rel_parts: list[str]) -> tuple[str, str, str, str, str] |
     stem cannot be mapped to a platform timeframe — the caller reports it
     as skipped.
     """
-    if len(rel_parts) < 3 or not rel_parts[-1].endswith(".parquet"):
+    if len(rel_parts) < 3 or not rel_parts[-1].endswith(_PARQUET_SUFFIX):
         return None
     asset_class = rel_parts[1]
     filename = rel_parts[-1]
     # Flat variant: {source}/{asset_class}/{symbol}.parquet → implicit 1d.
     if len(rel_parts) == 3:
-        symbol = filename[: -len(".parquet")]
+        symbol = filename[: -len(_PARQUET_SUFFIX)]
         if not symbol or "." in symbol or _old_timeframe(symbol) is not None:
             return None
         return asset_class, "", symbol, "1d", ""
@@ -163,7 +164,7 @@ def _classify_old_file(rel_parts: list[str]) -> tuple[str, str, str, str, str] |
         region, symbol = rel_parts[2], rel_parts[3]
     else:
         return None
-    stem = filename[: -len(".parquet")]
+    stem = filename[: -len(_PARQUET_SUFFIX)]
     prefix = f"{symbol}_"
     if stem.lower().startswith(prefix.lower()):
         stem = stem[len(prefix) :]
@@ -246,7 +247,7 @@ def _collect_source(
             skipped.append(f"{source}: unrecognized file {parquet}")
             continue
         asset_class, region, symbol, timeframe, segment = classified
-        stem = parquet.name[: -len(".parquet")]
+        stem = parquet.name[: -len(_PARQUET_SUFFIX)]
         prefix = f"{symbol}_"
         if stem.lower().startswith(prefix.lower()):
             stem = stem[len(prefix) :]

@@ -227,8 +227,8 @@ def read_manifest(data_root: str | Path, source: str) -> dict[str, Any]:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return {}
-    except (OSError, json.JSONDecodeError) as exc:
-        logger.error("Unreadable OHLCV manifest %s: %s", path, exc)
+    except (OSError, json.JSONDecodeError):
+        logger.exception("Unreadable OHLCV manifest %s", path)
         return {}
     return payload if isinstance(payload, dict) else {}
 

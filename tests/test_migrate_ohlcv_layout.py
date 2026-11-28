@@ -32,7 +32,7 @@ def _write_old(root: Path, *parts: str, frame: pd.DataFrame | None = None) -> Pa
     return path
 
 
-@pytest.fixture()
+@pytest.fixture
 def old_tree(tmp_path: Path) -> Path:
     """An old-layout tree exercising every migration shape."""
     src = tmp_path / "old" / "ohlcv"
