@@ -238,8 +238,9 @@ explicit-preview-rules = true
 # definition time, so B008 is a false positive there.
 "strategies/pynecore_*/*" = ["B008"]
 # Test doubles: class-level mutable attributes are per-test fixtures that are
-# never shared across instances in a way that matters, and test subprocesses
-# are asserted on via returncode/output rather than check=True.
+# never shared across instances in a way that matters, test subprocesses
+# are asserted on via returncode/output rather than check=True, and tests
+# legitimately use try-except-pass for teardown and assertion guards.
 "tests/*" = ["RUF012", "PLW1510", "S110"]
 # PLC2701 stays off in tests: doubles and fixtures legitimately import and
 # monkeypatch private helpers (the production-code ban is what the rule

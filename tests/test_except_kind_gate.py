@@ -63,19 +63,40 @@ def _name_is_loaded(node: ast.AST, name: str) -> bool:
     )
 
 
+def _straight_line_raise(stmts: list[ast.stmt]) -> bool:
+    """A raise that runs unconditionally on this control-flow path.
+
+    ``try``/``with`` bodies are transparent (they do not make the raise
+    conditional); ``if``/``for``/``while``/``match``/nested ``def`` do, so
+    they are not descended into.
+    """
+    for stmt in stmts:
+        if isinstance(stmt, ast.Raise):
+            return True
+        if isinstance(stmt, ast.Try):
+            if _straight_line_raise(stmt.body + stmt.orelse + stmt.finalbody):
+                return True
+        elif isinstance(stmt, (ast.With, ast.AsyncWith)):
+            if _straight_line_raise(stmt.body):
+                return True
+    return False
+
+
 def _handler_propagates(handler: ast.ExceptHandler) -> bool:
     """A ``propagate`` marker must actually propagate.
 
-    The body must either raise, or hand the caught exception object to the
-    caller in a way that surfaces it later: appended/added to a collection
-    (``errors.append(exc)`` — the vectorbt aggregate), stored into a
-    subscript or attribute (``error["value"] = exc`` — the copilot bridge),
-    or returned. Merely *referencing* the exception — e.g. passing it to a
-    logging call — does not count: that is observation, not propagation.
+    The body must either raise unconditionally, or hand the caught
+    exception object to the caller in a way that surfaces it later:
+    appended/added to a collection (``errors.append(exc)`` — the vectorbt
+    aggregate), stored into a subscript or attribute
+    (``error["value"] = exc`` — the copilot bridge), or returned. Merely
+    *referencing* the exception — e.g. passing it to a logging call —
+    does not count: that is observation, not propagation. A raise nested
+    inside ``if``/``for``/``while``/``match``/``def`` is conditional and
+    does not count either; such handlers must be reclassified.
     """
-    for node in ast.walk(handler):
-        if isinstance(node, ast.Raise):
-            return True
+    if _straight_line_raise(handler.body):
+        return True
     name = handler.name
     if not name:
         return False
@@ -208,6 +229,15 @@ def test_gate_scope_covers_the_money_and_engine_packages() -> None:
     assert runner_handlers > 0
 
 
+def test_live_runner_kind_set_is_pinned() -> None:
+    """The money path must never accept `best-effort`; pin the exact set."""
+    assert KINDS_BY_ROOT["live_runner"] == {
+        "loop-survival",
+        "money-decision",
+        "propagate",
+    }
+
+
 def test_gate_flags_a_propagate_marker_that_swallows(tmp_path: Path) -> None:
     """A `propagate` marker on a handler that drops the exception is a lie."""
     pkg = tmp_path / "runner"
@@ -225,13 +255,19 @@ def test_gate_flags_a_propagate_marker_that_swallows(tmp_path: Path) -> None:
         "    try:\n"
         "        third()\n"
         "    except Exception as exc:  # except-kind: propagate - logged only\n"
-        "        logger.warning('failed: %s', exc)\n",
+        "        logger.warning('failed: %s', exc)\n"
+        "    try:\n"
+        "        fourth()\n"
+        "    except Exception as exc:  # except-kind: propagate - conditional raise\n"
+        "        if exc:\n"
+        "            raise\n",
         encoding="utf-8",
     )
     _missing, invalid, _stray = _violations(tmp_path)
     assert invalid == [
         "runner/bad.py:4 (propagate but body never raises or uses the exception)",
         "runner/bad.py:12 (propagate but body never raises or uses the exception)",
+        "runner/bad.py:16 (propagate but body never raises or uses the exception)",
     ]
 
 
