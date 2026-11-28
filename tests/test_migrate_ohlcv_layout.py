@@ -81,10 +81,11 @@ def test_migrate_writes_new_layout(old_tree: Path, tmp_path: Path) -> None:
     # Collided symbol is never written.
     assert not (dst / "testsrc" / "COLL").exists()
 
-    # Manifest carries asset_class/region from the old path.
+    # Manifest carries asset_class/region from the old path, normalized to
+    # the store's single lowercase spelling.
     yfinance_manifest = ohlcv_store.read_manifest(tmp_path / "new", "yfinance")
     assert yfinance_manifest["AAPL"]["asset_class"] == "equity"
-    assert yfinance_manifest["AAPL"]["region"] == "US"
+    assert yfinance_manifest["AAPL"]["region"] == "us"
     dukascopy_manifest = ohlcv_store.read_manifest(tmp_path / "new", "dukascopy")
     assert dukascopy_manifest["EURUSD"]["asset_class"] == "forex"
     assert dukascopy_manifest["XAUUSD"]["asset_class"] == "metals"
@@ -151,7 +152,7 @@ def test_equity_etf_collision_resolves_to_etf_with_longest_coverage(
     # Winner data is kept (earliest first wins for ETF1) but the asset_class
     # is always canonicalised to "etf" for {equity, etf} collisions.
     assert manifest["ETF1"]["asset_class"] == "etf"
-    assert manifest["ETF1"]["region"] == "US"
+    assert manifest["ETF1"]["region"] == "us"
     assert manifest["ETF2"]["asset_class"] == "etf"
 
     entry1 = ohlcv_store.find_dataset(tmp_path / "new", "ETF1", "1d", data_source="yfinance")

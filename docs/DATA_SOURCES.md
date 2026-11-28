@@ -18,7 +18,9 @@ $TRADING_DATA_DIR/ohlcv/<source>/<SYMBOL>/<SYMBOL>_<TF>_<segment>.parquet
 `asset_class`, `region`, and `source_symbol` are NOT path components — they
 live in the source's `manifest.json` entry for each symbol, next to the
 per-file `rows`/`first`/`last` statistics every reader resolves through
-`ohlcv_store.list_datasets` / `find_dataset` / `entry_for_path`.
+`ohlcv_store.list_datasets` / `find_dataset` / `entry_for_path`. The store
+normalizes `asset_class` and `region` to lowercase on both read and write,
+so every consumer sees one spelling.
 
 Examples:
 

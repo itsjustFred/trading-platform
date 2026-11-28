@@ -260,7 +260,10 @@ def _fallback_asset_class(source: str, symbol: str) -> str:
 
 
 def _entry_asset_class(meta: Mapping[str, Any], source: str, symbol: str) -> str:
-    value = str(meta.get("asset_class") or "").strip()
+    # One spelling store-wide: consumers (sizing, slippage, the
+    # data_source filter) compare asset_class without re-normalizing, so a
+    # mixed-case manifest value is folded to lowercase on read.
+    value = str(meta.get("asset_class") or "").strip().lower()
     if value:
         return value
     return _fallback_asset_class(source, symbol)
@@ -375,7 +378,7 @@ def _dataset_entries_for_source(
                     symbol=symbol,
                     timeframe=timeframe,
                     asset_class=_entry_asset_class(meta, src, symbol),
-                    region=str(meta.get("region") or "").strip(),
+                    region=str(meta.get("region") or "").strip().lower(),
                     source_symbol=_entry_source_symbol(meta, src, symbol),
                     path=preferred if preferred is not None else paths[0],
                     rows=rows,
@@ -491,6 +494,12 @@ def find_dataset(
 ) -> DatasetEntry | None:
     """The deterministically chosen dataset for ``symbol``/``timeframe``.
 
+    ``symbol`` and ``timeframe`` are required coordinates: a blank value or
+    a timeframe that resolves to no platform timeframe raises
+    ``ValueError``. An unknown ``symbol`` (no stored data) and a
+    ``data_source`` filter that matches nothing are misses and return
+    ``None``.
+
     With ``data_source`` only entries whose source, asset class or region
     matches (the historical ``select_ohlcv_path`` filter, quirks included)
     are considered; otherwise every source's copy competes under the
@@ -498,10 +507,8 @@ def find_dataset(
     """
     normalized_symbol = str(symbol or "").strip().upper()
     if not normalized_symbol:
-        return None
-    normalized_timeframe = normalize_timeframe(str(timeframe or "").strip())
-    if normalized_timeframe not in _PLATFORM_TIMEFRAMES:
-        return None
+        raise ValueError("find_dataset requires a non-empty symbol")
+    normalized_timeframe = _platform_timeframe(timeframe)
 
     candidates = list_datasets(
         data_root, symbol=normalized_symbol, timeframe=normalized_timeframe
@@ -534,7 +541,16 @@ def entry_for_path(data_root: str | Path, path: str | Path) -> DatasetEntry | No
     if len(parts) != 3:
         return None
     source, symbol, filename = parts
-    manifest = read_manifest(data_root, source)
+    try:
+        # The source directory matches case-insensitively, exactly like the
+        # ``source`` argument of find_dataset/list_datasets (``_source_name``
+        # folds case); the symbol directory resolves through the manifest
+        # key lookup and the file name must carry the stored symbol
+        # spelling, so entry_for_path and find_dataset agree on the file.
+        src = _source_name(source)
+    except ValueError:
+        return None
+    manifest = read_manifest(data_root, src)
     key = _manifest_symbol_key(manifest, symbol)
     if key is None:
         return None
@@ -546,10 +562,11 @@ def entry_for_path(data_root: str | Path, path: str | Path) -> DatasetEntry | No
         timeframe = platform_timeframe(token)
     except ValueError:
         return None
-    for entry in _dataset_entries_for_source(data_root, source):
-        if entry.symbol == key and entry.timeframe == timeframe:
-            if any(segment.resolve() == resolved for segment in entry.segments):
-                return entry
+    for entry in _dataset_entries_for_source(data_root, src):
+        if entry.symbol != key or entry.timeframe != timeframe:
+            continue
+        if filename in {segment.name for segment in entry.segments}:
+            return entry
     return None
 
 
@@ -967,8 +984,8 @@ def write_frame(
         "first": str(timestamps.min()),
         "last": str(timestamps.max()),
     }
-    meta["asset_class"] = str(asset_class or "").strip()
-    meta["region"] = str(region or "").strip()
+    meta["asset_class"] = str(asset_class or "").strip().lower()
+    meta["region"] = str(region or "").strip().lower()
     meta["source_symbol"] = str(source_symbol or "").strip() or sym
     if extra_meta:
         for key, value in extra_meta.items():
@@ -1023,8 +1040,8 @@ def register_file(
         "first": bounds[0].isoformat() if bounds else "",
         "last": bounds[1].isoformat() if bounds else "",
     }
-    meta["asset_class"] = str(asset_class or "").strip()
-    meta["region"] = str(region or "").strip()
+    meta["asset_class"] = str(asset_class or "").strip().lower()
+    meta["region"] = str(region or "").strip().lower()
     meta["source_symbol"] = str(source_symbol or "").strip() or sym
     if extra_meta:
         for key, value in extra_meta.items():

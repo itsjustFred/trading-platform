@@ -145,7 +145,7 @@ def test_build_catalog_reads_dolthub_store_exports(tmp_path):
     assert ds["timeframe"] == "1d"
     assert ds["source"] == "dolthub"
     assert ds["asset_class"] == "equity"
-    assert ds["region"] == "US"
+    assert ds["region"] == "us"
     assert ds["start"] == "2024-02-01"
     assert ds["end"] == "2024-02-03"
 

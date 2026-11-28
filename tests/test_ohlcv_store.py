@@ -399,6 +399,35 @@ class TestListAndFind:
         assert entry is not None
         assert entry.timeframe == "1h"
 
+    @pytest.mark.parametrize("symbol", ["", "   ", None])
+    def test_find_dataset_blank_symbol_raises(
+        self, tmp_path: Path, symbol: str | None
+    ) -> None:
+        with pytest.raises(ValueError, match="symbol"):
+            ohlcv_store.find_dataset(tmp_path, symbol, "1h")  # type: ignore[arg-type]
+
+    @pytest.mark.parametrize("timeframe", ["", "   ", None])
+    def test_find_dataset_blank_timeframe_raises(
+        self, tmp_path: Path, timeframe: str | None
+    ) -> None:
+        with pytest.raises(ValueError, match="timeframe"):
+            ohlcv_store.find_dataset(tmp_path, "AAA", timeframe)  # type: ignore[arg-type]
+
+    def test_find_dataset_unknown_timeframe_raises(self, tmp_path: Path) -> None:
+        """A timeframe that resolves to no platform timeframe is a caller
+        bug, not a miss — like every other store entry point it raises."""
+        with pytest.raises(ValueError, match="timeframe"):
+            ohlcv_store.find_dataset(tmp_path, "AAA", "bogus")
+
+    def test_find_dataset_unknown_data_source_is_a_miss(self, tmp_path: Path) -> None:
+        """SPEC: an unknown data_source filter matches nothing and returns
+        None — it is a filter, not a required coordinate."""
+        _write(tmp_path, symbol="AAA", timeframe="1h")
+        assert (
+            ohlcv_store.find_dataset(tmp_path, "AAA", "1h", data_source="nosuch")
+            is None
+        )
+
 
 class TestReadFrame:
     def test_read_frame_basic(self, tmp_path: Path) -> None:
@@ -575,3 +604,85 @@ class TestEntryForPath:
     def test_unrelated_paths_return_none(self, tmp_path: Path, path: str) -> None:
         _write(tmp_path, source="src", symbol="SYM")
         assert ohlcv_store.entry_for_path(tmp_path, tmp_path / path) is None
+
+    def test_mixed_case_source_and_symbol_dirs_resolve(self, tmp_path: Path) -> None:
+        """entry_for_path must match source case-insensitively and symbol
+        against the manifest key — the same lookup find_dataset performs —
+        so both functions agree on the same file."""
+        path = _write(tmp_path, source="dukascopy", symbol="EURUSD")
+        mixed = tmp_path / "ohlcv" / "Dukascopy" / "eurusd" / "EURUSD_H1.parquet"
+        entry = ohlcv_store.entry_for_path(tmp_path, mixed)
+        assert entry is not None
+        assert entry.source == "dukascopy"
+        assert entry.symbol == "EURUSD"
+        assert entry == ohlcv_store.find_dataset(
+            tmp_path, "EURUSD", "1h", data_source="dukascopy"
+        )
+        # The canonical path still resolves identically.
+        assert ohlcv_store.entry_for_path(tmp_path, path) == entry
+
+
+class TestAssetClassNormalization:
+    """``asset_class``/``region`` have ONE spelling store-wide: the manifest
+    may carry mixed case (hand edits, older writers) but every consumer —
+    sizing, slippage, the ``data_source`` filter — sees the lowercase form."""
+
+    def test_write_normalizes_asset_class_and_region(self, tmp_path: Path) -> None:
+        _write(tmp_path, asset_class="Equity", region="US")
+        manifest = ohlcv_store.read_manifest(tmp_path, "testsrc")
+        assert manifest["TEST"]["asset_class"] == "equity"
+        assert manifest["TEST"]["region"] == "us"
+
+    def test_read_normalizes_mixed_case_manifest_values(self, tmp_path: Path) -> None:
+        ohlcv_store.write_manifest(
+            tmp_path,
+            "dukascopy",
+            {
+                "EURUSD": {
+                    "asset_class": "Forex",
+                    "region": "EMEA",
+                    "files": {"EURUSD_H1.parquet": {"rows": 1}},
+                }
+            },
+        )
+        entry = ohlcv_store.find_dataset(
+            tmp_path, "EURUSD", "1h", data_source="dukascopy"
+        )
+        assert entry is not None
+        assert entry.asset_class == "forex"
+        assert entry.region == "emea"
+
+    def test_risk_and_slippage_resolve_the_normalized_asset_class(
+        self, tmp_path: Path
+    ) -> None:
+        """A "Forex"/"Equity" manifest value must reach consumers lowercase:
+        ``resolve_max_position_exposure_pct`` compares asset classes without
+        lowercasing, so a leaked "Equity" would size like an unknown class."""
+        from runner.engines._shared import resolve_max_position_exposure_pct
+        from runner.slippage import resolve_slippage_model
+
+        ohlcv_store.write_manifest(
+            tmp_path,
+            "dukascopy",
+            {
+                "EURUSD": {
+                    "asset_class": "Forex",
+                    "files": {"EURUSD_H1.parquet": {"rows": 1}},
+                },
+                "AAPL": {
+                    "asset_class": "Equity",
+                    "files": {"AAPL_H1.parquet": {"rows": 1}},
+                },
+            },
+        )
+        forex = ohlcv_store.find_dataset(tmp_path, "EURUSD", "1h")
+        equity = ohlcv_store.find_dataset(tmp_path, "AAPL", "1h")
+        assert forex is not None and equity is not None
+        assert forex.asset_class == "forex"
+        assert equity.asset_class == "equity"
+        assert resolve_max_position_exposure_pct(
+            None, equity.asset_class
+        ) == resolve_max_position_exposure_pct(None, "equity")
+        assert resolve_slippage_model(
+            {}, asset_class=forex.asset_class
+        ).describe() == resolve_slippage_model({}, asset_class="forex").describe()
