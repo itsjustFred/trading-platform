@@ -1262,8 +1262,11 @@ def test_sandboxed_env_marks_and_names_a_sharing_child_together() -> None:
     assert sharing[suite_conftest.CHILD_SANDBOX_ENV_VAR] == suite_conftest.CHILD_SANDBOX_FLAG_VALUE
     assert sharing["TP_TEST_SESSION_ROOT"] == str(suite_conftest._SESSION_ROOT)
     own = suite_conftest.sandboxed_env(shares_sandbox=False)
+    # A child that builds its own sandbox still carries the provenance (nonce, session root) -
+    # that is what marks it as a child of this session rather than a forged top level - but not
+    # the sharing flag, which is what would make it adopt this session's directories.
     assert suite_conftest.CHILD_SANDBOX_ENV_VAR not in own
-    assert "TP_TEST_SESSION_ROOT" not in own
+    assert suite_conftest._child_markers_are_genuine(own)
 
 
 def test_no_allowlist_entry_is_credential_shaped() -> None:
@@ -1568,7 +1571,7 @@ def test_a_forged_child_marker_does_not_adopt_the_named_session(tmp_path: Path) 
             "tests/test_suite_isolation.py::test_env_data_dir_is_the_conftest_session_dir",
         ],
         cwd=str(_PROJECT_ROOT),
-        env={
+        env={  # sandbox-env: deliberately forged env; the forge is what is under test
             "PATH": os.environ["PATH"],
             "PYTHONPATH": str(_PROJECT_ROOT),
             "HOME": str(tmp_path / "home"),
@@ -1606,7 +1609,7 @@ def test_a_forged_child_override_list_is_not_honoured(tmp_path: Path) -> None:
             "tests/test_suite_isolation.py::test_no_external_credential_env_var_is_set",
         ],
         cwd=str(_PROJECT_ROOT),
-        env={
+        env={  # sandbox-env: deliberately forged env; the forge is what is under test
             "PATH": os.environ["PATH"],
             "PYTHONPATH": str(_PROJECT_ROOT),
             "HOME": str(tmp_path / "home"),

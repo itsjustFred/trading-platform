@@ -5,6 +5,7 @@ import contextlib
 import importlib
 import ipaddress
 import os
+import secrets
 import shutil
 import sys
 import tempfile
@@ -52,6 +53,27 @@ _CASE_INSENSITIVE_FS = os.name == "nt" or sys.platform == "darwin"
 # the teardown guard: two spellings would mean a sharing child nobody records or guards.
 CHILD_SANDBOX_ENV_VAR = "TP_TEST_CHILD_SANDBOX"
 CHILD_SANDBOX_FLAG_VALUE = "1"
+#: The rest of the handoff a sandboxed child carries, and the nonce that proves the handoff came
+#: from ``sandboxed_env()``: the nonce is written into the session directory the parent hands
+#: over, so a caller can spell the marker variables but cannot produce a matching nonce for a
+#: directory it does not own.
+CHILD_SESSION_ROOT_ENV_VAR = "TP_TEST_SESSION_ROOT"
+CHILD_REPO_ROOT_ENV_VAR = "TP_TEST_REPO_ROOT"
+CHILD_NONCE_ENV_VAR = "TP_TEST_CHILD_NONCE"
+CHILD_NONCE_FILE_NAME = "child-nonce"
+#: The names ``sandboxed_env()`` applied as overrides for one child, so the child's own sweeps
+#: keep what the parent chose for it - and, because the marker must be genuine, a caller cannot
+#: use the name to push a variable past the top level's sweeps.
+CHILD_ENV_OVERRIDES_ENV_VAR = "TP_TEST_CHILD_ENV"
+CHILD_MARKER_ENV_VARS = frozenset(
+    {
+        CHILD_SANDBOX_ENV_VAR,
+        CHILD_SESSION_ROOT_ENV_VAR,
+        CHILD_REPO_ROOT_ENV_VAR,
+        CHILD_NONCE_ENV_VAR,
+        CHILD_ENV_OVERRIDES_ENV_VAR,
+    }
+)
 
 def _register_parent_only_session_cleanup() -> None:
     """Register the session directory's removal - in the parent branch only.
@@ -74,7 +96,35 @@ def _register_parent_only_session_cleanup() -> None:
     atexit.register(shutil.rmtree, _SESSION_ROOT, ignore_errors=True)
 
 
+def _child_markers_are_genuine(environ: Mapping[str, str]) -> bool:
+    """Whether this process was started by ``sandboxed_env()`` and not by a forged env.
+
+    The marker names are ordinary strings a caller can export; the nonce is not. The parent
+    writes one into the session directory it hands a child and passes the same value in the
+    environment, so the pair is only true together inside a process ``sandboxed_env()`` built.
+    """
+    session_root = environ.get(CHILD_SESSION_ROOT_ENV_VAR)
+    nonce = environ.get(CHILD_NONCE_ENV_VAR)
+    if not session_root or not nonce:
+        return False
+    try:
+        recorded = (
+            Path(session_root, CHILD_NONCE_FILE_NAME).read_text(encoding="utf-8").strip()
+        )
+    except (OSError, ValueError):
+        return False
+    return recorded == nonce
+
+
 _CHILD_PROCESS = os.environ.get(CHILD_SANDBOX_ENV_VAR) == CHILD_SANDBOX_FLAG_VALUE
+# The nonce this process's sandbox was built with: the parent generates one and writes it into
+# the session root; a child inherits it through the environment and reads the same file back.
+_CHILD_NONCE = "" if _CHILD_PROCESS else secrets.token_hex(16)
+if _CHILD_PROCESS and not _child_markers_are_genuine(os.environ):
+    # A forged marker: this is a top-level run whose caller spelled the variables. Adopting the
+    # named session directory would take the child branch, where the data roots are only filled
+    # in, so it runs as a parent instead - its own session, its own forced data roots.
+    _CHILD_PROCESS = False
 if _CHILD_PROCESS:
     # The marker and the session directory are written in one act by sandboxed_env(), so a
     # child that carries one without the other is a desync inside this module - and taking
@@ -111,11 +161,6 @@ ISOLATED_DOTENV_FILE = _SESSION_ROOT / ".env"
 # scrubbed anyway: a variable that points at the checkout's secrets has no business being set for
 # a test, and keeping it out means a reintroduced reader cannot be fed by the shell.
 ACCOUNTS_ENV_ENV_VAR = "TP_ACCOUNTS_ENV"
-# The names ``sandboxed_env()`` applied as overrides for one child, so the child's own
-# sweeps - the allowlist one and the credential one - keep what the parent chose for it.
-# Without the handoff a ``JFOREX_JARS`` or ``TP_REPO_ROOT`` a test passed to its child would
-# be deleted by the very guard meant to protect that child.
-CHILD_ENV_OVERRIDES_ENV_VAR = "TP_TEST_CHILD_ENV"
 
 
 def _child_override_names(environ: Mapping[str, str]) -> frozenset[str]:
@@ -125,6 +170,8 @@ def _child_override_names(environ: Mapping[str, str]) -> frozenset[str]:
     ``sandboxed_env`` itself (which extends it): the format is the contract, and two readers
     of one format are two places for it to drift.
     """
+    if not _child_markers_are_genuine(environ):
+        return frozenset()
     recorded = environ.get(CHILD_ENV_OVERRIDES_ENV_VAR, "")
     return frozenset(name for name in recorded.split(",") if name)
 # Exported broker, Discord, Sentry and database configuration is as much a leak as the files
@@ -332,9 +379,15 @@ def _is_allowlisted_env(name: str) -> bool:
         or name.startswith(_SANDBOX_ENV_ALLOWLIST_PREFIXES)
     ):
         return True
-    if name == CHILD_ENV_OVERRIDES_ENV_VAR:
+    if _CHILD_PROCESS and name in CHILD_MARKER_ENV_VARS:
+        # A child keeps its own handoff: a process it starts with the inherited environment is
+        # the next generation of the same sandbox, and it is guarded by the marker rather than
+        # by a fresh build. The parent never allows these names, so a caller cannot use them to
+        # reach a top-level run.
         return True
-    return name in _child_override_names(os.environ)
+    if name == CHILD_ENV_OVERRIDES_ENV_VAR:
+        return _child_markers_are_genuine(os.environ)
+    return _child_markers_are_genuine(os.environ) and name in _child_override_names(os.environ)
 
 
 def _enforce_env_allowlist() -> None:
@@ -460,16 +513,21 @@ def sandboxed_env(
     if overrides:
         inherited = _child_override_names(env)
         env[CHILD_ENV_OVERRIDES_ENV_VAR] = ",".join(sorted(dict.fromkeys([*inherited, *overrides])))
-    if not shares_sandbox:
-        return env
-    # The xdist identity belongs to the worker xdist started, never to a child of it: a
-    # plain child that carries the marker would look like a worker to anything that
-    # checks, and the marker has no meaning in a process execnet did not start.
-    for name in [name for name in env if name.startswith("PYTEST_XDIST")]:
-        env.pop(name, None)
-    env[CHILD_SANDBOX_ENV_VAR] = CHILD_SANDBOX_FLAG_VALUE
-    env["TP_TEST_SESSION_ROOT"] = str(_SESSION_ROOT)
-    env["TP_TEST_REPO_ROOT"] = str(PROJECT_ROOT)
+    # The provenance every child of this session carries: the nonce, the session directory it
+    # was built for and the repo it was built from. A self-sandboxing child (one that runs the
+    # repo's own suite, and loads this file through pytest again) is still a child of this
+    # session - it inherits the recorded overrides, and it is not a caller-forged top level.
+    env[CHILD_SESSION_ROOT_ENV_VAR] = str(_SESSION_ROOT)
+    env[CHILD_REPO_ROOT_ENV_VAR] = str(PROJECT_ROOT)
+    env[CHILD_NONCE_ENV_VAR] = _CHILD_NONCE
+    if shares_sandbox:
+        # The sharing flag is what makes the child inherit this session's directories instead
+        # of building its own. The xdist identity belongs to the worker xdist started, never
+        # to a child of it: a plain child that carried it would look like a worker to anything
+        # that checks, and it has no meaning in a process execnet did not start.
+        for name in [name for name in env if name.startswith("PYTEST_XDIST")]:
+            env.pop(name, None)
+        env[CHILD_SANDBOX_ENV_VAR] = CHILD_SANDBOX_FLAG_VALUE
     return env
 
 
@@ -491,6 +549,10 @@ def _write_child_sandbox_shim() -> None:
         "child importing it, and a half-written shim is an unguarded child"
     )
     CHILD_SANDBOX_SHIM_DIR.mkdir(parents=True, exist_ok=True)
+    # The nonce a child's marker is only genuine with: written here, named in the environment
+    # the child inherits, and read back by the child's own import of this file. A caller can
+    # spell the marker variables; it cannot produce this for a directory it does not own.
+    (_SESSION_ROOT / CHILD_NONCE_FILE_NAME).write_text(_CHILD_NONCE + "\n", encoding="utf-8")
     # The files this shim loads into a child, by repo-relative path: a guard that sweeps the
     # repo for hooks or credentials excludes the suite's own modules when - and only when -
     # this child of the sandbox loaded them, which is what the daemon exit-hook guard does.
@@ -539,6 +601,7 @@ if not _CHILD_PROCESS:
     # Only the parent writes it: every child starts from the same bytes, and a child
     # rewriting the file another child is about to import is a race for no gain.
     _write_child_sandbox_shim()
+
 
 
 class SuiteHermeticityViolation(RuntimeError):
