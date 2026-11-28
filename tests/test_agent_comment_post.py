@@ -18,11 +18,11 @@ GitHub API (``GITHUB_API_URL`` points the script at it):
 from __future__ import annotations
 
 import importlib.util
-import os
 import subprocess
 import sys
 from pathlib import Path
 
+from tests.conftest import sandboxed_env
 from tests.helpers.github_api_stub import GitHubAPIStub
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -69,19 +69,26 @@ def _setup(
         for cid in (ids or [])
     ]
     api = GitHubAPIStub(heads=heads, comments=comments)
-    env = {
-        **os.environ,
+    # The overrides _run() hands to sandboxed_env(); credential_override_reason
+    # travels with them so the GH_TOKEN fixture stays justified at the call.
+    overrides = {
         "GH_TOKEN": "test-token",
         "GITHUB_API_URL": api.url,
         "GITHUB_REPOSITORY": "itsjustFred/trading-platform",
         "PR_NUMBER": "409",
         "HEAD_SHA": HEAD,
         "QUOTA_SKIP": "false",
+        "credential_override_reason": "test-token is a fixture for the local API stub",
     }
-    return env, work, api
+    return overrides, work, api
 
 
 def _run(env: dict, work: Path, *extra: str) -> subprocess.CompletedProcess[str]:
+    overrides = {k: v for k, v in env.items() if k != "credential_override_reason"}
+    child_env = sandboxed_env(
+        credential_override_reason=env.get("credential_override_reason", ""),
+        **overrides,
+    )
     return subprocess.run(
         [
             sys.executable,
@@ -91,7 +98,7 @@ def _run(env: dict, work: Path, *extra: str) -> subprocess.CompletedProcess[str]
             *extra,
         ],
         cwd=work,
-        env=env,
+        env=child_env,
         capture_output=True,
         text=True,
     )

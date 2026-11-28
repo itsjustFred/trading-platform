@@ -22,6 +22,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.conftest import sandboxed_env
+
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 fastapi_testclient = pytest.importorskip("fastapi.testclient")
@@ -129,6 +131,7 @@ def test_interpreter_exit_is_not_pinned_by_inflight_prewarm():
         capture_output=True,
         text=True,
         timeout=30,
+        env=sandboxed_env(),
     )
     elapsed = time.monotonic() - started
 

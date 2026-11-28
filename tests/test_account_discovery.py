@@ -9,6 +9,7 @@ import pytest
 import live_runner.account_discovery as account_discovery
 from live_runner.alpaca_adapter import alpaca_acc_indexes, alpaca_credential_blocks
 from shared.models import LiveAccount
+from tests.conftest import sandboxed_env
 
 
 def test_ctrader_account_name_prefers_resolved_account_label():
@@ -517,6 +518,7 @@ def _run_discovery_subprocess(body: str):
         text=True,
         timeout=60,
         cwd=str(Path(__file__).resolve().parents[1]),
+        env=sandboxed_env(),
     )
 
 

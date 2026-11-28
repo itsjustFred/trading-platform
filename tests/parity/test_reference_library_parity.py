@@ -27,8 +27,8 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from runner.engines.base import BacktestConfig
 from runner.engines.native_adapter import NativeAdapter
+from tests.builders import make_backtest_config
 
 pytestmark = pytest.mark.filterwarnings("ignore::DeprecationWarning")
 
@@ -79,7 +79,7 @@ def _run_engine(slug: str, tmp_path: Path) -> EngineRun:
     # #130: the reference trades are gross fills; declare the explicit
     # no-slippage opt-out rather than inherit the per-class default.
     parameters["slippage"] = "none"
-    config = BacktestConfig(
+    config = make_backtest_config(
         strategy_name="ref_parity",
         symbols=[SYMBOL],
         timeframe="1d",

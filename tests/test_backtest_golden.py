@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import os
 import subprocess
 import sys
 import tempfile
@@ -14,6 +13,8 @@ from typing import Any
 
 import pandas as pd
 import pytest
+
+from tests.conftest import sandboxed_env
 
 # Running this module as a script puts ``tests/`` first on ``sys.path`` and does
 # not add the working directory, so ``shared`` would resolve from whatever the
@@ -352,41 +353,36 @@ def _build_fixture(tmp_path: Path) -> tuple[Path, Path, Path]:
 
 
 def _child_environment(tmp_path: Path, data_dir: Path) -> dict[str, str]:
-    environment = {
-        "DATA_DIR": str(data_dir),
-        "GOLDEN_ISOLATION_MARKER": str(tmp_path / "isolation-ok"),
-        "HOME": str(tmp_path),
-        "LOG_DIR": str(tmp_path / "logs"),
-        "MPLBACKEND": "Agg",
-        "MPLCONFIGDIR": str(tmp_path / "matplotlib"),
-        "MPLIGNORE_SYSTEM_FONTS": "1",
-        "PYTHONDONTWRITEBYTECODE": "1",
-        "PYTHONHASHSEED": "0",
-        "PYTHONIOENCODING": "utf-8",
-        "PYTHONNOUSERSITE": "1",
-        "PYTHONPATH": str(tmp_path),
-        "PYTHONPYCACHEPREFIX": str(tmp_path / "pycache"),
-        "PYTHONUTF8": "1",
-        "SENTRY_ENABLED": "false",
-        "SENTRY_RELEASE": "backtest-golden",
-        "TMPDIR": str(tmp_path / "child-tmp"),
-        "TZ": "UTC",
-        "USERPROFILE": str(tmp_path),
-        "XDG_CACHE_HOME": str(tmp_path / "cache"),
-        "XDG_CONFIG_HOME": str(tmp_path / "config"),
-    }
-    for key in (
-        "APPDATA",
-        "COMSPEC",
-        "LOCALAPPDATA",
-        "PATH",
-        "SYSTEMROOT",
-        "TEMP",
-        "TMP",
-        "WINDIR",
-    ):
-        if key in os.environ:
-            environment[key] = os.environ[key]
+    """The golden child's environment, pinned per variable.
+
+    The child must see exactly what this mapping says: a developer's ``TZ`` or
+    ``MPLCONFIGDIR`` must not move a golden run, and ``sandboxed_env()`` is the
+    base that guarantees it (the allowlist, the session directories, PATH and the
+    Windows PROCESS variables, which is why copying them by hand is gone).
+    """
+    environment = sandboxed_env(
+        DATA_DIR=str(data_dir),
+        GOLDEN_ISOLATION_MARKER=str(tmp_path / "isolation-ok"),
+        HOME=str(tmp_path),
+        LOG_DIR=str(tmp_path / "logs"),
+        MPLBACKEND="Agg",
+        MPLCONFIGDIR=str(tmp_path / "matplotlib"),
+        MPLIGNORE_SYSTEM_FONTS="1",
+        PYTHONDONTWRITEBYTECODE="1",
+        PYTHONHASHSEED="0",
+        PYTHONIOENCODING="utf-8",
+        PYTHONNOUSERSITE="1",
+        PYTHONPATH=str(tmp_path),
+        PYTHONPYCACHEPREFIX=str(tmp_path / "pycache"),
+        PYTHONUTF8="1",
+        SENTRY_ENABLED="false",
+        SENTRY_RELEASE="backtest-golden",
+        TMPDIR=str(tmp_path / "child-tmp"),
+        TZ="UTC",
+        USERPROFILE=str(tmp_path),
+        XDG_CACHE_HOME=str(tmp_path / "cache"),
+        XDG_CONFIG_HOME=str(tmp_path / "config"),
+    )
     for key in (
         "MPLCONFIGDIR",
         "PYTHONPYCACHEPREFIX",
@@ -399,10 +395,14 @@ def _child_environment(tmp_path: Path, data_dir: Path) -> dict[str, str]:
 
 
 def _run_child_probe(environment: dict[str, str], source: str) -> subprocess.CompletedProcess[str]:
+    """Run *source* in a child with the mapping the caller built from ``sandboxed_env()``.
+
+    A parameter is not visible to the static scan, so the call documents its exception.
+    """
     return subprocess.run(
         [sys.executable, "-c", source],
         cwd=ROOT,
-        env=environment,
+        env=environment,  # sandbox-env: built from sandboxed_env() by the caller (a parameter)
         capture_output=True,
         encoding="utf-8",
         timeout=30,

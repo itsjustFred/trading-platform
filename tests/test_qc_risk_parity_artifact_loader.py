@@ -36,8 +36,6 @@ def test_load_local_prices_reads_complete_local_parquet_universe(tmp_path: Path)
 
 def test_regenerate_offline_accepts_history_start_kwarg(tmp_path: Path):
     """Offline-Regen muss den history_start-Kwarg von run_backtest (A-M6) schlucken."""
-    import sys
-    sys.path.insert(0, str(Path(__file__).parent.parent))
     from scripts.regenerate_qc_risk_parity_artifact import regenerate
 
     source = Path("ohlcv/yfinance/equity/US")

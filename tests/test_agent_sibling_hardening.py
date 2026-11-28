@@ -36,6 +36,8 @@ from pathlib import Path
 import pytest
 import yaml
 
+from tests.conftest import sandboxed_env
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 WORKFLOWS = REPO_ROOT / ".github" / "workflows"
 
@@ -268,7 +270,7 @@ def probe_repo(tmp_path):
         subprocess.run(
             ["git", *args],
             cwd=repo,
-            env={**os.environ, **env},
+            env=sandboxed_env(**env),
             check=True,
             capture_output=True,
             text=True,
@@ -282,7 +284,12 @@ def probe_repo(tmp_path):
     git("add", "-A")
     git("commit", "-qm", "base with a skill")
     base_sha = subprocess.run(
-        ["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+        env=sandboxed_env(),
     ).stdout.strip()
     # One base per stage with that stage's skill absent, so each sibling's own
     # "the base has none" case is a base where the *other* stage's skill is still there.
@@ -293,7 +300,12 @@ def probe_repo(tmp_path):
         git("add", "-A")
         git("commit", "-qm", f"base without the {stage} skill")
         missing[stage] = subprocess.run(
-            ["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo,
+            check=True,
+            capture_output=True,
+            text=True,
+            env=sandboxed_env(),
         ).stdout.strip()
     git("checkout", "-q", "-b", "head")
     return {
@@ -337,15 +349,16 @@ def _run_selection(job: dict, probe: dict, *, base: str, skill_path: str | None)
     github_env.write_text("", encoding="utf-8")
     if skill_path is None:
         # Set but empty, as a workflow expression that resolves to nothing leaves it.
-        environment = {**os.environ, "SKILL_PATH": ""}
+        skill_value = ""
     else:
-        environment = {**os.environ, "SKILL_PATH": skill_path}
-    environment.update(
-        {
-            "RUNNER_TEMP": str(runner_temp),
-            "GITHUB_ENV": str(github_env),
-            "BASE_SHA": base,
-        }
+        skill_value = skill_path
+    # The workflow variables are data for the child script; sandboxed_env() is
+    # what keeps the caller's own environment out of it.
+    environment = sandboxed_env(
+        SKILL_PATH=skill_value,
+        RUNNER_TEMP=str(runner_temp),
+        GITHUB_ENV=str(github_env),
+        BASE_SHA=base,
     )
     script = probe["repo"] / "selection.sh"
     script.write_text(
@@ -691,10 +704,10 @@ def _stub_bin(tmp_path) -> Path:
 def test_the_quota_probe_step_reports_only_a_positive_quota_signature(tmp_path) -> None:
     """The probe's whole contract is its output: `available=false` only when the
     model's own reply carries a quota signature. Executed against a stub
-    `opencode` in both siblings, because the classification is a grep over the
-    reply and a string assertion cannot tell a pattern that matches from one
-    that does not. A success and a non-quota failure both fail open - the agent
-    job runs and the genuine failure surfaces there."""
+    `opencode` in the one shared probe workflow, because the classification is
+    a grep over the reply and a string assertion cannot tell a pattern that
+    matches from one that does not. A success and a non-quota failure both
+    fail open - the agent job runs and the genuine failure surfaces there."""
     probe_job = _load(PROBE)["jobs"]["probe"]
     step = _find_step(probe_job, r"^Probe model quota$")
     for mode, expected in (
@@ -714,14 +727,13 @@ def test_the_quota_probe_step_reports_only_a_positive_quota_signature(tmp_path) 
         runner_temp.mkdir(exist_ok=True)
         output = case / "github-output"
         output.write_text("", encoding="utf-8")
-        env = {
-            **os.environ,
-            "PATH": os.pathsep.join([str(_stub_bin(case)), os.environ["PATH"]]),
-            "STUB_OPENCODE_MODE": mode,
-            "RUNNER_TEMP": str(runner_temp),
-            "GITHUB_OUTPUT": str(output),
-            "OPENCODE_DISABLE_PROJECT_CONFIG": "1",
-        }
+        env = sandboxed_env(
+            PATH=os.pathsep.join([str(_stub_bin(case)), os.environ["PATH"]]),
+            STUB_OPENCODE_MODE=mode,
+            RUNNER_TEMP=str(runner_temp),
+            GITHUB_OUTPUT=str(output),
+            OPENCODE_DISABLE_PROJECT_CONFIG="1",
+        )
         script = case / "probe.sh"
         script.write_text(_run(step), encoding="utf-8")
         result = subprocess.run(
@@ -785,13 +797,12 @@ _AGENT_STEP = {
 
 
 def _git(repo: Path, *args: str) -> str:
-    env = {
-        **os.environ,
-        "GIT_AUTHOR_NAME": "probe",
-        "GIT_AUTHOR_EMAIL": "probe@example.invalid",
-        "GIT_COMMITTER_NAME": "probe",
-        "GIT_COMMITTER_EMAIL": "probe@example.invalid",
-    }
+    env = sandboxed_env(
+        GIT_AUTHOR_NAME="probe",
+        GIT_AUTHOR_EMAIL="probe@example.invalid",
+        GIT_COMMITTER_NAME="probe",
+        GIT_COMMITTER_EMAIL="probe@example.invalid",
+    )
     done = subprocess.run(
         ["git", *args], cwd=repo, env=env, check=True, capture_output=True, text=True
     )
@@ -857,23 +868,22 @@ def test_the_mid_run_quota_skip_reports_instead_of_failing(tmp_path) -> None:
             (runner_temp / stage).mkdir(parents=True, exist_ok=True)
             (runner_temp / stage / "meta.json").write_text("{}", encoding="utf-8")
             (runner_temp / stage / "scope.txt").write_text("f.txt\n", encoding="utf-8")
-            env = {
-                **os.environ,
-                "PATH": os.pathsep.join([str(_stub_bin(case)), os.environ["PATH"]]),
-                "STUB_OPENCODE_MODE": mode,
-                "RUNNER_TEMP": str(runner_temp),
-                "GITHUB_OUTPUT": str(case / "github-output"),
-                "GITHUB_STEP_SUMMARY": str(case / "step-summary"),
-                "PR_NUMBER": "296",
-                "BASE_SHA": "1" * 40,
-                "HEAD_SHA": head,
-                "SKILL_SOURCE": "base branch",
-                "SKILL_PATH": f".agents/skills/{stage}/SKILL.md",
-                "MODEL": "opencode/inkling-2-small-free",
-                "VARIANT": "max",
-                "OPENCODE_DISABLE_PROJECT_CONFIG": "1",
-                "SCOPE_EMPTY": "false",
-            }
+            env = sandboxed_env(
+                PATH=os.pathsep.join([str(_stub_bin(case)), os.environ["PATH"]]),
+                STUB_OPENCODE_MODE=mode,
+                RUNNER_TEMP=str(runner_temp),
+                GITHUB_OUTPUT=str(case / "github-output"),
+                GITHUB_STEP_SUMMARY=str(case / "step-summary"),
+                PR_NUMBER="296",
+                BASE_SHA="1" * 40,
+                HEAD_SHA=head,
+                SKILL_SOURCE="base branch",
+                SKILL_PATH=f".agents/skills/{stage}/SKILL.md",
+                MODEL="opencode/inkling-2-small-free",
+                VARIANT="max",
+                OPENCODE_DISABLE_PROJECT_CONFIG="1",
+                SCOPE_EMPTY="false",
+            )
             script = case / "step.sh"
             script.write_text(body, encoding="utf-8")
             result = subprocess.run(
@@ -962,24 +972,26 @@ def test_an_agent_output_carrying_the_nvidia_key_is_never_kept(tmp_path) -> None
             (runner_temp / stage).mkdir(parents=True)
             (runner_temp / stage / "meta.json").write_text("{}", encoding="utf-8")
             (runner_temp / stage / "scope.txt").write_text("f.txt\n", encoding="utf-8")
-            env = {
-                **os.environ,
-                "PATH": os.pathsep.join([str(_stub_bin(case)), os.environ["PATH"]]),
-                "STUB_OPENCODE_MODE": mode,
-                "RUNNER_TEMP": str(runner_temp),
-                "GITHUB_OUTPUT": str(case / "out"),
-                "GITHUB_STEP_SUMMARY": str(case / "step-summary"),
-                "PR_NUMBER": "409",
-                "BASE_SHA": "1" * 40,
-                "HEAD_SHA": head,
-                "SKILL_SOURCE": "base branch",
-                "SKILL_PATH": f".agents/skills/{stage}/SKILL.md",
-                "MODEL": "nvidia/stepfun-ai/step-5-preview",
-                "VARIANT": "high",
-                "NVIDIA_API_KEY": key,
-                "OPENCODE_DISABLE_PROJECT_CONFIG": "1",
-                "SCOPE_EMPTY": "false",
-            }
+            env = sandboxed_env(
+                PATH=os.pathsep.join([str(_stub_bin(case)), os.environ["PATH"]]),
+                STUB_OPENCODE_MODE=mode,
+                RUNNER_TEMP=str(runner_temp),
+                GITHUB_OUTPUT=str(case / "out"),
+                GITHUB_STEP_SUMMARY=str(case / "step-summary"),
+                PR_NUMBER="409",
+                BASE_SHA="1" * 40,
+                HEAD_SHA=head,
+                SKILL_SOURCE="base branch",
+                SKILL_PATH=f".agents/skills/{stage}/SKILL.md",
+                MODEL="nvidia/stepfun-ai/step-5-preview",
+                VARIANT="high",
+                NVIDIA_API_KEY=key,
+                credential_override_reason=(
+                    "the leak-guard's own fixture key; the guard has to see a key to refuse one"
+                ),
+                OPENCODE_DISABLE_PROJECT_CONFIG="1",
+                SCOPE_EMPTY="false",
+            )
             script = case / "step.sh"
             script.write_text(body, encoding="utf-8")
             result = subprocess.run(
@@ -1024,7 +1036,13 @@ def test_the_leak_guard_still_refuses_when_one_stream_is_missing(tmp_path) -> No
             )
             result = subprocess.run(
                 [shutil.which("bash") or "bash", str(script)],
-                env={**os.environ, "NVIDIA_API_KEY": key},
+                env=sandboxed_env(
+                    NVIDIA_API_KEY=key,
+                    credential_override_reason=(
+                        "the leak-guard's own fixture key; the guard has to see a key to "
+                        "refuse one"
+                    ),
+                ),
                 capture_output=True,
                 text=True,
             )

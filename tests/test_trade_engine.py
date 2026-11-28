@@ -14,6 +14,7 @@ from runner.engines.contract import parse_date_bound
 from runner.engines.native_adapter import NativeAdapter
 from runner.engines.vectorbt_adapter import VectorbtAdapter
 from shared.constants import DATA_DIR
+from tests.builders import make_backtest_config
 from tests.helpers import TEST_OHLCV_DIR_ENV, resolve_ohlcv_root
 
 
@@ -33,7 +34,7 @@ def _to_utc_datetime(value: object) -> datetime | None:
 @pytest.mark.parametrize("exposure", [0.0, -0.01])
 def test_backtest_config_rejects_position_exposure_outside_fraction_range(exposure: float):
     with pytest.raises(ValueError):
-        BacktestConfig(
+        make_backtest_config(
             strategy_name="bounds",
             symbols=["TEST"],
             timeframe="1h",
@@ -47,7 +48,7 @@ def test_backtest_config_rejects_position_exposure_outside_fraction_range(exposu
 def test_backtest_config_accepts_position_exposure_above_one(exposure: float):
     """#240: a per-position notional cap above 1x is leverage; the broker
     maximum (``max_leverage``) bounds it at sizing time, not at config time."""
-    cfg = BacktestConfig(
+    cfg = make_backtest_config(
         strategy_name="bounds",
         symbols=["TEST"],
         timeframe="1h",
@@ -119,7 +120,7 @@ def test_trade_engine_market_entry_and_signal_exit_price_model():
         exits.iloc[20] = True
         return entries, exits, {}, []
 
-    cfg = BacktestConfig(risk_per_trade_pct=0.01,
+    cfg = make_backtest_config(risk_per_trade_pct=0.01,
         strategy_name="unit-test",
         symbols=["TEST"],
         timeframe="1h",
@@ -173,7 +174,7 @@ def test_sizing_only_stop_survives_fill_and_is_used_for_risk_metadata():
         signals.loc[0, "stop_distance"] = 0.5
         return signals
 
-    cfg = BacktestConfig(
+    cfg = make_backtest_config(
         strategy_name="sizing-only-stop",
         symbols=["TEST"],
         timeframe="1h",
@@ -206,7 +207,7 @@ def test_sizing_only_stop_equal_to_fill_is_skipped():
         signals.loc[0, "sizing_sl_price"] = 101.0
         return signals
 
-    cfg = BacktestConfig(
+    cfg = make_backtest_config(
         strategy_name="invalid-sizing-stop",
         symbols=["TEST"],
         timeframe="1h",
@@ -238,7 +239,7 @@ def test_trade_engine_stop_uses_bar_low_and_risk_sizing_1pct():
         signals.loc[10, "stop_loss"] = 109.0
         return signals
 
-    cfg = BacktestConfig(
+    cfg = make_backtest_config(
         strategy_name="risk-test",
         symbols=["TEST"],
         timeframe="1h",
@@ -283,7 +284,7 @@ def test_trade_engine_accepts_sl_price_alias_for_native_stops_and_risk_sizing():
         indicators["sl_price"].iloc[10] = 109.0
         return entries, exits, indicators, []
 
-    cfg = BacktestConfig(
+    cfg = make_backtest_config(
         strategy_name="risk-test",
         symbols=["TEST"],
         timeframe="1h",
@@ -332,7 +333,7 @@ def test_trade_engine_can_anchor_market_stop_to_fill_price_with_stop_distance():
         indicators["stop_distance"].iloc[10] = 2.0
         return entries, exits, indicators, []
 
-    cfg = BacktestConfig(
+    cfg = make_backtest_config(
         strategy_name="risk-test",
         symbols=["TEST"],
         timeframe="1h",
@@ -371,7 +372,7 @@ def _tight_stop_strategy(df: pd.DataFrame, params: dict):
 
 
 def _run_tight_stop(**overrides) -> float:
-    cfg = BacktestConfig(
+    cfg = make_backtest_config(
         strategy_name="leverage-test",
         symbols=["TEST"],
         timeframe="1h",
@@ -422,7 +423,7 @@ def test_stop_distance_only_order_gets_fill_anchored_live_stop():
         indicators["stop_distance"].iloc[10] = 2.0
         return entries, exits, indicators, []
 
-    cfg = BacktestConfig(
+    cfg = make_backtest_config(
         strategy_name="stop-distance-only",
         symbols=["TEST"],
         timeframe="1h",
@@ -472,7 +473,7 @@ def test_trade_engine_configured_same_bar_take_profit_priority_falls_back_to_sto
         indicators["take_profit"].iloc[10] = 113.0
         return entries, exits, indicators, []
 
-    cfg = BacktestConfig(
+    cfg = make_backtest_config(
         strategy_name="execution-test",
         symbols=["TEST"],
         timeframe="1h",
@@ -543,7 +544,7 @@ def test_example_sma_native_vs_vectorbt_smoke_on_local_data():
         )
 
     symbol = selected.parent.name
-    cfg = BacktestConfig(risk_per_trade_pct=0.01,
+    cfg = make_backtest_config(risk_per_trade_pct=0.01,
         strategy_name="example_sma",
         symbols=[symbol],
         timeframe="1h",
@@ -581,7 +582,7 @@ class TestIssueC2ExposureMath:
         from runner.engine import TradeEngine
 
         return TradeEngine(
-            BacktestConfig(
+            make_backtest_config(
                 strategy_name="t",
                 symbols=["X"],
                 timeframe="1h",
@@ -743,7 +744,7 @@ def _wide_bar_run(strategy_name: str, *, stop=None, take_profit=None, exit_index
             signals.loc[exit_index, "exits"] = True
         return signals
 
-    cfg = BacktestConfig(
+    cfg = make_backtest_config(
         strategy_name=strategy_name,
         symbols=["TEST"],
         timeframe="1h",
@@ -849,7 +850,7 @@ def _excursion_run(take_profit=None, stop=None, direction="LONG", tps=None, hi=1
             signals.loc[20, "exits"] = True
         return signals
 
-    cfg = BacktestConfig(
+    cfg = make_backtest_config(
         strategy_name="excursion-side",
         symbols=["TEST"],
         timeframe="1h",
@@ -1042,7 +1043,7 @@ def _ladder_strategy(
 
 
 def _ladder_config() -> BacktestConfig:
-    return BacktestConfig(
+    return make_backtest_config(
         strategy_name="tp-ladder",
         symbols=["TEST"],
         timeframe="1h",
@@ -1138,7 +1139,7 @@ def test_a_partial_take_profit_fill_is_followed_by_a_stop_on_the_remainder():
         }
     )
 
-    cfg = BacktestConfig(
+    cfg = make_backtest_config(
         strategy_name="tp-ladder-then-stop",
         symbols=["TEST"],
         timeframe="1h",
