@@ -886,6 +886,29 @@ def _qty_to_broker_volume(qty: float, volume_per_qty: float = QTY_VOLUME_SCALE) 
     return int(volume)
 
 
+def _validate_broker_volume(volume: Any, *, field_name: str) -> int:
+    """Validate the broker volume a request builder was handed, failing closed.
+
+    Both builders receive the volume ``submit_order`` resolved once, as a
+    Python ``int`` count of whole broker volume units - the protocol fields are
+    int32, and a whole-valued ``float`` is refused rather than accepted: this
+    seam is a typed contract, not a coercion point. A fractional, boolean or
+    textual value means the caller handed this seam something else - qty, or a
+    scaled quantity - and rounding it would put a size on the wire that nobody
+    decided on. The two builders must agree on this contract, so the check
+    lives here rather than in each of them.
+    """
+    if isinstance(volume, bool) or not isinstance(volume, int):
+        raise ValueError(
+            f"{field_name} must be an int count of broker volume units, got "
+            f"{volume!r}; refusing to round or coerce a size."
+        )
+    broker_volume = int(volume)
+    if broker_volume <= 0:
+        raise ValueError(f"{field_name} must be a positive integer.")
+    return broker_volume
+
+
 def _floor_to_volume_step(volume: int, step_volume: int) -> int:
     """Floor *volume* onto the broker's volume grid.
 
@@ -3017,8 +3040,69 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         # only removes float noise.
         return round(floored_qty * float(scale.volume_per_qty))
 
+    def _verify_sizing_scale(
+        self, *, symbol: str, metadata: Mapping[str, Any], scale: SymbolScale
+    ) -> None:
+        """The #146 guard: refuse a qty sized against a scale that moved.
+
+        The daemon sizes this qty with a pip value derived from the symbol
+        scale at sizing time and records it as
+        ``pip_value_units_per_qty``. If the scale changed since (e.g. a
+        reconnect whose props fetch failed fell back to the static table), the
+        same qty would be a different position size, so the submit fails closed.
+        A caller pip value carries no units-per-qty, so the check cannot run
+        for it: converting the sized qty with whatever scale is current could
+        be a different position size (#146), and that fails closed too.
+
+        Called from :meth:`_resolve_order_volume` and again by ``submit_order``
+        immediately before the request is built, because a symbol scale can
+        move across that submit's awaits (a reconnect's props refresh inside
+        ``_resolve_symbol_id``) and the resolved volume is pinned, not
+        re-resolved, against the new scale.
+        """
+        sized_units = metadata.get("pip_value_units_per_qty")
+        if sized_units is None and metadata.get("pip_value_source") == "caller":
+            # An explicit caller pip value carries no units-per-qty, so the
+            # submit-time scale check cannot run; converting the sized qty with
+            # whatever scale is current could be a different position size
+            # (#146). Fail closed instead of skipping the check.
+            raise ValueError(
+                f"cTrader cannot verify the volume scale for {symbol}: the "
+                "caller-supplied pip value carries no pip_value_units_per_qty; "
+                "refusing to submit a qty whose sizing scale is unknown."
+            )
+        if sized_units is None:
+            return
+        current_units = scale.volume_per_qty / CTRADER_VOLUME_PER_BASE_UNIT
+        try:
+            sized_units_value = float(sized_units)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(
+                f"Invalid pip_value_units_per_qty for {symbol}: {sized_units!r}"
+            ) from exc
+        if not math.isclose(sized_units_value, current_units, rel_tol=1e-9, abs_tol=0.0):
+            raise ValueError(
+                f"cTrader volume scale for {symbol} changed since sizing "
+                f"({sized_units_value!r} -> {current_units!r} units per qty); "
+                "refusing to submit a qty sized for a different contract."
+            )
+
     def _resolve_order_volume(self, signal: LiveSignal) -> int:
-        """Resolve broker volume from the binding risk-engine ``qty``."""
+        """Resolve the binding risk-engine ``qty`` into broker volume units.
+
+        Returns a whole number of broker volume units as a builtin ``int`` -
+        the request seams are typed to that and refuse anything else, so a
+        refactor returning a float would fail closed at the builders rather
+        than change a size.
+
+        Reads only the sizing metadata (``qty``, the pip value and
+        ``risk_sizing_mode``). In particular it reads no position or exit
+        metadata, which is why ``submit_order`` does not re-resolve the exit
+        path after it records the broker position id: a resolver that starts
+        reading that metadata must restore the re-resolution (and its
+        idempotency compare) with it - see
+        ``test_ctrader_resolved_volume_ignores_exit_position_metadata``.
+        """
         scale = self._scale_for(signal.symbol)
         metadata = signal.metadata or {}
         raw_keys = [key for key in ("ctrader_volume", "volume") if key in metadata]
@@ -3040,35 +3124,9 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 "Signal has no positive quantity ('qty'); refusing to "
                 "submit an order with a default size."
             ) from exc
-        sized_units = metadata.get("pip_value_units_per_qty")
-        if sized_units is None and metadata.get("pip_value_source") == "caller":
-            # An explicit caller pip value carries no units-per-qty, so the
-            # submit-time scale check below cannot run; converting the sized
-            # qty with whatever scale is current could be a different
-            # position size (#146). Fail closed instead of skipping the check.
-            raise ValueError(
-                f"cTrader cannot verify the volume scale for {signal.symbol}: the "
-                "caller-supplied pip value carries no pip_value_units_per_qty; "
-                "refusing to submit a qty whose sizing scale is unknown."
-            )
-        if sized_units is not None:
-            # #146: the daemon sized this qty with a pip value derived from the
-            # symbol scale at sizing time. If the scale changed since (e.g. a
-            # reconnect whose props fetch failed fell back to the static
-            # table), the same qty would be a different position size.
-            current_units = scale.volume_per_qty / CTRADER_VOLUME_PER_BASE_UNIT
-            try:
-                sized_units_value = float(sized_units)
-            except (TypeError, ValueError, OverflowError) as exc:
-                raise ValueError(
-                    f"Invalid pip_value_units_per_qty for {signal.symbol}: {sized_units!r}"
-                ) from exc
-            if not math.isclose(sized_units_value, current_units, rel_tol=1e-9, abs_tol=0.0):
-                raise ValueError(
-                    f"cTrader volume scale for {signal.symbol} changed since sizing "
-                    f"({sized_units_value!r} -> {current_units!r} units per qty); "
-                    "refusing to submit a qty sized for a different contract."
-                )
+        self._verify_sizing_scale(
+            symbol=signal.symbol, metadata=metadata, scale=scale
+        )
         if str(metadata.get("risk_sizing_mode") or "") == EXIT_ONLY_RISK_SIZING_MODE:
             volume = self._exit_volume(signal.symbol, qty, scale)
         else:
@@ -4002,15 +4060,20 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 str((signal.metadata or {}).get("risk_sizing_mode") or "")
                 == EXIT_ONLY_RISK_SIZING_MODE
             )
+            # Resolve the broker volume ONCE, here, from the binding qty, and
+            # hand this value to the request builders below. They must not
+            # resolve again: submit_order awaits several times after this
+            # point, and a resolution that reads the scale fresh could size
+            # the wire request off a scale that moved in the meantime - a
+            # volume the persisted qty below no longer describes.
             order_volume = self._resolve_order_volume(signal)
             # Persist the quantity the broker is actually asked for, not the
             # unrounded risk-sized one: the volume grid floor can drop a
             # sub-step remainder the broker can never work, and a persisted
             # requested qty larger than the fill reads as a working-order
-            # expectation forever in broker reconciliation. Recomputing the
-            # volume from the normalized qty is idempotent (the lot-grid
-            # floor's noise band absorbs the float round-trip), so the request
-            # builders below still derive the same volume.
+            # expectation forever in broker reconciliation. Normalizing from
+            # the volume resolved above keeps the persisted qty and the wire
+            # request on one number.
             scale = self._scale_for(signal.symbol)
             submitted_qty = _broker_volume_to_qty(order_volume, scale.volume_per_qty)
             # Only the lot-grid noise band (<= 1e-6 of a step, see
@@ -4057,13 +4120,15 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                     }
                 }
             )
-            # The request builders below re-resolve the volume from this
-            # normalized signal; it must reproduce the volume resolved from
-            # the binding qty, or the wire request and the persisted qty
-            # would diverge. The float round-trip (volume -> qty -> volume)
-            # stays far inside the lot-grid floor's 1e-6-unit noise band for
-            # every volume a broker int32 can express (~5e-7 units at
-            # INT32_MAX), so an exact int compare cannot false-positive.
+            # The ONE deliberate re-resolution: the signal's input CHANGED
+            # since the call above - its qty is now the volume-grid quantity
+            # the broker can work, not the binding qty - so resolving again is
+            # not a duplicate, it is the guard that the persisted quantity
+            # still resolves to the volume we are about to send. The float
+            # round-trip (volume -> qty -> volume) stays far inside the
+            # lot-grid floor's 1e-6-unit noise band for every volume a broker
+            # int32 can express (~5e-7 units at INT32_MAX), so an exact int
+            # compare cannot false-positive.
             reresolved_volume = self._resolve_order_volume(signal)
             if reresolved_volume != order_volume:
                 raise RuntimeError(
@@ -4098,6 +4163,12 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                     signal.symbol, requested_position_id
                 )
                 close_position_id = position_id
+                # Records which broker position this close addresses. There is
+                # deliberately no re-resolution here: _resolve_order_volume reads
+                # neither position_id nor any other exit metadata, so this key
+                # cannot change the volume - the volume resolved above stays the
+                # one to send. If the resolver ever starts reading position or
+                # exit metadata, the re-resolution must come back with it.
                 signal = signal.model_copy(
                     update={
                         "metadata": {
@@ -4106,22 +4177,35 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                         }
                     }
                 )
-                self._resolve_order_volume(signal)
 
             # Build the broker request BEFORE persisting: a refusal here
             # (unknown symbol, missing SL/TP) must not leave a live_signals
             # row that reads as "an order may exist" and routes retries into
             # the persisted-signal recovery path.
             symbol_id = await self._resolve_symbol_id(signal.symbol)
+            # #146: the request builders used to re-resolve the volume, which
+            # re-ran the "scale changed since sizing" check after these awaits -
+            # so a symbol scale that moved in this window (a reconnect's props
+            # refresh inside ``_resolve_symbol_id``) refused the submit. The
+            # volume is now resolved once and passed down, so the check is
+            # re-run here instead, against the scale as it stands right before
+            # the request is built and before anything is persisted.
+            self._verify_sizing_scale(
+                symbol=signal.symbol,
+                metadata=signal.metadata or {},
+                scale=self._scale_for(signal.symbol),
+            )
             if exit_only:
                 if position_id is None:
                     raise RuntimeError("cTrader exit-only position id was not resolved.")
                 request = self._build_close_position_request(
                     position_id=position_id,
-                    volume=self._resolve_order_volume(signal),
+                    volume=order_volume,
                 )
             else:
-                request = self._build_new_order_request(signal, symbol_id=symbol_id)
+                request = self._build_new_order_request(
+                    signal, symbol_id=symbol_id, volume=order_volume
+                )
 
             canonical_signal_id, created = await asyncio.to_thread(
                 save_live_signal, signal
@@ -4277,6 +4361,11 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         return symbol_id
 
     def _build_close_position_request(self, *, position_id: int, volume: int) -> Any:
+        """Build the position-addressed close for an already-resolved *volume*.
+
+        ``submit_order`` resolves the volume exactly once and passes it here,
+        exactly as it does for the entry request.
+        """
         if self._ProtoOAClosePositionReq is None:
             raise RuntimeError("cTrader close-position request type is unavailable.")
         if isinstance(position_id, bool):
@@ -4289,17 +4378,30 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             isinstance(position_id, float) and position_id != position_id_value
         ):
             raise ValueError("cTrader close position id must be positive integer.")
-        volume_value = coerce_positive_live_qty(volume, field_name="cTrader close volume")
-        broker_volume = round(volume_value)
-        if broker_volume <= 0:
-            raise ValueError("cTrader close volume must be a positive integer.")
+        broker_volume = _validate_broker_volume(
+            volume, field_name="cTrader close volume"
+        )
         request = self._ProtoOAClosePositionReq()
         request.ctidTraderAccountId = self.ctid_trader_account_id
         request.positionId = position_id_value
         request.volume = broker_volume
         return request
 
-    def _build_new_order_request(self, signal: LiveSignal, *, symbol_id: int) -> Any:
+    def _build_new_order_request(
+        self, signal: LiveSignal, *, symbol_id: int, volume: int
+    ) -> Any:
+        """Build the entry request for an already-resolved broker *volume*.
+
+        ``submit_order`` resolves the volume exactly once (from the binding
+        qty, then guards the normalized one) and passes it in: the request must
+        carry that volume, not a fresh resolution against a scale that may have
+        moved across the submit's awaits.
+
+        ``volume`` is therefore required and must never gain a default that
+        resolves it here - that would reintroduce exactly the divergence the
+        single resolution removed, and the resolver-call-count spy tests are
+        what catch it.
+        """
         if signal.action not in {"buy", "sell"}:
             raise ValueError(f"Unsupported signal action: {signal.action}")
         metadata = signal.metadata or {}
@@ -4314,7 +4416,12 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         request.tradeSide = (
             self._ProtoOATradeSide.BUY if signal.action == "buy" else self._ProtoOATradeSide.SELL
         )
-        request.volume = self._resolve_order_volume(signal)
+        # The volume no longer arrives validated from the resolver, so validate
+        # it here, on the same contract the close request uses: whole broker
+        # volume units or nothing.
+        request.volume = _validate_broker_volume(
+            volume, field_name="cTrader new-order volume"
+        )
         request.timeInForce = self._ProtoOATimeInForce.IMMEDIATE_OR_CANCEL
         request.clientOrderId = str(signal.id)
         # One allowlist and one resolver for both levels (G19). ANY_FLOAT keeps
