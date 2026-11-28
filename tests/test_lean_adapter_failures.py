@@ -7,12 +7,13 @@ import pytest
 
 from runner.engines.base import BacktestConfig
 from runner.engines.lean_adapter import LeanAdapter
+from tests.builders import make_backtest_config
 
 
 def _config(tmp_path: Path) -> BacktestConfig:
     # The LEAN run path refuses signal_exit_fill="next_open"; entry points
     # declare the legacy "close" fill for it (default_signal_exit_fill_for_engine).
-    return BacktestConfig(risk_per_trade_pct=0.01, parameters={"fees": "zero"},
+    return make_backtest_config(risk_per_trade_pct=0.01, parameters={"fees": "zero"},
         signal_exit_fill="close",
         strategy_name="lean_demo",
         symbols=["SPY"],

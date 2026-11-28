@@ -25,6 +25,7 @@ from pydantic import ValidationError
 
 from runner.engines.base import BacktestConfig
 from runner.engines.vectorbt_adapter import resolve_max_position_exposure_pct
+from tests.builders import make_backtest_config
 from tests.helpers import with_zero_fees
 
 # ─── BacktestConfig field semantics ─────────────────────────────────────────
@@ -41,7 +42,7 @@ class TestBacktestConfigField:
             "end_date": "2024-01-31",
         }
         payload.update(overrides)
-        return BacktestConfig(**with_zero_fees(payload))
+        return make_backtest_config(**with_zero_fees(payload))
 
     def test_new_field_is_the_canonical_name(self):
         config = self._config(max_position_exposure_pct=0.75)
@@ -280,7 +281,7 @@ class TestNativeEngineExposureWiring:
             "parameters": {},
         }
         payload.update(overrides)
-        return TradeEngine(BacktestConfig(**with_zero_fees(payload)), symbol="X")
+        return TradeEngine(make_backtest_config(**with_zero_fees(payload)), symbol="X")
 
     def test_exposure_flag_caps_per_position_notional(self):
         from risk.config import RiskConfig

@@ -92,19 +92,11 @@ def test_process_signal_selects_trailing_mode_via_config():
     }
 
 
-def test_process_signal_emits_supertrend_flip_config_for_known_mode():
-    """#150: supertrend_flip is known, so the processor builds and emits its
-    workflow description; executing paths reject the signal (#168 enables it
-    by extending the support sets)."""
-    processor = RamJetSignalProcessor({"ram_jet": {"trailing_mode": "supertrend_flip"}})
-    signal = processor.process_signal(
-        {"symbol": "AAPL", "action": "BUY"}, _sample_market_data()
-    )
-    trailing = signal.metadata["trailing_sl_config"]
-    assert trailing["mode"] == "supertrend_flip"
-    assert trailing["breakeven_after_tp1"] is True
-    assert trailing["activation_phase"] == "wait_for_first_green_after_tp1"
-    assert trailing["exit_phase"] == "exit_on_first_red_after_activation"
+def test_removed_supertrend_flip_mode_rejected_at_config_time():
+    """The workflow was removed: a bot config naming the mode is refused at
+    construction with a "removed" message — never emits a flip config."""
+    with pytest.raises(ValueError, match="removed"):
+        RamJetSignalProcessor({"ram_jet": {"trailing_mode": "supertrend_flip"}})
 
 
 def test_unknown_trailing_mode_rejected_at_config_time():

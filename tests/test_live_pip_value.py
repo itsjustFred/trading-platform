@@ -35,6 +35,7 @@ import live_runner.daemon as daemon
 from live_runner.base_adapter import BaseLiveAdapter, LivePipValue, LiveQuote
 from risk import RiskConfig, RiskEngine, TradeSignal
 from shared.models import LiveDeploymentConfig, LiveSignal
+from tests.builders import make_live_deployment, make_live_signal
 
 pb = pytest.importorskip("ctrader_open_api.messages.OpenApiMessages_pb2")
 model = pytest.importorskip("ctrader_open_api.messages.OpenApiModelMessages_pb2")
@@ -148,7 +149,7 @@ def _deployment(**settings: Any) -> LiveDeploymentConfig:
         # 100 % of balance: every position below stays under it (asserted).
         "max_notional_per_trade": 1.0,
     }
-    return LiveDeploymentConfig(
+    return make_live_deployment(
         id=str(uuid4()),
         strategy_name="pip-value",
         account_id="acc-1",
@@ -171,7 +172,7 @@ def _signal(
     action: str = "buy",
     extra: dict[str, Any] | None = None,
 ) -> LiveSignal:
-    return LiveSignal(
+    return make_live_signal(
         deployment_id=str(deployment.id),
         symbol=symbol,
         action=action,
@@ -336,7 +337,7 @@ def test_demo_repro_reports_the_risk_the_broker_volume_actually_carries():
     the stop, and the broker minimum (100,000) refuses the order.
     """
     fixture = _CTrader({"EURUSD": _quote(1.10504)}, balance=99.94)
-    deployment = LiveDeploymentConfig(
+    deployment = make_live_deployment(
         id=str(uuid4()), strategy_name="repro", account_id="acc-1", symbols=["EURUSD"],
         timeframe="1h", status="ACTIVE", signal_source="internal", signal_config={},
         settings={},
@@ -612,7 +613,7 @@ def test_ctrader_submit_refuses_a_qty_sized_for_a_different_scale():
 
 def test_ctrader_submit_refuses_a_malformed_sized_scale():
     fixture = _CTrader({})
-    signal = LiveSignal(
+    signal = make_live_signal(
         deployment_id="d", symbol="EURUSD", action="buy", theoretical_price=1.1,
         timestamp=datetime.now(timezone.utc),
         metadata={"qty": 1.0, "pip_value_units_per_qty": "abc"},
@@ -890,7 +891,7 @@ def test_exit_only_orders_need_no_pip_value(monkeypatch):
     adapter = _Book(error=AssertionError("must not be called"))
     deployment = _deployment()
     _own_ledger(monkeypatch, deployment, 3.0)
-    signal = LiveSignal(
+    signal = make_live_signal(
         deployment_id=str(deployment.id), symbol="AAPL", action="sell",
         theoretical_price=100.0, timestamp=datetime.now(timezone.utc),
         metadata={"exit_only": True},
@@ -911,7 +912,7 @@ def test_exit_only_close_ignores_payload_pip_value_keys(monkeypatch):
     adapter = _Book(error=AssertionError("must not be called"))
     deployment = _deployment()
     _own_ledger(monkeypatch, deployment, 3.0)
-    signal = LiveSignal(
+    signal = make_live_signal(
         deployment_id=str(deployment.id), symbol="AAPL", action="sell",
         theoretical_price=100.0, timestamp=datetime.now(timezone.utc),
         metadata={
@@ -999,7 +1000,7 @@ def test_ctrader_refuses_a_caller_pip_value_whose_scale_cannot_be_verified():
     # scale guard cannot run; converting qty with whatever scale is current
     # could be a different position size. Fail closed.
     fixture = _CTrader({})
-    signal = LiveSignal(
+    signal = make_live_signal(
         deployment_id="d", symbol="EURUSD", action="buy", theoretical_price=1.1,
         timestamp=datetime.now(timezone.utc),
         metadata={"qty": 1.0, "pip_value": 2.0, "pip_value_source": "caller"},

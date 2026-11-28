@@ -1414,8 +1414,8 @@ def _indicator_meta_key(name: str) -> str:
 #: Protective-level aliases in canonical-first order (#237). A strategy that
 #: publishes both spellings of one level must resolve identically in every
 #: engine, so the winner can never depend on the indicators dict's insertion
-#: order. The order is the one ``risk.live._LIVE_SL_KEYS``/``_LIVE_TP_KEYS``
-#: and the native ``TradeEngine._extract_levels`` use.
+#: order. The order is the one ``risk.signal_levels.SL_METADATA_KEYS``/
+#: ``TP_METADATA_KEYS`` and the native ``TradeEngine._extract_levels`` use.
 _LEVEL_ALIASES: dict[str, tuple[str, ...]] = {
     "sizing_stop": ("sizing_stop", "sizing_sl_price", "sizing_sl"),
     "stop_loss": ("stop_loss", "sl_price"),

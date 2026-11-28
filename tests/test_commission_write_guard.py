@@ -17,7 +17,8 @@ import pytest
 from pydantic import ValidationError
 
 from shared.database import LiveExecutionModel
-from shared.models import LiveExecution, LiveSignal, validate_commission_cost
+from shared.models import LiveExecution, validate_commission_cost
+from tests.builders import make_live_signal
 from tests.conftest import seed_live_deployments
 
 T0 = datetime(2026, 7, 15, 10, 0, 0, tzinfo=timezone.utc)
@@ -87,7 +88,7 @@ def database(isolated_db):
 
 
 def _persist_signal(database) -> str:
-    signal = LiveSignal(
+    signal = make_live_signal(
         deployment_id=DEP_1,
         symbol="EURUSD",
         action="buy",
