@@ -9,7 +9,6 @@ exercised for its graceful-skip paths here (a temp repo has no ``uv.lock`` /
 
 from __future__ import annotations
 
-import os
 import subprocess
 import sys
 from pathlib import Path
@@ -17,17 +16,14 @@ from pathlib import Path
 import pytest
 
 from scripts.agents import worktree_preflight
+from tests.conftest import sandboxed_env
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PREFLIGHT = REPO_ROOT / "scripts" / "agents" / "worktree_preflight.py"
 
 
 def _env(home: Path) -> dict[str, str]:
-    return {
-        "PATH": os.environ.get("PATH", os.defpath),
-        "HOME": str(home),
-        "TMPDIR": str(home),
-    }
+    return sandboxed_env(HOME=str(home), TMPDIR=str(home))
 
 
 def _git(repo: Path, *args: str) -> None:

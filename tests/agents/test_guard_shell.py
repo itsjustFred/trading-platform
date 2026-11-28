@@ -10,7 +10,6 @@ because the main-checkout rule set keys off exactly that distinction.
 from __future__ import annotations
 
 import json
-import os
 import subprocess
 import sys
 from pathlib import Path
@@ -18,6 +17,7 @@ from pathlib import Path
 import pytest
 
 from scripts.agents import guard_shell
+from tests.conftest import sandboxed_env
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 GUARD = REPO_ROOT / "scripts" / "agents" / "guard_shell.py"
@@ -42,12 +42,8 @@ def _git(repo: Path, *args: str) -> None:
 
 
 def _child_env(home: Path) -> dict[str, str]:
-    """Minimal environment for git/python children: no inherited credentials."""
-    return {
-        "PATH": os.environ.get("PATH", os.defpath),
-        "HOME": str(home),
-        "TMPDIR": str(home),
-    }
+    """Sandboxed environment for git/python children (no inherited credentials)."""
+    return sandboxed_env(HOME=str(home), TMPDIR=str(home))
 
 
 @pytest.fixture
