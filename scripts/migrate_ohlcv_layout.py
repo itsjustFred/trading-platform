@@ -16,7 +16,10 @@ New layout (written through :func:`shared.ohlcv_store.write_frame`)::
 ``_bid``/``_ask`` split files are merged into ONE two-sided frame
 (``bid_*``/``ask_*`` columns) before writing. ``asset_class``/``region`` are
 taken from the old path. A symbol that appears under more than one
-(asset_class, region) pair within a source is a collision: it is skipped and
+(asset_class, region) pair within a source is a collision. A collision whose
+asset classes are exactly ``{equity, etf}`` is resolved by keeping the copy
+with the longest coverage (earliest first timestamp, then most rows) and
+writing it with ``asset_class="etf"``; every other collision is skipped and
 reported, never silently merged — the new layout keys symbols uniquely per
 source. Nothing is ever deleted; ``--dry-run`` reports without writing.
 
@@ -91,6 +94,7 @@ class MigrationReport:
     written: list[str] = field(default_factory=list)
     skipped: list[str] = field(default_factory=list)
     collisions: list[str] = field(default_factory=list)
+    resolved: list[str] = field(default_factory=list)
     per_source: dict[str, dict[str, int]] = field(default_factory=dict)
 
     def summary_lines(self) -> list[str]:
@@ -100,9 +104,14 @@ class MigrationReport:
             lines.append(
                 f"  {source}: written={counts.get('written', 0)} "
                 f"skipped={counts.get('skipped', 0)} "
-                f"collisions={counts.get('collisions', 0)}"
+                f"collisions={counts.get('collisions', 0)} "
+                f"resolved={counts.get('resolved', 0)}"
             )
-        for kind, items in (("collision", self.collisions), ("skipped", self.skipped)):
+        for kind, items in (
+            ("collision", self.collisions),
+            ("resolved", self.resolved),
+            ("skipped", self.skipped),
+        ):
             lines.extend(f"  {kind}: {item}" for item in items)
         if not self.written and not self.skipped and not self.collisions:
             lines.append("  (nothing to migrate)")
@@ -270,6 +279,68 @@ def _collect_source(
     return targets, skipped
 
 
+def _parquet_first_rows(path: Path) -> tuple[pd.Timestamp, int]:
+    """(first timestamp, row count) of one old-layout parquet.
+
+    Row-group statistics answer both without a full read; when the timestamp
+    stats are missing the timestamp column alone is read.
+    """
+    import pyarrow.parquet as pq
+
+    try:
+        parquet = pq.ParquetFile(str(path))
+        rows = int(parquet.metadata.num_rows)
+    except (OSError, ValueError):
+        rows = 0
+    bounds = ohlcv_store.timestamp_bounds(path)
+    if bounds is not None:
+        return bounds[0], rows
+    try:
+        frame = pd.read_parquet(path, columns=["timestamp"])
+    except (OSError, ValueError):
+        return pd.Timestamp.max, rows
+    first = pd.Timestamp(frame["timestamp"].min())
+    if first.tzinfo is None:
+        first = first.tz_localize("UTC")
+    else:
+        first = first.tz_convert("UTC")
+    return first, max(rows, len(frame))
+
+
+def _collision_winner(
+    targets: dict[tuple[str, str, str, str], dict[str, object]],
+    symbol: str,
+    metas: set[tuple[str, str]],
+) -> tuple[str, str]:
+    """Pick the (asset_class, region) copy of ``symbol`` with the longest
+    coverage: earliest first timestamp across its files, then most rows."""
+    best_meta: tuple[str, str] | None = None
+    best_key: tuple[pd.Timestamp, int] | None = None
+    for meta in sorted(metas):
+        firsts: list[pd.Timestamp] = []
+        rows = 0
+        for target in targets.values():
+            if (str(target["asset_class"]), str(target["region"])) != meta:
+                continue
+            if str(target["symbol"]) != symbol:
+                continue
+            slots = target["frames"]
+            assert isinstance(slots, dict)
+            for path in slots.values():
+                first, count = _parquet_first_rows(Path(path))
+                firsts.append(first)
+                rows += count
+        first = min(firsts) if firsts else pd.Timestamp.max
+        # Earliest first wins; ties go to the copy with most rows (negated
+        # so the smaller key is better throughout).
+        key = (first, -rows)
+        if best_key is None or key < best_key:
+            best_key = key
+            best_meta = meta
+    assert best_meta is not None
+    return best_meta
+
+
 def migrate(
     src_root: str | Path,
     dst_root: str | Path,
@@ -304,11 +375,15 @@ def migrate(
 
     for source in source_names:
         targets, skipped = _collect_source(src, source)
-        report.per_source.setdefault(source, {"written": 0, "skipped": 0, "collisions": 0})
+        report.per_source.setdefault(
+            source, {"written": 0, "skipped": 0, "collisions": 0, "resolved": 0}
+        )
         report.skipped.extend(f"{item}" for item in skipped)
         report.per_source[source]["skipped"] += len(skipped)
 
         # Collisions: one symbol mapping to more than one (asset_class, region).
+        # {equity, etf} collisions resolve to the longest-coverage copy,
+        # canonicalised to asset_class "etf"; anything else fails loudly.
         symbol_meta: dict[str, set[tuple[str, str]]] = {}
         for target in targets.values():
             symbol_meta.setdefault(str(target["symbol"]), set()).add(
@@ -317,17 +392,34 @@ def migrate(
         collided = {
             symbol for symbol, metas in symbol_meta.items() if len(metas) > 1
         }
+        resolved_winners: dict[str, tuple[str, str]] = {}
         for symbol in sorted(collided):
-            metas = sorted(symbol_meta[symbol])
+            metas = symbol_meta[symbol]
+            if {asset_class for asset_class, _region in metas} == {"equity", "etf"}:
+                winner = _collision_winner(targets, symbol, metas)
+                resolved_winners[symbol] = winner
+                report.resolved.append(
+                    f"{source}: symbol {symbol} resolved to {winner} as etf"
+                )
+                report.per_source[source]["resolved"] += 1
+                continue
+            metas_sorted = sorted(metas)
             report.collisions.append(
-                f"{source}: symbol {symbol} appears under multiple layouts {metas}; skipped"
+                f"{source}: symbol {symbol} appears under multiple layouts {metas_sorted}; skipped"
             )
             report.per_source[source]["collisions"] += 1
+        skipped_symbols = collided - resolved_winners.keys()
 
         for (_symbol, _asset, _region, _tfseg), target in sorted(targets.items()):
             symbol = str(target["symbol"])
-            if symbol in collided:
+            if symbol in skipped_symbols:
                 continue
+            asset_class = str(target["asset_class"])
+            if symbol in resolved_winners:
+                winner = resolved_winners[symbol]
+                if (asset_class, str(target["region"])) != winner:
+                    continue
+                asset_class = "etf"
             timeframe = str(target["timeframe"])
             segment = str(target["segment"])
             slots = target["frames"]
@@ -355,7 +447,7 @@ def migrate(
                     symbol,
                     timeframe,
                     merged,
-                    asset_class=str(target["asset_class"]),
+                    asset_class=asset_class,
                     region=str(target["region"]),
                     segment=segment,
                 )

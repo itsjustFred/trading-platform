@@ -117,6 +117,72 @@ def test_split_bid_ask_merged_into_one_file(old_tree: Path, tmp_path: Path) -> N
     assert frame["ask_open"].tolist() == pytest.approx([1.2] * 3)
 
 
+def test_equity_etf_collision_resolves_to_etf_with_longest_coverage(
+    tmp_path: Path,
+) -> None:
+    """{equity, etf} collisions keep the longest-coverage copy, labelled etf."""
+    src = tmp_path / "old" / "ohlcv"
+    # ETF1: equity copy starts earlier → wins despite fewer rows.
+    _write_old(
+        src, "yfinance", "equity", "US", "ETF1", "1d.parquet",
+        frame=_frame(periods=2, start="2020-01-01", freq="D"),
+    )
+    _write_old(
+        src, "yfinance", "etf", "US", "ETF1", "1d.parquet",
+        frame=_frame(periods=5, start="2024-01-01", freq="D"),
+    )
+    # ETF2: same first timestamp → the copy with most rows wins (etf).
+    _write_old(
+        src, "yfinance", "equity", "US", "ETF2", "1d.parquet",
+        frame=_frame(periods=3, start="2024-01-01", freq="D"),
+    )
+    _write_old(
+        src, "yfinance", "etf", "US", "ETF2", "1d.parquet",
+        frame=_frame(periods=6, start="2024-01-01", freq="D"),
+    )
+
+    dst = tmp_path / "new" / "ohlcv"
+    report = migrate(src, dst, sources=["yfinance"])
+
+    assert report.collisions == []
+    assert len(report.resolved) == 2
+
+    manifest = ohlcv_store.read_manifest(tmp_path / "new", "yfinance")
+    # Winner data is kept (earliest first wins for ETF1) but the asset_class
+    # is always canonicalised to "etf" for {equity, etf} collisions.
+    assert manifest["ETF1"]["asset_class"] == "etf"
+    assert manifest["ETF1"]["region"] == "US"
+    assert manifest["ETF2"]["asset_class"] == "etf"
+
+    entry1 = ohlcv_store.find_dataset(tmp_path / "new", "ETF1", "1d", data_source="yfinance")
+    assert entry1 is not None
+    assert entry1.first is not None and str(entry1.first).startswith("2020-01-01")
+    entry2 = ohlcv_store.find_dataset(tmp_path / "new", "ETF2", "1d", data_source="yfinance")
+    assert entry2 is not None
+    assert entry2.rows == 6
+
+
+def test_non_equity_etf_collision_still_fails_loudly(tmp_path: Path) -> None:
+    """Collisions outside {equity, etf} — including a third asset class —
+    are still reported and skipped."""
+    src = tmp_path / "old" / "ohlcv"
+    _write_old(src, "yfinance", "equity", "US", "SPY", "1d.parquet", frame=_frame(freq="D"))
+    _write_old(src, "yfinance", "etf", "US", "SPY", "1h.parquet", frame=_frame())
+    _write_old(src, "yfinance", "index", "US", "SPY", "1d.parquet", frame=_frame(freq="D"))
+    _write_old(src, "testsrc", "forex", "COLL", "1h.parquet")
+    _write_old(src, "testsrc", "metals", "COLL", "1h.parquet")
+
+    dst = tmp_path / "new" / "ohlcv"
+    report = migrate(src, dst)
+
+    assert any("SPY" in item and "multiple layouts" in item for item in report.collisions)
+    assert any("COLL" in item and "multiple layouts" in item for item in report.collisions)
+    assert report.per_source["yfinance"]["collisions"] == 1
+    assert report.per_source["testsrc"]["collisions"] == 1
+    assert not (dst / "yfinance" / "SPY").exists()
+    assert not (dst / "testsrc" / "COLL").exists()
+
+
 def test_collisions_and_skips_reported(old_tree: Path, tmp_path: Path) -> None:
     dst = tmp_path / "new" / "ohlcv"
     report = migrate(old_tree, dst)
