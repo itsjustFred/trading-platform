@@ -48,10 +48,12 @@ parent Cleanup 16 record.
   when the bar opens through the stop AND the resulting limit is marketable
   at that open; a plain LIMIT keeps the conservative level fill (no
   favourable-gap price improvement). A gap-through open fill is marketable,
-  so it pays the same spread a MARKET order at that open pays (maintainer
-  default 2026-11-23): a LONG buys the ask (`open + spread`), a SHORT sells
-  the bid open — symmetric with MARKET entries; intrabar level fills and
-  fills at a resting limit price carry no spread.
+  so it fills at the open on the side the order trades on (#472): a LONG
+  buys the ask (the bar's `ask_open`, or `open + spread`/`spread_price_col`
+  on a one-sided frame), a SHORT sells the bid open — symmetric with
+  MARKET entries; intrabar level fills and fills at a resting limit price
+  carry no spread on top (the level is already denominated on the order's
+  side).
   `ExecutionModelSettings.market_order_timing = "next_bar_open"` and
   `entry_price_side = "open"` document this on every native trade
   (`trade.meta["execution_model"]`, `trade.meta["entry_fill"]`).
@@ -67,12 +69,18 @@ parent Cleanup 16 record.
 ### Protective exits (stop-loss / take-profit)
 
 - Trigger sides: a LONG stop triggers when `low <= stop`; a LONG take-profit
-  triggers when `high >= take_profit`; mirrored for SHORT. Native records this
+  triggers when `high >= take_profit`; mirrored for SHORT — except that on
+  a two-sided frame (`ask_*` columns present) the native engine triggers
+  SHORT stops/TPs on the ASK range and buy-side pending orders on the ask
+  range too (#472; the frozen vectorbt adapter keeps the `ask_ohlc`
+  opt-in). Native records this
   as `stop_trigger_side = "bar_low_high"` and
   `take_profit_trigger_side = "bar_high_low"`.
 - Fill price (owner decision 2026-11-13, supersedes "always the level"): the
   protective **level ± the resolved slippage model** (#130 — with
-  `slippage="none"` the level is exact) on an **intrabar touch** (the bar
+  `slippage="none"` the level is exact; on a two-sided frame the level is
+  already denominated on the exit's side — bid for LONG, ask for SHORT —
+  so the bar-spread model adds nothing on top, #472) on an **intrabar touch** (the bar
   opens on the safe side and trades through the level later); the bar's
   **open** ± slippage when the bar **opens beyond** the level (gap through a
   stop — the worse price — or through a take-profit in your favour — the
@@ -90,10 +98,11 @@ parent Cleanup 16 record.
   is frozen: its `_normalize_trade_exits` containment restates a
   level-violating leg to the recorded level only — no gap→open restatement
   (frozen engines get fail-loud guards only, ADR 0002).
-  SHORT exits buy the ask, so native adds the spread on top of the open on a
-  gap fill exactly as on a level fill. A gap fill is a market fill, so a SHORT
-  target gapped by less than the spread fills at `open + spread`, which can be
-  worse than the target level — realistic. When a
+  SHORT exits buy the ask (#472): on a two-sided frame the level is
+  ask-denominated, so the gap fill is the bar's `ask_open` — no spread is
+  added on top, it is already inside the ask price. A gap fill is a market
+  fill, so a SHORT target gapped through fills at the ask open, which can
+  be worse than the target level — realistic. When a
   trailing stop is active, native reports reason `trailing_stop`; otherwise
   `stop_loss`. Native names take-profit exits after the level name (`tp`,
   `tp1`, …); vectorbt and signal replay use `take_profit`. Consumers must
@@ -165,11 +174,18 @@ protective stop unless it emits `exit_order_type="level"` (§2).
 Slippage is applied to the **fill price** in the adverse direction —
 never as a separate cost line, so `pnl`, `net_pnl`, the equity curve and
 sizing equity all carry the same cost. For the fixed-bps models that
-means buys fill higher and sells fill lower; the bar-spread model
-charges the quoted spread **once per round trip, on the buy side only**
-(canonical OHLC is the bid series: buys lift to the ask, sells stay on
-the bid) — an implementer porting this must not subtract the spread on
-sells as well or the spread is charged twice.
+means buys fill higher and sells fill lower. The quoted spread itself is
+priced by the **fill**, not the model (#472): canonical OHLC is the bid
+series, and on a frame that carries `ask_*` columns the native engine
+always fills and triggers on the side a real order would hit — buys at
+the ask (ask open for market/next-open fills, the ask level for
+ask-side stops/limits), sells at the bid, LONG SL/TP on the bid range,
+SHORT SL/TP on the ask range. The spread is therefore paid **once per
+round trip, inside the fill prices** — an implementer porting this must
+not add it again on top of an ask-denominated fill or it is charged
+twice. On a one-sided frame (no `ask_*` columns — yfinance, Alpaca, ...)
+ask == bid and the only cost is the configured model; the legacy
+`spread_price_col` parameter still derives `ask = bid + spread` there.
 Scope per the maintainer decision: the **native** engine and **signal
 replay** only (the engines #318 keeps; LEAN stays import-only; vectorbt
 and pynecore do not model slippage and record that fact in
@@ -193,10 +209,13 @@ and pynecore do not model slippage and record that fact in
   reader never has to guess which cost model produced the numbers.
 - When a strategy already prices the spread through `spread_price_col`,
   the auto model degrades to fixed bps so the quoted spread is not
-  charged twice. `ask_ohlc` does not degrade the model — it only moves
-  SHORT stop/TP *triggers* onto the ask side, and those ask-triggered
-  exits pass `fill_side="ask"` so the bar spread is not charged twice on
-  them either.
+  charged twice. On a two-sided frame `spread_price_col` is not consulted
+  at all — the `ask_*` columns state the ask exactly (#472). The legacy
+  `ask_ohlc` parameter is inert on the native engine (the ask side is
+  the default there); it remains a vectorbt-only opt-in for SHORT
+  stop/TP *triggers*, and those ask-triggered exits pass
+  `fill_side="ask"` so the bar spread is not charged twice on them
+  either.
 
 ## 2. End-date boundary
 
@@ -241,7 +260,9 @@ is under active development):
   `_check_stops`, **after** open-gap exits (which keep their stop/target reason)
   and **before** the bar's intrabar walk and before pending entries fill, so a
   reversal (exit + entry on one bar) closes the old position and opens the new
-  one at the same open. SHORT exits pay the spread.
+  one at the same open. SHORT exits buy the ask — on a two-sided frame
+  that is the bar's own ask price (#472), so the quoted spread is inside
+  the fill rather than added by the slippage model.
 - vectorbt / pynecore (frozen): do **not** implement `next_open` and **refuse**
   a `next_open` config outright (`_frozen_signal_exit_fill` raises) — frozen
   engines get fail-loud guards, not silent re-interpretation. Entry points
@@ -290,7 +311,9 @@ or `level` (case-insensitive):
   `meta["exit_level_missing_price"]`.
 - a `level` outside the exit bar's traded range is never booked at the
   level (`contract.exit_level_disposition`, evaluated on the ask range for
-  a SHORT exit when `ask_ohlc` data is enabled). On the *untraded* side —
+  a SHORT exit whenever the frame carries `ask_*` columns — always on
+  native since #472; on the frozen vectorbt adapter only under the
+  `ask_ohlc` opt-in). On the *untraded* side —
   above the bar's high for a LONG exit, below the low for a SHORT exit —
   the order could never have filled: it falls back to the market fill,
   warns once and flags `meta["exit_level_unreachable"]`. On the
@@ -299,11 +322,9 @@ or `level` (case-insensitive):
   gap-through-level convention it fills at the bar's **open** and flags
   `meta["exit_level_gapped"]`.
   Direction-specific, like every open fill: a LONG exit sells the bid at
-  the raw open, while a SHORT exit buys the ask at `open + spread` when a
-  spread is configured. With explicit `ask_high`/`ask_low` columns but no
-  `spread_price_col`, reachability is still judged on the ask range while
-  the fill stays the raw open (spread 0) — the same convention every
-  open fill already follows. `level` has **limit-order semantics**: an
+  the raw open, while a SHORT exit buys the ask — the explicit
+  `ask_open`, else bid open + the row's quoted/`spread_price_col` spread,
+  else the raw open when ask == bid. `level` has **limit-order semantics**: an
   untraded-side level is "unreachable" and falls back to the market fill.
   A strategy whose `exit_price` is really a *stop* (e.g. a sell stop
   above the whole bar after a gap down) should express it through the
@@ -457,9 +478,10 @@ Implementation:
   `lot_step` when the leverage cap binds) instead of refusing; an unknown
   broker maximum means 1x.
 - **`entry` is the price the order actually fills at**, for every order type
-  (MARKET: the next bar's open, plus the configured spread for a LONG;
-  LIMIT: its limit price; STOP/STOP_LIMIT: the trigger/limit level, or the
-  bar open — plus the configured spread for a LONG — when the bar gaps
+  (MARKET: the next bar's open on the order's side — the ask open for a
+  LONG on a two-sided frame, #472; LIMIT: its limit price;
+  STOP/STOP_LIMIT: the trigger/limit level on that side, or the bar open on
+  that side — ask for a LONG — when the bar gaps
   through the stop and the fill is marketable at that open; for STOP_LIMIT
   only when the limit is marketable at that open). Pre-fill
   creation sizing is only a pending-order estimate and must never survive into

@@ -641,11 +641,12 @@ class TestNativeAdapterMetadata:
         # Classified equity run defaults to 5bps: entry 100 -> 100.05.
         assert result.trades[0].entry_price == pytest.approx(100.05)
 
-    def test_price_basis_reflects_resolved_model_on_two_sided_data(
+    def test_price_basis_reflects_two_sided_data_on_native(
         self, tmp_path: Path
     ) -> None:
-        """``price_basis`` is 'bid_ask' only when the bar-spread model can
-        use the ask columns; 'bid' when they exist but the model is none."""
+        """``price_basis`` is 'bid_ask' whenever the frame carries ask
+        columns — #472 makes ask-side fills/triggers the engine default, so
+        the basis no longer depends on which slippage model resolved."""
         from runner.engines.base import BacktestConfig
         from runner.engines.native_adapter import NativeAdapter
         from tests.helpers import write_ohlcv
@@ -688,7 +689,9 @@ class TestNativeAdapterMetadata:
         )
         model_meta = none_result.meta.data["slippage"]["models"]["EURUSD"]
         assert model_meta["model"] == "none"
-        assert model_meta["price_basis"] == "bid"
+        # slippage='none' skips the cost model, not the ask-side fills:
+        # buys still fill at the ask on a two-sided frame (#472).
+        assert model_meta["price_basis"] == "bid_ask"
 
 
 class TestSignalReplaySlippage:
@@ -921,8 +924,10 @@ class TestNativeEngineForexSpread:
         trade = result.trades[0]
         # SHORT entry sells the bid: no spread on the sell side.
         assert trade.entry_price == pytest.approx(100.0)
-        # SHORT TP buys the ask: 98 + 0.4.
-        assert trade.exits[0].price == pytest.approx(98.4)
+        # #472: the SHORT TP level is ask-denominated — the ask low reaches
+        # 98 and the buy-back fills AT the ask level 98.0; the quoted
+        # spread is inside the fill, not added on top by the model.
+        assert trade.exits[0].price == pytest.approx(98.0)
 
     def test_long_stop_loss_sells_bid_level(self) -> None:
         """A LONG stop exits on the bid: the bar spread is NOT subtracted
@@ -954,7 +959,7 @@ class TestNativeEngineForexSpread:
         assert trade.exits[0].reason == "stop_loss"
         assert trade.exits[0].price == pytest.approx(98.0)
 
-    def test_short_stop_loss_buys_ask_level_plus_spread(self) -> None:
+    def test_short_stop_loss_buys_ask_level(self) -> None:
         from runner.engine import TradeEngine
 
         def stop_strategy(df, params):
@@ -978,16 +983,17 @@ class TestNativeEngineForexSpread:
         trade = result.trades[0]
         # SHORT entry sells the bid at 100.0 (no spread on sells).
         assert trade.entry_price == pytest.approx(100.0)
-        # Stop 102 triggers on bar 15 (bid high 103); the buy-back lifts
-        # to the ask: 102 + 0.4 spread — charged once via the slippage
-        # model, not again on the sell side.
+        # #472: the stop is ask-denominated — the ask high (103.4) reaches
+        # the 102 stop and the buy-back fills AT the ask level 102.0, not
+        # 102 + spread; the quoted spread is paid once, inside the fill.
         assert trade.exits[0].reason == "stop_loss"
-        assert trade.exits[0].price == pytest.approx(102.4)
+        assert trade.exits[0].price == pytest.approx(102.0)
 
-    def test_ask_ohlc_short_stop_does_not_double_charge_spread(self) -> None:
-        """``ask_ohlc`` keeps the bar-spread model: an ask-triggered SHORT
-        stop fills at the ask-denominated level WITHOUT paying the spread
-        a second time, while a LONG entry still pays it once."""
+    def test_short_stop_does_not_double_charge_spread(self) -> None:
+        """#472: an ask-triggered SHORT stop fills at the ask-denominated
+        level WITHOUT paying the spread a second time — the behaviour is
+        now the default on two-sided data, so the legacy ``ask_ohlc``
+        parameter is passed only to pin that it changes nothing."""
         from runner.engine import TradeEngine
 
         def stop_strategy(df, params):

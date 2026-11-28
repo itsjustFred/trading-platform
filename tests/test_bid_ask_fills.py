@@ -57,7 +57,9 @@ def _engine(parameters: dict[str, Any] | None = None, **overrides: Any) -> Trade
     return TradeEngine(_config(parameters, **overrides), symbol="EURUSD")
 
 
-def _frame(bars: list[tuple[float, float, float, float]], *, two_sided: bool = True) -> pd.DataFrame:
+def _frame(
+    bars: list[tuple[float, float, float, float]], *, two_sided: bool = True
+) -> pd.DataFrame:
     """A bid-bar frame, plus ``ask_*`` = bid + 0.5 when ``two_sided``."""
     timestamps = pd.date_range("2024-01-01", periods=len(bars), freq="min", tz="UTC")
     data: dict[str, Any] = {

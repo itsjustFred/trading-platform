@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 import pandas as pd
@@ -91,33 +92,93 @@ def resolve_bar_spread(row: pd.Series, raw_col: Any) -> float:
         return 0.0
 
 
+#: The four quote columns a two-sided (Dukascopy-style) feed carries. Their
+#: canonical ``open/high/low/close`` counterparts are the BID series.
+ASK_COLUMNS = ("ask_open", "ask_high", "ask_low", "ask_close")
+
+
+def _row_value(row: Any, column: str) -> float | None:
+    """Finite float for ``column`` on ``row``, or ``None``."""
+    try:
+        raw = row.get(column)
+    except (AttributeError, KeyError, TypeError):
+        return None
+    if raw is None or pd.isna(raw):
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(value):
+        return None
+    return value
+
+
+def has_ask_side(row: Any) -> bool:
+    """True when ``row`` carries usable ``ask_*`` quote columns (#472).
+
+    A two-sided feed's canonical OHLC is the BID book and the ``ask_*``
+    columns are the other side of the quote; their presence is what makes the
+    engine fill and trigger on the side a real order would hit. A row without
+    them (yfinance, Alpaca, dolthub, ...) has ask == bid.
+    """
+    return any(_row_value(row, column) is not None for column in ASK_COLUMNS)
+
+
+def bar_spread_units(row: Any) -> float | None:
+    """Per-bar ask-minus-bid spread in price units, or ``None``.
+
+    Canonical OHLC is the bid-side series (``normalize_ohlcv_frame`` fills
+    it from ``bid_*`` and the MT5-chart convention treats bid as the
+    reference). For each canonical field with an ``ask_*`` counterpart the
+    positive difference is a quoted spread observation; the median of the
+    available observations is used so one stale column cannot dominate.
+    Non-positive differences (ask-side canonical data where ``ask_*``
+    merely repeats the canonical series) are ignored — they carry no
+    spread information and must not produce a negative adjustment.
+    """
+    values: dict[str, float] = {}
+    try:
+        items = row.items() if hasattr(row, "items") else []
+    except (AttributeError, TypeError):
+        return None
+    for key, raw in items:
+        if raw is None or (isinstance(raw, float) and pd.isna(raw)):
+            continue
+        try:
+            values[str(key).lower()] = float(raw)
+        except (TypeError, ValueError):
+            continue
+    if not values:
+        return None
+    diffs: list[float] = []
+    for field in ("open", "high", "low", "close"):
+        ask = values.get(f"ask_{field}")
+        bid = values.get(field)
+        if ask is None or bid is None:
+            continue
+        diff = ask - bid
+        if diff > 0 and pd.notna(diff):
+            diffs.append(diff)
+    if not diffs:
+        return None
+    diffs.sort()
+    mid = len(diffs) // 2
+    return diffs[mid] if len(diffs) % 2 else (diffs[mid - 1] + diffs[mid]) / 2.0
+
+
 def resolve_ask_high_low(row: pd.Series, spread: float) -> tuple[float | None, float | None]:
     """Per-bar ask-side high/low in price units (shared D3 helper).
 
     Byte-identical consolidation of ``TradeEngine._ask_bar`` and
     ``_vbt_ask_bar``: reads explicit ``ask_high``/``ask_low`` data columns
     when present, otherwise falls back to bid high/low plus ``spread``.
-    Returns (None, None) when unavailable. Callers gate on the ``ask_ohlc``
-    strategy parameter and supply the spread themselves (native
-    ``_bar_spread`` / ``_vbt_bar_spread``), so this helper stays free of
-    engine-specific config plumbing.
+    Returns (None, None) when unavailable. Callers supply the spread they
+    price with (native ``_bar_spread`` / ``_vbt_bar_spread``), so this helper
+    stays free of engine-specific config plumbing.
     """
-    ask_high = ask_low = None
-    try:
-        raw_high = row.get("ask_high")
-        raw_low = row.get("ask_low")
-    except (AttributeError, KeyError):
-        raw_high = raw_low = None
-    if raw_high is not None and pd.notna(raw_high):
-        try:
-            ask_high = float(raw_high)
-        except (TypeError, ValueError):
-            ask_high = None
-    if raw_low is not None and pd.notna(raw_low):
-        try:
-            ask_low = float(raw_low)
-        except (TypeError, ValueError):
-            ask_low = None
+    ask_high = _row_value(row, "ask_high")
+    ask_low = _row_value(row, "ask_low")
     if ask_high is None or ask_low is None:
         try:
             base_high = float(row["high"])
@@ -129,6 +190,36 @@ def resolve_ask_high_low(row: pd.Series, spread: float) -> tuple[float | None, f
         if ask_low is None:
             ask_low = base_low + spread
     return ask_high, ask_low
+
+
+def resolve_ask_price(row: Any, field: str, spread: float) -> float | None:
+    """Ask-side open/close of a bar in price units, or ``None``.
+
+    Explicit ``ask_open``/``ask_close`` wins (a two-sided feed states the
+    quote exactly). Otherwise the ask is the bid plus the caller's ``spread``
+    (``spread_price_col``); when that is zero the bar carries no ask
+    information at all — on a two-sided row the quoted spread is derived from
+    the row itself so a feed that only ships ``ask_high``/``ask_low`` still
+    prices the ask open/close, and on a single-sided row ``None`` means "ask
+    is the bid".
+    """
+    if field not in ("open", "close"):
+        raise ValueError(f"field must be 'open' or 'close', got {field!r}")
+    explicit = _row_value(row, f"ask_{field}")
+    if explicit is not None:
+        return explicit
+    try:
+        base = float(row[field])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if spread > 0:
+        return base + spread
+    if has_ask_side(row):
+        derived = bar_spread_units(row)
+        if derived is not None:
+            return base + derived
+    return None
+
 
 
 def _trade_equity_basis(trade: Trade, initial_capital: float) -> float:

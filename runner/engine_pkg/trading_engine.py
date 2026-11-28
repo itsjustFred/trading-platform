@@ -29,7 +29,13 @@ from runner.engine_pkg.execution_model import ExecutionModelSettings
 from runner.engine_pkg.orders import Order, OrderType, Position
 from runner.engine_pkg.result import build_indicator_series, build_result
 from runner.engines import contract
-from runner.engines._shared import resolve_ask_high_low, resolve_bar_spread
+from runner.engines._shared import (
+    bar_spread_units,
+    has_ask_side,
+    resolve_ask_high_low,
+    resolve_ask_price,
+    resolve_bar_spread,
+)
 from runner.engines.base import BacktestConfig
 from runner.engines.contract import (
     EXIT_LEVEL_GAPPED,
@@ -1107,18 +1113,18 @@ class TradeEngine:
         return to_iso_utc(value)
 
     def _bar_spread(self, row: pd.Series) -> float:
-        """Per-bar spread surcharge in price units (ask = open + spread).
+        """Legacy ``spread_price_col`` spread in price units, for one-sided frames.
 
-        Opt-in via the ``spread_price_col`` strategy parameter naming a data
-        column with the spread in PRICE units (e.g. converted from MT5
-        spread points at ingest). Default off (0.0): all existing behavior
-        is unchanged. Only LONG market fills pay the spread (buys lift the
-        ask); SHORT fills stay on the bid-side data, and gap-through STOP and
-        marketable-at-open STOP_LIMIT fills pay it too — matching the
-        cross-engine contract §1 and MT5 order semantics tick-for-tick
-        (verified: platform long entries equaled MT5 entries exactly after
-        adding open-side spread).
+        #472: a frame that carries ``ask_*`` columns states the ask exactly,
+        so the configured spread column is not consulted at all (and cannot
+        be charged on top of the ask). On a frame without ask columns the
+        column keeps its #130 role: it is the spread in PRICE units (e.g.
+        converted from MT5 spread points at ingest) that the ask side is
+        derived from — ``ask = bid + spread`` — and it defaults to 0.0, which
+        means ask == bid.
         """
+        if has_ask_side(row):
+            return 0.0
         return resolve_bar_spread(row, self.config.parameters.get("spread_price_col"))
 
     def _equity_proportional_for_stop(self, stop_loss_price: float | None) -> bool:
@@ -1304,11 +1310,18 @@ class TradeEngine:
         the recorded fill price, the PnL and the equity path all carry the
         same cost. Limit-price clamping is NOT modeled (a slipped limit
         buy could fill above its limit); the engine only submits market
-        orders today, so no live path reaches it. ``fill_side="ask"``
-        marks an ask-triggered SHORT exit whose level is already
-        ask-denominated (``ask_ohlc``), so the bar-spread model does not
-        charge the spread a second time.
+        orders today, so no live path reaches it.
+
+        #472: every BUY fill the engine produces is already ask-denominated
+        (the ask open, the ask level, or the ask of a two-sided bar), so the
+        bar-spread model must not charge the quoted spread a second time on
+        it — ``fill_side="ask"`` says exactly that. Sells stay on the bid,
+        where the bar-spread model has nothing to add either. The fixed-bps
+        models still apply in full, which is the documented cost for frames
+        that carry no spread information.
         """
+        if fill_side is None and side == "buy":
+            fill_side = "ask"
         return float(
             self.slippage_model.slip_price(
                 float(price), side, bar, fill_side=fill_side
@@ -1319,9 +1332,7 @@ class TradeEngine:
     def _pending_stop_fill_price(
         direction: str,
         stop_price: float,
-        bar_open: float,
-        *,
-        bar_spread: float = 0.0,
+        trigger_open: float,
     ) -> float:
         """Fill price for a pending stop-market order on one bar.
 
@@ -1329,29 +1340,24 @@ class TradeEngine:
         fills at the open above the stop; a SHORT sell-stop that gaps down
         fills at the open below it. An intrabar touch keeps the stop price.
 
-        A gap-through fill is a marketable order at the open, so it pays the
-        same spread a MARKET order at that open would (maintainer default
-        2026-11-23): a LONG lifts the ask (``open + spread``), a SHORT hits
-        the bid open — symmetric with ``OrderType.MARKET`` above. The
-        intrabar level fill keeps the stop price (pre-existing convention).
-        ``max``/``min`` are kept so a NaN open still propagates NaN into the
-        fail-closed unpriced-fill check instead of filling at the stop.
+        #472: ``trigger_open`` is the open on the side the order trades on —
+        the ASK open for a buy stop, the bid open for a sell stop — so a gap
+        fill is the price actually available on that side, and the intrabar
+        level fill is the level itself (ask-denominated for a buy), never the
+        level plus the spread again. ``max``/``min`` are kept so a NaN open
+        still propagates NaN into the fail-closed unpriced-fill check instead
+        of filling at the stop.
         """
         if direction == "LONG":
-            fill = max(float(bar_open), float(stop_price))
-            if fill == float(bar_open):
-                fill += bar_spread
-            return fill
-        return min(float(bar_open), float(stop_price))
+            return max(float(trigger_open), float(stop_price))
+        return min(float(trigger_open), float(stop_price))
 
     @staticmethod
     def _pending_stop_limit_fill_price(
         direction: str,
         stop_price: float,
         limit_price: float,
-        bar_open: float,
-        *,
-        bar_spread: float = 0.0,
+        trigger_open: float,
     ) -> float:
         """Fill price for a pending stop-limit order on one bar.
 
@@ -1359,27 +1365,21 @@ class TradeEngine:
         if that makes the limit marketable at the open, the fill is the open.
         Otherwise the resting limit keeps its limit price.
 
-        The open fill is marketable, so a LONG pays the ask like a MARKET buy
-        at that open (``open + spread``); a SHORT hits the bid like a MARKET
-        sell — the same convention as ``_pending_stop_fill_price``. A fill at
-        the resting limit price carries no spread.
-
-        LONG marketability is judged on that ask, not the bid open: a buy
-        limit must never fill above its limit, so when ``open + spread``
-        exceeds the limit the order rests at the limit price instead of
-        filling through it. SHORT is symmetric on the bid and unchanged: its
-        open fill can never print below the limit.
+        #472: ``trigger_open`` is the open on the order's own side (ask for a
+        buy, bid for a sell), so the open fill is the price that side actually
+        traded at — no extra spread on top. LONG marketability is judged on
+        that ask: a buy limit must never fill above its limit, so when the ask
+        open exceeds the limit the order rests at the limit price instead of
+        filling through it. SHORT is symmetric on the bid.
         """
         if direction == "LONG":
-            gapped_through_stop = bar_open >= stop_price
-            ask_open = float(bar_open) + bar_spread
-            limit_marketable_at_open = ask_open <= limit_price
+            gapped_through_stop = trigger_open >= stop_price
+            limit_marketable_at_open = trigger_open <= limit_price
         else:
-            gapped_through_stop = bar_open <= stop_price
-            limit_marketable_at_open = bar_open >= limit_price
+            gapped_through_stop = trigger_open <= stop_price
+            limit_marketable_at_open = trigger_open >= limit_price
         if gapped_through_stop and limit_marketable_at_open:
-            spread = bar_spread if direction == "LONG" else 0.0
-            return float(bar_open) + spread
+            return float(trigger_open)
         return float(limit_price)
 
     def _fill_pending_orders(self, row: pd.Series, i: int) -> None:
@@ -1390,6 +1390,13 @@ class TradeEngine:
         bar_open = float(row["open"])
         bar_high = float(row["high"])
         bar_low = float(row["low"])
+        # #472: the side each order trades on. A buy trades on the ask book,
+        # a sell on the bid book; on a one-sided frame both are the canonical
+        # series (ask == bid), so the values are identical there.
+        ask_high, ask_low = self._ask_bar(row)
+        buy_high = ask_high if ask_high is not None else bar_high
+        buy_low = ask_low if ask_low is not None else bar_low
+        buy_open = self._buy_open(row)
         fill_time = self._to_iso(row["timestamp"])
 
         for order in self.pending_orders:
@@ -1398,11 +1405,12 @@ class TradeEngine:
 
             if order.order_type == OrderType.MARKET:
                 filled = i > order.created_index
-                # Spread-aware market fill: LONGs lift the ask (open + spread),
-                # SHORTs hit the bid (open). Matches MT5 fills tick-for-tick
-                # when the spread column carries per-bar ask-bid in price units.
+                # Spread-aware market fill: LONGs lift the ask, SHORTs hit the
+                # bid. On a two-sided frame the fill is the bar's own ask open
+                # (#472); on a one-sided frame the ask is the bid open plus the
+                # configured spread_price_col (or the bid open itself).
                 if order.direction == "LONG":
-                    fill_price = bar_open + self._bar_spread(row)
+                    fill_price = buy_open
                 else:
                     fill_price = bar_open
             elif order.order_type == OrderType.LIMIT:
@@ -1410,20 +1418,19 @@ class TradeEngine:
                 # creation bar — the signal is computed from that bar's
                 # close, so spending its range would be lookahead.
                 if order.direction == "LONG" and order.limit_price is not None:
-                    filled = i > order.created_index and bar_low <= order.limit_price
+                    filled = i > order.created_index and buy_low <= order.limit_price
                     fill_price = order.limit_price
                 elif order.direction == "SHORT" and order.limit_price is not None:
                     filled = i > order.created_index and bar_high >= order.limit_price
                     fill_price = order.limit_price
             elif order.order_type == OrderType.STOP:
                 if order.direction == "LONG" and order.stop_price is not None:
-                    filled = i > order.created_index and bar_high >= order.stop_price
+                    filled = i > order.created_index and buy_high >= order.stop_price
                     if filled:
                         fill_price = self._pending_stop_fill_price(
                             order.direction,
                             order.stop_price,
-                            bar_open,
-                            bar_spread=self._bar_spread(row),
+                            buy_open,
                         )
                 elif order.direction == "SHORT" and order.stop_price is not None:
                     filled = i > order.created_index and bar_low <= order.stop_price
@@ -1432,7 +1439,6 @@ class TradeEngine:
                             order.direction,
                             order.stop_price,
                             bar_open,
-                            bar_spread=self._bar_spread(row),
                         )
             elif order.order_type == OrderType.STOP_LIMIT:
                 # The trigger is evaluated per bar, not latched: trigger and
@@ -1440,19 +1446,18 @@ class TradeEngine:
                 # needs a latched trigger is #339's contract decision.
                 trigger = i > order.created_index
                 if order.direction == "LONG" and order.stop_price is not None:
-                    trigger = trigger and bar_high >= order.stop_price
+                    trigger = trigger and buy_high >= order.stop_price
                     filled = (
                         trigger
                         and order.limit_price is not None
-                        and bar_low <= order.limit_price
+                        and buy_low <= order.limit_price
                     )
                     if filled and order.limit_price is not None:
                         fill_price = self._pending_stop_limit_fill_price(
                             order.direction,
                             order.stop_price,
                             order.limit_price,
-                            bar_open,
-                            bar_spread=self._bar_spread(row),
+                            buy_open,
                         )
                 elif order.direction == "SHORT" and order.stop_price is not None:
                     trigger = trigger and bar_low <= order.stop_price
@@ -1467,7 +1472,6 @@ class TradeEngine:
                             order.stop_price,
                             order.limit_price,
                             bar_open,
-                            bar_spread=self._bar_spread(row),
                         )
 
             if filled:
@@ -1900,7 +1904,11 @@ class TradeEngine:
         # signal bar's own open) was removed (issue #153):
         # ``contract.normalize_signal_exit_fill`` rejects it, and MT5 clock
         # exits are served by raising the signal one bar early instead.
+        # #472: a market BUY fills at the ask, a market SELL at the bid — so a
+        # SHORT's close exit is the ask close on a two-sided frame, a LONG's is
+        # the bid close (unchanged).
         base_exit = float(row["close"])
+        base_exit_short = self._buy_close(row)
         time_iso = self._to_iso(row["timestamp"])
         next_positions: list[Position] = []
         ask_high, ask_low = self._ask_bar(row)
@@ -1959,21 +1967,20 @@ class TradeEngine:
                 # the stop/TP legs.
                 fill_price = position_level
             elif level_gapped:
-                # Gap-through-level: marketable at the open. A SHORT buy
-                # lifts the ask (open + spread); a LONG sell hits the bid.
-                open_value = row.get("open")
-                gap_base = (
-                    float(open_value)
-                    if open_value is not None and pd.notna(open_value)
+                # Gap-through-level: marketable at the open, on the side the
+                # exit trades on (ask for a SHORT buy, bid for a LONG sell).
+                # A missing/non-finite open degrades to the close, never to a
+                # NaN fill.
+                trigger_open = self._trigger_open(position, row)
+                fill_price = (
+                    trigger_open
+                    if math.isfinite(trigger_open)
                     else float(row["close"])
                 )
-                fill_price = gap_base + (
-                    self._bar_spread(row)
-                    if position.direction != "LONG"
-                    else 0.0
-                )
             else:
-                fill_price = base_exit
+                fill_price = (
+                    base_exit_short if position.direction != "LONG" else base_exit
+                )
             if level_missing_price:
                 position.meta["exit_level_missing_price"] = True
             if level_unreachable:
@@ -2078,19 +2085,51 @@ class TradeEngine:
         return None
 
     def _ask_bar(self, row: pd.Series) -> tuple[float | None, float | None]:
-        """Per-bar ask-side high/low in price units (opt-in).
+        """Per-bar ask-side high/low in price units.
 
-        MT5 triggers SHORT stops/TPs on the ASK, not the bid: a short stop
-        fills when ask-high >= stop. Enable via the ``ask_ohlc`` strategy
-        parameter (default False — legacy bid-only behavior unchanged).
-        Reads explicit ``ask_high``/``ask_low`` data columns when present
-        (exact, e.g. Dukascopy bid/ask M1); otherwise falls back to
-        bid high/low + ``spread_price_col`` spread when configured.
-        Returns (None, None) when neither is available.
+        #472: MT5 (and a real book) triggers SHORT stops/TPs on the ASK, so
+        the ask side is used whenever the frame can state it — explicit
+        ``ask_high``/``ask_low`` columns on a two-sided feed, else the bid
+        high/low plus ``spread_price_col``. A one-sided frame with no spread
+        column returns ``(None, None)``: ask == bid and the callers keep the
+        canonical (bid) series, which is what makes behaviour unchanged
+        there.
         """
-        if not bool(self.config.parameters.get("ask_ohlc", False)):
+        spread = self._bar_spread(row)
+        if not has_ask_side(row) and spread <= 0.0:
             return None, None
-        return resolve_ask_high_low(row, self._bar_spread(row))
+        if spread <= 0.0:
+            # Two-sided row with a partial ask side (e.g. only ask_open):
+            # price the missing high/low off the spread the row itself
+            # quotes, not off the bid.
+            spread = bar_spread_units(row) or 0.0
+        return resolve_ask_high_low(row, spread)
+
+    def _ask_open(self, row: pd.Series) -> float | None:
+        """Ask-side open of the bar, or ``None`` when ask == bid.
+
+        Explicit ``ask_open`` wins; on a two-sided feed without it the row's
+        own quoted spread is used; on a one-sided frame the configured
+        ``spread_price_col`` is. ``None`` means the bid open IS the ask open.
+        """
+        return resolve_ask_price(row, "open", self._bar_spread(row))
+
+    def _ask_close(self, row: pd.Series) -> float | None:
+        """Ask-side close of the bar, or ``None`` when ask == bid."""
+        return resolve_ask_price(row, "close", self._bar_spread(row))
+
+    def _buy_open(self, row: pd.Series) -> float:
+        """Open price a market BUY fills at: the ask open (#472).
+
+        Falls back to the bid open on a one-sided frame, where ask == bid.
+        """
+        ask = self._ask_open(row)
+        return float(row["open"]) if ask is None else ask
+
+    def _buy_close(self, row: pd.Series) -> float:
+        """Close price a market BUY fills at: the ask close (#472)."""
+        ask = self._ask_close(row)
+        return float(row["close"]) if ask is None else ask
 
     def _record_bar_excursion(
         self,
@@ -2166,16 +2205,16 @@ class TradeEngine:
     def _trigger_open(self, position: Position, row: pd.Series) -> float:
         """The bar open on the side the position's exits trigger on.
 
-        LONG exits trigger on the bid (the bar's own open). SHORT exits trigger
-        on the ask, which is the bid open plus the spread when ``ask_ohlc`` is
-        enabled and the bid open otherwise (same convention as ``_ask_bar``).
+        #472: LONG exits trigger and fill on the bid (the bar's own open);
+        SHORT exits trigger and fill on the ask, which is the explicit ask
+        open on a two-sided feed, else the bid open plus ``spread_price_col``,
+        else the bid open itself.
         """
-        bar_open = float(row["open"])
-        if position.direction != "LONG" and bool(
-            self.config.parameters.get("ask_ohlc", False)
-        ):
-            return bar_open + self._bar_spread(row)
-        return bar_open
+        if position.direction != "LONG":
+            ask = self._ask_open(row)
+            if ask is not None:
+                return ask
+        return float(row["open"])
 
     def _level_fill_price(
         self,
@@ -2186,32 +2225,40 @@ class TradeEngine:
         level: float,
         allow_gap: bool,
     ) -> float:
-        """Fill price (spread included) of a protective level on this bar.
+        """Fill price of a protective level on this bar.
 
         Owner decision 2026-11-13 (supersedes the old "stop/TP always fill at
         the level" rule): a bar that OPENS beyond the level fills at its open
         - the price actually available - instead of the level the market
         skipped. Intrabar touches (the bar opens on the safe side) keep filling
-        at the level. SHORT exits buy the ask, so they carry the spread either
-        way (A-H7). ``allow_gap`` is False on the entry bar: the position was
+        at the level. ``allow_gap`` is False on the entry bar: the position was
         opened at that very open, so it cannot have been gapped through.
+
+        #472: the level is already denominated on the side the position exits
+        on — a LONG sells the bid at the level, a SHORT buys the ask at the
+        level — so no spread is added on top; the gap fill is the open on that
+        same side (``_trigger_open``). The spread is therefore paid exactly
+        once per side, through the fill price itself.
         """
-        spread = self._bar_spread(row) if position.direction != "LONG" else 0.0
+        trigger_open = self._trigger_open(position, row)
         if allow_gap and level_gapped_at_open(
             direction=position.direction,
             kind=kind,
             level=float(level),
-            bar_open=self._trigger_open(position, row),
+            bar_open=trigger_open,
         ):
-            return float(row["open"]) + spread
-        return float(level) + spread
+            return trigger_open
+        return float(level)
 
     def _close_at_open_for_signal(
         self, position: Position, row: pd.Series, time_iso: str, i: int
     ) -> None:
-        """Execute a parked signal exit at this bar's open (next-open fill)."""
-        spread = self._bar_spread(row) if position.direction != "LONG" else 0.0
-        fill = float(row["open"]) + spread
+        """Execute a parked signal exit at this bar's open (next-open fill).
+
+        #472: a SHORT exit buys, so it fills at the ask open; a LONG exit
+        sells at the bid open.
+        """
+        fill = self._buy_open(row) if position.direction != "LONG" else float(row["open"])
         # The position is out at the open: nothing later in the bar belongs to it.
         self._record_bar_excursion(position, row, favorable_cap=fill, adverse_cap=fill)
         self._close_partial(
@@ -2379,7 +2426,7 @@ class TradeEngine:
                     if (
                         bar_high >= float(level["price"])
                         if position.direction == "LONG"
-                        else bar_low <= float(level["price"])
+                        else short_low <= float(level["price"])
                     )
                 ]
                 if reached:
@@ -2408,10 +2455,10 @@ class TradeEngine:
                 adverse_cap=excursion_adverse_cap,
             )
 
-            # A-L5/A-H7: with ``ask_ohlc`` a SHORT's protective levels are
-            # ask-denominated — the trigger compared the ask side, so the
-            # exit fill must not pay the quoted spread a second time via
-            # the slippage model (#130).
+            # A-L5/A-H7/#472: a SHORT's protective levels are ask-denominated —
+            # the trigger compared the ask side, so the exit fill is that same
+            # ask-side price and the slippage model must not pay the quoted
+            # spread a second time.
             exit_fill_side = (
                 "ask"
                 if position.direction != "LONG"
@@ -2449,7 +2496,10 @@ class TradeEngine:
                     if position.direction == "LONG":
                         reached = bar_high >= trigger_price
                     else:
-                        reached = bar_low <= trigger_price
+                        # #472: the SHORT target is on the ask side — the same
+                        # series the trigger above was evaluated on. Checking
+                        # the bid low here left an ask-only touch unfilled.
+                        reached = short_low <= trigger_price
                     if not reached:
                         continue
 
@@ -2524,9 +2574,10 @@ class TradeEngine:
                 high_pnl = (float(row["high"]) - position.entry_price) * position.remaining_qty
                 low_pnl = (float(row["low"]) - position.entry_price) * position.remaining_qty
             else:
-                # A-L5: SHORT exits trigger on the ASK when ask_ohlc is
-                # enabled — MAE/MFE must be measured on the same side the
-                # position would actually trade, not on bid high/low.
+                # A-L5/#472: SHORT exits trigger on the ASK whenever the
+                # frame carries ask data — MAE/MFE must be measured on the
+                # same side the position would actually trade, not on bid
+                # high/low.
                 ask_high, ask_low = self._ask_bar(row)
                 ref_high = ask_high if ask_high is not None else float(row["high"])
                 ref_low = ask_low if ask_low is not None else float(row["low"])
