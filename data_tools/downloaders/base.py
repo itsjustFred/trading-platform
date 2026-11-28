@@ -181,7 +181,7 @@ class Downloader(ABC):
         parts = output_path.relative_to(ohlcv_dir).parts
         if len(parts) != 3 or not parts[2].endswith(".parquet"):
             return None
-        source, symbol, filename = parts
+        source, symbol, _filename = parts
         stem = parts[2][: -len(".parquet")]
         prefix = f"{symbol}_"
         if not stem.startswith(prefix):
@@ -245,8 +245,11 @@ class Downloader(ABC):
             combined = combined.drop_duplicates().reset_index(drop=True)
 
         identity = self._dataset_identity(output_path)
-        has_ohlc = all(column in combined.columns for column in ("open", "high", "low", "close")) or all(
-            f"bid_{column}" in combined.columns for column in ("open", "high", "low", "close")
+        has_ohlc = all(
+            column in combined.columns for column in ("open", "high", "low", "close")
+        ) or all(
+            f"bid_{column}" in combined.columns
+            for column in ("open", "high", "low", "close")
         )
         if identity is not None and "timestamp" in combined.columns and has_ohlc:
             data_root, source, symbol, timeframe, segment = identity

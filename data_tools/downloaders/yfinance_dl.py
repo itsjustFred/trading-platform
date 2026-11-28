@@ -350,7 +350,9 @@ class YFinanceDownloader(Downloader):
                 )
             )
 
-        combined = self._merge_and_store_single_file(out_path, df, asset_class="equity", region="US")
+        combined = self._merge_and_store_single_file(
+            out_path, df, asset_class="equity", region="US"
+        )
         # C5: a clipped intraday window is an explicit artifact, not just a
         # warning — downstream coverage sees the truncation.
         truncated = False

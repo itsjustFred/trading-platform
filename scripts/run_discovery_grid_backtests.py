@@ -17,9 +17,8 @@ from typing import Any
 
 import pandas as pd
 
-from shared import ohlcv_store
-
 from runner.agent_process import build_backtest_child_env
+from shared import ohlcv_store
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DISCOVERY_PATH = Path("/mnt/block-volume-data/discovered_strategies/discovery_20260618_0752.json")

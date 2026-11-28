@@ -6,7 +6,7 @@ import math
 import os
 import re
 from bisect import bisect_left, bisect_right
-from collections.abc import Iterator, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date
 from functools import lru_cache
@@ -19,8 +19,8 @@ import pyarrow.parquet as pq
 
 from data_tools.path_safety import validate_dataset_component
 from shared import market_calendar, venue_calendar
-from shared.ohlcv_store import DatasetEntry, dataset_bounds, list_datasets, read_frame
 from shared.constants import DATA_DIR, normalize_timeframe
+from shared.ohlcv_store import DatasetEntry, dataset_bounds, list_datasets, read_frame
 
 logger = logging.getLogger(__name__)
 

@@ -184,7 +184,10 @@ class TestResampleMerge:
         merged = pd.read_parquet(outputs[0])
 
         assert len(merged) == 2
-        assert float(merged.loc[merged["timestamp"].dt.date == pd.Timestamp("2020-01-01").date(), "close"].iloc[0]) == 9.05
+        day1_close = merged.loc[
+            merged["timestamp"].dt.date == pd.Timestamp("2020-01-01").date(), "close"
+        ].iloc[0]
+        assert float(day1_close) == 9.05
 
     def test_resample_write_is_atomic(self, tmp_path, monkeypatch):
         source = _store_source(
@@ -777,7 +780,8 @@ class TestMergeRefusesLegacyWeeklyLabels:
         source = _store_source(
             tmp_path,
             pd.DataFrame({
-                "timestamp": days, "open": 1.0, "high": 2.0, "low": 0.5, "close": 1.5, "volume": 1.0,
+                "timestamp": days, "open": 1.0, "high": 2.0,
+                "low": 0.5, "close": 1.5, "volume": 1.0,
             }),
             timeframe="1d",
         )

@@ -12,8 +12,6 @@ import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 
-import pandas as pd
-import pyarrow.lib
 import pytest
 from sqlmodel import select
 

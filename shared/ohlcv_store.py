@@ -196,6 +196,26 @@ def data_path(
     return source_dir(data_root, source) / sym / f"{name}.parquet"
 
 
+def parse_dataset_path(
+    data_root: str | Path, path: str | Path
+) -> tuple[str, str, str] | None:
+    """``(source, symbol, filename)`` for a path inside the store, or None.
+
+    The only place besides :func:`entry_for_path` that knows the store's
+    three-component ``<source>/<SYMBOL>/<file>`` shape; callers must not
+    re-derive it from path parts themselves.
+    """
+    try:
+        resolved = Path(path).resolve()
+        relative = resolved.relative_to(store_root(data_root).resolve())
+    except (OSError, ValueError):
+        return None
+    parts = relative.parts
+    if len(parts) != 3:
+        return None
+    return parts[0], parts[1], parts[2]
+
+
 def read_manifest(data_root: str | Path, source: str) -> dict[str, Any]:
     """The source's ``manifest.json`` as a dict; ``{}`` when absent/corrupt."""
     path = manifest_path(data_root, source)

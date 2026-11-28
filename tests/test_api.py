@@ -35,10 +35,9 @@ def _seed_benchmark_ohlcv(data_dir: Path) -> None:
     """
     import pandas as pd
 
+    from shared import ohlcv_store
     import viewer.core as viewer_core
 
-    symbol_dir = data_dir / "ohlcv" / "AAPL"
-    symbol_dir.mkdir(parents=True, exist_ok=True)
     frame = pd.DataFrame(
         {
             "timestamp": pd.date_range("2024-01-01", periods=30, freq="1D", tz="UTC"),
@@ -49,7 +48,9 @@ def _seed_benchmark_ohlcv(data_dir: Path) -> None:
             "volume": 1000.0,
         }
     )
-    frame.to_parquet(symbol_dir / "1d.parquet", index=False)
+    ohlcv_store.write_frame(
+        data_dir, "test_source", "AAPL", "1d", frame, asset_class="equity"
+    )
     with viewer_core._OHLCV_DF_CACHE_LOCK:
         viewer_core._OHLCV_DF_CACHE.pop(("AAPL", "1d"), None)
 

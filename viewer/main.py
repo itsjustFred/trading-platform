@@ -97,9 +97,6 @@ from runner.engines.signal_replay_adapter import ReplaySignal, SignalReplayAdapt
 from runner.grid_identity import data_staleness_reason, read_identity
 from runner.promotion_gate import StrategyNotPromotedError
 from shared.database import (
-    DB_PATH as BACKTEST_DB_PATH,
-)
-from shared.database import (
     BROKER_CLOSE_SIGNAL_SOURCE,
     ENTRIES_HALT_SETTINGS_KEY,
     LIVE_SUBMISSION_DRAIN_BUDGET_SECONDS,
@@ -156,6 +153,9 @@ from shared.database import (
     upsert_live_accounts,
     upsert_verification_evidence,
     utcnow_naive,
+)
+from shared.database import (
+    DB_PATH as BACKTEST_DB_PATH,
 )
 from shared.database import (
     delete_portfolio as delete_portfolio_record,

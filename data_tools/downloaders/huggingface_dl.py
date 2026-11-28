@@ -303,7 +303,9 @@ class HuggingFaceDownloader(Downloader):
                 f"HuggingFace download produced no rows for {normalized_symbol} ({canonical_tf})."
             )
 
-        stored = self._merge_and_store_single_file(out_path, prepared, asset_class="equity", region="US")
+        stored = self._merge_and_store_single_file(
+            out_path, prepared, asset_class="equity", region="US"
+        )
         if failed_months:
             warnings.append(
                 f"failed months ({len(failed_months)}): {', '.join(failed_months)}"

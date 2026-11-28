@@ -188,14 +188,11 @@ def _export_table_csv(repo_path: Path, table: str, output_csv: Path):
     atomic_replace(output_csv, _write)
 
 
-def _stock_export_path(target_dir: Path, symbol: str) -> Path:
+def _stock_export_path(symbol: str) -> Path:
     """Return the manifest-store output path for a daily equity export.
 
-    ``target_dir`` is only used to locate the data root (the ``ohlcv``
-    parent's parent); the file itself lands at
-    ``ohlcv/dolthub/<SYMBOL>/<SYMBOL>_D1.parquet``.
+    The file lands at ``ohlcv/dolthub/<SYMBOL>/<SYMBOL>_D1.parquet``.
     """
-    del target_dir
     return ohlcv_store.data_path(DATA_DIR, "dolthub", symbol, "1d")
 
 
@@ -222,7 +219,9 @@ def _export_stocks() -> None:
         return
 
     logger.info("Exporting stocks OHLCV...")
-    target_dir = EXPORT_DIR / "equity" / "US"
+    # CSV staging stays out of the OHLCV store tree; only the manifest
+    # store's parquet output lives under ``ohlcv/dolthub``.
+    target_dir = DOLT_DIR / "_export_staging"
     target_dir.mkdir(parents=True, exist_ok=True)
 
     table_name = _stocks_table_name(stocks_repo)
@@ -239,7 +238,7 @@ def _export_stocks() -> None:
             logger.warning("Skipping unexpected symbol value: %r", symbol)
             continue
 
-        out_parquet = _stock_export_path(target_dir, symbol)
+        out_parquet = _stock_export_path(symbol)
         if out_parquet.exists():
             continue  # skip already exported
 
@@ -353,7 +352,7 @@ def export_data():
     stocks_repo = DOLT_DIR / "stocks"
     if stocks_repo.exists() and (stocks_repo / DOLT_METADATA_DIR).exists():
         logger.info("Exporting stocks OHLCV...")
-        target_dir = EXPORT_DIR / "equity" / "US"
+        target_dir = DOLT_DIR / "_export_staging"
         target_dir.mkdir(parents=True, exist_ok=True)
 
         tables = _list_tables(stocks_repo)
@@ -386,7 +385,7 @@ def export_data():
 
                 csv_path: Path | None = None
                 try:
-                    out_parquet = _stock_export_path(target_dir, symbol)
+                    out_parquet = _stock_export_path(symbol)
                     if out_parquet.exists():
                         continue  # skip already exported
                     out_parquet.parent.mkdir(parents=True, exist_ok=True)

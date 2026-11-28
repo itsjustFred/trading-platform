@@ -17,8 +17,7 @@ from typing import Any
 import pandas as pd
 
 from data_tools.downloaders.base import Downloader, DownloadResult, SourceMeta
-from shared import ohlcv_store
-from shared import venue_calendar
+from shared import ohlcv_store, venue_calendar
 from shared.constants import DATA_DIR, normalize_timeframe
 
 logger = logging.getLogger(__name__)
@@ -346,7 +345,9 @@ class AlpacaDownloader(Downloader):
             .drop_duplicates(subset=["timestamp"], keep="last")
             .reset_index(drop=True)
         )
-        stored = self._merge_and_store_single_file(out_path, combined_new, asset_class="equity", region="US")
+        stored = self._merge_and_store_single_file(
+            out_path, combined_new, asset_class="equity", region="US"
+        )
         self._cache_exchange_calendar(
             output_dir, normalized_symbol, parsed_start, parsed_end
         )

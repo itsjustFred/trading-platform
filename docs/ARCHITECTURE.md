@@ -177,8 +177,12 @@ backend, the following files must stay synchronized:
 ### Canonical data path
 
 ```text
-$DATA_DIR/ohlcv/{source}/{asset_class}/[{region}/]{symbol}/{timeframe}.parquet
+$DATA_DIR/ohlcv/<source>/manifest.json
+$DATA_DIR/ohlcv/<source>/<SYMBOL>/<SYMBOL>_<TF>.parquet
 ```
+
+`asset_class`/`region`/`source_symbol` live in each source's `manifest.json`
+(#471); all readers resolve datasets through `shared/ohlcv_store.py`.
 
 ### Supporting tools
 

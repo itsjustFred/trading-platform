@@ -52,7 +52,7 @@ from data_tools.downloaders.dukascopy_native import (
     parse_ticks,
 )
 from shared import ohlcv_store
-from shared.atomic_io import write_text_atomically, write_parquet_atomically
+from shared.atomic_io import write_parquet_atomically, write_text_atomically
 from shared.constants import resolve_genesis_path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent

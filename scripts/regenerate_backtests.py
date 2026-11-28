@@ -26,7 +26,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import re
 import shutil
 import sqlite3
 from dataclasses import dataclass, field
@@ -65,11 +64,11 @@ _guard.ensure_own_checkout("regenerate_backtests")
 # scripts that must carry the guard. Kept deliberately, and silenced rather than removed:
 # dropping it would take this script off the roster and out of the gate that keeps it alive.
 import shared  # noqa: F401
-from shared import ohlcv_store
 from runner.cli import get_engine
 from runner.engines.base import BacktestConfig, resolve_strategy_parameters
 from runner.engines.contract import default_signal_exit_fill_for_engine
 from runner.stats import compute_stats_for_result
+from shared import ohlcv_store
 from shared.database import (
     BacktestRecord,
     DrawingRecord,

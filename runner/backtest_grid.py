@@ -20,7 +20,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
-import pandas as pd
 from pydantic import ValidationError
 
 from data_tools.auto_download import ensure_backtest_data

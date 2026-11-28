@@ -5,22 +5,37 @@ how they are ingested, and where they land inside `$TRADING_DATA_DIR`.
 
 ## Canonical storage layout
 
-All normalized OHLCV data is stored as parquet under:
+All normalized OHLCV data is stored as parquet under the manifest-driven
+store (`shared/ohlcv_store.py`, #471):
 
 ```text
-$TRADING_DATA_DIR/ohlcv/{source}/{asset_class}/[{region}/]{symbol}/{timeframe}.parquet
+$TRADING_DATA_DIR/ohlcv/<source>/manifest.json
+$TRADING_DATA_DIR/ohlcv/<source>/<SYMBOL>/<SYMBOL>_<TF>.parquet
+$TRADING_DATA_DIR/ohlcv/<source>/<SYMBOL>/<SYMBOL>_<TF>_<segment>.parquet
 ```
+
+`<TF>` is the store's file token (`1h` → `H1`, `1d` → `D1`, `tick` → `TICK`).
+`asset_class`, `region`, and `source_symbol` are NOT path components — they
+live in the source's `manifest.json` entry for each symbol, next to the
+per-file `rows`/`first`/`last` statistics every reader resolves through
+`ohlcv_store.list_datasets` / `find_dataset` / `entry_for_path`.
 
 Examples:
 
 ```text
-~/data/ohlcv/dukascopy/forex/EURUSD/1h.parquet
-~/data/ohlcv/yfinance/equity/US/AAPL/1d.parquet
-~/data/ohlcv/dolthub/equity/US/MSFT/1d.parquet
-~/data/ohlcv/huggingface/crypto/BTCUSD/1h.parquet
+~/data/ohlcv/dukascopy/manifest.json
+~/data/ohlcv/dukascopy/EURUSD/EURUSD_H1.parquet
+~/data/ohlcv/yfinance/AAPL/AAPL_D1.parquet
+~/data/ohlcv/dolthub/MSFT/MSFT_D1.parquet
+~/data/ohlcv/huggingface/BTCUSD/BTCUSD_H1.parquet
 ```
 
-The catalog builder reads that tree and writes `catalog.json`:
+Parquet files the manifest does not declare are ignored by every reader.
+Trees written in the pre-#471
+`ohlcv/{source}/{asset_class}/[{region}/]{symbol}/{timeframe}.parquet` layout
+are converted once with `scripts/migrate_ohlcv_layout.py`.
+
+The catalog builder reads the manifest store and writes `catalog.json`:
 
 ```bash
 python -m data_tools.catalog_builder -o "$TRADING_DATA_DIR/catalog.json"
@@ -163,8 +178,8 @@ Files:
 1. **Repo sync/export path** (`dolthub_manager.py`)
    - Used by the viewer for source `dolthub`
    - Clones or updates repos under `$TRADING_DATA_DIR/dolthub/`
-   - Exports canonical parquet files under:
-     - `ohlcv/dolthub/equity/US/{symbol}/1d.parquet`
+   - Exports canonical parquet files under the manifest store:
+     - `ohlcv/dolthub/{SYMBOL}/{SYMBOL}_D1.parquet`
      - `fundamentals/dolthub/earnings/*.parquet`
      - `fundamentals/dolthub/rates/*.parquet`
 
@@ -227,7 +242,7 @@ File: `data_tools/downloaders/histdata_dl.py`
 
 - Imports free FX minute data from histdata.com
 - Resamples `1m` to higher frames locally after download
-- Writes into `ohlcv/histdata/forex/{symbol}/{timeframe}.parquet`
+- Writes into the manifest store as `ohlcv/histdata/{SYMBOL}/{SYMBOL}_<TF>.parquet`
 
 ### Example
 
@@ -266,7 +281,7 @@ The live downloader module is `data_tools/downloaders/yfinance_dl.py`
 and in some UI labels because the platform stores equity datasets under:
 
 ```text
-$TRADING_DATA_DIR/ohlcv/yfinance/equity/US/{symbol}/{timeframe}.parquet
+$TRADING_DATA_DIR/ohlcv/yfinance/{SYMBOL}/{SYMBOL}_<TF>.parquet
 ```
 
 Existing CSV archives are additionally populated through

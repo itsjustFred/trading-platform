@@ -342,14 +342,10 @@ def _dataset_identity(
     if ohlcv_dir is None:
         return None
     root = Path(data_root) if data_root is not None else ohlcv_dir.parent
-    try:
-        relative = source_path.resolve().relative_to((root / "ohlcv").resolve())
-    except (OSError, ValueError):
+    parsed = ohlcv_store.parse_dataset_path(root, source_path)
+    if parsed is None:
         return None
-    parts = relative.parts
-    if len(parts) != 3:
-        return None
-    source, symbol, _filename = parts
+    source, symbol, _filename = parsed
     entry = ohlcv_store.entry_for_path(root, source_path)
     return root, source, symbol, entry
 

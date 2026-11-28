@@ -768,7 +768,7 @@ def _load_ohlcv_df(symbol: str, timeframe: str) -> pd.DataFrame | None:
         _invalidate_ohlcv_cache(cache_key)
         return None
 
-    ohlcv_root = (DATA_DIR / "ohlcv").resolve()
+    ohlcv_root = ohlcv_store.store_root(DATA_DIR).resolve()
     matches = _ohlcv_candidates(ohlcv_root, normalized_symbol, normalized_timeframe)
     if not matches or len(matches) > _OHLCV_MAX_MATCHES:
         _invalidate_ohlcv_cache(cache_key)
@@ -890,7 +890,7 @@ def ohlcv_asset_class(symbol: str, timeframe: str) -> str:
         or _OHLCV_TIMEFRAME_RE.fullmatch(normalized_timeframe) is None
     ):
         return ""
-    ohlcv_root = (DATA_DIR / "ohlcv").resolve()
+    ohlcv_root = ohlcv_store.store_root(DATA_DIR).resolve()
     matches = _ohlcv_candidates(ohlcv_root, normalized_symbol, normalized_timeframe)
     if not matches or len(matches) > _OHLCV_MAX_MATCHES:
         return ""
