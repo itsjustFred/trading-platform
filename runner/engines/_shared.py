@@ -232,12 +232,12 @@ def resolve_ask_price(row: Any, field: str, spread: float) -> float | None:
     """Ask-side open/close of a bar in price units, or ``None``.
 
     Explicit ``ask_open``/``ask_close`` wins (a two-sided feed states the
-    quote exactly). Otherwise the ask is the bid plus the caller's ``spread``
-    (``spread_price_col``); when that is zero the bar carries no ask
-    information at all — on a two-sided row the quoted spread is derived from
-    the row itself so a feed that only ships ``ask_high``/``ask_low`` still
-    prices the ask open/close, and on a single-sided row ``None`` means "ask
-    is the bid".
+    quote exactly). On a row carrying other usable ``ask_*`` values the
+    quoted spread derived from the row itself prices the missing side —
+    real ask data beats a configured assumption. Otherwise the ask is the
+    bid plus the caller's ``spread`` (``spread_price_col``); when that is
+    zero the bar carries no ask information at all — on a single-sided row
+    ``None`` means "ask is the bid".
     """
     if field not in ("open", "close"):
         raise ValueError(f"field must be 'open' or 'close', got {field!r}")
@@ -248,12 +248,14 @@ def resolve_ask_price(row: Any, field: str, spread: float) -> float | None:
         base = float(row[field])
     except (KeyError, TypeError, ValueError):
         return None
-    if spread > 0:
-        return base + spread
     if has_ask_side(row):
+        # The row's own quoted spread beats a caller-supplied fallback:
+        # real ask data is more faithful than a configured assumption.
         derived = bar_spread_units(row)
         if derived is not None:
             return base + derived
+    if spread > 0:
+        return base + spread
     return None
 
 

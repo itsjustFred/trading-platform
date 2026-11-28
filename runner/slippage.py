@@ -155,6 +155,8 @@ _BPS_SPELLINGS = frozenset({"bps", "fixed", "fixed_bps"})
 #: spread on a two-sided frame lives inside the fill prices themselves
 #: (ask open / ask level), and ask-side fills pass ``fill_side="ask"`` so
 #: the bar-spread model does not charge it a second time on those legs.
+#: Any future external spread-surcharge parameter must be added here or the
+#: two-sided strip in TradeEngine._resolve_two_sided_slippage will not see it.
 EXTERNAL_SPREAD_PARAMS = ("spread_price_col",)
 
 #: Engines that apply a fill-price slippage model (#130 scope: the native

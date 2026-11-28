@@ -426,8 +426,9 @@ def test_ask_ohlc_parameter_no_longer_changes_anything():
     strategy = _strategy(4, direction="SHORT", stop=101.0)
 
     default = _single_trade(_run(_frame(bars), strategy))
+    opted_frame = _frame(bars)
     with pytest.warns(DeprecationWarning, match="ask_ohlc"):
-        result = _run(_frame(bars), strategy, {"ask_ohlc": True})
+        result = _run(opted_frame, strategy, {"ask_ohlc": True})
     opted_in = _single_trade(result)
 
     assert default.exits[0].reason == "stop_loss"
