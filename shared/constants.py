@@ -14,6 +14,8 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+from shared.paths import PathContainmentError, safe_join
+
 try:  # pragma: no cover - pwd is not available on Windows
     import pwd
 except ImportError:  # pragma: no cover - Windows
@@ -202,9 +204,14 @@ def ensure_path_within_workspace(path: Path) -> Path:
     """Resolve ``path`` and reject anything outside the project workspace.
 
     Guards operator-facing CLI tools against LLM-supplied arguments that
-    escape the repository (python:S8707).
+    escape the repository (python:S8707). The path is resolved first, so a
+    relative value keeps its ``Path.resolve()`` meaning -- relative to the
+    process working directory, as it always has -- and the containment
+    decision is :func:`shared.paths.safe_join`'s. The workspace root itself is
+    accepted because callers name directories as well as files.
     """
     resolved = path.expanduser().resolve()
-    if not resolved.is_relative_to(PROJECT_ROOT):
-        raise ValueError(f"Path escapes the project workspace: {resolved}")
-    return resolved
+    try:
+        return safe_join(PROJECT_ROOT, resolved, allow_absolute=True, allow_base=True)
+    except PathContainmentError as exc:
+        raise ValueError(f"Path escapes the project workspace: {resolved}") from exc

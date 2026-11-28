@@ -37,6 +37,7 @@ import pytest
 import live_runner.daemon as daemon
 from live_runner.base_adapter import BaseLiveAdapter, LiveQuote
 from shared.models import LiveDeploymentConfig, LiveSignal
+from tests.builders import make_live_deployment, make_live_signal
 
 #: 21:00 ET on a trading day: the review's after-hours Discord buy.
 NOW = datetime(2026, 11, 10, 2, 0, tzinfo=timezone.utc)
@@ -98,7 +99,7 @@ class _Adapter(BaseLiveAdapter):
 
 
 def _deployment(**settings: Any) -> LiveDeploymentConfig:
-    return LiveDeploymentConfig(
+    return make_live_deployment(
         id=str(uuid4()),
         strategy_name="demo",
         account_id="acc-1",
@@ -112,7 +113,7 @@ def _deployment(**settings: Any) -> LiveDeploymentConfig:
 
 
 def _signal(deployment: LiveDeploymentConfig, metadata: dict | None = None) -> LiveSignal:
-    return LiveSignal(
+    return make_live_signal(
         deployment_id=str(deployment.id),
         symbol="AAPL",
         action="buy",

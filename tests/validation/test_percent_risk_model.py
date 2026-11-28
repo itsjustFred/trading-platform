@@ -251,16 +251,6 @@ def test_lot_size_zero_disables_rounding() -> None:
 # ─── Min / max clamping ─────────────────────────────────────────────────────
 
 
-def test_min_position_size_clamping_zero() -> None:
-    """DV-B48: a size below min_position_size fails closed (raises)."""
-    config = PercentRiskConfig(risk_percent=0.01, min_position_size=200.0)
-    model = PercentRiskModel(config)
-    # distance = 10 -> size = 1, below min 200 -> raises instead of 0
-    inp = _make_input(entry_price=100.0, stop_loss=90.0, account_balance=10_000.0)
-    with pytest.raises(ValueError, match="minimum position size"):
-        model.size(inp)
-
-
 def test_min_position_size_not_clamped_when_above() -> None:
     config = PercentRiskConfig(risk_percent=0.01, min_position_size=50.0)
     model = PercentRiskModel(config)

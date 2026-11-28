@@ -9,7 +9,7 @@
 ## 1. Scope-Grenzen
 
 ### In-Scope
-- Import und Normalisierung externer Backtest-Reports (primär MT5-XLSX, HTML-Fallback) in ein gemeinsames `ValidationReference`-Modell.
+- Import und Normalisierung externer Backtest-Reports (primär MT5-XLSX, das einzige geparste MT5-Format) in ein gemeinsames `ValidationReference`-Modell.
 - Systematischer Vergleich externer Referenzdaten mit internen `BacktestResult`-Daten.
 - Trade Matching (Entry/Exit Time, Direction, Entry/Exit Price, Volume, Position Size, PnL, SL, TP).
 - Risk Matching (Fixed-Risk, Risk-%, Stop Distance, Risk Per Trade, Position Size).
@@ -31,8 +31,8 @@
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │ Externer Report                                                             │
-│  • MT5-XLSX  (primär)                                                       │
-│  • MT5-HTML  (Fallback)                                                     │
+│  • MT5-XLSX  (einzige geparste MT5-Form)                                      │
+│  • HTML-Reports bleiben Menschen-Artefakte, werden nicht geparst              │
 │  • später: QuantConnect, LEAN, Stockkit                                     │
 └──────────────────────────────────┬──────────────────────────────────────────┘
                                    │
@@ -40,7 +40,6 @@
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │ Importer / Converter Layer                                                  │
 │  • MT5XLSXImporter                                                          │
-│  • MT5HTMLImporter                                                          │
 │  • ConverterRegistry                                                        │
 └──────────────────────────────────┬──────────────────────────────────────────┘
                                    │
@@ -99,8 +98,7 @@
 | `ValidationReference` | `validation/models/reference.py` | Zentrales Aggregat mit Pflichtfeldern und Provenienz-Informationen (`source_framework`, `raw_metadata`). |
 | `ValidationResult` | `validation/models/result.py` | Ergebnis des Vergleichs mit Status, Score und Abweichungsliste. |
 | `Deviation` | `validation/models/result.py` | Einzelne Abweichung: Feld, erwarteter Wert, tatsächlicher Wert, Toleranz, Schweregrad. |
-| `MT5XLSXImporter` | `validation/importers/mt5_xlsx.py` | Primärer Importer für MT5-XLSX-Reports. |
-| `MT5HTMLImporter` | `validation/importers/mt5_html.py` | Fallback-Importer für MT5-HTML-Reports. |
+| `MT5XLSXImporter` | `validation/importers/mt5_xlsx.py` | Importer für MT5-XLSX-Reports (einzige geparste MT5-Form). |
 | `BaseImporter` | `validation/importers/base.py` | Gemeinsames Interface für alle Importer. |
 | `TradeComparator` | `validation/comparators/trades.py` | Erkennt matched/missing/extra/mismatch-Trades. |
 | `RiskComparator` | `validation/comparators/risk.py` | Vergleicht Stop Distance, Risk Per Trade, Position Size. |
@@ -129,7 +127,6 @@ trading-platform/
 │   │   ├── __init__.py
 │   │   ├── base.py           # BaseImporter
 │   │   ├── mt5_xlsx.py       # MT5XLSXImporter
-│   │   └── mt5_html.py       # MT5HTMLImporter
 │   ├── comparators/
 │   │   ├── __init__.py
 │   │   ├── trades.py         # TradeComparator
@@ -152,7 +149,6 @@ trading-platform/
 ├── tests/validation/
 │   ├── test_validation_reference.py
 │   ├── test_mt5_xlsx_importer.py
-│   ├── test_mt5_html_importer.py
 │   ├── test_trade_matcher.py
 │   ├── test_trade_comparison.py
 │   ├── test_trade_anomalies.py
@@ -173,8 +169,6 @@ trading-platform/
 │   │   └── goldens/               # importer output projected for regression pins
 │   │       ├── hedged_partial_open.json
 │   │       └── position_id_shared.json
-│   ├── mt5_html/
-│   │   └── sample_report.html
 │   └── goldens/
 │       ├── eurusd_h1_golden.json
 │       ├── nas100_m15_golden.json
@@ -193,8 +187,7 @@ trading-platform/
 
 1. **Phase 2 — Import & Normalization**
    - `ValidationReference` implementieren.
-   - `MT5XLSXImporter` bauen (robust gegen variable Header-Offsets).
-   - `MT5HTMLImporter` als Fallback.
+   - `MT5XLSXImporter` für XLSX-Reports; HTML-Reports werden nicht geparst.
    - Golden Files erzeugen.
 
 2. **Phase 3 — Trade Comparison Engine**

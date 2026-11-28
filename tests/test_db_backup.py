@@ -19,6 +19,7 @@ from pathlib import Path
 import pytest
 
 from scripts import db_backup
+from tests.conftest import sandboxed_env
 
 
 @pytest.fixture
@@ -314,7 +315,8 @@ def _hold_db_open(db_path: Path, ready: Path) -> subprocess.Popen:
             "time.sleep(60)\n",
             str(db_path),
             str(ready),
-        ]
+        ],
+        env=sandboxed_env(),
     )
 
 
@@ -543,15 +545,13 @@ def test_cli_backup_list_verify_and_forced_restore(
     db_path: Path, backup_dir: Path
 ) -> None:
     _make_db(db_path, [1.0], ["m1"])
-    env = dict(os.environ)
-
     def run(*argv: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             [sys.executable, "-m", "scripts.db_backup", *argv],
             capture_output=True,
             text=True,
             cwd=str(Path(__file__).resolve().parents[1]),
-            env=env,
+            env=sandboxed_env(),
             timeout=120,
         )
 
@@ -604,7 +604,8 @@ def _hold_db_exclusive(db_path: Path, ready: Path) -> subprocess.Popen:
             "time.sleep(60)\n",
             str(db_path),
             str(ready),
-        ]
+        ],
+        env=sandboxed_env(),
     )
 
 

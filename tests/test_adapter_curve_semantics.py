@@ -18,8 +18,8 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from runner.engines.base import BacktestConfig
 from runner.engines.native_adapter import NativeAdapter
+from tests.builders import make_backtest_config
 from tests.helpers import deterministic_ohlcv_frame, sma_crossover_strategy_text
 
 STRATEGY = sma_crossover_strategy_text("curve_sma")
@@ -38,7 +38,7 @@ def curve_env(tmp_path: Path):
     symbol_dir = tmp_path / "ohlcv" / "test_source" / "equities" / "CRV"
     symbol_dir.mkdir(parents=True)
     _frame().to_parquet(symbol_dir / "1h.parquet", index=False)
-    config = BacktestConfig(risk_per_trade_pct=0.01,
+    config = make_backtest_config(risk_per_trade_pct=0.01,
         strategy_name="curve_sma",
         symbols=["CRV"],
         timeframe="1h",
@@ -160,7 +160,7 @@ class TestNativeCurveExitOrder:
         symbol_dir.mkdir(parents=True)
         frame = _overlap_frame()
         frame.to_parquet(symbol_dir / "1h.parquet", index=False)
-        config = BacktestConfig(
+        config = make_backtest_config(
             risk_per_trade_pct=0.01,
             parameters={"fees": "zero", "slippage": "none"},
             strategy_name="overlap_curve",

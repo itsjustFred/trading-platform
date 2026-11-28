@@ -19,7 +19,7 @@ from uuid import uuid4
 import pytest
 
 from shared.models import LiveDeploymentConfig, LiveExecution, LiveSignal
-from tests.conftest import seed_live_deployments
+from tests.conftest import sandboxed_env, seed_live_deployments
 
 # The reconcile-payload helpers below build real protobuf messages; without
 # the package every test in that block would fail on import rather than skip.
@@ -259,7 +259,8 @@ def test_env_key_persistence_serializes_concurrent_writers(tmp_path: Path) -> No
                     "_write_env_keys(Path(sys.argv[1]), {'CTRADER_ACCESS_TOKEN': 'new-access'})"
                 ),
                 str(accounts_env),
-            ]
+            ],
+            env=sandboxed_env(),
         )
         time.sleep(0.2)
         assert writer.poll() is None

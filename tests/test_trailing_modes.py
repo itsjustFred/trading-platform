@@ -22,11 +22,14 @@ from shared.trailing import (
     LIVE_ANY_BROKER_TRAILING_MODES,
     LIVE_BASELINE_TRAILING_MODES,
     LIVE_SUPPORTED_TRAILING_MODES_BY_BROKER,
+    REMOVED_SUPERTREND_FLIP_OPT_IN_KEY,
+    REMOVED_TRAILING_MODES,
     REPLAY_SUPPORTED_TRAILING_MODES,
     RISK_ENGINE_SUPPORTED_TRAILING_MODES,
     live_supported_trailing_modes,
-    tp1_partial_quantity,
+    validate_live_deployment_trailing_mode,
     validate_live_deployment_trailing_override,
+    validate_no_removed_flip_opt_in,
     validate_trailing_mode,
     validate_trailing_sl_config,
 )
@@ -55,38 +58,35 @@ def _deployment(signal_config: dict | None = None) -> LiveDeploymentConfig:
 
 
 def test_support_sets_are_what_the_paths_can_execute() -> None:
-    assert KNOWN_TRAILING_MODES == {"none", "percent", "supertrend_flip"}
-    # #168: replay executes supertrend_flip itself; the risk engine does not.
-    assert REPLAY_SUPPORTED_TRAILING_MODES == {"none", "percent", "supertrend_flip"}
+    assert KNOWN_TRAILING_MODES == {"none", "percent"}
+    assert REPLAY_SUPPORTED_TRAILING_MODES == {"none", "percent"}
     assert RISK_ENGINE_SUPPORTED_TRAILING_MODES == {"none", "percent"}
-    # Live support is per broker (#167): percent on Alpaca only.
+    # Live support is per broker (#167): percent on Alpaca only; cTrader
+    # trails nothing now that the supertrend_flip workflow is removed.
     assert LIVE_SUPPORTED_TRAILING_MODES_BY_BROKER == {
         "alpaca": {"none", "percent"},
-        # #168: cTrader can execute supertrend_flip, but only for deployments
-        # carrying the live_supertrend_flip opt-in on a demo/paper account -
-        # enforced by the deployment-validation and signal-time gates.
-        "ctrader": {"none", "supertrend_flip"},
+        "ctrader": {"none"},
     }
     assert LIVE_BASELINE_TRAILING_MODES == {"none"}
-    assert LIVE_ANY_BROKER_TRAILING_MODES == {"none", "percent", "supertrend_flip"}
+    assert LIVE_ANY_BROKER_TRAILING_MODES == {"none", "percent"}
+    # The removed Discord-signal workflow mode is named explicitly so a stale
+    # config is refused with a "removed" message, never "unknown mode".
+    assert REMOVED_TRAILING_MODES == {"supertrend_flip"}
 
 
 def test_live_modes_are_resolved_per_broker_and_fail_closed() -> None:
     assert live_supported_trailing_modes("alpaca") == {"none", "percent"}
     assert live_supported_trailing_modes(" Alpaca ") == {"none", "percent"}
-    assert live_supported_trailing_modes("ctrader") == {"none", "supertrend_flip"}
+    assert live_supported_trailing_modes("ctrader") == {"none"}
     # Unknown or missing broker: baseline only.
     for broker in (None, "", "ibkr"):
         assert live_supported_trailing_modes(broker) == {"none"}
     # No stop-amendment capability: baseline only, whatever the broker.
     assert live_supported_trailing_modes("alpaca", supports_stop_amendment=False) == {"none"}
     assert live_supported_trailing_modes("alpaca", supports_stop_amendment="yes") == {"none"}  # type: ignore[arg-type]
-    # supertrend_flip is cTrader-only (#168); every other broker stays
-    # without it, and the deployment opt-in + demo/paper gates apply
-    # downstream of this table.
-    for broker, modes in LIVE_SUPPORTED_TRAILING_MODES_BY_BROKER.items():
-        if broker != "ctrader":
-            assert "supertrend_flip" not in modes
+    # No broker executes a removed mode; it never appears in a support set.
+    for modes in LIVE_SUPPORTED_TRAILING_MODES_BY_BROKER.values():
+        assert REMOVED_TRAILING_MODES.isdisjoint(modes)
 
 
 def test_mode_is_normalised() -> None:
@@ -103,13 +103,37 @@ def test_unknown_mode_is_rejected(value) -> None:
 
 
 def test_known_but_unsupported_mode_is_rejected_with_its_own_message() -> None:
-    # #168 made replay support supertrend_flip; the live Alpaca set still
-    # lacks it, so it carries the "known but unsupported" case now.
     with pytest.raises(ValueError, match="not supported by the live path"):
         validate_trailing_mode(
-            "supertrend_flip",
-            supported=LIVE_SUPPORTED_TRAILING_MODES_BY_BROKER["alpaca"],
+            "percent",
+            supported=LIVE_BASELINE_TRAILING_MODES,
             context="the live path",
+        )
+
+
+@pytest.mark.parametrize(
+    "supported",
+    [
+        KNOWN_TRAILING_MODES,
+        REPLAY_SUPPORTED_TRAILING_MODES,
+        RISK_ENGINE_SUPPORTED_TRAILING_MODES,
+        LIVE_ANY_BROKER_TRAILING_MODES,
+        LIVE_SUPPORTED_TRAILING_MODES_BY_BROKER["alpaca"],
+        LIVE_SUPPORTED_TRAILING_MODES_BY_BROKER["ctrader"],
+        LIVE_BASELINE_TRAILING_MODES,
+    ],
+)
+def test_removed_supertrend_flip_mode_is_rejected_on_every_path(supported) -> None:
+    """Maintainer decision 2026-11-26: the mode is gone everywhere. A config
+    that still names it fails closed with a message that says it was removed -
+    never "unknown mode" and never silently treated as "no trailing"."""
+    with pytest.raises(
+        ValueError, match=r"supertrend_flip.*removed|removed.*supertrend_flip"
+    ):
+        validate_trailing_mode("supertrend_flip", supported=supported, context="test")
+    with pytest.raises(ValueError, match="removed"):
+        validate_trailing_sl_config(
+            {"mode": "supertrend_flip"}, supported=supported, context="test"
         )
 
 
@@ -167,7 +191,7 @@ def test_sl_config_returns_the_supported_mode() -> None:
 
 @pytest.mark.parametrize("mode", ["supertrend_flip", "bogus"])
 def test_live_deployment_rejects_a_trailing_mode_no_live_broker_can_run(mode: str) -> None:
-    with pytest.raises(ValidationError, match="trailing"):
+    with pytest.raises(ValidationError, match=r"[Tt]railing"):
         _deployment({"signal_processor_config": {"trailing_mode": mode}})
 
 
@@ -195,6 +219,56 @@ def test_broker_aware_override_check_rejects_unsupported_modes_on_alpaca(mode: s
             {"signal_processor_config": {"trailing_mode": mode}},
             context="test",
             broker="alpaca",
+        )
+
+
+# ── the removed live_supertrend_flip deployment opt-in ───────────────────────
+
+
+def test_removed_flip_opt_in_key_is_rejected_at_deployment_validation() -> None:
+    """A deployment still carrying ``settings.live_supertrend_flip`` asks for
+    a workflow that no longer exists: refused at model validation, naming the
+    removed opt-in - never silently ignored."""
+    with pytest.raises(ValidationError, match=REMOVED_SUPERTREND_FLIP_OPT_IN_KEY):
+        LiveDeploymentConfig(
+            strategy_name="ramjet-live",
+            account_id="acct-1",
+            symbols=["AAPL"],
+            timeframe="5m",
+            settings={REMOVED_SUPERTREND_FLIP_OPT_IN_KEY: "true"},
+        )
+
+
+@pytest.mark.parametrize("value", ["true", "yes", "1", "on", True])
+def test_removed_flip_opt_in_truthy_values_are_rejected(value) -> None:
+    with pytest.raises(ValueError, match="live_supertrend_flip"):
+        validate_no_removed_flip_opt_in(
+            {REMOVED_SUPERTREND_FLIP_OPT_IN_KEY: value}, context="test"
+        )
+
+
+@pytest.mark.parametrize(
+    "settings",
+    [
+        None,
+        {},
+        {"live_supertrend_flip": "false"},
+        {"live_supertrend_flip": ""},
+        {"live_supertrend_flip": "off"},
+        {"live_supertrend_flip": False},
+    ],
+)
+def test_removed_flip_opt_in_inert_values_pass(settings) -> None:
+    """Absent or explicitly-off values ask for nothing: not an error."""
+    validate_no_removed_flip_opt_in(settings, context="test")
+
+
+def test_deployment_with_removed_opt_in_is_refused_by_the_full_gate() -> None:
+    deployment = _deployment()
+    deployment.settings = {REMOVED_SUPERTREND_FLIP_OPT_IN_KEY: "true"}
+    with pytest.raises(ValueError, match="live_supertrend_flip"):
+        validate_live_deployment_trailing_mode(
+            deployment, context="test", broker="ctrader", timeframe="5m"
         )
 
 
@@ -373,7 +447,7 @@ _ALPACA_WITHOUT_AMEND = SimpleNamespace(broker_name="alpaca", supports_stop_amen
     ],
 )
 def test_live_signal_with_unexecutable_trailing_is_refused(monkeypatch, trailing_cfg) -> None:
-    with pytest.raises(ValueError, match=r"[Tt]railing|trailing_sl_config"):
+    with pytest.raises(ValueError, match=r"[Tt]railing|trailing_sl_config|removed"):
         _process(monkeypatch, trailing_cfg)
 
 
@@ -389,7 +463,7 @@ def test_live_percent_signal_is_refused_for_an_adapter_that_cannot_trail(
 def test_live_signal_with_a_mode_no_adapter_executes_is_refused(
     monkeypatch, trailing_cfg
 ) -> None:
-    with pytest.raises(ValueError, match=r"[Tt]railing"):
+    with pytest.raises(ValueError, match=r"[Tt]railing|removed"):
         _process(monkeypatch, trailing_cfg, _ALPACA_LIKE)
 
 
@@ -435,11 +509,16 @@ def _live_signal(metadata: dict) -> LiveSignal:
 
 
 @pytest.mark.parametrize(
-    "trailing_cfg", [{"mode": "percent", "percent": 0.02}, {"mode": "supertrend_flip"}]
+    "trailing_cfg",
+    [
+        {"mode": "percent", "percent": 0.02},
+        {"mode": "supertrend_flip"},
+        {"mode": "bogus"},
+    ],
 )
 def test_order_preparation_refuses_trailing_before_touching_the_broker(trailing_cfg) -> None:
     signal = _live_signal({"trailing_sl_config": trailing_cfg, "stop_loss": 95.0})
-    with pytest.raises(ValueError, match="not supported"):
+    with pytest.raises(ValueError, match=r"not supported|removed|Unknown trailing stop mode"):
         _prepare_order(signal)
 
 
@@ -466,6 +545,7 @@ def test_order_preparation_lets_mode_none_through_to_sizing(monkeypatch) -> None
         (_CTRADER_LIKE, {"mode": "percent", "percent": 0.02}),
         (_ALPACA_WITHOUT_AMEND, {"mode": "percent", "percent": 0.02}),
         (_ALPACA_LIKE, {"mode": "supertrend_flip"}),
+        (_ALPACA_LIKE, {"mode": "bogus"}),
     ],
 )
 def test_order_preparation_refuses_trailing_the_adapter_cannot_execute(
@@ -478,7 +558,7 @@ def test_order_preparation_refuses_trailing_the_adapter_cannot_execute(
     signal = _live_signal({"trailing_sl_config": trailing_cfg, "stop_loss": 95.0})
     deployment = _deployment()
     preparation = daemon.prepare_order_with_risk(adapter, deployment, signal)
-    with pytest.raises(ValueError, match="not supported"):
+    with pytest.raises(ValueError, match=r"not supported|removed|Unknown trailing stop mode"):
         asyncio.run(preparation)
 
 
@@ -674,7 +754,7 @@ def test_order_preparation_refuses_a_percent_entry_on_an_untrailable_timeframe(
         asyncio.run(preparation)
 
 
-# ── #168: a complete supertrend_flip config is still refused live ────────────
+# ── the removed supertrend_flip mode fails closed on every live path ────────
 
 _FULL_FLIP_CONFIG = {
     "mode": "supertrend_flip",
@@ -690,9 +770,9 @@ _FULL_FLIP_CONFIG = {
 def test_live_signal_with_a_complete_supertrend_flip_config_is_refused(
     monkeypatch, adapter
 ) -> None:
-    """Replay executes supertrend_flip (#168); live refuses it on every broker
-    even when the config is complete — the refusal is about the mode."""
-    with pytest.raises(ValueError, match="'supertrend_flip' is not supported"):
+    """The workflow is removed: even a complete flip config is refused on
+    every broker, and the refusal names the removed mode."""
+    with pytest.raises(ValueError, match="removed"):
         _process(monkeypatch, _FULL_FLIP_CONFIG, adapter)
 
 
@@ -714,43 +794,15 @@ def test_order_preparation_refuses_a_complete_supertrend_flip_config(
     )
     deployment = _deployment()
     preparation = daemon.prepare_order_with_risk(adapter, deployment, signal)
-    with pytest.raises(ValueError, match="'supertrend_flip' is not supported"):
+    with pytest.raises(ValueError, match="removed"):
         asyncio.run(preparation)
 
 
 @pytest.mark.parametrize("broker", ["alpaca", "ctrader", None, "ibkr"])
 def test_deployment_override_supertrend_flip_is_refused_per_broker(broker) -> None:
-    with pytest.raises(ValueError, match="supertrend_flip"):
+    with pytest.raises(ValueError, match="removed"):
         validate_live_deployment_trailing_override(
             {"signal_processor_config": {"trailing_mode": "supertrend_flip"}},
             context="test",
             broker=broker,
         )
-
-
-# ── #168: the TP1 tranche is whole shares, floored ──────────────────────────
-
-
-@pytest.mark.parametrize(
-    ("quantity", "fraction", "expected"),
-    [
-        (7.0, 0.5, 3.0),
-        (1.0, 0.5, 0.0),  # the original bot: nothing to sell at TP1
-        (7.5, 0.5, 3.0),  # 3.75 floors to 3, never up to 4
-        (7.0, 0.25, 1.0),
-        (200.0, 0.5, 100.0),
-        (7.0, 1.0, 7.0),  # a full fraction still floors to the whole quantity
-        (0.0, 0.5, 0.0),
-        (-7.0, 0.5, 0.0),  # fail closed: never a negative tranche
-        (3.0, 0.999999, 2.0),  # never rounds up to the whole position
-    ],
-)
-def test_tp1_partial_quantity_floors_to_whole_shares(quantity, fraction, expected) -> None:
-    assert tp1_partial_quantity(quantity, fraction) == expected
-
-
-def test_tp1_partial_quantity_of_non_finite_inputs_is_zero() -> None:
-    """A non-finite quantity/fraction cannot produce a tranche: 0, which the
-    caller must treat as \"nothing to sell\" (never a NaN order quantity)."""
-    for quantity, fraction in ((float("nan"), 0.5), (7.0, float("inf")), (7.0, float("nan"))):
-        assert tp1_partial_quantity(quantity, fraction) == 0.0

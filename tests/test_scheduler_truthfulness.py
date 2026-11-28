@@ -348,11 +348,51 @@ def test_scheduler_wrapper_defaults_to_completed_when_handler_returns_none() -> 
     assert records[-1]["status"] == "completed"
 
 
-def test_scheduler_task_ids_are_unique_within_a_second() -> None:
-    """B2: microsecond suffix — same-second runs must not share a task id."""
-    import inspect
-
+def test_scheduler_task_ids_are_unique_within_a_second(monkeypatch) -> None:
+    """B2: two runs inside the same second must not share a task id."""
     import scheduler.scheduler as scheduler_module
 
-    source = inspect.getsource(scheduler_module.ServiceScheduler._run_service_job)
-    assert "%Y%m%d%H%M%S%f" in source
+    scheduler = None
+    records: list[dict] = []
+
+    first = datetime(2026, 1, 1, 12, 0, 0, 100000, tzinfo=timezone.utc)
+    second = datetime(2026, 1, 1, 12, 0, 0, 900000, tzinfo=timezone.utc)
+    calls = {"n": 0}
+
+    class _FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            calls["n"] += 1
+            return first if calls["n"] == 1 else second
+
+    async def _handler(**kwargs):
+        return None
+
+    async def _scenario() -> None:
+        nonlocal scheduler
+        scheduler = scheduler_module.ServiceScheduler()
+        scheduler._scheduler.start()
+        scheduler._started = True
+        try:
+            with patch(
+                "scheduler.scheduler.update_service_status"
+            ), patch("scheduler.scheduler.upsert_background_task_record") as upsert, patch.dict(
+                "scheduler.scheduler._SCHEDULED_JOB_HANDLERS",
+                {"job_x": _handler},
+            ), patch.object(scheduler_module, "datetime", _FrozenDatetime):
+                upsert.side_effect = lambda **kwargs: records.append(dict(kwargs))
+                for _ in range(2):
+                    await scheduler._run_service_job(
+                        service_id="svc-x",
+                        service_name="X",
+                        job_type="job_x",
+                    )
+        finally:
+            await scheduler.stop()
+
+    asyncio.run(_scenario())
+
+    task_ids = {record["task_id"] for record in records if record.get("task_id")}
+    assert len(task_ids) == 2, (
+        f"two same-second runs shared task ids: {sorted(task_ids)}"
+    )

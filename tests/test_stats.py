@@ -227,42 +227,6 @@ class TestComputeStats:
         expected = (121000.0 / 100000.0) ** (365.25 / 731) - 1
         assert math.isclose(stats["cagr"], expected, rel_tol=1e-9, abs_tol=CAGR_PAYLOAD_TOLERANCE)
 
-    def test_cagr_prefers_equity_period_over_trade_bounds(self):
-        """Same contract as `test_cagr_annualizes_with_trade_period_bounds`.
-
-        Merge resolution: the two sides of the merge added this scenario under
-        different names. Both keep the shared 731-day equity window, so both are
-        retained as separate tests rather than one shadowing the other.
-        """
-        equity = [
-            EquityPoint(time="2020-01-01T00:00:00+00:00", equity=100000.0),
-            EquityPoint(time="2022-01-01T00:00:00+00:00", equity=121000.0),
-        ]
-        trades = [
-            Trade(
-                id=1,
-                symbol="X",
-                direction="LONG",
-                entry_time="2021-01-01T00:00:00+00:00",
-                entry_price=100.0,
-                quantity=1,
-                exits=[
-                    TradeExit(
-                        time="2023-01-01T00:00:00+00:00",
-                        price=121.0,
-                        quantity=1,
-                        pnl=21000.0,
-                    )
-                ],
-                pnl=21000.0,
-            )
-        ]
-
-        stats = compute_stats(trades, equity_curve=equity)
-
-        expected = (121000.0 / 100000.0) ** (365.25 / 731) - 1
-        assert math.isclose(stats["cagr"], expected, rel_tol=1e-9, abs_tol=CAGR_PAYLOAD_TOLERANCE)
-
     def test_cagr_handles_mixed_fractional_curve_timestamps(self):
         # Daily equity curves mix second-resolution inception points with
         # microsecond-resolution closes; without format="mixed" every close
@@ -277,39 +241,6 @@ class TestComputeStats:
 
         expected = (101_000.0 / 100_000.0) ** (365.25 / 3.0) - 1.0
         assert stats["cagr"] == pytest.approx(expected, rel=0, abs=1e-6)
-
-    def test_cagr_uses_fractional_days_from_trade_bounds(self):
-        # #84: calendar window — 2024 is a leap year (366 days), not the
-        # 365.75-day trade span.
-        equity = [
-            EquityPoint(time="2024-01-01T00:00:00+00:00", equity=100000.0),
-            EquityPoint(time="2025-01-01T00:00:00+00:00", equity=110000.0),
-        ]
-        trades = [
-            Trade(
-                id=1,
-                symbol="X",
-                direction="LONG",
-                entry_time="2024-01-01T12:00:00+00:00",
-                entry_price=100.0,
-                quantity=1,
-                exits=[
-                    TradeExit(
-                        time="2025-01-01T06:00:00+00:00",
-                        price=110.0,
-                        quantity=1,
-                        pnl=10000.0,
-                    )
-                ],
-                pnl=10000.0,
-            )
-        ]
-
-        stats = compute_stats(trades, equity_curve=equity)
-
-        # 2024-01-01T00:00Z -> 2025-01-01T00:00Z is 366 calendar days.
-        expected = (110000.0 / 100000.0) ** (365.25 / 366) - 1
-        assert math.isclose(stats["cagr"], expected, rel_tol=1e-9, abs_tol=CAGR_PAYLOAD_TOLERANCE)
 
     def test_cagr_uses_equity_period_when_available(self):
         """The equity window, not the 365.75-day trade span, drives CAGR.

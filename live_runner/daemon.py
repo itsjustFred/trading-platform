@@ -50,7 +50,6 @@ from live_runner.base_adapter import (
     QUOTE_TIME_RULE_INVALID,
     QUOTE_TIME_RULE_MISSING,
     QUOTE_TIME_RULE_STALE,
-    UNBOUNDED_TP_POLICY,
     BaseLiveAdapter,
     BrokerOrderRejectedError,
     LivePipValue,
@@ -69,6 +68,7 @@ from live_runner.credential_env import (
     discord_bot_env_canonical_name,
     discord_bot_env_key,
     load_accounts_env_values,
+    parse_bool_env,
     resolve_accounts_env_path,
     resolve_env_value,
 )
@@ -169,11 +169,6 @@ from live_runner.stockkit_routing import (
     resolve_deployment_stockkit_route,
     validate_stockkit_deployment_route,
 )
-from live_runner.supertrend_flip import (
-    FLIP_SUPPORTED_BROKERS,
-    LiveSupertrendFlipManager,
-    run_flip_workflow_loop,
-)
 from live_runner.trailing_stops import (
     LiveTrailingStopManager,
     adapter_live_trailing_modes,
@@ -184,6 +179,8 @@ from risk import (
     RiskConfig,
     RiskEngine,
     TradeSignal,
+    coerce_setting_float,
+    coerce_setting_int,
     effective_max_notional_per_trade,
 )
 from risk.live import (
@@ -244,10 +241,7 @@ from shared.single_instance import (
 )
 from shared.trailing import (
     ANY_BROKER,
-    TRAILING_MODE_SUPERTREND_FLIP,
     TRAILING_SL_CONFIG_METADATA_KEY,
-    deployment_supertrend_flip_enabled,
-    normalize_trailing_mode,
     validate_live_deployment_trailing_mode,
     validate_trailing_sl_config,
 )
@@ -400,30 +394,6 @@ def _trailing_eligible_adapters(
     }
 
 
-def _parse_bool_env(value: str | None, *, default: bool = True) -> bool:
-    if value is None:
-        return default
-    return value.strip().lower() in {"1", "true", "yes", "on"}
-
-
-_TRUE_BOOL_TOKENS = {"1", "true", "yes", "y", "on"}
-_FALSE_BOOL_TOKENS = {"0", "false", "no", "n", "off"}
-
-
-def _parse_strict_bool_env(name: str, value: str | None, *, default: bool = True) -> bool:
-    if value is None:
-        return default
-    token = value.strip().lower()
-    if token in _TRUE_BOOL_TOKENS:
-        return True
-    if token in _FALSE_BOOL_TOKENS:
-        return False
-    valid = ", ".join(sorted(_TRUE_BOOL_TOKENS | _FALSE_BOOL_TOKENS))
-    raise ValueError(
-        f"Invalid boolean value for {name}: {value!r}. Valid values are: {valid}."
-    )
-
-
 def _raw_bool_text(value: object) -> str | None:
     """Normalize a config value to text for boolean parsing.
 
@@ -552,7 +522,7 @@ def _resolve_ctrader_credentials(
         return None
     raw_demo_value = env_values.get("CTRADER_DEMO")
     demo_value = raw_demo_value.strip() if isinstance(raw_demo_value, str) else None
-    demo = _parse_strict_bool_env("CTRADER_DEMO", demo_value, default=True)
+    demo = parse_bool_env("CTRADER_DEMO", demo_value, default=True)
     return app_id, app_secret, access_token, refresh_token, demo
 
 
@@ -620,96 +590,18 @@ def _block_ctrader_account(account_id: str, exc: BaseException | str) -> None:
     _CTRADER_AUTH_BLOCKED_REASONS[account_id] = reason
 
 
-def _coerce_live_float(
-    value: Any,
-    *,
-    field_name: str,
-    minimum: float | None = None,
-) -> float:
-    if isinstance(value, bool):
-        raise ValueError(f"Invalid {field_name}: {value!r}")
-    try:
-        parsed = float(value)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError(f"Invalid {field_name}: {value!r}") from exc
-    if not math.isfinite(parsed):
-        raise ValueError(f"{field_name} must be finite")
-    if minimum is not None and parsed < minimum:
-        raise ValueError(f"{field_name} must be >= {minimum}")
-    return parsed
-
-
-def _coerce_live_int(
-    value: Any,
-    *,
-    field_name: str,
-    minimum: int | None = None,
-) -> int:
-    if isinstance(value, bool):
-        raise ValueError(f"Invalid {field_name}: {value!r}")
-    try:
-        numeric = float(value)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError(f"Invalid {field_name}: {value!r}") from exc
-    if not math.isfinite(numeric) or not numeric.is_integer():
-        raise ValueError(f"{field_name} must be an integer")
-    parsed = int(numeric)
-    if minimum is not None and parsed < minimum:
-        raise ValueError(f"{field_name} must be >= {minimum}")
-    return parsed
-
-
 def _risk_config_for_deployment(deployment: LiveDeploymentConfig) -> RiskConfig:
-    settings = deployment.settings or {}
-    risk_per_trade_raw = settings.get(
-        "max_risk_per_trade",
-        settings.get("risk_per_trade_pct", 0.01),
-    )
-    max_total_exposure_raw = settings.get("max_total_exposure", 0.05)
-    max_positions_raw = settings.get("max_positions", 5)
-    sl_multiplier_raw = settings.get("default_sl_atr_multiplier", 2.0)
-    fallback_stop_pct_raw = settings.get("fallback_stop_pct", 0.02)
-    max_notional_raw = settings.get("max_notional_per_trade", 0.20)
-    allow_fallback_raw = settings.get("allow_fallback_stop", True)
-    reject_missing_raw = settings.get("reject_missing_stop", False)
-
-    return RiskConfig(
-        max_risk_per_trade=_coerce_live_float(
-            risk_per_trade_raw,
-            field_name="max_risk_per_trade",
-            minimum=0.0,
-        ),
-        max_total_exposure=_coerce_live_float(
-            max_total_exposure_raw,
-            field_name="max_total_exposure",
-            minimum=0.0,
-        ),
-        max_positions=_coerce_live_int(max_positions_raw, field_name="max_positions", minimum=1),
-        default_sl_atr_multiplier=_coerce_live_float(
-            sl_multiplier_raw,
-            field_name="default_sl_atr_multiplier",
-            minimum=0.0,
-        ),
-        fallback_stop_pct=_coerce_live_float(
-            fallback_stop_pct_raw,
-            field_name="fallback_stop_pct",
-            minimum=0.0,
-        ),
-        max_notional_per_trade=_coerce_live_float(
-            max_notional_raw,
-            field_name="max_notional_per_trade",
-            minimum=0.0,
-        ),
-        allow_fallback_stop=allow_fallback_raw,
-        reject_missing_stop=reject_missing_raw,
-    )
+    # Improvement-run G03: the settings -> RiskConfig mapping lives in
+    # ``RiskConfig.from_settings``, so the live defaults are the dataclass
+    # fields instead of a second copy of the literals here.
+    return RiskConfig.from_settings(deployment.settings)
 
 
 def _deployment_allows_short(deployment: LiveDeploymentConfig) -> bool:
     settings = deployment.settings or {}
     configured = deployment.signal_config or {}
     value = configured.get("allow_short", settings.get("allow_short", False))
-    return _parse_strict_bool_env("allow_short", _raw_bool_text(value), default=False)
+    return parse_bool_env("allow_short", _raw_bool_text(value), default=False)
 
 
 def _deployment_wait_for_candle_close(
@@ -717,16 +609,16 @@ def _deployment_wait_for_candle_close(
 ) -> bool:
     configured = deployment.signal_config or {}
     if "wait_candle_close" in configured:
-        return _parse_strict_bool_env(
+        return parse_bool_env(
             "wait_candle_close", _raw_bool_text(configured.get("wait_candle_close")), default=False
         )
     if "wait_for_candle_close" in configured:
-        return _parse_strict_bool_env(
+        return parse_bool_env(
             "wait_for_candle_close",
             _raw_bool_text(configured.get("wait_for_candle_close")),
             default=False,
         )
-    return _parse_strict_bool_env(
+    return parse_bool_env(
         "DISCORD_WAIT_FOR_CANDLE_CLOSE",
         env_values.get("DISCORD_WAIT_FOR_CANDLE_CLOSE"),
         default=True,
@@ -927,7 +819,7 @@ def _validate_signal_age_before_wait(
     else:
         # Through the shared coercer: a boolean or a non-finite value is a config
         # error, not a budget. `float(True)` silently means one second.
-        max_age = _coerce_live_float(configured, field_name="max_signal_age_seconds")
+        max_age = coerce_setting_float(configured, field_name="max_signal_age_seconds")
     if max_age <= 0:
         raise ValueError("max_signal_age_seconds must be positive")
     age_seconds = (datetime.now(timezone.utc) - received_at).total_seconds()
@@ -1011,7 +903,7 @@ def _apply_signal_processor(
     # the signal.
     validate_trailing_sl_config(
         (processed.metadata or {}).get(TRAILING_SL_CONFIG_METADATA_KEY),
-        supported=_live_signal_trailing_modes(adapter, deployment),
+        supported=adapter_live_trailing_modes(adapter),
         context=(
             f"live deployment '{deployment.strategy_name}' ({deployment.id}) "
             f"signal processor '{processor_name}'"
@@ -1101,7 +993,7 @@ def size_live_signal_for_submission(
     metadata.pop("current_positions", None)
     trusted_positions = 0
     if current_positions is not None:
-        trusted_positions = _coerce_live_int(
+        trusted_positions = coerce_setting_int(
             current_positions, field_name="current_positions", minimum=0
         )
         metadata["current_positions"] = trusted_positions
@@ -1111,7 +1003,7 @@ def size_live_signal_for_submission(
     resolved_pip = (
         1.0
         if pip_value is None
-        else _coerce_live_float(pip_value, field_name="pip_value", minimum=0.0)
+        else coerce_setting_float(pip_value, field_name="pip_value", minimum=0.0)
     )
 
     trade_signal = TradeSignal(
@@ -1154,7 +1046,7 @@ def size_live_signal_for_submission(
         else None
     )
     metadata["risk_timeframe"] = resolved_timeframe
-    sized_stop = sized_order.signal.stop_loss
+    sized_stop = sized_order.resolved_stop_loss
     if sized_stop is not None:
         metadata["resolved_stop_loss"] = float(sized_stop)
     else:
@@ -1494,9 +1386,9 @@ async def _resolve_live_pip_value(
     if not isinstance(resolved, LivePipValue):
         raise _refuse(f"adapter returned {type(resolved).__name__}, not LivePipValue")
     try:
-        value = _coerce_live_float(resolved.value, field_name="pip value")
-        units_per_qty = _coerce_live_float(resolved.units_per_qty, field_name="units per qty")
-        rate = _coerce_live_float(resolved.conversion_rate, field_name="conversion rate")
+        value = coerce_setting_float(resolved.value, field_name="pip value")
+        units_per_qty = coerce_setting_float(resolved.units_per_qty, field_name="units per qty")
+        rate = coerce_setting_float(resolved.conversion_rate, field_name="conversion rate")
     except ValueError as exc:
         raise _refuse(str(exc)) from exc
     if value <= 0 or units_per_qty <= 0 or rate <= 0:
@@ -1633,86 +1525,6 @@ def _describe_exit_rows(
         )
         for row in rows
     )
-
-
-def _live_signal_trailing_modes(
-    adapter: BaseLiveAdapter | None, deployment: LiveDeploymentConfig
-) -> frozenset[str]:
-    """Trailing modes a signal may request through THIS adapter+deployment.
-
-    ``adapter_live_trailing_modes`` covers the broker table plus the
-    adapter's stop-amendment capability. ``supertrend_flip`` is the single
-    exception (#168): the cTrader broker table lists it, but it runs ONLY for
-    a deployment carrying the explicit ``live_supertrend_flip`` settings
-    opt-in on a provably demo/paper cTrader account
-    (``supports_supertrend_flip`` + ``_adapter_is_demo``). Every other
-    combination resolves to the adapter's own modes - fail closed, exactly
-    the ``main`` behaviour for live and non-opted accounts.
-    """
-    modes = adapter_live_trailing_modes(adapter)
-    try:
-        flip_ok = (
-            str(getattr(adapter, "broker_name", "") or "").strip().lower()
-            in FLIP_SUPPORTED_BROKERS
-            and getattr(adapter, "supports_supertrend_flip", False) is True
-            and deployment_supertrend_flip_enabled(deployment)
-            and adapter is not None
-            and _adapter_is_demo(adapter)
-        )
-    except Exception:  # except-kind: money-decision
-        flip_ok = False
-    if flip_ok:
-        return modes | {TRAILING_MODE_SUPERTREND_FLIP}
-    return modes - {TRAILING_MODE_SUPERTREND_FLIP}
-
-
-def _flip_managed_entry(
-    adapter: BaseLiveAdapter | None,
-    deployment: LiveDeploymentConfig,
-    metadata: Mapping[str, Any],
-) -> bool:
-    """Whether this entry is managed by the live ``supertrend_flip`` workflow.
-
-    The same predicate ``_live_signal_trailing_modes`` uses to admit the
-    mode, plus the signal actually requesting it through its trailing
-    config. Only then is the broker take-profit stripped at submission:
-    the signal's ``take_profit`` IS TP1 - the level the manager itself
-    closes part of - so sending it as the order's broker TP would close
-    the whole position at TP1 and the workflow (breakeven, await-green,
-    flip exit) would never run (#168 maintainer default: the entry goes
-    to the broker stop-only, the manager owns TP1).
-    """
-    try:
-        trailing_cfg = metadata.get(TRAILING_SL_CONFIG_METADATA_KEY)
-        if not isinstance(trailing_cfg, Mapping):
-            return False
-        if (
-            normalize_trailing_mode(trailing_cfg.get("mode"))
-            != TRAILING_MODE_SUPERTREND_FLIP
-        ):
-            return False
-        return (
-            TRAILING_MODE_SUPERTREND_FLIP
-            in _live_signal_trailing_modes(adapter, deployment)
-        )
-    except Exception:  # except-kind: money-decision
-        return False
-
-
-async def _flip_exit_in_flight_check(
-    adapter: BaseLiveAdapter, deployment: LiveDeploymentConfig, symbol: str
-) -> bool:
-    """True when any exit for this deployment+symbol may still be working.
-
-    Wraps :func:`_ensure_no_exit_in_flight` for the flip manager: its own
-    working exit (``ExitInFlightError``) and other deployments' working exits
-    both mean "defer this close", never "submit anyway".
-    """
-    try:
-        others = await _ensure_no_exit_in_flight(adapter, deployment, symbol)
-    except ExitInFlightError:
-        return True
-    return bool(others)
 
 
 def _exit_targets_same_lot(row: Mapping[str, Any], target_signal_id: str | None) -> bool:
@@ -2487,7 +2299,7 @@ async def prepare_order_with_risk(
     # _apply_signal_processor).
     validate_trailing_sl_config(
         metadata.get(TRAILING_SL_CONFIG_METADATA_KEY),
-        supported=_live_signal_trailing_modes(adapter, deployment),
+        supported=adapter_live_trailing_modes(adapter),
         context=f"live deployment '{deployment.strategy_name}' ({deployment.id}) order submission",
     )
     validate_adapter_trailing_timeframe(
@@ -2607,7 +2419,7 @@ async def prepare_order_with_risk(
     if pip_value is None:
         resolved_pip, pip_metadata = await _resolve_live_pip_value(adapter, deployment, signal)
     else:
-        resolved_pip = _coerce_live_float(pip_value, field_name="pip_value", minimum=0.0)
+        resolved_pip = coerce_setting_float(pip_value, field_name="pip_value", minimum=0.0)
         pip_metadata = _pip_value_record(resolved_pip, source="caller")
         # The override is a trusted channel that bypasses the broker lookup and
         # its freshness checks (#146); make every use visible in the logs.
@@ -2674,7 +2486,7 @@ async def prepare_order_with_risk(
     sized_stop = (
         None
         if sized_stop_raw is None
-        else _coerce_live_float(sized_stop_raw, field_name="resolved_stop_loss")
+        else coerce_setting_float(sized_stop_raw, field_name="resolved_stop_loss")
     )
     if stop_loss is None:
         stop_loss = sized_stop
@@ -2715,7 +2527,6 @@ async def prepare_order_with_risk(
         stop_loss=stop_loss,
         take_profit=take_profit,
     )
-    flip_managed_entry = _flip_managed_entry(adapter, deployment, metadata)
     if take_profit is None and unbounded_tp:
         logger.warning(
             "Submitting live order with explicitly unbounded take profit "
@@ -2731,19 +2542,13 @@ async def prepare_order_with_risk(
     metadata["entry_price"] = float(entry_price)
     metadata["stop_loss"] = float(stop_loss)
     metadata["resolved_stop_loss"] = float(stop_loss)
-    if flip_managed_entry:
-        # #168 maintainer default: the broker order is STOP-ONLY. The
-        # signal's take_profit is TP1, which the flip manager closes part
-        # of itself - a broker TP at that level would flatten the whole
-        # position before breakeven/await-green/the flip exit can run.
-        # ``tp1_price`` stays in metadata for the manager; the explicit
-        # unbounded policy is what the adapters already honour as "no TP
-        # leg". ``take_profit`` itself is dropped so neither the order nor
-        # the persisted signal claims a full-position target.
-        metadata["take_profit_policy"] = UNBOUNDED_TP_POLICY
-        metadata.pop("take_profit", None)
-        metadata.pop("tp_price", None)
-    elif take_profit is not None:
+    # No surviving trailing mode owns its own take-profit exits: the removed
+    # ``supertrend_flip`` workflow was the only one, and it used to strip
+    # ``take_profit`` here because a broker TP would flatten the position
+    # before its own exit logic ran. Any future mode that manages partial
+    # exits itself must restore that conditional strip (plus the unbounded-TP
+    # policy) keyed to a per-mode flag.
+    if take_profit is not None:
         metadata["take_profit"] = float(take_profit)
     else:
         metadata.pop("take_profit", None)
@@ -2779,12 +2584,6 @@ async def prepare_order_with_risk(
         for key, value in {**sized_metadata, **preserved_metadata}.items()
         if key not in _ENTRY_STRIPPED_METADATA_KEYS
     }
-    if flip_managed_entry:
-        # The sized metadata is a copy of the incoming payload and can
-        # carry the TP aliases back in; the broker order must stay
-        # stop-only regardless of which alias the signal used.
-        final_metadata.pop("take_profit", None)
-        final_metadata.pop("tp_price", None)
     # The gate's and the pip value's figures are written last: a payload value
     # under one of these keys can neither shadow nor survive them.
     final_metadata.update(quote_metadata)
@@ -7863,25 +7662,6 @@ async def _run_daemon_locked(
                 ),
                 name="trailing-stops-loop",
             )
-            # #168: the live supertrend_flip workflow. The loop runs
-            # unconditionally but manages nothing unless a deployment carries
-            # the explicit settings opt-in (default off) AND its account's
-            # adapter is a demo/paper cTrader - the manager re-checks both, so
-            # this wiring cannot turn the mode on by itself.
-            flip_task = asyncio.create_task(
-                run_flip_workflow_loop(
-                    LiveSupertrendFlipManager(
-                        mutation_gate=_broker_mutation,
-                        exit_lock=_exit_lock,
-                        exit_in_flight_check=_flip_exit_in_flight_check,
-                    ),
-                    eligible_adapters=lambda: _trailing_eligible_adapters(
-                        active_adapters
-                    ),
-                    current_deployments=lambda: list(deployment_snapshot),
-                ),
-                name="supertrend-flip-loop",
-            )
             commission_task = asyncio.create_task(
                 _backfill_commissions_loop(active_adapters), name="commission-backfill"
             )
@@ -7908,7 +7688,6 @@ async def _run_daemon_locked(
                 service_sync_task,
                 balance_task,
                 trailing_task,
-                flip_task,
                 commission_task,
                 reconciliation_task,
                 internal_strategy_task,
