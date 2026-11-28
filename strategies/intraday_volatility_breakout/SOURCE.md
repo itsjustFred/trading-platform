@@ -9,7 +9,7 @@
 ## Licence / redistribution status
 
 - Status: `restricted`
-- Notes: The EA header says `Copyright 2025, RobustifyTrading` and `All rights reserved`; no redistribution licence was found in the repository or at the linked Discord URL.
+- Notes: The EA header says `Copyright 2025, RobustifyTrading` and `All rights reserved`, hence `restricted`. No licence file was found in the repository. The linked Discord channel needs a login and was not checked, so any terms posted there are unknown.
 
 ## Conversion notes
 
