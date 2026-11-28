@@ -300,10 +300,10 @@ def test_frame_and_feature_failures_become_skip_records(
         [_received_record("m1"), _received_record("m2")],
     )
 
-    def _boom(frame: pd.DataFrame) -> pd.DataFrame:
+    def _boom(entry: object) -> pd.DataFrame:
         raise RuntimeError("bad frame")
 
-    monkeypatch.setattr(saf, "normalize_ohlcv_frame", _boom)
+    monkeypatch.setattr(saf.ohlcv_store, "read_frame", _boom)
     counts = saf.process_archive_file(
         data_root / "signal_log" / "discord_signals-2026-11-10.jsonl",
         tmp_path / "out" / "discord_signal_features-2026-11-10.jsonl",
@@ -312,7 +312,7 @@ def test_frame_and_feature_failures_become_skip_records(
     assert counts["features"] == 0
     assert counts["skipped"] == 2
     out = _read_sidecar(tmp_path / "out", "2026-11-10")
-    assert {r["skip_reason"] for r in out} == {"features_failed"}
+    assert {r["skip_reason"] for r in out} == {"ohlcv_unreadable"}
 
     monkeypatch.undo()
 

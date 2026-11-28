@@ -25,12 +25,16 @@ with different semantics. It does not unify the three execution-timing models
 from __future__ import annotations
 
 import math
-from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping
 
 import pandas as pd
 
 from shared.models import VALID_TIMEFRAMES
+from shared.ohlcv_store import (
+    apply_date_filter,
+    normalize_ohlcv_frame,
+    parse_date_bound,
+)
 
 __all__ = [
     "apply_date_filter",
@@ -266,99 +270,6 @@ def exit_level_disposition(
         direction == "SHORT" and level > hi
     )
     return EXIT_LEVEL_GAPPED if marketable else EXIT_LEVEL_UNREACHABLE
-
-
-# ─── Date filter convention (F9) ────────────────────────────────────────────
-
-
-def parse_date_bound(value: str, *, is_end: bool) -> pd.Timestamp:
-    """Parse a ``start_date``/``end_date`` value into an inclusive filter bound.
-
-    Decision Record (Cleanup 16-A, 2026-08-31): a date-only end boundary is
-    inclusive of the full day. Concretely:
-
-    - ``"2024-01-15"`` as a start bound → ``2024-01-15T00:00:00Z``;
-    - ``"2024-01-15"`` as an end bound → ``2024-01-15T23:59:59.999999Z``;
-    - a value carrying a time component (``"2024-01-15T14:30:00Z"``) is used
-      as-is; naive timestamps are interpreted as UTC.
-
-    Raises:
-        ValueError: If ``value`` is empty or not parseable as a timestamp.
-    """
-    raw = str(value or "").strip()
-    if not raw:
-        raise ValueError("Date filter value cannot be empty")
-
-    normalized = raw.replace("Z", "+00:00")
-    try:
-        parsed = datetime.fromisoformat(normalized)
-    except ValueError as exc:
-        raise ValueError(f"Invalid date filter value: {value!r}") from exc
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    if is_end and "T" not in raw and ":" not in raw:
-        parsed = parsed + timedelta(days=1) - timedelta(microseconds=1)
-    return pd.Timestamp(parsed)
-
-
-def apply_date_filter(
-    frame: pd.DataFrame,
-    *,
-    start: str | None,
-    end: str | None,
-    timestamp_column: str = "timestamp",
-) -> pd.DataFrame:
-    """Filter ``frame`` to the inclusive [start, end] window (see F9 above).
-
-    Empty/None bounds are treated as unbounded on that side. The frame must
-    carry a UTC-convertible ``timestamp`` column.
-
-    This must be the ONLY date filter applied to the frame. A caller that
-    pre-filters with a bare-date string comparison (``df[df["timestamp"] <=
-    end_date]``) truncates at midnight and reintroduces the F9 end-day
-    truncation bug before this helper ever sees the data.
-    """
-    if start:
-        frame = frame[
-            frame[timestamp_column] >= parse_date_bound(start, is_end=False)
-        ]
-    if end:
-        frame = frame[
-            frame[timestamp_column] <= parse_date_bound(end, is_end=True)
-        ]
-    return frame
-
-
-# ─── OHLCV column normalization (bid_/ask_-prefixed feeds) ─────────────────
-
-
-def normalize_ohlcv_frame(frame: pd.DataFrame) -> pd.DataFrame:
-    """Fill canonical ``open/high/low/close/volume`` from ``bid_*`` columns.
-
-    In-memory counterpart of
-    ``data_tools.download_grid_market_data.normalize_ohlcv_columns``
-    (which rewrites parquet files and drops non-OHLCV columns -- unsuitable
-    here because ``ask_*``/spread columns must survive for ask-side stop
-    monitoring). Dukascopy index/energy feeds store ``bid_open/bid_high/...``
-    (plus ``ask_*``) instead of, or alongside all-NaN, plain OHLC. Missing
-    values are filled per-value from the ``bid_`` counterpart (the bid side
-    is the conservative, MT5-chart equivalent series); existing non-null
-    canonical values always win. All other columns pass through untouched.
-
-    C-1: this helper is NON-MUTATING — it works on a copy and returns it.
-    Callers must use the return value; the input frame is never modified
-    in place.
-    """
-    frame = frame.copy()
-    for canonical in ("open", "high", "low", "close", "volume"):
-        bid_col = f"bid_{canonical}"
-        if bid_col not in frame.columns:
-            continue
-        if canonical not in frame.columns:
-            frame[canonical] = frame[bid_col].to_numpy()
-        else:
-            frame[canonical] = frame[canonical].fillna(frame[bid_col])
-    return frame
 
 
 # ─── Same-bar stop / take-profit priority (F8) ──────────────────────────────

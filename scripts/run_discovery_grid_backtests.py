@@ -17,6 +17,25 @@ from typing import Any
 
 import pandas as pd
 
+# isort: split
+
+# --- import-origin guard ---
+# `shared` must resolve to this checkout, not the installed package. The mechanism lives in
+# scripts/import_origin.py; only the invocation is per script. scripts/ goes on sys.path - never
+# the repo root, which would repair `import shared` and defeat the guard - so a direct run is
+# refused (exit 2) instead of mutating another tree's schema. See
+# tests/test_script_import_origin.py; run as:
+#     python -m scripts.run_discovery_grid_backtests
+import sys as _sys
+from pathlib import Path as _path
+
+_scripts_dir = str(_path(__file__).resolve().parent)
+if _scripts_dir not in _sys.path:
+    _sys.path.insert(0, _scripts_dir)
+import import_origin as _guard
+
+_guard.ensure_own_checkout("run_discovery_grid_backtests")
+# --- end import-origin guard ---
 from runner.agent_process import build_backtest_child_env
 from shared import ohlcv_store
 

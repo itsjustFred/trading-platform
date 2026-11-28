@@ -19,6 +19,7 @@ import pytest
 from starlette.middleware.gzip import GZipMiddleware
 from starlette.websockets import WebSocketDisconnect
 
+from shared import ohlcv_store
 from shared.models import (
     BacktestMeta,
     BacktestResult,
@@ -56,6 +57,28 @@ def _tiny_replay_ohlcv_df() -> pd.DataFrame:
             "close": [100.5, 101.5, 102.5],
             "volume": [1000, 1100, 1200],
         }
+    )
+
+
+def _write_store_ohlcv(
+    data_dir: Path,
+    source: str,
+    symbol: str,
+    timeframe: str,
+    frame: pd.DataFrame,
+    *,
+    asset_class: str = "equity",
+    segment: str = "",
+) -> Path:
+    """Write a fixture dataset in the manifest store layout (#471)."""
+    return ohlcv_store.write_frame(
+        data_dir,
+        source,
+        symbol,
+        timeframe,
+        frame,
+        asset_class=asset_class,
+        segment=segment,
     )
 
 
@@ -400,9 +423,7 @@ def test_data_download_rejects_dates_before_genesis(viewer_client, tmp_path):
 
 def test_trade_detail_includes_meta(viewer_client, tmp_path):
     backtests_dir = tmp_path / "backtests"
-    ohlcv_dir = tmp_path / "ohlcv" / "test_source" / "equities" / "AAPL"
     backtests_dir.mkdir()
-    ohlcv_dir.mkdir(parents=True)
 
     df = pd.DataFrame({
         "timestamp": pd.date_range("2024-01-01T09:00:00Z", periods=6, freq="h", tz="UTC"),
@@ -412,7 +433,7 @@ def test_trade_detail_includes_meta(viewer_client, tmp_path):
         "close": [100.5, 101.5, 102.5, 103.5, 104.5, 105.5],
         "volume": [10, 11, 12, 13, 14, 15],
     })
-    df.to_parquet(ohlcv_dir / "1h.parquet", index=False)
+    _write_store_ohlcv(tmp_path, "test_source", "AAPL", "1h", df)
 
     result = BacktestResult(
         meta=BacktestMeta(
@@ -488,9 +509,7 @@ def test_trade_detail_includes_meta(viewer_client, tmp_path):
 
 def test_trade_detail_handles_invalid_entry_time(viewer_client, tmp_path):
     backtests_dir = tmp_path / "backtests"
-    ohlcv_dir = tmp_path / "ohlcv" / "test_source" / "equities" / "AAPL"
     backtests_dir.mkdir(parents=True, exist_ok=True)
-    ohlcv_dir.mkdir(parents=True, exist_ok=True)
 
     df = pd.DataFrame({
         "timestamp": pd.date_range("2024-01-01T09:00:00Z", periods=8, freq="h", tz="UTC"),
@@ -500,7 +519,7 @@ def test_trade_detail_handles_invalid_entry_time(viewer_client, tmp_path):
         "close": [100.5, 101.5, 102.5, 103.5, 104.5, 105.5, 106.5, 107.5],
         "volume": [10, 11, 12, 13, 14, 15, 16, 17],
     })
-    df.to_parquet(ohlcv_dir / "1h.parquet", index=False)
+    _write_store_ohlcv(tmp_path, "test_source", "AAPL", "1h", df)
 
     result = BacktestResult(
         meta=BacktestMeta(
@@ -546,9 +565,7 @@ def test_trade_detail_handles_invalid_entry_time(viewer_client, tmp_path):
 
 def test_backtest_replay_endpoint_returns_full_chart_payload(viewer_client, tmp_path):
     backtests_dir = tmp_path / "backtests"
-    ohlcv_dir = tmp_path / "ohlcv" / "test_source" / "equities" / "AAPL"
     backtests_dir.mkdir(parents=True, exist_ok=True)
-    ohlcv_dir.mkdir(parents=True, exist_ok=True)
 
     df = pd.DataFrame({
         "timestamp": pd.date_range("2024-01-01T00:00:00Z", periods=6, freq="h", tz="UTC"),
@@ -558,7 +575,7 @@ def test_backtest_replay_endpoint_returns_full_chart_payload(viewer_client, tmp_
         "close": [100.5, 101.5, 102.5, 103.5, 104.5, 105.5],
         "volume": [10, 11, 12, 13, 14, 15],
     })
-    df.to_parquet(ohlcv_dir / "1h.parquet", index=False)
+    _write_store_ohlcv(tmp_path, "test_source", "AAPL", "1h", df)
 
     result = BacktestResult(
         meta=BacktestMeta(
@@ -634,9 +651,7 @@ def test_backtest_replay_endpoint_returns_full_chart_payload(viewer_client, tmp_
 
 def test_backtest_replay_endpoint_limits_ohlcv_to_trade_windows(viewer_client, tmp_path):
     backtests_dir = tmp_path / "backtests"
-    ohlcv_dir = tmp_path / "ohlcv" / "test_source" / "equities" / "AAPL"
     backtests_dir.mkdir(parents=True, exist_ok=True)
-    ohlcv_dir.mkdir(parents=True, exist_ok=True)
 
     df = pd.DataFrame({
         "timestamp": pd.date_range("2021-01-01T00:00:00Z", periods=16050, freq="h", tz="UTC"),
@@ -646,7 +661,7 @@ def test_backtest_replay_endpoint_limits_ohlcv_to_trade_windows(viewer_client, t
         "close": [100.5 + (idx * 0.01) for idx in range(16050)],
         "volume": [1000 + (idx % 100) for idx in range(16050)],
     })
-    df.to_parquet(ohlcv_dir / "1h.parquet", index=False)
+    _write_store_ohlcv(tmp_path, "test_source", "AAPL", "1h", df)
 
     first_entry = df["timestamp"].iloc[120]
     first_exit = df["timestamp"].iloc[160]
@@ -824,9 +839,6 @@ def test_data_category_strips_price_payload_fields(viewer_client, tmp_path):
 
 
 def test_data_endpoints_read_fast_date_ranges_without_catalog(viewer_client, tmp_path):
-    ohlcv_dir = tmp_path / "ohlcv" / "test_source" / "equity" / "US" / "AAPL"
-    ohlcv_dir.mkdir(parents=True)
-
     df = pd.DataFrame({
         "timestamp": pd.to_datetime(
             ["2024-03-01T09:30:00Z", "2024-03-02T09:30:00Z", "2024-03-03T09:30:00Z"],
@@ -838,7 +850,7 @@ def test_data_endpoints_read_fast_date_ranges_without_catalog(viewer_client, tmp
         "close": [100.5, 101.5, 102.5],
         "volume": [10, 11, 12],
     })
-    df.to_parquet(ohlcv_dir / "1d.parquet", index=False)
+    parquet_path = _write_store_ohlcv(tmp_path, "test_source", "AAPL", "1d", df)
 
     overview_resp = viewer_client.get("/api/data/overview")
 
@@ -857,11 +869,11 @@ def test_data_endpoints_read_fast_date_ranges_without_catalog(viewer_client, tmp
         {
             "symbol": "AAPL",
             "timeframe": "1d",
-            "path": str(ohlcv_dir / "1d.parquet"),
-            "size_mb": pytest.approx((ohlcv_dir / "1d.parquet").stat().st_size / (1024 * 1024), rel=0, abs=0.01),
+            "path": str(parquet_path),
+            "size_mb": pytest.approx(parquet_path.stat().st_size / (1024 * 1024), rel=0, abs=0.01),
             "row_count": 3,
             "file_count": 1,
-            "files": [str(ohlcv_dir / "1d.parquet")],
+            "files": [str(parquet_path)],
             "sources": ["test_source"],
             "start": "2024-03-01",
             "end": "2024-03-03",
@@ -1093,9 +1105,6 @@ def test_data_endpoints_merge_same_symbol_timeframe_across_sources(viewer_client
 
 
 def test_data_endpoints_group_symbol_prefixed_segmented_files(viewer_client, tmp_path):
-    symbol_dir = tmp_path / "ohlcv" / "dukascopy" / "forex"
-    symbol_dir.mkdir(parents=True)
-
     jan = pd.DataFrame({
         "timestamp": pd.to_datetime(
             ["2024-01-01T00:00:00Z", "2024-01-31T23:59:59Z"],
@@ -1113,10 +1122,21 @@ def test_data_endpoints_group_symbol_prefixed_segmented_files(viewer_client, tmp
         "ask": [2020.3, 2030.4],
     })
 
-    jan_path = symbol_dir / "XAUUSD_tick_2024_01.parquet"
-    feb_path = symbol_dir / "XAUUSD_tick_2024_02.parquet"
-    jan.to_parquet(jan_path, index=False)
-    feb.to_parquet(feb_path, index=False)
+    for segment, frame in (("2024_01", jan), ("2024_02", feb)):
+        path = ohlcv_store.data_path(
+            tmp_path, "dukascopy", "XAUUSD", "tick", segment=segment
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        frame.to_parquet(path, index=False)
+        ohlcv_store.register_file(
+            tmp_path,
+            "dukascopy",
+            "XAUUSD",
+            "tick",
+            path,
+            asset_class="forex",
+            segment=segment,
+        )
 
     overview_resp = viewer_client.get("/api/data/overview")
     assert overview_resp.status_code == 200
@@ -1140,8 +1160,8 @@ def test_data_endpoints_group_symbol_prefixed_segmented_files(viewer_client, tmp
     assert symbols[0]["start"] == "2024-01-01"
     assert symbols[0]["end"] == "2024-02-29"
     assert [Path(segment["path"]).name for segment in symbols[0]["segments"]] == [
-        "XAUUSD_tick_2024_01.parquet",
-        "XAUUSD_tick_2024_02.parquet",
+        "XAUUSD_TICK_2024_01.parquet",
+        "XAUUSD_TICK_2024_02.parquet",
     ]
     assert [segment["segment"] for segment in symbols[0]["segments"]] == ["2024_01", "2024_02"]
 
@@ -1195,9 +1215,6 @@ def test_data_category_includes_warning_message_from_catalog(viewer_client, tmp_
 
 
 def test_dolthub_exports_appear_as_equities(viewer_client, tmp_path):
-    ohlcv_dir = tmp_path / "ohlcv" / "dolthub" / "equity" / "US"
-    ohlcv_dir.mkdir(parents=True)
-
     df = pd.DataFrame({
         "timestamp": pd.to_datetime(["2024-04-01", "2024-04-02"], utc=True),
         "open": [150.0, 151.0],
@@ -1206,7 +1223,7 @@ def test_dolthub_exports_appear_as_equities(viewer_client, tmp_path):
         "close": [150.5, 151.5],
         "volume": [1000, 1100],
     })
-    df.to_parquet(ohlcv_dir / "MSFT.parquet", index=False)
+    parquet_path = _write_store_ohlcv(tmp_path, "dolthub", "MSFT", "1d", df)
 
     overview_resp = viewer_client.get("/api/data/overview")
 
@@ -1226,11 +1243,11 @@ def test_dolthub_exports_appear_as_equities(viewer_client, tmp_path):
         {
             "symbol": "MSFT",
             "timeframe": "1d",
-            "path": str(ohlcv_dir / "MSFT.parquet"),
-            "size_mb": pytest.approx((ohlcv_dir / "MSFT.parquet").stat().st_size / (1024 * 1024), rel=0, abs=0.01),
+            "path": str(parquet_path),
+            "size_mb": pytest.approx(parquet_path.stat().st_size / (1024 * 1024), rel=0, abs=0.01),
             "row_count": 2,
             "file_count": 1,
-            "files": [str(ohlcv_dir / "MSFT.parquet")],
+            "files": [str(parquet_path)],
             "sources": ["dolthub"],
             "start": "2024-04-01",
             "end": "2024-04-02",
@@ -3801,8 +3818,6 @@ def test_backtest_run_signals_real_adapter_records_fees(viewer_client, tmp_path)
     and asserts the task completes with non-zero fees in the saved result."""
     import viewer.main as viewer_app_module
 
-    ohlcv_dir = tmp_path / "ohlcv" / "test_source" / "equities" / "AAPL"
-    ohlcv_dir.mkdir(parents=True)
     periods = 72
     base = 100.0
     frame = pd.DataFrame(
@@ -3817,7 +3832,7 @@ def test_backtest_run_signals_real_adapter_records_fees(viewer_client, tmp_path)
             "volume": [1000] * periods,
         }
     )
-    frame.to_parquet(ohlcv_dir / "1h.parquet", index=False)
+    _write_store_ohlcv(tmp_path, "test_source", "AAPL", "1h", frame)
 
     response = viewer_client.post(
         "/api/backtests/run-signals",
@@ -4251,9 +4266,7 @@ def _close_prices_from_returns(returns: list[float], *, start_price: float = 100
 
 def test_backtest_capm_endpoint_returns_regression_payload(viewer_client, tmp_path):
     backtests_dir = tmp_path / "backtests"
-    ohlcv_dir = tmp_path / "ohlcv" / "test_source" / "equities" / "SPY"
     backtests_dir.mkdir(parents=True, exist_ok=True)
-    ohlcv_dir.mkdir(parents=True, exist_ok=True)
 
     market_returns = [0.012, -0.008, 0.01, 0.003, -0.004, 0.009, 0.001, -0.002]
     alpha_daily = 0.0002
@@ -4270,7 +4283,7 @@ def test_backtest_capm_endpoint_returns_regression_payload(viewer_client, tmp_pa
             "volume": [1000] * (len(market_returns) + 1),
         }
     )
-    benchmark_df.to_parquet(ohlcv_dir / "1d.parquet", index=False)
+    _write_store_ohlcv(tmp_path, "test_source", "SPY", "1d", benchmark_df)
 
     result = BacktestResult(
         meta=BacktestMeta(
@@ -4305,9 +4318,7 @@ def test_backtest_capm_endpoint_returns_regression_payload(viewer_client, tmp_pa
 
 def test_backtest_capm_endpoint_uses_first_symbol_when_benchmark_missing(viewer_client, tmp_path):
     backtests_dir = tmp_path / "backtests"
-    ohlcv_dir = tmp_path / "ohlcv" / "test_source" / "equities" / "SPY"
     backtests_dir.mkdir(parents=True, exist_ok=True)
-    ohlcv_dir.mkdir(parents=True, exist_ok=True)
 
     market_returns = [0.01, -0.004, 0.006, 0.003, -0.002]
     closes = _close_prices_from_returns(market_returns)
@@ -4321,7 +4332,7 @@ def test_backtest_capm_endpoint_uses_first_symbol_when_benchmark_missing(viewer_
             "volume": [1000] * len(closes),
         }
     )
-    benchmark_df.to_parquet(ohlcv_dir / "1d.parquet", index=False)
+    _write_store_ohlcv(tmp_path, "test_source", "SPY", "1d", benchmark_df)
 
     result = BacktestResult(
         meta=BacktestMeta(

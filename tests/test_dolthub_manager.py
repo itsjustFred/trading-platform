@@ -6,19 +6,17 @@ import pytest
 
 import data_tools.dolthub_manager as dolthub_manager
 from data_tools.dolthub_manager import _stock_export_path
+from shared import ohlcv_store
 
 
-def test_stock_export_path_migrates_legacy_flat_export(tmp_path: Path):
-    target_dir = tmp_path / "ohlcv" / "dolthub" / "equity" / "US"
-    target_dir.mkdir(parents=True)
-    legacy_path = target_dir / "AAPL.parquet"
-    legacy_path.write_text("legacy parquet placeholder")
+def test_stock_export_path_uses_manifest_store_layout(tmp_path: Path, monkeypatch):
+    data_dir = tmp_path / "data"
+    monkeypatch.setattr(dolthub_manager, "DATA_DIR", data_dir)
 
-    canonical_path = _stock_export_path(target_dir, "AAPL")
+    canonical_path = _stock_export_path("AAPL")
 
-    assert canonical_path == target_dir / "AAPL" / "1d.parquet"
-    assert canonical_path.read_text() == "legacy parquet placeholder"
-    assert not legacy_path.exists()
+    assert canonical_path == ohlcv_store.data_path(data_dir, "dolthub", "AAPL", "1d")
+    assert canonical_path == data_dir / "ohlcv" / "dolthub" / "AAPL" / "AAPL_D1.parquet"
 
 
 def test_export_stocks_skips_symbols_that_fail_symbol_validation(tmp_path, monkeypatch, caplog):
@@ -28,8 +26,10 @@ def test_export_stocks_skips_symbols_that_fail_symbol_validation(tmp_path, monke
     stocks_repo = tmp_path / "stocks"
     (stocks_repo / dolthub_manager.DOLT_METADATA_DIR).mkdir(parents=True)
     export_dir = tmp_path / "exports"
+    data_dir = tmp_path / "data"
     monkeypatch.setattr(dolthub_manager, "DOLT_DIR", tmp_path)
     monkeypatch.setattr(dolthub_manager, "EXPORT_DIR", export_dir)
+    monkeypatch.setattr(dolthub_manager, "DATA_DIR", data_dir)
 
     monkeypatch.setattr(dolthub_manager, "_stocks_table_name", lambda repo: "ohlcv")
     monkeypatch.setattr(
@@ -50,8 +50,8 @@ def test_export_stocks_skips_symbols_that_fail_symbol_validation(tmp_path, monke
         dolthub_manager._export_stocks()
 
     assert exported == ["AAPL"]
-    assert (export_dir / "equity" / "US" / "AAPL" / "1d.parquet").exists()
-    assert not (export_dir / "equity" / "US" / ".." / "escape").exists()
+    assert (data_dir / "ohlcv" / "dolthub" / "AAPL" / "AAPL_D1.parquet").exists()
+    assert not (data_dir / "ohlcv" / "dolthub" / "escape").exists()
     warnings = [record.getMessage() for record in caplog.records]
     assert any("../escape" in message for message in warnings)
     assert any("BAD SYMBOL" in message for message in warnings)
@@ -63,6 +63,7 @@ def test_export_data_skips_unsafe_symbols_before_path_construction(tmp_path, mon
     (stocks_repo / dolthub_manager.DOLT_METADATA_DIR).mkdir(parents=True)
     monkeypatch.setattr(dolthub_manager, "DOLT_DIR", tmp_path / "dolthub")
     monkeypatch.setattr(dolthub_manager, "EXPORT_DIR", tmp_path / "exports")
+    monkeypatch.setattr(dolthub_manager, "DATA_DIR", tmp_path / "data")
     monkeypatch.setattr(dolthub_manager, "_list_tables", lambda _repo: ["ohlcv"])
     monkeypatch.setattr(
         dolthub_manager,
@@ -74,7 +75,7 @@ def test_export_data_skips_unsafe_symbols_before_path_construction(tmp_path, mon
 
     dolthub_manager.export_data()
 
-    assert not (tmp_path / "exports" / "equity" / "US" / "escape").exists()
+    assert not (tmp_path / "data" / "ohlcv" / "dolthub" / "escape").exists()
 
 
 def test_export_table_csv_keeps_previous_file_when_dolt_fails(tmp_path, monkeypatch):

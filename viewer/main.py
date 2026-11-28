@@ -8885,6 +8885,28 @@ def _normalize_ohlcv_validation(
     return normalized_validation
 
 
+#: Manifest ``asset_class`` → overview category name. Store paths carry no
+#: asset-class segment, so ``_categorize_path`` alone cannot classify them.
+_ASSET_CLASS_CATEGORIES = {
+    "equity": "Equities",
+    "equities": "Equities",
+    "stock": "Equities",
+    "stocks": "Equities",
+    "etf": "ETFs",
+    "etfs": "ETFs",
+    "forex": "Forex",
+    "metals": "Metals",
+    "metal": "Metals",
+    "indices": "Indices",
+    "index": "Indices",
+    "energy": "Energy",
+    "crypto": "Crypto",
+    "rates": "Rates",
+    "earnings": "Earnings",
+    "options": "Options",
+}
+
+
 def _aggregate_ohlcv_entry_payload(
     entry: dict[str, Any],
     *,
@@ -8892,7 +8914,10 @@ def _aggregate_ohlcv_entry_payload(
     include_size_bytes: bool = False,
 ) -> dict[str, Any]:
     path_value = str(entry.get("path") or "")
-    category = _categorize_path(path_value) if include_category else ""
+    asset_class = str(entry.get("asset_class") or "").strip().lower()
+    category = (
+        _ASSET_CLASS_CATEGORIES.get(asset_class) or _categorize_path(path_value)
+    ) if include_category else ""
     start_value = entry.get("start") or entry.get("start_date")
     end_value = entry.get("end") or entry.get("end_date")
     size_bytes = _entry_size_bytes(entry)

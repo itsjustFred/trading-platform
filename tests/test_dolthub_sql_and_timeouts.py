@@ -133,6 +133,7 @@ class TestSqlBuilders:
 
         monkeypatch.setattr(dm, "DOLT_DIR", dolt_dir)
         monkeypatch.setattr(dm, "EXPORT_DIR", tmp_path / "export")
+        monkeypatch.setattr(dm, "DATA_DIR", tmp_path / "data")
         monkeypatch.setattr(dm, "run_dolt", fake_run_dolt)
         monkeypatch.setattr(dm, "_list_tables", lambda repo: ["we`ird"])
         monkeypatch.setattr(dm, "_list_symbols", lambda repo, table: ["AAPL"])
