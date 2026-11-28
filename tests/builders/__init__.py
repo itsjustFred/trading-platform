@@ -41,8 +41,10 @@ def make_live_deployment(**overrides: Any) -> LiveDeploymentConfig:
 def make_live_signal(**overrides: Any) -> LiveSignal:
     """A valid ``LiveSignal``; ``overrides`` replace any field.
 
-    Defaults cover the required fields; ``timestamp`` defaults to now (UTC) and
-    ``metadata`` to an empty dict. ``id`` is a fresh UUID per call.
+    Defaults cover the required fields; ``timestamp`` defaults to a fixed
+    instant (2024-01-01 UTC) so a caller that forgets to set it cannot get a
+    run-dependent value, and ``metadata`` defaults to an empty dict. ``id``
+    is a fresh UUID per call.
     """
     fields: dict[str, Any] = {
         "id": uuid4(),
@@ -50,27 +52,31 @@ def make_live_signal(**overrides: Any) -> LiveSignal:
         "symbol": "AAPL",
         "action": "buy",
         "theoretical_price": 100.0,
-        "timestamp": datetime.now(timezone.utc),
+        "timestamp": datetime(2024, 1, 1, tzinfo=timezone.utc),
         "metadata": {},
     }
     fields.update(overrides)
     return LiveSignal(**fields)
 
 
-def make_backtest_config(**overrides: Any) -> BacktestConfig:
+def make_backtest_config(
+    *, start_date: str, end_date: str, **overrides: Any
+) -> BacktestConfig:
     """A valid ``BacktestConfig``; ``overrides`` replace any field.
 
-    Defaults cover the required fields (``strategy_name``, ``symbols``,
-    ``timeframe``, ``start_date``, ``end_date``); every other field keeps the
-    model's own default, including the deprecated-kwarg folding in
-    ``BacktestConfig.__init__``.
+    ``start_date``/``end_date`` are required keyword arguments: the window a
+    backtest covers is the single most load-bearing choice, so every caller
+    states it explicitly instead of inheriting a silent default. Defaults
+    cover the remaining required fields (``strategy_name``, ``symbols``,
+    ``timeframe``); every other field keeps the model's own default, including
+    the deprecated-kwarg folding in ``BacktestConfig.__init__``.
     """
     fields: dict[str, Any] = {
         "strategy_name": "test-strategy",
         "symbols": ["AAPL"],
         "timeframe": "1h",
-        "start_date": "2024-01-01",
-        "end_date": "2024-12-31",
+        "start_date": start_date,
+        "end_date": end_date,
     }
     fields.update(overrides)
     return BacktestConfig(**fields)
@@ -96,7 +102,8 @@ def make_ohlcv(
     Exactly one of ``bars`` (explicit ``(open, high, low, close)`` tuples),
     ``closes`` or ``periods`` selects the price series:
 
-    - ``bars``: used verbatim.
+    - ``bars``: used verbatim (validated: ``high >= max(open, close)`` and
+      ``low <= min(open, close)`` on every bar).
     - ``closes``: ``open == close``, ``high == close + wick``,
       ``low == close - wick``.
     - ``periods`` (with neither of the above): linear closes
@@ -119,6 +126,14 @@ def make_ohlcv(
         ohlc = [(close, close + wick, close - wick, close) for close in series]
     else:
         raise ValueError("make_ohlcv needs one of bars, closes or periods")
+
+    for open_, high, low, close_ in ohlc:
+        if high < max(open_, close_) or low > min(open_, close_):
+            raise ValueError(
+                f"make_ohlcv got a malformed bar (open={open_}, high={high}, "
+                f"low={low}, close={close_}): high must be >= max(open, close) "
+                "and low <= min(open, close)"
+            )
 
     index = pd.date_range(start, periods=len(ohlc), freq=freq, tz=tz)
     data: dict[str, Any] = {

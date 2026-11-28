@@ -39,6 +39,11 @@ def daemon_without_background_loops(monkeypatch: pytest.MonkeyPatch) -> Any:
     monkeypatch.setattr(daemon, "_recover_failed_services", lambda: [])
     monkeypatch.setattr(daemon, "ServiceScheduler", _Scheduler)
     monkeypatch.setattr(daemon, "LiveTrailingStopManager", lambda **_kwargs: object())
+    # ``run_daemon`` constructs both managers eagerly as arguments to the loop
+    # calls, so silencing the loops alone still runs the real constructors.
+    monkeypatch.setattr(
+        daemon, "LiveSupertrendFlipManager", lambda **_kwargs: object()
+    )
     for name in (
         "sync_deployments_loop",
         "sync_services_loop",
