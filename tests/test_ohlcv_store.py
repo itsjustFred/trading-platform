@@ -340,6 +340,43 @@ class TestWriteFrame:
         assert set(manifest) == {"SPY"}
         assert manifest["SPY"]["files"]["SPY_H1.parquet"]["rows"] == 6
 
+    def test_manifest_update_waits_on_the_source_lock(
+        self, tmp_path: Path
+    ) -> None:
+        """Manifest updates are read-modify-write: a second writer for the
+        same source must serialize behind the per-source lock instead of
+        overwriting a stale manifest and dropping the other entry."""
+        import fcntl
+        import threading
+
+        src_dir = ohlcv_store.source_dir(tmp_path, "src")
+        src_dir.mkdir(parents=True)
+        lock_path = src_dir / ".manifest.lock"
+        done = threading.Event()
+        errors: list[BaseException] = []
+
+        def writer() -> None:
+            try:
+                ohlcv_store.write_frame(
+                    tmp_path, "src", "AAA", "1h", _frame(), asset_class="equity"
+                )
+                done.set()
+            except BaseException as exc:  # noqa: BLE001 - test collects it
+                errors.append(exc)
+
+        with open(lock_path, "a+b") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            thread = threading.Thread(target=writer)
+            thread.start()
+            # While the lock is held the writer must not complete its
+            # manifest update.
+            assert not done.wait(timeout=2)
+        thread.join(timeout=30)
+        assert done.is_set()
+        assert errors == []
+        manifest = ohlcv_store.read_manifest(tmp_path, "src")
+        assert set(manifest) == {"AAA"}
+
 
 class TestListAndFind:
     def test_list_datasets_filters(self, tmp_path: Path) -> None:
@@ -447,6 +484,18 @@ class TestListAndFind:
             ohlcv_store.find_dataset(tmp_path, "AAA", "1h", data_source="nosuch")
             is None
         )
+
+    def test_equity_like_asset_classes_rank_as_plausible(self, tmp_path: Path) -> None:
+        """``etf``/``stock`` are equity-like spellings every consumer already
+        accepts; the plausibility rank must not penalize them below
+        ``equity`` copies regardless of source name."""
+        _write(tmp_path, source="zzz", symbol="AAPL", asset_class="equity")
+        _write(tmp_path, source="aaa", symbol="AAPL", asset_class="etf")
+        entry = ohlcv_store.find_dataset(tmp_path, "AAPL", "1h")
+        assert entry is not None
+        # Both rank equally plausible → deterministic source/name tie-break.
+        assert entry.asset_class == "etf"
+        assert entry.source == "aaa"
 
 
 class TestDateBounds:

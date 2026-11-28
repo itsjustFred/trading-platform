@@ -16368,16 +16368,17 @@ async def delete_symbol_data(path: str = Query(default="")) -> dict[str, Any]:
         # stay declared or every store reader would keep resolving it.
         entry = ohlcv_store.entry_for_path(DATA_DIR, file_path)
         if entry is not None:
-            manifest = ohlcv_store.read_manifest(DATA_DIR, entry.source)
-            meta = manifest.get(entry.symbol)
-            files = meta.get("files") if isinstance(meta, dict) else None
-            if isinstance(files, dict):
-                files.pop(file_path.name, None)
-                if files:
-                    ohlcv_store.write_manifest(DATA_DIR, entry.source, manifest)
-                else:
-                    manifest.pop(entry.symbol, None)
-                    ohlcv_store.write_manifest(DATA_DIR, entry.source, manifest)
+            with ohlcv_store.manifest_update_lock(DATA_DIR, entry.source):
+                manifest = ohlcv_store.read_manifest(DATA_DIR, entry.source)
+                meta = manifest.get(entry.symbol)
+                files = meta.get("files") if isinstance(meta, dict) else None
+                if isinstance(files, dict):
+                    files.pop(file_path.name, None)
+                    if files:
+                        ohlcv_store.write_manifest(DATA_DIR, entry.source, manifest)
+                    else:
+                        manifest.pop(entry.symbol, None)
+                        ohlcv_store.write_manifest(DATA_DIR, entry.source, manifest)
         cache_manager.invalidate_cache(DATA_DIR, reason="manual")
         _invalidate_data_views_cache()
         _refresh_catalog()

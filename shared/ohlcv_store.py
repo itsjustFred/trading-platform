@@ -19,6 +19,8 @@ lives only in ``scripts/migrate_ohlcv_layout.py``.
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import json
 import logging
 import os
@@ -43,6 +45,7 @@ __all__ = [
     "find_dataset",
     "list_datasets",
     "manifest_path",
+    "manifest_update_lock",
     "normalize_ohlcv_frame",
     "parse_date_bound",
     "platform_timeframe",
@@ -257,6 +260,30 @@ def write_manifest(
     )
     os.replace(tmp, path)
     return path
+
+
+@contextlib.contextmanager
+def manifest_update_lock(data_root: str | Path, source: str):
+    """Serialize a manifest read-modify-write per source across processes.
+
+    ``write_frame``/``register_file`` update ``manifest.json`` as a
+    read-modify-write. The parquet write itself is atomic, but two
+    concurrent writers for the same source (viewer download tasks,
+    scheduler refresh, CLI) could each read a stale manifest and drop the
+    other's entry — a silently missing dataset. An ``flock`` on a per-source
+    lock file makes the critical section atomic across processes; the lock
+    file sits next to the manifest and is never deleted. Linux-only, like
+    the rest of the platform.
+    """
+    src = _source_name(source)
+    lock_path = source_dir(data_root, src) / ".manifest.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, "a+b") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def _fallback_asset_class(source: str, symbol: str) -> str:
@@ -482,7 +509,10 @@ def selection_rank(entry: DatasetEntry, symbol: str) -> tuple[Any, ...]:
     elif len(symbol) == 6 and symbol.isalpha():
         asset_rank = 0 if asset_class == "forex" else 1
     else:
-        asset_rank = 0 if asset_class in {"equity", "equities", "stocks"} else 1
+        # Equity-like spellings — the same set slippage and the exposure
+        # resolver treat as equity — must not rank below "equity" copies.
+        equity_like = {"equity", "equities", "stock", "stocks", "etf", "etfs"}
+        asset_rank = 0 if asset_class in equity_like else 1
     source_rank = _SOURCE_PRIORITY.get(entry.source, 4)
     return (
         asset_rank,
@@ -969,10 +999,10 @@ def write_frame(
     from the frame, never trusted from the caller. The manifest is written
     after the data file, also atomically.
 
-    Single-writer assumption: the manifest update is a read-modify-write,
-    so writers for the same source must be serialized (downloaders,
-    resample and the migration script are); concurrent writers can drop
-    each other's entries.
+    The manifest update is a read-modify-write serialized per source by an
+    ``flock`` (see :func:`manifest_update_lock`), so concurrent writers —
+    viewer download tasks, scheduler refresh, CLI — cannot drop each
+    other's entries.
     """
     src = _source_name(source)
     sym = _symbol_name(symbol)
@@ -988,27 +1018,28 @@ def write_frame(
         tmp.unlink(missing_ok=True)
         raise
 
-    manifest = read_manifest(data_root, src)
-    meta = manifest.get(sym)
-    if not isinstance(meta, dict):
-        meta = {}
-        manifest[sym] = meta
-    files = meta.get("files")
-    if not isinstance(files, dict):
-        files = {}
-        meta["files"] = files
-    files[path.name] = {
-        "rows": len(checked),
-        "first": str(timestamps.min()),
-        "last": str(timestamps.max()),
-    }
-    meta["asset_class"] = str(asset_class or "").strip().lower()
-    meta["region"] = str(region or "").strip().lower()
-    meta["source_symbol"] = str(source_symbol or "").strip() or sym
-    if extra_meta:
-        for key, value in extra_meta.items():
-            meta[str(key)] = value
-    write_manifest(data_root, src, manifest)
+    with manifest_update_lock(data_root, src):
+        manifest = read_manifest(data_root, src)
+        meta = manifest.get(sym)
+        if not isinstance(meta, dict):
+            meta = {}
+            manifest[sym] = meta
+        files = meta.get("files")
+        if not isinstance(files, dict):
+            files = {}
+            meta["files"] = files
+        files[path.name] = {
+            "rows": len(checked),
+            "first": str(timestamps.min()),
+            "last": str(timestamps.max()),
+        }
+        meta["asset_class"] = str(asset_class or "").strip().lower()
+        meta["region"] = str(region or "").strip().lower()
+        meta["source_symbol"] = str(source_symbol or "").strip() or sym
+        if extra_meta:
+            for key, value in extra_meta.items():
+                meta[str(key)] = value
+        write_manifest(data_root, src, manifest)
     return path
 
 
@@ -1033,8 +1064,8 @@ def register_file(
     through :func:`write_frame` would be wasted I/O; ``write_frame`` remains
     the writer for frames held in memory.
 
-    Same single-writer assumption as :func:`write_frame`: manifest updates
-    are read-modify-write and must be serialized per source.
+    The manifest update uses the same per-source ``flock`` as
+    :func:`write_frame`.
     """
     src = _source_name(source)
     sym = _symbol_name(symbol)
@@ -1047,25 +1078,26 @@ def register_file(
 
     rows = _parquet_row_count(target)
     bounds = timestamp_bounds(target)
-    manifest = read_manifest(data_root, src)
-    meta = manifest.get(sym)
-    if not isinstance(meta, dict):
-        meta = {}
-        manifest[sym] = meta
-    files = meta.get("files")
-    if not isinstance(files, dict):
-        files = {}
-        meta["files"] = files
-    files[expected.name] = {
-        "rows": rows or 0,
-        "first": bounds[0].isoformat() if bounds else "",
-        "last": bounds[1].isoformat() if bounds else "",
-    }
-    meta["asset_class"] = str(asset_class or "").strip().lower()
-    meta["region"] = str(region or "").strip().lower()
-    meta["source_symbol"] = str(source_symbol or "").strip() or sym
-    if extra_meta:
-        for key, value in extra_meta.items():
-            meta[str(key)] = value
-    write_manifest(data_root, src, manifest)
+    with manifest_update_lock(data_root, src):
+        manifest = read_manifest(data_root, src)
+        meta = manifest.get(sym)
+        if not isinstance(meta, dict):
+            meta = {}
+            manifest[sym] = meta
+        files = meta.get("files")
+        if not isinstance(files, dict):
+            files = {}
+            meta["files"] = files
+        files[expected.name] = {
+            "rows": rows or 0,
+            "first": bounds[0].isoformat() if bounds else "",
+            "last": bounds[1].isoformat() if bounds else "",
+        }
+        meta["asset_class"] = str(asset_class or "").strip().lower()
+        meta["region"] = str(region or "").strip().lower()
+        meta["source_symbol"] = str(source_symbol or "").strip() or sym
+        if extra_meta:
+            for key, value in extra_meta.items():
+                meta[str(key)] = value
+        write_manifest(data_root, src, manifest)
     return target
