@@ -342,7 +342,11 @@ def build_report(skipped: list[SkippedTest], sources: list[str]) -> str:
     lines.append(f"JUnit input: {', '.join(sources)}")
     lines.append(f"Skipped tests: {len(skips)}")
     if xfails:
-        lines.append(f"XFailed tests: {len(xfails)} (expected outcomes, not counted)")
+        fakes_xfails = sum(1 for t in xfails if _is_fakes_module(t.module))
+        note = "expected outcomes, not counted"
+        if fakes_xfails:
+            note += f"; {fakes_xfails} tests.fakes xfail(s) DO count as violations"
+        lines.append(f"XFailed tests: {len(xfails)} ({note})")
     if not skipped:
         lines.append("")
         lines.append("No skips.")

@@ -224,6 +224,23 @@ def test_is_money_path_covers_live_runner_and_engine_tests() -> None:
             f"{path.name} must not ignore collection: deselected tests "
             "never reach the skip report"
         )
+    # Deselection can also come from outside tests/fakes: an --ignore or a
+    # collect_ignore aimed at the fakes would hide every contract test just
+    # as thoroughly. Pin the CI invocation and the root conftest.
+    repo_root = Path(__file__).resolve().parents[1]
+    for workflow in sorted((repo_root / ".github" / "workflows").glob("*.yml")):
+        for line in workflow.read_text(encoding="utf-8").splitlines():
+            if "--ignore" in line or "--deselect" in line:
+                assert "fakes" not in line, (
+                    f"{workflow.name} deselects tests/fakes: {line.strip()}"
+                )
+    for line in (fakes_root.parent / "conftest.py").read_text(
+        encoding="utf-8"
+    ).splitlines():
+        if "collect_ignore" in line:
+            assert "fakes" not in line, (
+                f"tests/conftest.py ignores fakes collection: {line.strip()}"
+            )
     assert not is_money_path("tests.test_safe_path")
     assert not is_money_path("tests.strategies.test_channel_breakout")
 
