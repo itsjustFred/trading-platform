@@ -170,6 +170,20 @@ def test_parse_junit_xfail_is_not_a_violation(tmp_path: Path) -> None:
     assert "### XFail by reason" in report
 
 
+def test_a_fakes_xfail_is_a_violation(tmp_path: Path) -> None:
+    # An expected-failure on the broker fakes would hide the adapter
+    # breakage their contract tests exist to catch.
+    path = tmp_path / "junit.xml"
+    path.write_text(
+        '<testsuite><testcase classname="tests.fakes.test_alpaca" name="t">'
+        '<skipped type="pytest.xfail" message="flaky"/>'
+        "</testcase></testsuite>",
+        encoding="utf-8",
+    )
+    (test,) = parse_junit(path)
+    assert violations([test]) == [test]
+
+
 def test_collect_skips_warns_on_missing_files(tmp_path: Path) -> None:
     present = _write(tmp_path, "a.xml", [("tests.test_a", "t", "why")])
     skipped, missing = collect_skips([present, tmp_path / "absent.xml"])
@@ -188,7 +202,7 @@ def test_is_money_path_covers_live_runner_and_engine_tests() -> None:
     assert is_money_path("tests.fakes.test_ctrader")
     # Pin the pattern itself: dropping it while keeping is_money_path green
     # for other modules would silently un-gate the fakes.
-    assert any(p.pattern == r"^tests\.fakes\." for p in MUST_NOT_SKIP_PATTERNS)
+    assert any(p.pattern == r"^tests\.fakes(\.|$)" for p in MUST_NOT_SKIP_PATTERNS)
     # No allowed-skip pair may match the fakes either: a reason-scoped
     # exemption would let a flaky contract test skip silently.
     assert not any(
@@ -196,6 +210,14 @@ def test_is_money_path_covers_live_runner_and_engine_tests() -> None:
         for module_pattern, _reason in ALLOWED_SKIPS
         for module in ("tests.fakes.test_alpaca", "tests.fakes.test_ctrader")
     )
+    # A ``slow`` marker would deselect a fakes test under ``-m "not slow"`` —
+    # invisible to the JUnit skip gate — so none may carry it.
+    fakes_root = Path(__file__).resolve().parents[1] / "tests" / "fakes"
+    for path in sorted(fakes_root.glob("test_*.py")):
+        assert "mark.slow" not in path.read_text(encoding="utf-8"), (
+            f"{path.name} must not be slow-marked: deselected tests never "
+            "reach the skip report"
+        )
     assert not is_money_path("tests.test_safe_path")
     assert not is_money_path("tests.strategies.test_channel_breakout")
 
