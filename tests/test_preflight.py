@@ -75,22 +75,6 @@ class TestPreflightValidator:
         errors, _ = _validate_deployments(accounts, deployments)
         assert any("no timeframe configured" in e for e in errors)
 
-    def test_discord_channel_warning(self):
-        accounts = [LiveAccountConfig(id="acc1", broker="alpaca")]
-        deployments = [
-            LiveDeploymentConfig(
-                strategy_name="test_strat",
-                account_id="acc1",
-                symbols=["AAPL"],
-                timeframe="1h",
-                signal_source="discord",
-                signal_config={},
-            )
-        ]
-        _, warnings = _validate_deployments(accounts, deployments)
-        assert any("channel_id" in w for w in warnings)
-
-
 class TestRunLivePreflight:
     """Integration-style tests for run_live_preflight."""
 
@@ -246,7 +230,7 @@ def test_active_non_discord_deployment_warns_it_will_never_trade():
     assert errors == []
     assert len(warnings) == 1
     assert "internal_strat" in warnings[0]
-    assert "no live strategy runner" in warnings[0]
+    assert "internal strategy runner" in warnings[0]
 
 
 def test_non_active_non_discord_deployment_does_not_warn():

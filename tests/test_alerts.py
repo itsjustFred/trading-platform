@@ -862,7 +862,7 @@ class TestInstall:
             raise RuntimeError("accounts database is on fire")
 
         monkeypatch.setattr(
-            daemon_module, "_discover_and_register_discord_services", _boom
+            daemon_module, "_recover_failed_services", _boom
         )
         with pytest.raises(RuntimeError, match="accounts database is on fire"):
             asyncio.run(

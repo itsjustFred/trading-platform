@@ -276,6 +276,18 @@ class LiveDeploymentConfig(BaseModel):
         # logs the row at load.
         if isinstance(info.context, dict) and info.context.get(STORED_ROW_CONTEXT):
             return self
+        # Discord signal ingestion was removed (maintainer decision 2026-11-26):
+        # a NEW deployment cannot ask for it. Stored rows still carry the value
+        # and load through STORED_ROW_CONTEXT above - they stay listed and are
+        # skipped by the daemon, never an error here.
+        for source_field in (self.signal_source, self.signal_source_type):
+            if str(source_field or "").strip().lower() == "discord":
+                raise ValueError(
+                    f"Live deployment '{self.strategy_name}' uses signal source "
+                    "'discord', which was removed; Discord signal ingestion no "
+                    "longer exists. Use signal source 'internal' or retire the "
+                    "deployment."
+                )
         validate_no_removed_flip_opt_in(
             self.settings,
             context=f"live deployment '{self.strategy_name}'",
