@@ -120,9 +120,6 @@ def test_the_cleanup_runs_as_many_bounded_phases_as_the_budget_counts(
         await daemon._shutdown_cleanup(
             loop_tasks=(),
             active_listener_tasks={},
-            active_discord_tasks={},
-            active_discord_bot_tasks={},
-            active_discord_bots={},
             active_adapters={},
             scheduler=_RecordingScheduler(),  # type: ignore[arg-type]
             shutdown=coordinator,
@@ -135,7 +132,6 @@ def test_the_cleanup_runs_as_many_bounded_phases_as_the_budget_counts(
     assert phases == [
         "cancel_loops",
         "cancel_listeners",
-        "disconnect_discord",
         "stop_scheduler",
         "disconnect_adapters",
         "close_archive",

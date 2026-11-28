@@ -59,8 +59,8 @@ def _deployment(
         symbols=["AAPL", "MSFT", "EURUSD"],
         timeframe="1h",
         status=status,
-        signal_source="discord",
-        signal_source_type="discord",
+        signal_source="internal",
+        signal_source_type="internal",
         signal_config={"channel_id": "100000000000000362"},
         settings={"max_risk_per_trade": 0.01, "max_total_exposure": 0.05},
     )
@@ -215,7 +215,6 @@ def _patch_claims(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         daemon, "renew_live_deployment_submission", lambda *_a, **_k: True
     )
-    monkeypatch.setattr(daemon, "_deployment_can_dispatch", lambda _d, **_k: True)
 
 
 def _patch_exit_ledgers(
@@ -323,13 +322,8 @@ def test_concurrent_exits_on_different_symbols_one_account_are_serialized(
     async def _both() -> None:
         tasks = [
             asyncio.create_task(
-                daemon._submit_normalized_discord_signal(
-                    deployment.account_id,
-                    adapter,
-                    deployment,
-                    _exit_trade_signal(symbol),
-                    signal_timeframe="1h",
-                    wait_enabled=False,
+                daemon._submit_internal_strategy_signal(
+                    adapter, deployment, _exit_trade_signal(symbol)
                 )
             )
             for deployment, symbol in ((first, "AAPL"), (second, "MSFT"))
@@ -527,13 +521,8 @@ def test_exit_submit_holds_exit_lock_outside_the_account_lock(monkeypatch) -> No
     adapter = _ProbeAdapter()
 
     async def _run() -> None:
-        await daemon._submit_normalized_discord_signal(
-            deployment.account_id,
-            adapter,
-            deployment,
-            _exit_trade_signal("AAPL"),
-            signal_timeframe="1h",
-            wait_enabled=False,
+        await daemon._submit_internal_strategy_signal(
+            adapter, deployment, _exit_trade_signal("AAPL")
         )
         assert not daemon._exit_lock(deployment.account_id, "AAPL").locked()
 
@@ -556,9 +545,21 @@ def test_exit_path_lock_timeout_refuses_and_releases_the_exit_lock(
     _patch_claims(monkeypatch)
     deployment = _deployment(account_id="acc-exit-timeout")
     adapter = _BlockingAdapter(positions=[])
-    decision = _FakeDecision()
-    monkeypatch.setattr(
-        daemon, "SignalDecisionRecorder", lambda **_kwargs: decision
+    normalized = _exit_trade_signal("AAPL")
+    live_signal = LiveSignal(
+        deployment_id=str(deployment.id),
+        symbol="AAPL",
+        action="sell",
+        theoretical_price=100.0,
+        timestamp=datetime.now(timezone.utc),
+        metadata=dict(normalized.metadata),
+    )
+    archive = _Archive()
+    decision = SignalDecisionRecorder(
+        trade_signal=normalized,
+        account_id=deployment.account_id,
+        deployment=deployment,
+        archive=archive,
     )
     persisted_stages: list[str] = []
 
@@ -577,15 +578,16 @@ def test_exit_path_lock_timeout_refuses_and_releases_the_exit_lock(
         lock = _account_order_lock(deployment.account_id)
         await lock.acquire()
         try:
-            await daemon._submit_normalized_discord_signal(
+            outcome = await _prepare_claim_and_submit_signal(
                 deployment.account_id,
                 adapter,
                 deployment,
-                _exit_trade_signal("AAPL"),
-                signal_timeframe="1h",
-                wait_enabled=False,
+                normalized,
+                live_signal,
+                is_exit=True,
+                decision=decision,
             )
-            assert not daemon._exit_lock(deployment.account_id, "AAPL").locked()
+            assert outcome == SUBMIT_OUTCOME_REFUSED
         finally:
             lock.release()
 
@@ -595,7 +597,9 @@ def test_exit_path_lock_timeout_refuses_and_releases_the_exit_lock(
     assert adapter.events == []
     assert adapter.submitted == []
     assert persisted_stages == ["prepare_exit"]
-    assert decision.records == [("refused", "account_order_lock_timeout")]
+    assert len(archive.records) == 1
+    assert archive.records[0]["outcome"] == "refused"
+    assert archive.records[0]["reason"] == "account_order_lock_timeout"
     assert "order-placement lock" in caplog.text
 
 
@@ -612,9 +616,21 @@ def test_signal_age_is_rechecked_after_acquiring_the_lock(monkeypatch) -> None:
         "max_signal_age_seconds": 0.3,
     }
     adapter = _BlockingAdapter(positions=[])
-    decision = _FakeDecision()
-    monkeypatch.setattr(
-        daemon, "SignalDecisionRecorder", lambda **_kwargs: decision
+    normalized = _exit_trade_signal("AAPL")
+    live_signal = LiveSignal(
+        deployment_id=str(deployment.id),
+        symbol="AAPL",
+        action="sell",
+        theoretical_price=100.0,
+        timestamp=datetime.now(timezone.utc),
+        metadata=dict(normalized.metadata),
+    )
+    archive = _Archive()
+    decision = SignalDecisionRecorder(
+        trade_signal=normalized,
+        account_id=deployment.account_id,
+        deployment=deployment,
+        archive=archive,
     )
     persisted_stages: list[str] = []
 
@@ -628,36 +644,39 @@ def test_signal_age_is_rechecked_after_acquiring_the_lock(monkeypatch) -> None:
         persisted_stages.append(stage)
 
     monkeypatch.setattr(daemon, "_persist_submission_rejection", _persist)
-    signal = _exit_trade_signal("AAPL")
 
     async def _run() -> None:
         lock = _account_order_lock(deployment.account_id)
         await lock.acquire()
         task = asyncio.create_task(
-            daemon._submit_normalized_discord_signal(
+            _prepare_claim_and_submit_signal(
                 deployment.account_id,
                 adapter,
                 deployment,
-                signal,
-                signal_timeframe="1h",
-                wait_enabled=False,
+                normalized,
+                live_signal,
+                is_exit=True,
+                decision=decision,
             )
         )
         try:
-            # The pre-lock age gate has already passed; the signal only expires
-            # while this submission is queued on the account lock.
+            # The signal only expires while this submission is queued on the
+            # account lock; the post-lock age recheck must still refuse it.
             await asyncio.sleep(0.45)
             assert adapter.events == []
         finally:
             lock.release()
-        await task
+        outcome = await task
+        assert outcome == SUBMIT_OUTCOME_REFUSED
 
     asyncio.run(_run())
 
     assert adapter.events == []
     assert adapter.submitted == []
     assert persisted_stages == ["prepare_exit"]
-    assert decision.records == [("refused", "signal_aged_out_during_lock_wait")]
+    assert len(archive.records) == 1
+    assert archive.records[0]["outcome"] == "refused"
+    assert archive.records[0]["reason"] == "signal_aged_out_during_lock_wait"
 
 
 # ── STOPPED and kill-switch flattens share the account lock ──────────────────

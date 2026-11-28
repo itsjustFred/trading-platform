@@ -2688,10 +2688,11 @@ class TestPendingStopGapPricing:
         assert len(engine.positions) == 1
         assert engine.positions[0].entry_price == pytest.approx(101.5)
 
-    # ── Maintainer default 2026-11-23: a gap-through open fill is marketable,
-    # so it pays the same spread a MARKET order at that open pays — a LONG
-    # lifts the ask (open + spread), a SHORT hits the bid open. Intrabar
-    # level fills and resting-limit fills carry no spread.
+    # ── #472: a gap-through open fill is marketable, so it fills at the open
+    # on the order's own side — the ask for a buy, the bid for a sell. A
+    # one-sided frame with spread_price_col has ask = bid + spread, so a LONG
+    # stop can gap on the ask even when the bid open is below the stop.
+    # Intrabar level fills and resting-limit fills carry no spread.
 
     @staticmethod
     def _spread_frame() -> pd.DataFrame:
@@ -2705,8 +2706,10 @@ class TestPendingStopGapPricing:
             # STOP: gap fill at the open — LONG pays ask, SHORT pays bid.
             ("STOP", "LONG", 105.0, 106.0, 104.0, 101.0, None, 105.5),
             ("STOP", "SHORT", 95.0, 96.0, 94.0, 100.0, None, 95.0),
-            # STOP intrabar touch keeps the stop price despite the spread.
-            ("STOP", "LONG", 100.8, 101.5, 100.7, 101.0, None, 101.0),
+            # STOP LONG: the ask open (100.8 + 0.5 = 101.3) is already through
+            # the 101 stop even though the bid open is below it, so the buy
+            # stop gapped and fills at the ask open.
+            ("STOP", "LONG", 100.8, 101.5, 100.7, 101.0, None, 101.3),
             # STOP_LIMIT marketable-at-open gap fills.
             ("STOP_LIMIT", "LONG", 102.0, 104.0, 101.5, 101.0, 103.0, 102.5),
             ("STOP_LIMIT", "SHORT", 99.0, 99.5, 98.5, 100.0, 98.0, 99.0),

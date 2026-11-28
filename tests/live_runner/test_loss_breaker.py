@@ -1846,7 +1846,7 @@ def test_run_daemon_points_loss_breaker_env_at_accounts_env(monkeypatch, tmp_pat
         async def stop(self):
             return None
 
-    monkeypatch.setattr(daemon, "_discover_and_register_discord_services", _noop_sync)
+    monkeypatch.setattr(daemon, "_recover_failed_services", _noop_sync)
     monkeypatch.setattr(daemon, "_recover_failed_services", _noop_sync)
     monkeypatch.setattr(daemon, "ServiceScheduler", lambda: _Scheduler())
     monkeypatch.setattr(daemon, "sync_deployments_loop", _noop_async)

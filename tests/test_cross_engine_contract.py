@@ -755,9 +755,15 @@ class TestExitLevelGapped:
         assert trade.meta.get("exit_level_gapped") is True
 
     def test_short_level_reachability_uses_ask_range(self, tmp_path: Path):
-        # With ask_ohlc enabled a SHORT exit is judged on the ASK range:
-        # level 106.9 sits inside the BID range (106.75..107.25) but below
-        # the ask low (107.0), so the buy limit could never have filled.
+        # #472: the native engine judges a SHORT exit on the ASK range
+        # whenever the frame carries ask columns — no parameter needed.
+        # Level 106.9 sits inside the BID range (106.75..107.25) but below
+        # the ask low (107.0), so the buy limit could never have filled and
+        # the market fallback buys the ask close (107 + derived 0.375
+        # spread). The frozen vectorbt adapter keeps the opt-in
+        # ``ask_ohlc`` gate: with it the same ask-range judgement applies
+        # (market fallback at the bid close, 107.0); without it the level
+        # is inside the bid range and fills at 106.9.
         frame = _frame()
         frame["ask_high"] = frame["high"] + 0.5
         frame["ask_low"] = frame["low"] + 0.25
@@ -767,20 +773,23 @@ class TestExitLevelGapped:
         )
         strategy_fn = _load_strategy_fn(text, tmp_path, "exit_lvl_ask")
 
-        native = _native_result(frame, strategy_fn, parameters=params)
-        vectorbt = _vectorbt_result(tmp_path, frame, text, parameters=params)
-
-        for result in (native, vectorbt):
-            trade = result.trades[0]
-            assert trade.exits[0].price == pytest.approx(107.0)
+        for native_params in (params, {}):
+            native = _native_result(frame, strategy_fn, parameters=native_params)
+            trade = native.trades[0]
+            assert trade.exits[0].price == pytest.approx(107.375)
             assert trade.meta.get("exit_level_unreachable") is True
 
-        # Without ask_ohlc the same level is inside the bid range and fills.
-        native_bid = _native_result(frame, strategy_fn)
+        vectorbt = _vectorbt_result(tmp_path, frame, text, parameters=params)
+        trade = vectorbt.trades[0]
+        assert trade.exits[0].price == pytest.approx(107.0)
+        assert trade.meta.get("exit_level_unreachable") is True
+
+        # Vectorbt without ask_ohlc still judges the bid range: the level
+        # is inside it and fills.
         vectorbt_bid = _vectorbt_result(tmp_path, frame, text)
-        for result in (native_bid, vectorbt_bid):
-            assert result.trades[0].exits[0].price == pytest.approx(106.9)
-            assert "exit_level_unreachable" not in result.trades[0].meta
+        trade = vectorbt_bid.trades[0]
+        assert trade.exits[0].price == pytest.approx(106.9)
+        assert "exit_level_unreachable" not in trade.meta
 
     def test_unreachable_level_warns_once_per_run(self, tmp_path: Path, caplog):
         # Two trades with the same unreachable level: warn-once must fire

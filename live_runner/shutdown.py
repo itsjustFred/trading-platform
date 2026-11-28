@@ -76,12 +76,12 @@ FORCED_EXIT_CODE = 130
 EXIT_CRASH = 1
 
 # How many bounded cleanup phases run after the drain, in order: the daemon loop
-# cancel, the listener/Discord cancel, the Discord close, the scheduler stop, the
-# adapter disconnect, the signal-archive close and the Twisted reactor release.
+# cancel, the listener cancel, the scheduler stop, the adapter disconnect, the
+# signal-archive close and the Twisted reactor release.
 # Each gets its own ``DEFAULT_CLEANUP_TIMEOUT_SECONDS``, and the shutdown budget
 # the runbook and the systemd unit pin is derived from how many there are - see
 # ``WORST_CASE_SHUTDOWN_SECONDS``.
-CLEANUP_PHASE_COUNT = 7
+CLEANUP_PHASE_COUNT = 6
 
 #: The daemon's shutdown drain guard for one broker mutation:
 #: ``async with gate() as may_mutate`` registers the mutation so the shutdown
