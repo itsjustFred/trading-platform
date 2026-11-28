@@ -455,12 +455,15 @@ def list_datasets(
 
 def _selection_rank(entry: DatasetEntry, symbol: str) -> tuple[Any, ...]:
     """The ``select_ohlcv_path`` ranking, now fed by manifest metadata."""
+    # The retired path-based lookup compared lowercased components; manifest
+    # values keep their case, so the plausibility checks lowercase here.
+    asset_class = entry.asset_class.lower()
     if symbol in _METAL_SYMBOLS:
-        asset_rank = 0 if entry.asset_class == "metals" else 1
+        asset_rank = 0 if asset_class == "metals" else 1
     elif len(symbol) == 6 and symbol.isalpha():
-        asset_rank = 0 if entry.asset_class == "forex" else 1
+        asset_rank = 0 if asset_class == "forex" else 1
     else:
-        asset_rank = 0 if entry.asset_class in {"equity", "equities", "stocks"} else 1
+        asset_rank = 0 if asset_class in {"equity", "equities", "stocks"} else 1
     source_rank = _SOURCE_PRIORITY.get(entry.source, 4)
     return (
         asset_rank,
@@ -503,7 +506,7 @@ def find_dataset(
             for entry in candidates
             if requested
             in {
-                value
+                str(value).lower()
                 for value in (entry.source, entry.asset_class, entry.region)
                 if value
             }
@@ -562,8 +565,13 @@ def _read_segment_frames(paths: list[Path]) -> list[pd.DataFrame]:
     for path in paths:
         try:
             frame = pd.read_parquet(path)
-        except (OSError, ValueError) as exc:
-            logger.warning("Could not read OHLCV parquet %s: %s", path, exc)
+        except FileNotFoundError:
+            # A missing file reads as "no data" only when it is the whole
+            # dataset; among sibling segments it would silently shrink the
+            # frame, so it fails loudly like any other read error.
+            if len(paths) > 1:
+                raise
+            logger.warning("OHLCV parquet missing: %s", path)
             continue
         frame.columns = [str(column).lower() for column in frame.columns]
         frames.append(frame)

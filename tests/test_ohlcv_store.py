@@ -356,6 +356,19 @@ class TestListAndFind:
         assert entry.source == "beta"
         assert ohlcv_store.find_dataset(tmp_path, "AAA", "1h", data_source="gamma") is None
 
+    def test_find_dataset_data_source_matches_case_insensitively(
+        self, tmp_path: Path
+    ) -> None:
+        """The data_source filter matched lowercased path components under the
+        old layout; manifest values keep their case (region "US"), so both
+        sides must compare lowercase."""
+        _write(tmp_path, source="yfinance", symbol="SPY", asset_class="etf", region="US")
+        for requested in ("us", "US", "YFINANCE", "Etf"):
+            entry = ohlcv_store.find_dataset(
+                tmp_path, "SPY", "1h", data_source=requested
+            )
+            assert entry is not None, requested
+
     def test_find_dataset_missing(self, tmp_path: Path) -> None:
         assert ohlcv_store.find_dataset(tmp_path, "NOPE", "1h") is None
         _write(tmp_path, symbol="AAA", timeframe="1h")
@@ -423,6 +436,34 @@ class TestReadFrame:
     def test_read_frame_missing_file_is_empty(self, tmp_path: Path) -> None:
         frame = ohlcv_store.read_frame(tmp_path / "ohlcv" / "src" / "SYM" / "SYM_H1.parquet")
         assert frame.empty
+
+    def test_read_frame_unreadable_segment_fails_loudly(self, tmp_path: Path) -> None:
+        """A corrupt segment must not silently shrink a multi-segment frame:
+        the remaining rows would produce a wrong backtest."""
+        _write(tmp_path, symbol="SYM", timeframe="tick", segment="2024_01", freq="D")
+        feb_path = _write(
+            tmp_path, symbol="SYM", timeframe="tick", segment="2024_02",
+            start="2024-02-01", freq="D",
+        )
+        feb_path.write_bytes(b"not a parquet")
+        entry = ohlcv_store.find_dataset(tmp_path, "SYM", "tick")
+        assert entry is not None
+        with pytest.raises(ValueError):
+            ohlcv_store.read_frame(entry)
+
+    def test_read_frame_missing_segment_fails_loudly(self, tmp_path: Path) -> None:
+        """Same for a declared segment absent from disk: partial coverage is
+        not a frame."""
+        _write(tmp_path, symbol="SYM", timeframe="tick", segment="2024_01", freq="D")
+        feb_path = _write(
+            tmp_path, symbol="SYM", timeframe="tick", segment="2024_02",
+            start="2024-02-01", freq="D",
+        )
+        feb_path.unlink()
+        entry = ohlcv_store.find_dataset(tmp_path, "SYM", "tick")
+        assert entry is not None
+        with pytest.raises(FileNotFoundError):
+            ohlcv_store.read_frame(entry)
 
     def test_read_frame_segments_concatenated_in_order(self, tmp_path: Path) -> None:
         jan = _frame(periods=2, start="2024-01-01", freq="D")
