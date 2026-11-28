@@ -32,6 +32,7 @@ from shared.models import (
 from shared.models import (
     EquityPoint as EquityPointModel,
 )
+from tests.builders import make_live_signal
 from tests.conftest import seed_live_deployments
 
 
@@ -174,7 +175,7 @@ def _make_live_signal(
     if broker_order_id is not None:
         metadata["broker_order_id"] = broker_order_id
     metadata.update(extra)
-    return LiveSignal(
+    return make_live_signal(
         id=uuid4(),
         deployment_id=deployment_id,
         symbol="AAPL",
@@ -570,7 +571,7 @@ def _make_live_signal_at(
     metadata: dict = {"discord_message_id": discord_message_id}
     if broker_order_id is not None:
         metadata["broker_order_id"] = broker_order_id
-    return LiveSignal(
+    return make_live_signal(
         id=uuid4(),
         deployment_id="dep-1",
         symbol="AAPL",

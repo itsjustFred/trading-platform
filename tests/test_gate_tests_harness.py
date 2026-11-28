@@ -17,7 +17,6 @@ or is renamed, must not be reported as passed. The roster is compared by name fo
 
 from __future__ import annotations
 
-import os
 import re
 import shutil
 import subprocess
@@ -25,6 +24,8 @@ import sys
 from pathlib import Path
 
 import pytest
+
+from tests.conftest import sandboxed_env
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 GATE_SCRIPT = REPO_ROOT / "scripts" / "gate-tests.sh"
@@ -40,7 +41,12 @@ def _bash(body: str) -> subprocess.CompletedProcess[str]:
     """Source the runner library, run `body`, and return the result."""
     script = f'set -uo pipefail\n. "{GATE_LIB.as_posix()}"\n{body}\n'
     return subprocess.run(
-        ["bash", "-c", script], capture_output=True, text=True, cwd=str(REPO_ROOT), timeout=120
+        ["bash", "-c", script],
+        capture_output=True,
+        text=True,
+        cwd=str(REPO_ROOT),
+        timeout=120,
+        env=sandboxed_env(),
     )
 
 
@@ -139,6 +145,7 @@ def test_the_declared_roster_is_not_empty() -> None:
         text=True,
         cwd=str(REPO_ROOT),
         timeout=120,
+        env=sandboxed_env(),
     )
     assert result.returncode == 0, result.stderr
     declared = [line for line in result.stdout.splitlines() if line.strip()]
@@ -214,13 +221,13 @@ def test_full_roster(tmp_path: Path) -> None:
     The gate runner excludes this case when it runs the harness self-check, so there is no cycle:
     the script runs the unit cases above, and this case runs the script.
     """
-    env = dict(os.environ)
-    for name in ("BASE_URL", "PERMA_ALLOW_LIVE_VIEWER_WRITES"):
-        env.pop(name, None)
-    env["PYTHON"] = sys.executable
-    env["DATA_DIR"] = str(tmp_path)
-    env["TRADING_DATA_DIR"] = str(tmp_path)
-    env["LOG_DIR"] = str(tmp_path / "logs")
+    # The sandboxed environment for the runner and every gate it spawns: the allowlist drops
+    # BASE_URL and PERMA_ALLOW_LIVE_VIEWER_WRITES, and the data roots are the session sandbox's,
+    # which no gate can write the checkout's data through. The child does not share the
+    # sandbox: every gate that runs a suite runs it as its own pytest process, and that process
+    # must build the suite sandbox a standalone run builds - its own session, its own forced
+    # data roots - rather than inherit one it did not establish.
+    env = sandboxed_env(PYTHON=sys.executable, shares_sandbox=False)
     result = subprocess.run(
         ["bash", str(GATE_SCRIPT)],
         capture_output=True,

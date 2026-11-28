@@ -16,8 +16,8 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from runner.engines.base import BacktestConfig
 from runner.engines.native_adapter import NativeAdapter
+from tests.builders import make_backtest_config
 from tests.helpers import with_zero_fees
 from tests.helpers import write_ohlcv as _write_ohlcv
 
@@ -97,7 +97,7 @@ def test_market_exits_fill_at_next_open(tmp_path: Path, name: str):
         "data_dir": str(tmp_path),
         "parameters": {},
     }
-    config = BacktestConfig(**with_zero_fees(payload))
+    config = make_backtest_config(**with_zero_fees(payload))
     result = NativeAdapter().run(config, str(STRATEGIES_DIR / name / f"{name}.py"))
 
     assert result.trades, f"{name}: synthetic run produced no trades (check is vacuous)"

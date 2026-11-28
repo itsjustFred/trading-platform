@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -19,6 +20,47 @@ from typing import Any
 # happen only inside RiskEngine.calculate_position_size.
 UNIT_FRACTION = "fraction_of_balance"
 UNIT_QUANTITY = "account_currency_units_of_symbol"
+
+
+def coerce_setting_float(
+    value: Any, *, field_name: str, minimum: float | None = None
+) -> float:
+    """Coerce one operator setting to a finite float.
+
+    Shared by ``RiskConfig.from_settings`` (deployment risk settings) and the
+    live daemon's non-``RiskConfig`` values (broker pip data etc.). Kept
+    separate from ``RiskConfig._finite_float``: the setting messages
+    ("Invalid <field>: <value>") name the offending value for an operator
+    fixing a live deployment row, and the numeric minimum is checked before
+    the field's own range rule runs in ``__post_init__``.
+    """
+    if isinstance(value, bool):
+        raise ValueError(f"Invalid {field_name}: {value!r}")
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"Invalid {field_name}: {value!r}") from exc
+    if not math.isfinite(parsed):
+        raise ValueError(f"{field_name} must be finite")
+    if minimum is not None and parsed < minimum:
+        raise ValueError(f"{field_name} must be >= {minimum}")
+    return parsed
+
+
+def coerce_setting_int(value: Any, *, field_name: str, minimum: int | None = None) -> int:
+    """Coerce one operator setting to an integer (see ``coerce_setting_float``)."""
+    if isinstance(value, bool):
+        raise ValueError(f"Invalid {field_name}: {value!r}")
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"Invalid {field_name}: {value!r}") from exc
+    if not math.isfinite(numeric) or not numeric.is_integer():
+        raise ValueError(f"{field_name} must be an integer")
+    parsed = int(numeric)
+    if minimum is not None and parsed < minimum:
+        raise ValueError(f"{field_name} must be >= {minimum}")
+    return parsed
 
 
 @dataclass(slots=True)
@@ -64,6 +106,71 @@ class RiskConfig:
             raise ValueError("fallback_stop_pct must be between 0 and 1")
         if not 0 < self.max_notional_per_trade:
             raise ValueError("max_notional_per_trade must be > 0")
+
+    @classmethod
+    def from_settings(cls, settings: Mapping[str, Any] | None) -> RiskConfig:
+        """Build the RiskConfig a deployment's ``settings`` describe.
+
+        The one place that maps deployment settings to ``RiskConfig``
+        (improvement-run G03): the daemon used to re-type every default as its
+        own literal, so a changed dataclass default silently stopped applying
+        to live deployments. Missing keys fall back to the dataclass field
+        defaults; ``risk_per_trade_pct`` is the documented alias for
+        ``max_risk_per_trade`` (the canonical key wins when both are present).
+
+        Values are coerced with deployment-settings messages ("Invalid
+        <field>: <value>" for a non-numeric value) and then validated by
+        ``__post_init__`` — a value that passes the numeric minimum can still
+        be rejected by the field's own range rule.
+        """
+        values = settings or {}
+        defaults = cls()
+        return cls(
+            max_risk_per_trade=coerce_setting_float(
+                values.get(
+                    "max_risk_per_trade",
+                    values.get("risk_per_trade_pct", defaults.max_risk_per_trade),
+                ),
+                field_name="max_risk_per_trade",
+                minimum=0.0,
+            ),
+            max_total_exposure=coerce_setting_float(
+                values.get("max_total_exposure", defaults.max_total_exposure),
+                field_name="max_total_exposure",
+                minimum=0.0,
+            ),
+            max_positions=coerce_setting_int(
+                values.get("max_positions", defaults.max_positions),
+                field_name="max_positions",
+                minimum=1,
+            ),
+            default_sl_atr_multiplier=coerce_setting_float(
+                values.get(
+                    "default_sl_atr_multiplier",
+                    defaults.default_sl_atr_multiplier,
+                ),
+                field_name="default_sl_atr_multiplier",
+                minimum=0.0,
+            ),
+            fallback_stop_pct=coerce_setting_float(
+                values.get("fallback_stop_pct", defaults.fallback_stop_pct),
+                field_name="fallback_stop_pct",
+                minimum=0.0,
+            ),
+            max_notional_per_trade=coerce_setting_float(
+                values.get(
+                    "max_notional_per_trade", defaults.max_notional_per_trade
+                ),
+                field_name="max_notional_per_trade",
+                minimum=0.0,
+            ),
+            allow_fallback_stop=values.get(
+                "allow_fallback_stop", defaults.allow_fallback_stop
+            ),
+            reject_missing_stop=values.get(
+                "reject_missing_stop", defaults.reject_missing_stop
+            ),
+        )
 
     @staticmethod
     def _finite_float(value: Any, field_name: str) -> float:

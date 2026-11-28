@@ -140,7 +140,7 @@ class TestEngineHardError:
         import pandas as pd
 
         from runner.engine import TradeEngine
-        from runner.engines.base import BacktestConfig
+        from tests.builders import make_backtest_config
 
         index = pd.RangeIndex(30)
         data = pd.DataFrame(
@@ -162,7 +162,7 @@ class TestEngineHardError:
             exits.iloc[20] = True
             return entries, exits, {}, []
 
-        cfg = BacktestConfig(risk_per_trade_pct=0.01,
+        cfg = make_backtest_config(risk_per_trade_pct=0.01,
             strategy_name="unit-test",
             symbols=["TEST"],
             timeframe="1h",

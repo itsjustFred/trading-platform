@@ -10,13 +10,10 @@ Januar = EST, d.h. NY-Mitternacht = 05:00 UTC):
 """
 
 import importlib.util
-import sys
 from pathlib import Path
 
 import pandas as pd
 import pytest
-
-sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 STRATEGY_PATH = PROJECT_ROOT / "strategies" / "us100_scalper" / "us100_scalper.py"

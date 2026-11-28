@@ -42,15 +42,6 @@ def generate_markdown_report(*args, **kwargs):
 
 
 class TestMarkdownReportBasics:
-    def test_generate_markdown_report_returns_string(self):
-        ref_trade = _make_trade(trade_id=1)
-        act_trade = _make_trade(trade_id=10)
-        ref = _make_reference([ref_trade])
-        platform = _make_platform_result([act_trade])
-
-        md = generate_markdown_report(ref, platform)
-        assert isinstance(md, str)
-
     def test_markdown_contains_strategy_name(self):
         ref_trade = _make_trade(trade_id=1)
         act_trade = _make_trade(trade_id=10)

@@ -110,17 +110,22 @@ def test_fallback_stop_is_below_entry_for_buys_and_above_for_sells():
         action="sell", symbol="AAPL", entry_price=100.0, stop_loss=None,
         take_profit=None, timeframe="1h", metadata={"atr": 1.5},
     )
-    _engine().calculate_position_size(
+    sized_buy = _engine().calculate_position_size(
         signal=buy, account_balance=10_000.0, pip_value=1.0, current_exposure=0.0
     )
-    _engine().calculate_position_size(
+    sized_sell = _engine().calculate_position_size(
         signal=sell, account_balance=10_000.0, pip_value=1.0, current_exposure=0.0
     )
 
-    assert buy.stop_loss is not None, "the long leg must carry a stop loss"
-    assert buy.stop_loss < buy.entry_price, "a long stop must sit below entry"
-    assert sell.stop_loss is not None, "the short leg must carry a stop loss"
-    assert sell.stop_loss > sell.entry_price, "a short stop must sit above entry"
+    long_stop = sized_buy.resolved_stop_loss
+    short_stop = sized_sell.resolved_stop_loss
+    assert long_stop is not None, "the long leg must carry a stop loss"
+    assert long_stop < buy.entry_price, "a long stop must sit below entry"
+    assert short_stop is not None, "the short leg must carry a stop loss"
+    assert short_stop > sell.entry_price, "a short stop must sit above entry"
+    # The resolved stop is returned, not written back onto the signal.
+    assert buy.stop_loss is None
+    assert sell.stop_loss is None
 
 
 def test_fallback_stop_without_atr_is_percent_of_price():
@@ -138,7 +143,8 @@ def test_fallback_stop_without_atr_is_percent_of_price():
     )
 
     expected_distance = 100_000.0 * 0.02
-    assert signal.stop_loss == pytest.approx(100_000.0 - expected_distance)
+    assert sized.resolved_stop_loss == pytest.approx(100_000.0 - expected_distance)
+    assert signal.stop_loss is None
     # risk_amount (1% of 10k) = 100; the 20% notional cap (2000 / 100k entry)
     # binds at 0.02 units — far below the uncapped 0.05, not hundreds of BTC.
     assert sized.position_size == pytest.approx(0.02)

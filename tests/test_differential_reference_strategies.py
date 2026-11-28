@@ -78,6 +78,7 @@ from data_tools.differential_slice import (
 from runner.engines.base import BacktestConfig
 from runner.engines.native_adapter import NativeAdapter
 from runner.engines.vectorbt_adapter import VectorbtAdapter
+from tests.builders import make_backtest_config
 from tests.helpers.differential_slice import violations, write_slice_like
 
 pytestmark = pytest.mark.filterwarnings("ignore::DeprecationWarning")
@@ -439,7 +440,7 @@ def _config(
     # #130: the reference fills are gross, so the engine run must declare the
     # explicit no-slippage opt-out rather than inherit the per-class default.
     parameters.setdefault("slippage", "none")
-    return BacktestConfig(
+    return make_backtest_config(
         strategy_name="differential",
         symbols=["SYN"],
         timeframe=timeframe,

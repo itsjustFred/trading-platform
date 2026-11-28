@@ -8,25 +8,22 @@ the regression surface is the fallback script
 `scripts/run_risk_parity_backtest.py`.
 """
 
-import sys
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import pytest
 
-sys.path.insert(0, str(Path(__file__).parent.parent.parent))
-
 from scripts.run_risk_parity_backtest import (
     ASSETS,
     TICKERS,
     _simulate_portfolio_value,
-    compounded_growth,
     adjust_for_regime,
     apply_tail_risk_hedge,
     apply_volatility_scaling,
     calculate_covariance,
     calculate_risk_parity_weights,
+    compounded_growth,
     detect_correlation_regime,
     first_available_trading_dates,
     latest_correlation_regime,

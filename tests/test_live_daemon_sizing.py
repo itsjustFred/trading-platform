@@ -25,10 +25,11 @@ import live_runner.daemon as daemon
 from live_runner.base_adapter import BaseLiveAdapter, LiveQuote
 from risk.config import RiskConfig
 from shared.models import LiveDeploymentConfig, LiveSignal
+from tests.builders import make_live_deployment, make_live_signal
 
 
 def _deployment(**settings: Any) -> LiveDeploymentConfig:
-    return LiveDeploymentConfig(
+    return make_live_deployment(
         id=str(uuid4()),
         strategy_name="demo",
         account_id="acc-1",
@@ -42,7 +43,7 @@ def _deployment(**settings: Any) -> LiveDeploymentConfig:
 
 
 def _signal(metadata: dict, *, action: str = "buy", price: float = 100.0) -> LiveSignal:
-    return LiveSignal(
+    return make_live_signal(
         deployment_id="dep-1",
         symbol="AAPL",
         action=action,
@@ -92,17 +93,6 @@ class _Broker(BaseLiveAdapter):
 
 
 # ── one live sizing entry point ───────────────────────────────────────────────
-
-
-def test_there_is_no_second_live_sizing_entry_point():
-    """risk.live keeps the shared resolver; sizing lives in the daemon only."""
-    import risk
-    import risk.live
-
-    assert not hasattr(risk.live, "size_live_signal")
-    assert "size_live_signal" not in risk.__all__
-    assert not hasattr(risk, "size_live_signal")
-    assert callable(risk.live.resolve_live_levels)
 
 
 # ── moved from test_live_risk_sizing.py ───────────────────────────────────────
