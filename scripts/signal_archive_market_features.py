@@ -389,7 +389,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--data-source",
         default="",
-        help="Restrict OHLCV selection to a source (see select_ohlcv_path)",
+        help="Restrict OHLCV selection to a source (see ohlcv_store.find_dataset)",
     )
     args = parser.parse_args(argv)
 
