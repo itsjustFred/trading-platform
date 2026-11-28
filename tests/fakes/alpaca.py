@@ -96,11 +96,13 @@ def _text(raw: Any) -> str:
 
 
 def _float(raw: Any) -> float:
+    # Non-finite values pass through: alpaca-py returns what the wire carried,
+    # and a NaN mark price or qty must reach the adapter's refusal path rather
+    # than being silently zeroed by the fake.
     try:
-        value = float(raw)
+        return float(raw)
     except (TypeError, ValueError):
         return 0.0
-    return value if math.isfinite(value) else 0.0
 
 
 def _optional_float(raw: Any) -> float | None:

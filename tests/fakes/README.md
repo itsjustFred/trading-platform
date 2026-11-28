@@ -33,6 +33,11 @@ with fake_alpaca_transport(client) as (client, stream, historical):
 `FakeTradingStream.deliver(client)` hands the recorded updates to subscribed
 callbacks; `client.trade_updates` holds them either way.
 
+Known gap: `fake_alpaca_transport` stubs `StockHistoricalDataClient` only.
+The adapter's crypto-bar path constructs `CryptoHistoricalDataClient`
+directly (`live_runner/alpaca_adapter.py`), so a test exercising crypto
+history would hit the real client — keep crypto coverage off this fake.
+
 Key knobs: `mark_prices`, `fill_seconds` (confirmation delay),
 `partial_fill_ratio`, `reject_submissions` (callable or list consumed in
 order), `reject_after_acknowledgement`, `cancel_settles`, `allow_shorting`,
@@ -86,6 +91,10 @@ so both the fake and `fake_ctrader_transport` import it lazily under
 fake never decides the process's reactor. A test that drives a real
 `connect()` should run where no platform reactor is already installed (the
 contract test uses a subprocess for exactly this reason).
+
+Concurrency note: both transports patch `sys.modules` globally and the
+fakes keep per-instance state only — run broker-fake tests serially in one
+process (no pytest-xdist sharing, no threads driving two fakes at once).
 
 ## Contract tests
 

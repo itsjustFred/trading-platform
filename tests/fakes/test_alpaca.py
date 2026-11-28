@@ -8,6 +8,7 @@ so a fake that silently stopped modelling Alpaca breaks here first.
 from __future__ import annotations
 
 import asyncio
+import math
 from datetime import timedelta
 from types import SimpleNamespace
 
@@ -421,6 +422,20 @@ def test_a_partially_filled_order_rests_for_the_remainder() -> None:
     ], "every chunk of a partial fill is its own trade update"
 
 
+def test_a_nan_fill_price_is_not_erased_by_the_next_fill() -> None:
+    # alpaca-py hands back whatever the wire carried; the fake must not zero a
+    # non-finite stored price, or a NaN mark silently becomes a clean average.
+    client = FakeAlpacaTradingClient(mark_prices={AAPL: 100.0}, partial_fill_ratio=0.5)
+    order = client.submit_order(_buy(qty=4.0))
+
+    client.set_mark_price(AAPL, float("nan"))
+    client.advance(30.0)
+    client.set_mark_price(AAPL, 100.0)
+    client.advance(30.0)
+
+    assert math.isnan(order.filled_avg_price)
+
+
 def test_a_partial_fill_never_exceeds_the_requested_quantity() -> None:
     client = FakeAlpacaTradingClient(mark_prices={AAPL: 100.0}, partial_fill_ratio=0.9)
     order = client.submit_order(_buy(qty=5.0))
@@ -798,7 +813,8 @@ def test_the_real_adapter_submits_a_bracket_and_flattens_through_the_fake(
         assert broker_order_id
         client.advance(30.0)
         positions = await adapter.get_positions()
-        assert positions and positions[0]["qty"] == 10.0
+        assert positions
+        assert positions[0]["qty"] == 10.0
 
         outcome = await adapter.close_all_positions()
         assert outcome.failed == ()
