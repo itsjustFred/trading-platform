@@ -7,12 +7,8 @@ a few seconds, not one.
 
 from __future__ import annotations
 
-import sys
 from datetime import datetime, timezone
-from pathlib import Path
 from uuid import uuid4
-
-sys.path.insert(0, str(Path(__file__).parent.parent))
 
 
 def test_poll_rates_are_not_one_hertz():

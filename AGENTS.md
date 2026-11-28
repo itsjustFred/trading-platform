@@ -6,13 +6,14 @@ When creating an issue or PR, mention model as well as harness at the bottom of 
 Unless explicitly told, never push directly to main.
 Use conventional commit style messages unless not appropriate.
 If making changes, also check if you need to update other things such as docs, skills, etc.
+Before starting work, run `python scripts/agents/worktree_preflight.py` in your worktree; Claude Code sessions get the `scripts/agents/guard_shell.py` PreToolUse hook automatically via `.claude/settings.json` (other harnesses are not covered by the hook).
 
 ## Tests
 
 Do NOT weaken, remove, bypass or rewrite a test just to achieve a passing result, instead fix the underlying problem. Change tests only when the task changes or you can independently identify that the test is wrong.
 Bug fixes start with a test that fails on the unfixed code; say in the PR that it failed before the fix. New behaviour on the money path (`live_runner`, `risk`, the backtest engines, sizing) is written test-first: the test lands in the same PR and fails without the change.
-Install the dev tooling with `uv sync --frozen --all-extras` and run `uv run ruff check <changed files>` and `uv run mypy` (no arguments) before a PR.
-The test sandbox (see `tests/conftest.py`) guards only the pytest process: a test that starts a Python subprocess must give it a sandboxed environment explicitly, or a child importing `shared.constants` loads the checkout's real `.env`.
+Install the dev tooling with `uv sync --frozen --all-extras` and run `uv run ruff check <changed files>` and `uv run mypy` (no arguments) before a PR. In the main checkout the guard hook blocks plain `uv run` (it can mutate the daemon's venv) - use `uv run --no-sync ...` there.
+The test sandbox (see `tests/conftest.py`) guards only the pytest process: a test that starts a Python subprocess must hand it `sandboxed_env()` (from `tests/conftest.py`; the static scan in `tests/test_subprocess_env_contract.py` fails a spawn call without it), or a child importing `shared.constants` loads the checkout's real `.env` and resolves the real `.accounts.env` path.
 
 ## Issues
 

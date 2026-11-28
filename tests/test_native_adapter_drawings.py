@@ -74,7 +74,7 @@ def test_normalizer_makes_timestamp_drawings_json_serializable():
 def test_native_adapter_output_is_json_serializable(tmp_path, monkeypatch):
     """End to end through the adapter, which is where the leak reached storage."""
     from runner.engines import native_adapter
-    from runner.engines.base import BacktestConfig
+    from tests.builders import make_backtest_config
 
     strategy = tmp_path / "ts_drawings.py"
     strategy.write_text(
@@ -101,9 +101,9 @@ def test_native_adapter_output_is_json_serializable(tmp_path, monkeypatch):
     )
 
     frame = _frame()
-    monkeypatch.setattr(native_adapter, "_load_ohlcv", lambda *_a, **_k: frame)
+    monkeypatch.setattr(native_adapter, "load_ohlcv", lambda *_a, **_k: frame)
 
-    config = BacktestConfig(
+    config = make_backtest_config(
         strategy_name="native-drawings",
         symbols=["TEST"],
         timeframe="1d",

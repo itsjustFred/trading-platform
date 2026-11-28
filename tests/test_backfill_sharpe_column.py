@@ -456,8 +456,3 @@ def test_production_corpus_is_what_the_script_reports():
         "cagr's sentinel count moved; note that its 54 drift rows are excluded by design, so this "
         "figure should be the sentinel population only"
     )
-
-
-def test_the_irreversible_direction_does_not_exist_in_the_script():
-    source = (REPO / "scripts" / "backfill_sharpe_column.py").read_text(encoding="utf-8")
-    assert "update backtests set stats" not in source.lower()

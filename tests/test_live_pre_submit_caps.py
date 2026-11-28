@@ -40,10 +40,11 @@ from live_runner.pre_submit_caps import (
 from risk.config import RiskConfig
 from shared.database import list_live_control_audit
 from shared.models import LiveDeploymentConfig, LiveSignal
+from tests.builders import make_live_deployment, make_live_signal
 
 
 def _deployment(**settings: Any) -> LiveDeploymentConfig:
-    return LiveDeploymentConfig(
+    return make_live_deployment(
         id=uuid4(),
         strategy_name="demo",
         account_id="acc-1",
@@ -65,7 +66,7 @@ def _signal(
 ) -> LiveSignal:
     meta = {"entry_price": 100.0, "stop_loss": 95.0, "take_profit": 110.0}
     meta.update(metadata or {})
-    return LiveSignal(
+    return make_live_signal(
         deployment_id=str(deployment.id),
         symbol=symbol,
         action=action,  # type: ignore[arg-type]
@@ -911,7 +912,7 @@ def test_claim_path_cap_refusal_releases_the_lease_and_never_submits(monkeypatch
         timeframe="1h",
         metadata={"received_at": datetime.now(timezone.utc).isoformat()},
     )
-    live_signal = daemon._trade_signal_to_live_signal(trade_signal, deployment)
+    live_signal = daemon.trade_signal_to_live_signal(trade_signal, deployment)
 
     released: list[str] = []
     monkeypatch.setattr(daemon, "claim_live_deployment_submission", lambda *a, **k: True)
@@ -959,7 +960,7 @@ def test_claim_path_submits_the_clamped_qty(monkeypatch):
         timeframe="1h",
         metadata={"received_at": datetime.now(timezone.utc).isoformat()},
     )
-    live_signal = daemon._trade_signal_to_live_signal(trade_signal, deployment)
+    live_signal = daemon.trade_signal_to_live_signal(trade_signal, deployment)
     prepared_signal = _signal(
         deployment,
         metadata={"entry_price": 100.0, "stop_loss": 99.9, "take_profit": 105.0},

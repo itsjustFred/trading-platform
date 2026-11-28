@@ -67,7 +67,7 @@ jobs:
         # `tests/test_lint_family_ratchet.py` test asserts the two agree.
         run: >-
           uv run --no-sync --no-build ruff check --select
-          B,DTZ,PERF,PLE,PLW0120,PLW0602,PLW1510,RUF005,RUF006,RUF007,RUF012,RUF013,RUF015,RUF019,RUF021,RUF023,RUF036,RUF043,RUF046,RUF059,S307 .
+          B,DTZ,PERF,PLE,PLW0120,PLW0602,PLW1510,RUF005,RUF006,RUF007,RUF012,RUF013,RUF015,RUF019,RUF021,RUF023,RUF036,RUF043,RUF046,RUF059,S307,PLC2701 .
       - name: Type check (mypy)
         # mypy is a dev dependency (`uv sync` installs it) and pinned there to
         # 2.4.1, so this is the same interpreter the developer gets from
@@ -151,3 +151,25 @@ jobs:
         run: npm run test:focused
       - name: Frontend TypeScript and production build
         run: npm run build
+
+  workflows:
+    name: Workflow lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # The agent workflows are ~1500 lines of YAML whose failure mode is a
+      # silent misroute (a skipped `if:`, a drifted reusable-call input), so
+      # they get a real linter, not just the contract tests. The binary is
+      # pinned by release version and verified against the published sha256,
+      # like gitleaks in secret-scan.yml.
+      - name: Install actionlint
+        run: |
+          set -euo pipefail
+          curl -fsSL --proto '=https' --proto-redir '=https' -o actionlint.tar.gz \
+            https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz
+          echo "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  actionlint.tar.gz" | sha256sum -c -
+          tar -xzf actionlint.tar.gz actionlint
+          ./actionlint --version
+      - name: Lint workflows
+        run: ./actionlint

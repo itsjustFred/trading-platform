@@ -5,12 +5,9 @@ import type {
   DataHarvestRequest,
   DataOverviewResponse,
   DataResampleRequest,
-  DataTaskDeleteResponse,
   DataTaskListResponse,
-  DataTaskLogsResponse,
   DataTaskStartResponse,
   DataTaskStatusResponse,
-  DataCacheInvalidationResponse,
   DataCheckResponse,
   DukascopyGenesisResponse,
   LiveAccount,
@@ -32,9 +29,6 @@ import type {
   Service,
   ServiceStatus,
   ServiceType,
-  VerificationEvidenceCreateRequest,
-  VerificationEvidenceRecord,
-  VerificationEvidenceSummary,
   LiveTradesResponse,
   SignalProcessorOption,
   LogContent,
@@ -47,11 +41,9 @@ import type {
   RunBacktestFromSignalsRequest,
   RunBacktestSignalsRequest,
   RunBacktestResponse,
-  RunBacktestStatusResponse,
   StrategyDetail,
   StrategyMeta,
   Trade,
-  TradeChartResponse,
   BacktestInfo,
   BacktestCapmResponse,
   BulkDeleteConfirmRequest,
@@ -80,8 +72,6 @@ import type {
   PortfoliosRemoveEmptyResponse,
   BacktestsDuplicatesResponse,
   BacktestMetadataItem,
-  BacktestsListResponse,
-  BacktestsQueryParams,
   BacktestReplayResponse,
   PortfoliosBulkDeleteResponse,
   BacktestStats,
@@ -152,8 +142,6 @@ async function supportsLiveStatsEndpoint(): Promise<boolean> {
 
 // Strategies
 export const getStrategies = () => fetchJSON<StrategyMeta[]>("/strategies");
-export const getStrategy = (name: string) =>
-  fetchJSON<StrategyDetail>(`/strategies/${encodeURIComponent(name)}`);
 export const getStrategyDetail = (name: string) =>
   fetchJSON<StrategyDetail>(`/strategies/${encodeURIComponent(name)}`);
 export const renameStrategy = (name: string, displayName: string) =>
@@ -183,51 +171,6 @@ function withQuery(path: string, query: string): string {
   return query ? `${path}?${query}` : path;
 }
 
-const BACKTESTS_QUERY_PARAMS: ReadonlyArray<{
-  key: keyof BacktestsQueryParams;
-  name: string;
-  kind: "string" | "number";
-}> = [
-  { key: "page", name: "page", kind: "number" },
-  { key: "per_page", name: "per_page", kind: "number" },
-  { key: "sort", name: "sort", kind: "string" },
-  { key: "order", name: "order", kind: "string" },
-  { key: "name", name: "name", kind: "string" },
-  { key: "strategy", name: "strategy", kind: "string" },
-  { key: "symbol", name: "symbol", kind: "string" },
-  { key: "timeframe", name: "timeframe", kind: "string" },
-  { key: "search", name: "search", kind: "string" },
-  { key: "total_return_min", name: "total_return_min", kind: "number" },
-  { key: "total_return_max", name: "total_return_max", kind: "number" },
-  { key: "sharpe_min", name: "sharpe_min", kind: "number" },
-  { key: "sharpe_max", name: "sharpe_max", kind: "number" },
-  { key: "psr_min", name: "psr_min", kind: "number" },
-  { key: "psr_max", name: "psr_max", kind: "number" },
-  { key: "p_value_min", name: "p_value_min", kind: "number" },
-  { key: "p_value_max", name: "p_value_max", kind: "number" },
-  { key: "cagr_min", name: "cagr_min", kind: "number" },
-  { key: "cagr_max", name: "cagr_max", kind: "number" },
-  { key: "win_rate_min", name: "win_rate_min", kind: "number" },
-  { key: "win_rate_max", name: "win_rate_max", kind: "number" },
-  { key: "drawdown_min", name: "drawdown_min", kind: "number" },
-  { key: "drawdown_max", name: "drawdown_max", kind: "number" },
-  { key: "max_drawdown_min", name: "max_drawdown_min", kind: "number" },
-  { key: "max_drawdown_max", name: "max_drawdown_max", kind: "number" },
-];
-
-export const getBacktests = (params?: BacktestsQueryParams) => {
-  const query = new URLSearchParams();
-  for (const { key, name } of BACKTESTS_QUERY_PARAMS) {
-    const value = params?.[key];
-    if (value == null || value === "") {
-      continue;
-    }
-    query.set(name, String(value));
-  }
-  return fetchJSON<BacktestsListResponse>(
-    withQuery(`/backtests`, query.toString()),
-  );
-};
 export const getBacktestsAll = (
   name?: string,
   options?: { includeEquityPreview?: boolean; previewLimit?: number },
@@ -245,10 +188,6 @@ export const getBacktestsAll = (
     `/backtests/all?${query.toString()}`,
   );
 };
-export const getBacktestEquityPreview = (id: string, limit = 80) =>
-  fetchJSON<number[]>(
-    `/backtests/${encodeURIComponent(id)}/equity-preview?limit=${Math.max(1, Math.min(100, limit))}`,
-  );
 export const getBacktestEquityPreviews = (ids: string[], limit = 48) => {
   const query = new URLSearchParams();
   query.set("ids", ids.join(","));
@@ -276,8 +215,6 @@ export const getBacktestTrades = (
   const queryString = query.toString();
   return fetchJSON<Trade[]>(withQuery(`/backtest/${id}/trades`, queryString));
 };
-export const getBacktestTrade = (id: string, nr: number) =>
-  fetchJSON<TradeChartResponse>(`/backtest/${id}/trade/${nr}`);
 export const getBacktestReplay = (id: string) =>
   fetchJSON<BacktestReplayResponse>(`/backtest/${id}/replay`);
 export const getBacktestEquity = (
@@ -305,8 +242,6 @@ export const getBacktestCapm = (id: string, benchmark?: string) => {
     withQuery(`/backtest/${id}/capm`, query),
   );
 };
-export const getBacktestOHLCV = (id: string) =>
-  fetchJSON<unknown>(`/backtest/${id}/ohlcv`);
 export const renameBacktest = (id: string, title: string) =>
   fetchJSON<unknown>(`/backtests/${encodeURIComponent(id)}/name`, {
     method: "PUT",
@@ -328,6 +263,8 @@ export const getMatrixGrid = (strategyId = "all", tradesLimit = 3) =>
   fetchJSON<MatrixGridOverview>(
     `/grid/${encodeURIComponent(strategyId)}?trades_limit=${Math.max(0, Math.min(20, Math.trunc(tradesLimit)))}`,
   );
+// Two-phase bulk delete: a dry run returns the exact candidate list and
+// deletes nothing; the confirm call deletes only the ids it is given.
 export function deduplicateBacktests(
   payload: BulkDeleteDryRunRequest,
 ): Promise<BacktestsDeduplicateDryRunResponse>;
@@ -479,8 +416,6 @@ export const getServices = (type?: ServiceType) => {
   const query = params.toString();
   return fetchJSON<Service[]>(withQuery(`/services`, query));
 };
-export const getService = (serviceId: string) =>
-  fetchJSON<Service>(`/services/${encodeURIComponent(serviceId)}`);
 export const createService = (payload: {
   name: string;
   type: ServiceType;
@@ -519,47 +454,6 @@ export const getServiceLogs = (
   );
 };
 
-// Verification evidence
-export const getVerificationEvidence = (params?: {
-  component?: string;
-  category?: string;
-  status?: "success" | "failed" | "partial" | "skipped";
-  limit?: number;
-}) => {
-  const query = new URLSearchParams();
-  if (params?.component) query.set("component", params.component);
-  if (params?.category) query.set("category", params.category);
-  if (params?.status) query.set("status", params.status);
-  if (params?.limit != null) query.set("limit", String(params.limit));
-  const queryString = query.toString();
-  return fetchJSON<VerificationEvidenceRecord[]>(
-    withQuery(`/verification/evidence`, queryString),
-  );
-};
-
-export const getVerificationEvidenceSummary = (params?: {
-  component?: string;
-  category?: string;
-  limit?: number;
-}) => {
-  const query = new URLSearchParams();
-  if (params?.component) query.set("component", params.component);
-  if (params?.category) query.set("category", params.category);
-  if (params?.limit != null) query.set("limit", String(params.limit));
-  const queryString = query.toString();
-  return fetchJSON<VerificationEvidenceSummary[]>(
-    withQuery(`/verification/evidence/summary`, queryString),
-  );
-};
-
-export const createVerificationEvidence = (
-  payload: VerificationEvidenceCreateRequest,
-) =>
-  fetchJSON<VerificationEvidenceRecord>("/verification/evidence", {
-    method: "POST",
-    body: JSON.stringify(payload),
-  });
-
 // Run backtest
 export const runBacktest = (data: RunBacktestRequest) =>
   fetchJSON<RunBacktestResponse>("/backtests/run", {
@@ -576,9 +470,6 @@ export const runBacktestFromSignals = (data: RunBacktestFromSignalsRequest) =>
     method: "POST",
     body: JSON.stringify(data),
   });
-export const getBacktestRunStatus = (jobId: string) =>
-  fetchJSON<RunBacktestStatusResponse>(`/backtests/run/${jobId}/status`);
-
 // Optimizations
 export const runOptimization = (data: OptimizationRunRequest) =>
   fetchJSON<OptimizationRunResponse>("/optimizations/run", {
@@ -599,8 +490,6 @@ export const getPortfolios = (params?: PortfoliosQueryParams) => {
   const queryString = query.toString();
   return fetchJSON<PortfolioSummary[]>(withQuery(`/portfolios`, queryString));
 };
-export const getPortfolio = (id: string) =>
-  fetchJSON<PortfolioDetail>(`/portfolios/${id}`);
 export const getPortfolioDetail = (id: string) =>
   fetchJSON<PortfolioDetail>(`/portfolios/${id}`);
 export const renamePortfolio = (id: string, name: string) =>
@@ -689,10 +578,6 @@ export function removeEmptyPortfolios(
     body: JSON.stringify(payload),
   });
 }
-export const comparePortfolios = (ids: string[]) =>
-  fetchJSON<{ portfolios: PortfolioDetail[] }>(
-    `/portfolios/compare?ids=${ids.join(",")}`,
-  );
 
 // Logs
 export const getLogs = () => fetchJSON<LogFile[]>("/logs");
@@ -782,8 +667,6 @@ export const listDataTasks = () =>
   fetchJSON<DataTaskListResponse>("/data/tasks");
 export const getDataTask = (taskId: string) =>
   fetchJSON<DataTaskStatusResponse>(`/data/tasks/${taskId}`);
-export const getDataTaskLogs = (taskId: string) =>
-  fetchJSON<DataTaskLogsResponse>(`/data/tasks/${taskId}/logs`);
 export const pauseDataTask = (taskId: string) =>
   fetchJSON<DataTaskStatusResponse>(`/data/tasks/${taskId}/pause`, {
     method: "POST",
@@ -800,22 +683,3 @@ export const restartDataTask = (taskId: string) =>
   fetchJSON<DataTaskStatusResponse>(`/data/tasks/${taskId}/restart`, {
     method: "POST",
   });
-export const deleteDataTask = (taskId: string) =>
-  fetchJSON<DataTaskDeleteResponse>(`/data/tasks/${taskId}`, {
-    method: "DELETE",
-  });
-export const invalidateDataCache = (
-  reason = "manual",
-  includeValidation?: boolean,
-) => {
-  const params = new URLSearchParams();
-  if (reason) params.set("reason", reason);
-  if (typeof includeValidation === "boolean") {
-    params.set("include_validation", includeValidation ? "true" : "false");
-  }
-  const query = params.toString();
-  return fetchJSON<DataCacheInvalidationResponse>(
-    withQuery(`/data/cache/invalidate`, query),
-    { method: "POST" },
-  );
-};

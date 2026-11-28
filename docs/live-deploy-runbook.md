@@ -94,93 +94,21 @@ live daemon installs the sink today; other entry points are unaffected.
 Central definition: `shared/trailing.py` (`LIVE_SUPPORTED_TRAILING_MODES_BY_BROKER`). Execution:
 `live_runner/trailing_stops.py`.
 
-| Broker  | `none` | `percent` | `supertrend_flip` |
-|---------|--------|-----------|-------------------|
-| Alpaca  | yes    | yes       | no                |
-| cTrader | yes    | no        | opt-in only       |
+| Broker  | `none` | `percent` |
+|---------|--------|-----------|
+| Alpaca  | yes    | yes       |
+| cTrader | yes    | no        |
 
 cTrader `percent` stays off: the adapter deliberately does not declare
 `supports_stop_amendment`, so the percent trail and the broker reconciler treat every cTrader
-account exactly as before. `supertrend_flip` runs live on cTrader ONLY for a deployment that
-carries the explicit opt-in and whose account is provably demo/paper:
+account exactly as before.
 
-- **Opt-in key:** `settings.live_supertrend_flip` on the `LiveDeploymentConfig` (truthy:
-  `true`, `"true"`, `"1"`, `"yes"`, `"on"`). Absent or unrecognized values fail closed - the
-  mode is refused at deployment validation and at signal time.
-- **Account gate:** the adapter must be a cTrader demo/paper account
-  (`supports_supertrend_flip` + the daemon's `_adapter_is_demo` check). Live cTrader accounts
-  and every non-opted deployment behave exactly as on `main`.
-- **Workflow** (`live_runner/supertrend_flip.py`): TP1 partial close sized to the broker's
-  volume step, intent persisted before every submit, confirmation from broker-reported closed
-  volume (position drop AND the execution ledger - a partial fill completes the tranche and is
-  never resubmitted), the plan bound to the broker `position_id` recorded at entry fill
-  (mismatch = alert + no action), breakeven stop after the TP1 bar (never loosens a tighter
-  stop), then Supertrend-flip exit of the remainder at market. Flip closes route through the
-  daemon's per-symbol exit lock and in-flight-exit check.
-- **Fallback take-profit on halt/give-up** (maintainer decision 2026-11-24): when the workflow
-  stops managing a position that is provably ours - a permanent halt or the give-up after
-  `FLIP_GIVE_UP_AFTER_SECONDS` - the broker stop stays in force AND the position gets a broker
-  take-profit at the plan's `tp1_price` (`amend_position_take_profit`, which echoes the current
-  stop loss verbatim into the same atomic `ProtoOAAmendPositionSLTPReq`, so the stop can never
-  be dropped or loosened; confirmation requires the TP at the target AND the echoed stop still
-  in force). TP1 already done - or a TP1 close still in flight - means there is no safe price
-  level for the remainder, so the position stays stop-only and the alert says so. Positions
-  whose provenance or quantity is unproven (first sight, or a halt raised before verification
-  completed - persisted as `unverified_position`) or whose `position_id` no longer matches are
-  never touched (zero broker writes on every path). The placed TP is persisted as
-  `fallback_tp_price` plus a pre-amend intent (`fallback_tp_pending_price`), making restarts
-  idempotent: an unconfirmed intent is resolved by reading the broker position, and resume
-  clears only a TP that matches the persisted price - a different broker TP fails closed with
-  a critical alert. Amend failures alert critical, keep the stop, and retry on the probe
-  cadence - permanent halts get the same bounded budget as give-ups
-  (`FLIP_FALLBACK_TP_MAX_ATTEMPTS`, reset when a plan resumes successfully; shutdown-gate
-  refusals never consume an attempt). On restart an unresolved fallback TP is treated as a
-  probe: it is removed only once a pass proves the outage recovered, and a still-failing pass
-  re-places it. When the outage recovers and the plan resumes, the fallback TP is amended away
-  BEFORE any TP1 close logic runs - a broker TP at `tp1_price` would close the whole position
-  instead of the tranche - and a failed removal fails closed: no TP1 close goes out while the
-  broker TP may still be in force.
-- **Live/replay differences (accepted):** live TP1 triggers on bid polling, so an intrapoll
-  wick that replay's bar-high would catch can be missed; live closes the remainder at market
-  while replay fills at the next bar's open. cTrader serves only sub-day bars
-  (`1m`/`5m`/`15m`/`30m`/`1h`) for this workflow because the broker anchors `4h`/`1d`/`1w` to
-  its server day/week, not the UTC alignment replay uses.
-
-**Alpaca remains replay-only** (#168 route (a), built on #350): the Alpaca entry is a
-full-quantity bracket whose take-profit leg sits at the TP1 price, so a partial TP1 exit needs
-a different entry order structure first - see #350. cTrader needed none of that: it closes
-part of a position natively.
-
-**Replay semantics to mirror live (decided 2026-11-16, `#176`)**
-
-Three rules the replay implements today; a live implementation must copy them exactly, or paper
-results stop predicting live behaviour:
-
-- *TP1 tranche in whole shares, floored.* The tranche is
-  `int(entry_quantity * tp1_exit_percent)` — the original bot's arithmetic
-  (`shared/trailing.py: tp1_partial_quantity`) — and the remainder is the entry quantity minus
-  that tranche. A tranche of zero whole shares (1 share at a 0.5 fraction) is skipped, not
-  rounded up: no sell, no breakeven stop, and the Supertrend workflow never arms, so the whole
-  position keeps its original stop. The trade's `supertrend_flip` metadata records it as
-  `tp1_skipped_time` so a backtest never hides it.
-- *The trail starts on the bar after the TP1 bar.* The TP1 bar after the TP1 fill is dead for
-  the workflow: its close is not read (a green close there does not activate the trail, a red
-  close there cannot flip it) and its range is not checked against the stop moved on it, so the
-  breakeven stop only takes effect from the next bar. Nothing that happens at or inside the
-  TP1 bar after the TP1 fill may move or trigger the trailing stop — live that means the
-  amendment waits for the first bar that closes after the TP1 fill.
-- *A bar that opens beyond a protective level fills at the open.* The pre-TP1 stop, the
-  post-TP1 stop (initial or breakeven) and the TP1 tranche all follow the gap rule (#287):
-  the open is the bar's first event, so a bar opening past a level fills at `bar_open` —
-  never the skipped level — and beats any later same-bar touch of the other level
-  (`contract.resolve_protective_exit` checks the gap before the stop-first same-bar policy).
-  One qualification inside the flip workflow: a bar that gaps through TP1 fills the
-  *tranche* at the open, but the remainder's pre-TP1 stop is still working for the rest of
-  that bar — the OTO stop sits at the initial level and the breakeven amendment only takes
-  effect on the next bar — so a later same-bar trade through it stops the remainder at the
-  stop level. Live that means the open-versus-level check must run before the bar's range
-  is evaluated, and an entry fill must never be checked against a level on its own fill bar
-  (the replay never evaluates the entry bar).
+`supertrend_flip` was removed (maintainer decision 2026-11-26): the live workflow
+(`live_runner/supertrend_flip.py`), its cTrader adapter primitives and its replay half are
+gone. A configuration that still names the mode — a `trailing_mode: supertrend_flip` override,
+a bot default, or a signal's `trailing_sl_config` — is refused at validation/load/signal time
+with a "removed" error; a deployment still carrying the `settings.live_supertrend_flip`
+opt-in is refused the same way. There is no path where the mode is silently ignored.
 
 **Where an unsupported mode is rejected**
 
@@ -423,9 +351,7 @@ pre-existing ACTIVE row from a new one, so the flag gates all of them.
   bracket-leg reservations), on cTrader accounts that cannot prove they
   hedge positions (`ProtoOAAccountType` NETTED or unreadable: a netted
   book merges several entries into one position whose per-lot exit cannot
-  be sized safely), and on any deployment carrying the
-  `live_supertrend_flip` opt-in (the flip workflow manages exactly one
-  position per symbol). On a *hedging* cTrader book each targeted exit is
+  be sized safely). On a *hedging* cTrader book each targeted exit is
   pinned to the position its entry opened — but only when that position's
   opening orders belong exclusively to the entry's signal; a position
   shared with other openers (a netted book, or a scale-in the ledger
@@ -494,7 +420,7 @@ missed bars are never backfilled with orders. Missing, malformed, unclosed or
 out-of-window bars fail closed — no order is emitted.
 
 **Orders.** Emitted intents go through the daemon's
-`_submit_internal_strategy_signal` → `_trade_signal_to_live_signal` →
+`_submit_internal_strategy_signal` → `trade_signal_to_live_signal` →
 `_prepare_claim_and_submit_signal`, the same prepare/claim/submit path as
 Discord signals: live level resolution, risk sizing, the SL/TP guard, the
 promotion gate, the demo/paper hard block, the submission lease and adapter

@@ -17,8 +17,9 @@ import live_runner.daemon as daemon
 from live_runner.signal_sources import discord_source as ds
 from live_runner.signal_sources.discord_source import (
     DiscordSignalSource,
-    _parse_trade_signal_from_message,
+    parse_trade_signal_from_message,
 )
+from tests.conftest import sandboxed_env
 
 
 @pytest.fixture(autouse=True)
@@ -80,7 +81,7 @@ def test_parser_rejects_message_from_untrusted_author() -> None:
         "**$AAPL** is now oversold — buy signal\nPrice: $190.50",
         author_id="random-guy",
     )
-    signal = _parse_trade_signal_from_message(
+    signal = parse_trade_signal_from_message(
         message, default_timeframe="1h", trusted_author_ids={"bot-1"}
     )
     assert signal is None
@@ -88,7 +89,7 @@ def test_parser_rejects_message_from_untrusted_author() -> None:
 
 def test_parser_accepts_message_from_trusted_author() -> None:
     message = _message("**$AAPL** is now oversold — buy signal\nPrice: $190.50", author_id="bot-1")
-    signal = _parse_trade_signal_from_message(
+    signal = parse_trade_signal_from_message(
         message, default_timeframe="1h", trusted_author_ids={"bot-1"}
     )
     assert signal is not None
@@ -99,7 +100,7 @@ def test_parser_accepts_trusted_author_case_insensitively() -> None:
     """Discord IDs are snowflakes, but a config typo in case must not lock the
     gate: comparison is normalized."""
     message = _message("**$AAPL** is now oversold — buy signal\nPrice: $190.50", author_id="BOT-1")
-    signal = _parse_trade_signal_from_message(
+    signal = parse_trade_signal_from_message(
         message, default_timeframe="1h", trusted_author_ids={"bot-1"}
     )
     assert signal is not None
@@ -177,7 +178,7 @@ def test_price_rejects_malformed_digit_groups() -> None:
 def test_parser_rejects_signal_with_thousands_corrupted_price() -> None:
     """A corrupted price must not become a live trade — the parser refuses."""
     message = _message("**$SPX** is now oversold — buy signal\nPrice: $5,934")
-    signal = _parse_trade_signal_from_message(
+    signal = parse_trade_signal_from_message(
         message, default_timeframe="1h", trusted_author_ids={"bot-1"}
     )
     assert signal is not None
@@ -195,7 +196,7 @@ def test_fallback_uppercase_symbol_stage_is_gone() -> None:
 
 def test_prose_never_mints_a_ticker() -> None:
     message = _message("WARNING ALL ALERT THE MARKET IS NOW RISK ON @ 100.00")
-    signal = _parse_trade_signal_from_message(
+    signal = parse_trade_signal_from_message(
         message, default_timeframe="1h", trusted_author_ids={"bot-1"}
     )
     assert signal is None
@@ -203,7 +204,7 @@ def test_prose_never_mints_a_ticker() -> None:
 
 def test_uppercase_prose_word_without_marker_does_not_become_symbol() -> None:
     message = _message("PUMP IT UP @ 42.00 buy")
-    signal = _parse_trade_signal_from_message(
+    signal = parse_trade_signal_from_message(
         message, default_timeframe="1h", trusted_author_ids={"bot-1"}
     )
     assert signal is None
@@ -1366,7 +1367,7 @@ class TestIssue232PoisonMessage:
         def _explode(*_args, **_kwargs):
             raise ValueError("boom: structurally malformed payload")
 
-        monkeypatch.setattr(ds, "_parse_trade_signal_from_message", _explode)
+        monkeypatch.setattr(ds, "parse_trade_signal_from_message", _explode)
 
         async def _fetch(_channel_id, *, after=None, **kwargs):
             return [_burst_message(1)]
@@ -1394,14 +1395,14 @@ class TestIssue232PoisonMessage:
 
         source = _source(trusted_author_ids={"bot-1"})
         source._last_seen_message_ids["channel-1"] = "1000"
-        real_parser = ds._parse_trade_signal_from_message
+        real_parser = ds.parse_trade_signal_from_message
 
         def _maybe_explode(message, **kwargs):
             if str(message.id) == "1002":
                 raise RuntimeError("poison payload")
             return real_parser(message, **kwargs)
 
-        monkeypatch.setattr(ds, "_parse_trade_signal_from_message", _maybe_explode)
+        monkeypatch.setattr(ds, "parse_trade_signal_from_message", _maybe_explode)
 
         async def _fetch(_channel_id, *, after=None, **kwargs):
             return [_burst_message(index) for index in (4, 1, 3, 2)]  # ids 1001..1004
@@ -1445,7 +1446,7 @@ class TestIssue232PoisonMessage:
         # answers `after=` with a repeat of the boundary row).
         poison = {**_burst_message(1), "author": "not-a-dict"}
         attempts: list[str] = []
-        real_parser = ds._parse_trade_signal_from_message
+        real_parser = ds.parse_trade_signal_from_message
 
         def _counting_parser(message, **kwargs):
             attempts.append(str(message.id))
@@ -1455,7 +1456,7 @@ class TestIssue232PoisonMessage:
                 return real_parser(message, **kwargs)
             raise ValueError("poison")
 
-        monkeypatch.setattr(ds, "_parse_trade_signal_from_message", _counting_parser)
+        monkeypatch.setattr(ds, "parse_trade_signal_from_message", _counting_parser)
 
         async def _fetch(_channel_id, *, after=None, **kwargs):
             return [_burst_message(2), poison] if after == "1000" else [poison]
@@ -2135,16 +2136,16 @@ def test_daemon_resolves_auth_scheme_file_first_with_per_bot_override(monkeypatc
     _no_auth_scheme_in_environment(monkeypatch)
 
     env = {"DISCORD_AUTH_SCHEME": "account"}
-    assert daemon._resolve_discord_auth_scheme("RAMJET", env) == "account"
+    assert daemon.resolve_discord_auth_scheme("RAMJET", env) == "account"
     # A per-bot entry wins over the global default.
     env_override = {**env, "DISCORD_BOT_NITRO_AUTH_SCHEME": "bot"}
-    assert daemon._resolve_discord_auth_scheme("NITRO", env_override) == "bot"
+    assert daemon.resolve_discord_auth_scheme("NITRO", env_override) == "bot"
     # Absent configuration falls back to the recorded operator default.
     # Merge resolution: this asserted "bot"; the resolved default is "raw"
     # (DEFAULT_DISCORD_AUTH_SCHEME). "raw" and "account" name the same
     # user/account credential, so the accepted vocabulary is {raw, bot, account}
     # and the unconfigured case is no longer a bot credential.
-    assert daemon._resolve_discord_auth_scheme("NITRO", {}) == "raw"
+    assert daemon.resolve_discord_auth_scheme("NITRO", {}) == "raw"
 
 
 def test_daemon_resolves_per_bot_auth_scheme_from_process_environment(monkeypatch):
@@ -2159,7 +2160,7 @@ def test_daemon_resolves_per_bot_auth_scheme_from_process_environment(monkeypatc
 
     monkeypatch.setenv("DISCORD_BOT_NITRO_AUTH_SCHEME", "account")
     monkeypatch.delenv("DISCORD_AUTH_SCHEME", raising=False)
-    assert daemon._resolve_discord_auth_scheme("NITRO", {}) == "account"
+    assert daemon.resolve_discord_auth_scheme("NITRO", {}) == "account"
 
 
 def test_daemon_auth_scheme_key_canonicalisation_matches_token_key(monkeypatch):
@@ -2174,8 +2175,8 @@ def test_daemon_auth_scheme_key_canonicalisation_matches_token_key(monkeypatch):
 
     monkeypatch.delenv("DISCORD_AUTH_SCHEME", raising=False)
     env = {"DISCORD_BOT_ROCKET_FUEL_AUTH_SCHEME": "account"}
-    assert daemon._resolve_discord_auth_scheme("Rocket Fuel", env) == "account"
-    assert daemon._resolve_discord_auth_scheme("  rocket-fuel  ", env) == "account"
+    assert daemon.resolve_discord_auth_scheme("Rocket Fuel", env) == "account"
+    assert daemon.resolve_discord_auth_scheme("  rocket-fuel  ", env) == "account"
 
 
 def test_process_environment_cannot_override_the_accounts_file(monkeypatch):
@@ -2184,7 +2185,7 @@ def test_process_environment_cannot_override_the_accounts_file(monkeypatch):
 
     monkeypatch.setenv("DISCORD_BOT_NITRO_AUTH_SCHEME", "account")
     env = {"DISCORD_BOT_NITRO_AUTH_SCHEME": "bot"}
-    assert daemon._resolve_discord_auth_scheme("NITRO", env) == "bot"
+    assert daemon.resolve_discord_auth_scheme("NITRO", env) == "bot"
 
 
 # ─── an unknown auth scheme is a config error, not a guess ───────────────────
@@ -2199,7 +2200,7 @@ def test_daemon_rejects_an_unknown_global_auth_scheme(monkeypatch):
     _no_auth_scheme_in_environment(monkeypatch)
 
     with pytest.raises(ValueError, match="Unsupported Discord auth_scheme"):
-        daemon._resolve_discord_auth_scheme(
+        daemon.resolve_discord_auth_scheme(
             "NITRO", {"DISCORD_AUTH_SCHEME": "bearer"}
         )
 
@@ -2208,7 +2209,7 @@ def test_daemon_rejects_an_unknown_per_bot_auth_scheme(monkeypatch):
     _no_auth_scheme_in_environment(monkeypatch)
 
     with pytest.raises(ValueError, match="Unsupported Discord auth_scheme"):
-        daemon._resolve_discord_auth_scheme(
+        daemon.resolve_discord_auth_scheme(
             "NITRO", {"DISCORD_BOT_NITRO_AUTH_SCHEME": "bearer"}
         )
 
@@ -2226,7 +2227,7 @@ def test_daemon_rejects_an_unknown_auth_scheme_hidden_by_whitespace(
     _no_auth_scheme_in_environment(monkeypatch)
 
     with pytest.raises(ValueError, match="Unsupported Discord auth_scheme"):
-        daemon._resolve_discord_auth_scheme(
+        daemon.resolve_discord_auth_scheme(
             "NITRO", {"DISCORD_BOT_NITRO_AUTH_SCHEME": configured}
         )
 
@@ -2239,7 +2240,7 @@ def test_daemon_rejects_any_scheme_outside_the_recorded_vocabulary(
     _no_auth_scheme_in_environment(monkeypatch)
 
     with pytest.raises(ValueError, match="Unsupported Discord auth_scheme"):
-        daemon._resolve_discord_auth_scheme(
+        daemon.resolve_discord_auth_scheme(
             "NITRO", {"DISCORD_AUTH_SCHEME": configured}
         )
 
@@ -2253,11 +2254,11 @@ def test_daemon_treats_a_whitespace_only_auth_scheme_as_unset(monkeypatch):
     _no_auth_scheme_in_environment(monkeypatch)
 
     assert (
-        daemon._resolve_discord_auth_scheme("NITRO", {"DISCORD_AUTH_SCHEME": "   "})
+        daemon.resolve_discord_auth_scheme("NITRO", {"DISCORD_AUTH_SCHEME": "   "})
         == "raw"
     )
     assert (
-        daemon._resolve_discord_auth_scheme(
+        daemon.resolve_discord_auth_scheme(
             "NITRO", {"DISCORD_BOT_NITRO_AUTH_SCHEME": "\t \n"}
         )
         == "raw"
@@ -2310,10 +2311,10 @@ def test_nitro_oversold_alert_parses_into_a_buy_signal():
     """Nitro formats its ticker as "**BE**" with no space after the asterisks,
     and never uses the word "oversold"; both details used to drop the signal."""
     from live_runner.signal_sources.discord_source import (
-        _parse_trade_signal_from_message,
+        parse_trade_signal_from_message,
     )
 
-    signal = _parse_trade_signal_from_message(
+    signal = parse_trade_signal_from_message(
         _live_channel_message(NITRO_OVERSOLD_MESSAGE), default_timeframe="1h"
     )
     assert signal is not None, "a real Nitro alert must produce a signal"
@@ -2326,11 +2327,11 @@ def test_nitro_oversold_alert_parses_into_a_buy_signal():
 def test_rocketfuel_overbought_alert_is_deliberately_not_traded():
     """Overbought is a warning, not an entry. It must never open a short."""
     from live_runner.signal_sources.discord_source import (
-        _parse_trade_signal_from_message,
+        parse_trade_signal_from_message,
     )
 
     assert (
-        _parse_trade_signal_from_message(
+        parse_trade_signal_from_message(
             _live_channel_message(ROCKETFUEL_OVERBOUGHT_MESSAGE, author_id="1469353101352767575"),
             default_timeframe="1h",
         )
@@ -2341,11 +2342,11 @@ def test_rocketfuel_overbought_alert_is_deliberately_not_traded():
 def test_daily_summary_message_is_not_mistaken_for_a_signal():
     """Summary posts mention tickers-free aggregates and must stay inert."""
     from live_runner.signal_sources.discord_source import (
-        _parse_trade_signal_from_message,
+        parse_trade_signal_from_message,
     )
 
     assert (
-        _parse_trade_signal_from_message(
+        parse_trade_signal_from_message(
             _live_channel_message(NITRO_SUMMARY_MESSAGE), default_timeframe="1h"
         )
         is None
@@ -2363,11 +2364,11 @@ def test_bold_header_is_not_mistaken_for_a_ticker():
 
 def test_untrusted_author_is_rejected_even_for_a_valid_nitro_alert():
     from live_runner.signal_sources.discord_source import (
-        _parse_trade_signal_from_message,
+        parse_trade_signal_from_message,
     )
 
     assert (
-        _parse_trade_signal_from_message(
+        parse_trade_signal_from_message(
             _live_channel_message(NITRO_OVERSOLD_MESSAGE, author_id="1"),
             default_timeframe="1h",
             trusted_author_ids=["1484753770645553192"],
@@ -2735,7 +2736,7 @@ class TestNitroGrammarContract:
         requirement is what the fix keys on, so it belongs in the example.
         """
         from live_runner.signal_sources.discord_source import (
-            _parse_trade_signal_from_message,
+            parse_trade_signal_from_message,
         )
 
         for content in (
@@ -2743,7 +2744,7 @@ class TestNitroGrammarContract:
             "BUY EURUSD @ 1.0850",
             "LONG AAPL @ 100.0",
         ):
-            signal = _parse_trade_signal_from_message(
+            signal = parse_trade_signal_from_message(
                 _live_channel_message(content), default_timeframe="1h"
             )
             assert signal is not None, content
@@ -2793,11 +2794,11 @@ class TestNitroGrammarContract:
         resolver, and still yields no signal without a price - the parser's
         price requirement, asserted for the phrasing that matters most."""
         from live_runner.signal_sources.discord_source import (
-            _parse_trade_signal_from_message,
+            parse_trade_signal_from_message,
         )
 
         assert (
-            _parse_trade_signal_from_message(
+            parse_trade_signal_from_message(
                 _live_channel_message("EURUSD is now oversold buy signal"),
                 default_timeframe="1h",
             )
@@ -2808,11 +2809,11 @@ class TestNitroGrammarContract:
         """A directive with no price cannot trade, so the parser drops it either
         way. Asserted so the price requirement reads as intentional."""
         from live_runner.signal_sources.discord_source import (
-            _parse_trade_signal_from_message,
+            parse_trade_signal_from_message,
         )
 
         assert (
-            _parse_trade_signal_from_message(
+            parse_trade_signal_from_message(
                 _live_channel_message("BUY EURUSD"), default_timeframe="1h"
             )
             is None
@@ -3029,14 +3030,14 @@ class TestAuthorRejectionIsCountable:
 
     def test_rejections_are_counted_and_the_author_recorded(self):
         from live_runner.signal_sources.discord_source import (
-            _parse_trade_signal_from_message,
+            parse_trade_signal_from_message,
         )
 
         rejections: list[str] = []
         allowlist = {self.WRONG_AUTHOR}  # the realistic misconfiguration
 
         for _ in range(3):
-            _parse_trade_signal_from_message(
+            parse_trade_signal_from_message(
                 _live_channel_message(NITRO_OVERSOLD_MESSAGE),
                 default_timeframe="1h",
                 trusted_author_ids=allowlist,
@@ -3050,11 +3051,11 @@ class TestAuthorRejectionIsCountable:
 
     def test_an_accepted_message_records_no_rejection(self):
         from live_runner.signal_sources.discord_source import (
-            _parse_trade_signal_from_message,
+            parse_trade_signal_from_message,
         )
 
         rejections: list[str] = []
-        signal = _parse_trade_signal_from_message(
+        signal = parse_trade_signal_from_message(
             _live_channel_message(NITRO_OVERSOLD_MESSAGE),
             default_timeframe="1h",
             trusted_author_ids={self.NITRO_AUTHOR},
@@ -3067,11 +3068,11 @@ class TestAuthorRejectionIsCountable:
     def test_the_observer_is_optional(self):
         """Backwards compatibility: the existing callers pass no observer."""
         from live_runner.signal_sources.discord_source import (
-            _parse_trade_signal_from_message,
+            parse_trade_signal_from_message,
         )
 
         assert (
-            _parse_trade_signal_from_message(
+            parse_trade_signal_from_message(
                 _live_channel_message(NITRO_OVERSOLD_MESSAGE, author_id=self.WRONG_AUTHOR),
                 default_timeframe="1h",
                 trusted_author_ids={self.NITRO_AUTHOR},
@@ -3100,10 +3101,10 @@ class TestAuthorRejectionIsCountable:
         """The property that matters: the gate still refuses, whatever the
         counting does."""
         from live_runner.signal_sources.discord_source import (
-            _parse_trade_signal_from_message,
+            parse_trade_signal_from_message,
         )
 
-        signal = _parse_trade_signal_from_message(
+        signal = parse_trade_signal_from_message(
             _live_channel_message(NITRO_OVERSOLD_MESSAGE),
             default_timeframe="1h",
             trusted_author_ids={self.NITRO_AUTHOR},
@@ -3111,7 +3112,7 @@ class TestAuthorRejectionIsCountable:
         )
         assert signal is not None
 
-        refused = _parse_trade_signal_from_message(
+        refused = parse_trade_signal_from_message(
             _live_channel_message(
                 NITRO_OVERSOLD_MESSAGE, author_id=self.WRONG_AUTHOR
             ),
@@ -3187,11 +3188,11 @@ class TestRejectionStreakIsLoggedNotFatal:
         import asyncio as _asyncio
 
         from live_runner.signal_sources.discord_source import (
-            _parse_trade_signal_from_message,
+            parse_trade_signal_from_message,
         )
 
         for _ in range(count):
-            _parse_trade_signal_from_message(
+            parse_trade_signal_from_message(
                 _live_channel_message(NITRO_OVERSOLD_MESSAGE, author_id=author),
                 default_timeframe="1h",
                 trusted_author_ids=source.trusted_author_ids,
@@ -3415,7 +3416,7 @@ class TestRejectionStreakIsLoggedNotFatal:
     def test_a_single_rejection_does_not_fail_a_healthy_bot(self):
         """One impersonation attempt must not take down a working deployment."""
         from live_runner.signal_sources.discord_source import (
-            _parse_trade_signal_from_message,
+            parse_trade_signal_from_message,
         )
 
         source = self._source(self.NITRO_AUTHOR)
@@ -3425,13 +3426,13 @@ class TestRejectionStreakIsLoggedNotFatal:
             # each time, so scattered impersonation attempts never accumulate
             # into a failure.
             for index in range(6):
-                _parse_trade_signal_from_message(
+                parse_trade_signal_from_message(
                     self._message(self.WRONG_AUTHOR, f"bad{index}"),
                     default_timeframe="1h",
                     trusted_author_ids=source.trusted_author_ids,
                     on_author_rejection=source._record_author_rejection,
                 )
-                _parse_trade_signal_from_message(
+                parse_trade_signal_from_message(
                     self._message(self.NITRO_AUTHOR, f"good{index}"),
                     default_timeframe="1h",
                     trusted_author_ids=source.trusted_author_ids,
@@ -3758,7 +3759,7 @@ def test_every_bot_path_honours_the_negation_guard() -> None:
     """
     from live_runner.signal_sources.discord_source import (
         _is_ramjet_signal,
-        _parse_trade_signal_from_message,
+        parse_trade_signal_from_message,
     )
 
     # A price is required, and without one the parser returns None on the
@@ -3772,7 +3773,7 @@ def test_every_bot_path_honours_the_negation_guard() -> None:
     message = _live_channel_message(content, author_id="bot-1")
     assert _is_ramjet_signal(content), "fixture no longer exercises the RamJet branch"
 
-    signal = _parse_trade_signal_from_message(
+    signal = parse_trade_signal_from_message(
         message,
         default_timeframe="1h",
         trusted_author_ids={"bot-1"},
@@ -3923,6 +3924,7 @@ class TestAuthorDiscoveryRecord:
             ["git", "check-ignore", "-v", default],
             capture_output=True,
             text=True,
+            env=sandboxed_env(),
         )
         assert probe.returncode == 0, (
             f"the default record path {default!r} is NOT gitignored, so an "
@@ -4390,13 +4392,13 @@ def test_an_empty_allowlist_rejects_every_message() -> None:
     )
 
     assert (
-        _parse_trade_signal_from_message(
+        parse_trade_signal_from_message(
             message, default_timeframe="1h", trusted_author_ids=set()
         )
         is None
     )
     assert (
-        _parse_trade_signal_from_message(
+        parse_trade_signal_from_message(
             message, default_timeframe="1h", trusted_author_ids=["", "  "]
         )
         is None
@@ -4679,7 +4681,7 @@ def test_the_parser_stamps_the_discord_producer_source() -> None:
         "**$AAPL** is now oversold — buy signal\nPrice: $190.50",
         author_id="bot-1",
     )
-    signal = _parse_trade_signal_from_message(
+    signal = parse_trade_signal_from_message(
         message, default_timeframe="1h", trusted_author_ids={"bot-1"}
     )
     assert signal is not None

@@ -2076,47 +2076,6 @@ def test_multi_lot_cap_is_refused_on_alpaca(tmp_path: Path) -> None:
     assert (str(deployment.id), "open_position_cap") in runner._reported
 
 
-def test_multi_lot_cap_is_refused_with_supertrend_flip(tmp_path: Path) -> None:
-    """#382 maintainer default: cap > 1 cannot combine with the live
-    ``supertrend_flip`` opt-in - the flip workflow manages exactly one
-    position per symbol."""
-    path = _strategy_file(tmp_path, META)
-    sent, submit = _collect()
-    runner = _runner(submit, path=path, module=_module_with(_entry_strategy))
-    deployment = _deployment(
-        settings={
-            "internal_max_open_per_symbol": 2,
-            "live_supertrend_flip": "true",
-        }
-    )
-
-    asyncio.run(
-        runner.run_once(
-            [deployment], {"acct-1": FakeAdapter()}, now=BASE + timedelta(seconds=70)
-        )
-    )
-
-    assert sent == []
-    assert (str(deployment.id), "open_position_cap") in runner._reported
-
-
-def test_flip_opt_in_with_single_lot_cap_still_enters(tmp_path: Path) -> None:
-    """The refusal is cap-scoped: the flip opt-in alone (cap 1) is the
-    maintainer-approved #168 shape and must keep trading."""
-    path = _strategy_file(tmp_path, META)
-    sent, submit = _collect()
-    runner = _runner(submit, path=path, module=_module_with(_entry_strategy))
-    deployment = _deployment(settings={"live_supertrend_flip": "yes"})
-
-    asyncio.run(
-        runner.run_once(
-            [deployment], {"acct-1": FakeAdapter()}, now=BASE + timedelta(seconds=70)
-        )
-    )
-
-    assert len(sent) == 1
-
-
 def test_strategy_exit_cancels_working_entry_orders(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2600,3 +2559,49 @@ def test_lot_position_map_skipped_for_single_lot_symbols(
     assert adapter.resolver_calls == []
     assert len(sent) == 1
     assert sent[0].symbol == "N2"
+
+
+@pytest.mark.parametrize(
+    ("direction", "shift", "expected_multiplier"),
+    [
+        ("LONG", 0.0, 0.98),
+        ("SHORT", 0.0, 1.02),
+        ("LONG", 100.0, 0.98),
+        ("SHORT", 100.0, 1.02),
+    ],
+)
+def test_fallback_broker_stop_price_characterization(
+    tmp_path: Path, direction: str, shift: float, expected_multiplier: float
+) -> None:
+    """Pin the fallback broker stop this live call site submits (G03).
+
+    The stop is ``fallback_stop_pct`` of the entry close, below for a long and
+    above for a short, at more than one price level.
+    """
+
+    def strategy(df: pd.DataFrame, params: dict[str, Any]):
+        entries = pd.Series(False, index=df.index)
+        exits = pd.Series(False, index=df.index)
+        entries.iloc[-1] = True
+        indicators = _indicators(tp_price=[110.0] * 30, direction=[direction] * 30)
+        return entries, exits, indicators, []
+
+    frame = _bars()
+    frame[["open", "high", "low", "close"]] += shift
+    last_close = float(frame["close"].iloc[-1])
+    path = _strategy_file(tmp_path, META)
+    sent, submit = _collect()
+    runner = _runner(submit, path=path, module=_module_with(strategy))
+    deployment = _deployment(signal_config={"allow_short": True})
+
+    asyncio.run(
+        runner.run_once(
+            [deployment],
+            {"acct-1": FakeAdapter(frame)},
+            now=BASE + timedelta(seconds=70),
+        )
+    )
+
+    assert len(sent) == 1
+    assert sent[0].stop_loss == pytest.approx(last_close * expected_multiplier)
+    assert sent[0].metadata["internal_stop_source"] == "fallback_pct"

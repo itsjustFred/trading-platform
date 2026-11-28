@@ -119,6 +119,14 @@ extend-exclude = [
 ]
 
 [tool.ruff.lint]
+# PLC2701 (import-private-name) is still a preview rule in ruff 0.16.x, so it
+# cannot be enabled by `select` alone. `preview = true` lives here (lint
+# scope only - a top-level setting would also flip preview FORMATTER style)
+# and would normally enable EVERY preview rule in the selected families;
+# `explicit-preview-rules` narrows that to rules named by their exact code,
+# so only PLC2701 - selected explicitly below - is turned on. Verified: no
+# other selected family gains a preview rule this way.
+preview = true
 select = [
     "E", "F", "I", "W",
     # Bug-class rules only (no style families, no mass reformat). Each family
@@ -163,7 +171,17 @@ select = [
     "RUF046",  # `int()` around a value that is already an integer
     "RUF059",  # unpacked variable that is never used
     "S307",    # eval()
+    # PLC2701 (import-private-name) is a preview rule: it needs the top-level
+    # `preview = true` plus `explicit-preview-rules = true` above, which keeps
+    # every other preview rule off. tests/** is exempt via per-file-ignores:
+    # test doubles legitimately reach into private helpers.
+    "PLC2701",
 ]
+
+# `explicit-preview-rules`: with `preview = true`, only preview rules selected
+# by their exact code (here: PLC2701) are enabled; family prefixes like `B` or
+# `RUF` do not pull in their preview members.
+explicit-preview-rules = true
 
 # Families NOT enabled, and why each stays off rather than being fixed:
 #   UP   `datetime.timezone.utc` -> `datetime.UTC` is a 470-site pure rename whose
@@ -217,12 +235,16 @@ select = [
 # never shared across instances in a way that matters, and test subprocesses
 # are asserted on via returncode/output rather than check=True.
 "tests/*" = ["RUF012", "PLW1510"]
+# PLC2701 stays off in tests: doubles and fixtures legitimately import and
+# monkeypatch private helpers (the production-code ban is what the rule
+# enforces).
+"tests/**" = ["PLC2701"]
 
 [tool.mypy]
 python_version = "3.12"
 # Scope is deliberately narrow: the packages whose type errors can become a
 # wrong order. Widen by adding paths here, not by loosening the flags.
-files = ["risk", "live_runner", "shared/models.py", "shared/market_calendar.py", "signal_bots", "strategies"]
+files = ["risk", "live_runner", "shared/models.py", "shared/market_calendar.py", "shared/paths.py", "signal_bots", "strategies"]
 check_untyped_defs = true
 warn_unused_ignores = true
 no_implicit_optional = true
