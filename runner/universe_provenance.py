@@ -389,31 +389,34 @@ def observe_symbol_coverage(
     unreadable frame, or a source filter that matches nothing is reported as
     ``None`` — "unknown", never "listed later".
     """
-    from data_tools.auto_download import ohlcv_timestamp_bounds
-    from runner.engines import contract
+    from shared import ohlcv_store
 
     observations: dict[str, SymbolCoverage | None] = {}
     for symbol in _normalize_symbols(symbols):
-        try:
-            selected, _candidates = contract.select_ohlcv_path(
-                _data_root(data_dir), symbol, timeframe, data_source=data_source
-            )
-        except (ValueError, OSError):
+        entry = ohlcv_store.find_dataset(
+            _data_root(data_dir), symbol, timeframe, data_source=data_source
+        )
+        if entry is None:
             observations[symbol] = None
             continue
-        if selected is None:
+        segments = list(entry.segments) or [entry.path]
+        bounds: list[tuple[pd.Timestamp, pd.Timestamp]] = []
+        for segment in segments:
+            segment_bounds = ohlcv_store.timestamp_bounds(segment)
+            if segment_bounds is None:
+                bounds = []
+                break
+            bounds.append(segment_bounds)
+        if not bounds:
             observations[symbol] = None
             continue
-        bounds = ohlcv_timestamp_bounds(selected)
-        if bounds is None:
-            observations[symbol] = None
-            continue
-        first_bar, last_bar = bounds
+        first_bar = min(bound[0] for bound in bounds)
+        last_bar = max(bound[1] for bound in bounds)
         observations[symbol] = SymbolCoverage(
             symbol=symbol,
             first_bar=first_bar,
             last_bar=last_bar,
-            path=str(selected),
+            path=str(entry.path),
         )
     return observations
 

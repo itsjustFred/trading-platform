@@ -36,7 +36,6 @@ from runner.auto_agent import (  # noqa: F401 - re-exported for viewer/main.py a
     SUPPORTED_MODEL_NAMES,
     run_auto_agent,
 )
-from runner.engines import contract
 from runner.llm_providers import (  # noqa: F401 - re-exported for viewer/main.py and the API surface
     DEFAULT_LLM_PROVIDER_NAME,
     SUPPORTED_LLM_PROVIDER_NAMES,
@@ -48,6 +47,7 @@ from runner.optimizer import (
     run_optimization as execute_optimization,  # noqa: F401 - re-exported for viewer/main.py and the API surface
 )
 from runner.stats import compute_stats, compute_stats_for_result
+from shared import ohlcv_store
 from shared.constants import (
     DATA_DIR,
     LOG_DIR,
@@ -886,10 +886,13 @@ def ohlcv_asset_class(symbol: str, timeframe: str) -> str:
     if not matches or len(matches) > _OHLCV_MAX_MATCHES:
         return ""
     # ``_load_ohlcv_df`` merges every selected match, so the class is only
-    # well-defined when all of them agree on one asset class.
-    asset_classes = {
-        contract.ohlcv_path_metadata(path)["asset_class"] for path in matches
-    }
+    # well-defined when all of them agree on one asset class. The manifest
+    # layout resolves each stored path back to its dataset entry (#471);
+    # paths the store cannot resolve contribute "" like an unclassed path.
+    asset_classes = set()
+    for path in matches:
+        entry = ohlcv_store.entry_for_path(DATA_DIR, path)
+        asset_classes.add(entry.asset_class if entry is not None else "")
     if len(asset_classes) != 1:
         return ""
     return asset_classes.pop()

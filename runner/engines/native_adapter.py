@@ -26,6 +26,7 @@ from runner.engines.mtm_equity import (
     describe_basis,
 )
 from runner.slippage import BarSpreadSlippage
+from shared import ohlcv_store
 from shared.constants import DATA_DIR
 from shared.models import BacktestMeta, BacktestResult
 
@@ -59,31 +60,22 @@ def _signature_parameter_default(func: Any, name: str) -> Any:
     return parameter.default
 
 
-def _find_ohlcv_path(data_root: Path, symbol: str, timeframe: str) -> Path | None:
-    matches = sorted(
-        (data_root / "ohlcv").rglob(f"**/{symbol}/{timeframe}.parquet"),
-        key=lambda path: path.as_posix(),
+def load_ohlcv(
+    data_root: Path,
+    symbol: str,
+    timeframe: str,
+    start: str,
+    end: str,
+    *,
+    data_source: str = "",
+) -> pd.DataFrame | None:
+    entry = ohlcv_store.find_dataset(
+        data_root, symbol, timeframe, data_source=data_source
     )
-    return matches[0] if matches else None
-
-
-def load_ohlcv(data_root: Path, symbol: str, timeframe: str, start: str, end: str) -> pd.DataFrame | None:
-    match = _find_ohlcv_path(data_root, symbol, timeframe)
-    if match is None:
+    if entry is None:
         return None
-
-    df = pd.read_parquet(match)
-    df.columns = [str(col).lower() for col in df.columns]
-    df = contract.normalize_ohlcv_frame(df)
-    if "timestamp" not in df.columns:
-        return None
-
-    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
-    df = df.dropna(subset=["timestamp"]).sort_values("timestamp")
-    # Conformance (Cleanup 16-A): shared date-filter convention (F9) — a
-    # date-only end boundary is inclusive of the full day.
-    df = contract.apply_date_filter(df, start=start, end=end)
-    return df.reset_index(drop=True)
+    df = ohlcv_store.read_frame(entry, start=start, end=end)
+    return df if not df.empty else None
 
 
 def _is_finer(candidate: str, base: str) -> bool:
@@ -100,6 +92,8 @@ def _load_intrabar_data(
     modeling_resolution: str,
     start: str,
     end: str,
+    *,
+    data_source: str = "",
 ) -> pd.DataFrame | None:
     # Conformance (Cleanup 16-A, F8): resolve the spelling through the shared
     # resolver so native and vectorbt always agree on which intrabar frame a
@@ -108,7 +102,7 @@ def _load_intrabar_data(
     selected = contract.resolve_intrabar_timeframe(base_timeframe, modeling_resolution)
     if not selected:
         return None
-    return load_ohlcv(data_root, symbol, selected, start, end)
+    return load_ohlcv(data_root, symbol, selected, start, end, data_source=data_source)
 
 
 class NativeAdapter(EngineAdapter):
@@ -169,7 +163,10 @@ class NativeAdapter(EngineAdapter):
             # trading to start_date..end_date.
             warmup_raw = str(getattr(config, "warmup_start", "") or "").strip()
             load_start = warmup_raw or config.start_date
-            data = load_ohlcv(data_root, symbol, config.timeframe, load_start, config.end_date)
+            data = load_ohlcv(
+                data_root, symbol, config.timeframe, load_start, config.end_date,
+                data_source=config.data_source or "",
+            )
             if data is None or data.empty:
                 raise RuntimeError(
                     f"No OHLCV data for {symbol}/{config.timeframe} in "
@@ -197,18 +194,20 @@ class NativeAdapter(EngineAdapter):
                 config.modeling_resolution,
                 load_start,
                 config.end_date,
+                data_source=config.data_source or "",
             )
             if intrabar is not None and not intrabar.empty and config.modeling_resolution not in used_timeframes:
                 used_timeframes.append(config.modeling_resolution)
 
             symbol_config = config.model_copy(update={"symbols": [symbol], "parameters": resolved_parameters})
-            # #130: classify the instrument from the OHLCV layout
-            # (ohlcv/{source}/{asset_class}/...) so the slippage defaults
-            # apply per asset class; unclassifiable paths record "none".
-            match = _find_ohlcv_path(data_root, symbol, config.timeframe)
-            asset_class = (
-                contract.ohlcv_path_metadata(match)["asset_class"] if match else ""
+            # #130: classify the instrument from the manifest entry so the
+            # slippage defaults apply per asset class; unclassifiable
+            # datasets record "".
+            entry = ohlcv_store.find_dataset(
+                data_root, symbol, config.timeframe,
+                data_source=config.data_source or "",
             )
+            asset_class = entry.asset_class if entry is not None else ""
             engine = TradeEngine(
                 symbol_config,
                 symbol=symbol,

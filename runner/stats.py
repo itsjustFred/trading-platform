@@ -444,26 +444,26 @@ def book_asset_class(
 def _ohlcv_asset_class_for(
     data_dir: str, symbol: str, timeframe: str, data_source: str
 ) -> str | None:
-    """Asset class carried by the selected OHLCV parquet path.
+    """Asset class carried by the selected OHLCV dataset's manifest entry.
 
-    ``None`` means no candidate path resolved (try the next timeframe);
-    ``""`` means a path resolved but carries no class; any other value is
-    the ``ohlcv/{source}/{asset_class}/...`` layout's class segment. The
-    lookup walks the data tree, so it is cached — optimizer loops call this
-    once per trial per symbol. The cache is process-local: OHLCV downloaded
-    while a long-lived viewer/daemon process runs is not seen until restart.
+    ``None`` means no dataset resolved (try the next timeframe); ``""``
+    means a dataset resolved but carries no class; any other value is the
+    manifest's ``asset_class``. The lookup reads the source manifests, so
+    it is cached — optimizer loops call this once per trial per symbol.
+    The cache is process-local: OHLCV downloaded while a long-lived
+    viewer/daemon process runs is not seen until restart.
     """
-    from runner.engines.contract import ohlcv_path_metadata, select_ohlcv_path
+    from shared import ohlcv_store
 
     try:
-        path, _candidates = select_ohlcv_path(
+        entry = ohlcv_store.find_dataset(
             data_dir, symbol, timeframe, data_source=data_source
         )
     except Exception:
         return None
-    if path is None:
+    if entry is None:
         return None
-    return ohlcv_path_metadata(path).get("asset_class", "")
+    return entry.asset_class
 
 
 def _result_venue_context(result: BacktestResult) -> dict[str, Any]:

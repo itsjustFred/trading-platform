@@ -63,7 +63,7 @@ from live_runner.signal_archive import (
     utcnow_iso,
 )
 from live_runner.signal_sources.execution_timing import timeframe_seconds
-from runner.engines.contract import normalize_ohlcv_frame, select_ohlcv_path
+from shared import ohlcv_store
 from shared.atomic_io import write_text_atomically
 from shared.constants import DATA_DIR, normalize_timeframe
 from shared.logging import get_logger, route_console_logs_to_stderr
@@ -189,11 +189,14 @@ def _frame_for_signal(
     bar_seconds = timeframe_seconds(timeframe)
     if bar_seconds is None:
         return None, None, "unknown_timeframe"
-    path, _candidates = select_ohlcv_path(data_root, symbol, timeframe, data_source=data_source)
-    if path is None:
+    entry = ohlcv_store.find_dataset(
+        data_root, symbol, timeframe, data_source=data_source
+    )
+    if entry is None:
         return None, None, "no_ohlcv"
+    path = entry.path
     try:
-        frame = pd.read_parquet(path)
+        frame = ohlcv_store.read_frame(entry)
     except Exception as exc:  # except-kind: loop-survival
         logger.warning(
             "OHLCV parquet unreadable; signal skipped",
@@ -201,7 +204,6 @@ def _frame_for_signal(
         )
         return None, path, "ohlcv_unreadable"
     try:
-        frame = normalize_ohlcv_frame(frame)
         closed = _closed_bars(frame, signal_time, bar_seconds)
     except Exception as exc:  # except-kind: loop-survival
         # One malformed feed must not abort the whole archive pass; the
