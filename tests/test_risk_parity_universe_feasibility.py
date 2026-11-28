@@ -151,7 +151,7 @@ def test_backtest_script_clamps_bounds_before_the_solver(monkeypatch) -> None:
 
     solver_bounds: list[tuple[float, float]] = []
     projections: list[tuple[float, float]] = []
-    real_projection = script._project_to_capped_simplex
+    real_projection = script.project_to_capped_simplex
 
     def fake_minimize(*_args, **kwargs):
         solver_bounds.extend(kwargs["bounds"])
@@ -162,7 +162,7 @@ def test_backtest_script_clamps_bounds_before_the_solver(monkeypatch) -> None:
         return real_projection(values, lower=lower, upper=upper)
 
     monkeypatch.setattr(script, "minimize", fake_minimize)
-    monkeypatch.setattr(script, "_project_to_capped_simplex", spy_projection)
+    monkeypatch.setattr(script, "project_to_capped_simplex", spy_projection)
 
     weights = script.calculate_risk_parity_weights(np.eye(3), -0.25, 1.25, ["A", "B", "C"])
 

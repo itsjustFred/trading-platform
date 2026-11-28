@@ -13,12 +13,13 @@ import pytest
 from runner.engines import native_adapter
 from runner.engines.base import BacktestConfig, native_strategy_parameter_errors
 from runner.engines.native_adapter import NativeAdapter
+from tests.builders import make_backtest_config
 
 TRAILING_ERROR = "trailing stops are not modelled by the native engine"
 
 
 def _config(parameters: dict) -> BacktestConfig:
-    return BacktestConfig(
+    return make_backtest_config(
         strategy_name="trailing_check",
         symbols=["TEST"],
         timeframe="1d",
@@ -97,7 +98,7 @@ def test_native_run_rejects_use_trailing_sl_before_loading_data(tmp_path, monkey
     def fail_if_data_loaded(*args, **kwargs):
         raise AssertionError("market data must not load for a refused config")
 
-    monkeypatch.setattr(native_adapter, "_load_ohlcv", fail_if_data_loaded)
+    monkeypatch.setattr(native_adapter, "load_ohlcv", fail_if_data_loaded)
 
     with pytest.raises(ValueError, match=TRAILING_ERROR):
         NativeAdapter().run(_config({"use_trailing_sl": True}), str(strategy))
@@ -110,7 +111,7 @@ def test_native_run_rejects_strategy_metadata_default(tmp_path, monkeypatch):
     def fail_if_data_loaded(*args, **kwargs):
         raise AssertionError("market data must not load for a refused config")
 
-    monkeypatch.setattr(native_adapter, "_load_ohlcv", fail_if_data_loaded)
+    monkeypatch.setattr(native_adapter, "load_ohlcv", fail_if_data_loaded)
 
     with pytest.raises(ValueError, match=TRAILING_ERROR):
         NativeAdapter().run(_config({}), str(strategy))
@@ -131,7 +132,7 @@ def test_native_run_rejects_signature_default_true(tmp_path, monkeypatch):
     def fail_if_data_loaded(*args, **kwargs):
         raise AssertionError("market data must not load for a refused config")
 
-    monkeypatch.setattr(native_adapter, "_load_ohlcv", fail_if_data_loaded)
+    monkeypatch.setattr(native_adapter, "load_ohlcv", fail_if_data_loaded)
 
     with pytest.raises(ValueError, match=TRAILING_ERROR):
         NativeAdapter().run(_config({}), str(strategy))

@@ -17,6 +17,7 @@ import pytest
 from runner.engines.base import BacktestConfig
 from runner.engines.native_adapter import NativeAdapter
 from runner.engines.vectorbt_adapter import VectorbtAdapter
+from tests.builders import make_backtest_config
 
 STRATEGY_PATH = str(
     Path(__file__).resolve().parents[1] / "strategies" / "example_sma" / "example_sma.py"
@@ -72,7 +73,7 @@ def parity_data_dir(tmp_path_factory) -> Path:
 
 
 def _parity_config(data_dir: Path) -> BacktestConfig:
-    return BacktestConfig(risk_per_trade_pct=0.01,
+    return make_backtest_config(risk_per_trade_pct=0.01,
         strategy_name="example_sma",
         symbols=["PARITY"],
         timeframe="1h",

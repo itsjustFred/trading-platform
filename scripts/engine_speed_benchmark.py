@@ -2,7 +2,7 @@
 """Speed benchmark: native vs the vectorbt adapter on an optimizer-like workload.
 
 Phase-S deliverable for issue #318 (see
-``docs/adr/0001-native-single-strategy-engine.md``): times both engines over a
+``docs/adr/0002-native-single-strategy-engine.md``): times both engines over a
 grid of strategy-parameter cells — the shape of an optimizer sweep — and writes
 a JSON report. **Report only**: it asserts nothing about which engine is
 faster and changes no defaults; the numbers inform the phase-M go/no-go.
@@ -32,7 +32,7 @@ from typing import Any
 
 # --- import-origin guard ---
 # `shared` must resolve to this checkout, not the installed package. The mechanism lives in
-# scripts/_import_origin.py; only the invocation is per script. scripts/ goes on sys.path - never
+# scripts/import_origin.py; only the invocation is per script. scripts/ goes on sys.path - never
 # the repo root, which would repair `import shared` and defeat the guard - so a direct run is
 # refused (exit 2) instead of mutating another tree's schema. See
 # tests/test_script_import_origin.py; run as:
@@ -43,7 +43,7 @@ from pathlib import Path as _path
 _scripts_dir = str(_path(__file__).resolve().parent)
 if _scripts_dir not in _sys.path:
     _sys.path.insert(0, _scripts_dir)
-import _import_origin as _guard
+import import_origin as _guard
 
 _guard.ensure_own_checkout("engine_speed_benchmark")
 # --- end import-origin guard ---

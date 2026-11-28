@@ -1,7 +1,7 @@
 # Cross-Engine Backtest Contract
 
 > **Freeze notice (#318, 2026-11-21).** Per
-> `docs/adr/0001-native-single-strategy-engine.md`, `native` is the single
+> `docs/adr/0002-native-single-strategy-engine.md`, `native` is the single
 > strategy engine going forward. `vectorbt`, `pynecore` and the LEAN *run*
 > path are frozen (bug fixes only, no new features) and scheduled for
 > removal; LEAN becomes import-only. This contract will shrink to native +
@@ -89,7 +89,7 @@ parent Cleanup 16 record.
   its `exit_order_type="level"` signal exits do honour gap → open, §2). PyneCore
   is frozen: its `_normalize_trade_exits` containment restates a
   level-violating leg to the recorded level only — no gap→open restatement
-  (frozen engines get fail-loud guards only, ADR 0001).
+  (frozen engines get fail-loud guards only, ADR 0002).
   SHORT exits buy the ask, so native adds the spread on top of the open on a
   gap fill exactly as on a level fill. A gap fill is a market fill, so a SHORT
   target gapped by less than the spread fills at `open + spread`, which can be
@@ -234,7 +234,7 @@ under `next_open` (e.g. `intraday_volatility_breakout` 1.2.0). `BacktestConfig`
 validation rejects `open` with a `ValueError` carrying that migration message
 (`contract.normalize_signal_exit_fill`).
 
-Per engine (ADR `docs/adr/0001-native-single-strategy-engine.md` — only native
+Per engine (ADR `docs/adr/0002-native-single-strategy-engine.md` — only native
 is under active development):
 
 - native: the exit signal is parked and executed at the next bar's open inside
@@ -588,7 +588,7 @@ persisted `equity_curve`, so that curve must show the paper PnL of open
 positions. **The native engine persists a mark-to-market (MTM) portfolio
 curve** (`runner/engines/mtm_equity.py`, single- and multi-symbol). The frozen
 vectorbt / pynecore / signal-replay adapters keep their realized-only curves
-until they are removed (ADR `docs/adr/0001-native-single-strategy-engine.md`),
+until they are removed (ADR `docs/adr/0002-native-single-strategy-engine.md`),
 so cross-engine stat comparisons must account for the different curve basis:
 
 - one observation per bar of the traded symbols plus every entry / exit-leg
@@ -635,17 +635,13 @@ behavior**, not a bug to be fixed by silently changing one engine:
 |---|---|---|
 | native | next-bar-open | Signal on bar *N* — entry **and** market signal exit — fills at bar *N+1* open (2026-11-13); protective exits evaluated per bar, filling at the level on a touch and at the open on a gap. `exit_order_type="level"` exits fill at their level on the signal bar (§2). |
 | vectorbt (frozen) | next-bar-open entries / signal-bar-close exits | Entries fill at bar *N+1* open; signal exits keep the legacy trigger-bar `close` fill — `next_open` is refused outright and the `open` mode was removed (§2). Protective exits fill at the level on a touch and at the open on a gap-through-level (§2); frozen otherwise. |
-| signal-replay | same-bar-close | External signal payloads fill at the signal bar's close (entries and signal exits alike); slippage/delay recorded in `trade.meta`. Protective exits fill at the level on a touch and at the open on a gap. The `supertrend_flip` leg is the exception: it fills at the next bar's open (see below). |
+| signal-replay | same-bar-close | External signal payloads fill at the signal bar's close (entries and signal exits alike); slippage/delay recorded in `trade.meta`. Protective exits fill at the level on a touch and at the open on a gap. |
 | pynecore | post-hoc restatement | Pine execution produces exit prices that are then *recontained* to the recorded protective levels. |
 
-**`supertrend_flip` exit (signal-replay, #168).** The flip leg is a signal exit
-decided at the close of the first red bar after activation and filled at the
-OPEN of the next bar, so a flip on the last bar closes as `end_of_data` at that
-bar's close. This is the only replay *signal* exit that is not a level fill and
-not a same-bar-close fill (the level exits themselves can fill at the open on a
-gap — see the §1 gap rule below). The run-level `signal_exit_fill` stays `close` for replay
-(the replay has no `open` model); each flip trade records
-`meta["supertrend_flip"]["flip_exit_fill"] = "next_bar_open"`.
+The `supertrend_flip` workflow was removed (2026-11-26): the replay leg that
+filled at the next bar's open is gone along with the live workflow. A
+`trailing_mode: supertrend_flip` signal is refused before it reaches the
+replay engine.
 
 The workflow's level exits — the stop before and after TP1, and the TP1
 tranche — follow the §1 gap rule (#287): a bar

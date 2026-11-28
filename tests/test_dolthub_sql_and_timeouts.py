@@ -93,13 +93,59 @@ class TestSqlBuilders:
         query = captured["cmd"][captured["cmd"].index("-q") + 1]
         assert query == "SELECT DISTINCT act_symbol FROM `ohlcv`"
 
-    def test_no_raw_interpolated_sql_in_manager_source(self) -> None:
-        """Guard against regression to f-string SQL in dolthub_manager."""
-        import inspect
+    def test_export_symbol_csv_sends_the_escaped_select_to_dolt(
+        self, monkeypatch, tmp_path: Path
+    ) -> None:
+        """The per-symbol export must hand dolt the builder's escaped SQL.
 
-        source = inspect.getsource(dm)
-        assert "FROM {table_name}" not in source
-        assert "act_symbol='" not in source
+        A raw f-string at the call site is invisible to a source scan that only
+        knows two old spellings; capturing the actual ``-q`` argument catches
+        any spelling (DV-B27).
+        """
+        captured: dict[str, object] = {}
+
+        def fake_run_dolt(cmd, **kwargs):
+            captured["cmd"] = cmd
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        monkeypatch.setattr(dm, "run_dolt", fake_run_dolt)
+        dm._export_symbol_csv(tmp_path, "we`ird", "AAPL", tmp_path, tmp_path / "o.parquet")
+
+        query = captured["cmd"][captured["cmd"].index("-q") + 1]
+        assert query == build_ohlcv_select("we`ird", "AAPL")
+        assert "`we``ird`" in query
+        assert "'AAPL'" in query
+
+    def test_export_data_stocks_loop_sends_the_escaped_select_to_dolt(
+        self, monkeypatch, tmp_path: Path
+    ) -> None:
+        """The second per-symbol call site inside ``export_data`` must hand
+        dolt the same escaped builder SQL — a raw f-string there is equally
+        invisible to a source scan (DV-B27)."""
+        dolt_dir = tmp_path / "dolthub"
+        stocks_repo = dolt_dir / "stocks"
+        (stocks_repo / dm.DOLT_METADATA_DIR).mkdir(parents=True)
+        captured: dict[str, object] = {}
+
+        def fake_run_dolt(cmd, **kwargs):
+            captured.setdefault("queries", []).append(cmd)
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        monkeypatch.setattr(dm, "DOLT_DIR", dolt_dir)
+        monkeypatch.setattr(dm, "EXPORT_DIR", tmp_path / "export")
+        monkeypatch.setattr(dm, "run_dolt", fake_run_dolt)
+        monkeypatch.setattr(dm, "_list_tables", lambda repo: ["we`ird"])
+        monkeypatch.setattr(dm, "_list_symbols", lambda repo, table: ["AAPL"])
+
+        dm.export_data()
+
+        queries = [
+            cmd[cmd.index("-q") + 1]
+            for cmd in captured["queries"]
+            if "-q" in cmd
+        ]
+        ohlcv_queries = [q for q in queries if "act_symbol" in q]
+        assert ohlcv_queries == [build_ohlcv_select("we`ird", "AAPL")]
 
 
 class TestDolthubDownloaderSql:

@@ -28,6 +28,7 @@ import pytest
 from live_runner.ctrader_adapter import CTraderLiveAdapter
 from risk.models import TradeSignal
 from shared.models import LiveDeploymentConfig, LiveExecution, LiveSignal
+from tests.builders import make_live_deployment, make_live_signal
 from tests.conftest import seed_live_deployments
 
 T0 = datetime(2026, 7, 15, 10, 0, 0, tzinfo=timezone.utc)
@@ -46,7 +47,7 @@ def database(isolated_db):
 
 
 def _persist_signal(database, *, deployment_id: str = DEP_1, broker_order_id: str = "") -> str:
-    signal = LiveSignal(
+    signal = make_live_signal(
         deployment_id=deployment_id,
         symbol="EURUSD",
         action="buy",
@@ -376,7 +377,7 @@ def test_alpaca_execution_id_is_still_the_preferred_key(monkeypatch) -> None:
 
 
 def _deployment(deployment_id: str = DEP_1) -> LiveDeploymentConfig:
-    return LiveDeploymentConfig(
+    return make_live_deployment(
         id=deployment_id,
         strategy_name="demo",
         account_id="fixture-account",
@@ -396,7 +397,7 @@ def _live_signal(
     entry: float = 1.1,
     stamp: Any = "2026-07-15T10:00:00+00:00",
 ) -> LiveSignal:
-    from live_runner.daemon import _trade_signal_to_live_signal
+    from live_runner.daemon import trade_signal_to_live_signal
 
     trade = TradeSignal(
         action=action,
@@ -407,7 +408,7 @@ def _live_signal(
         timeframe="1h",
         metadata={"signal_timestamp": stamp},
     )
-    return _trade_signal_to_live_signal(trade, _deployment(deployment_id))
+    return trade_signal_to_live_signal(trade, _deployment(deployment_id))
 
 
 def test_c18_safe_entry_exit_reentry_with_new_producer_stamps_are_three_signals(database) -> None:
@@ -433,7 +434,7 @@ def test_c18_safe_same_event_in_two_deployments_is_two_signals(database) -> None
 
 def test_c18_safe_every_keyed_field_separates_signals() -> None:
     """SAFE: price, action, SL/TP, timeframe and stamp each change the key."""
-    from live_runner.daemon import _trade_signal_to_live_signal
+    from live_runner.daemon import trade_signal_to_live_signal
 
     def _key(**override: Any) -> str:
         fields: dict[str, Any] = dict(
@@ -446,7 +447,7 @@ def test_c18_safe_every_keyed_field_separates_signals() -> None:
             metadata={"signal_timestamp": "2026-07-15T10:00:00+00:00"},
         )
         fields.update(override)
-        live = _trade_signal_to_live_signal(TradeSignal(**fields), _deployment())
+        live = trade_signal_to_live_signal(TradeSignal(**fields), _deployment())
         return str(live.metadata["idempotency_key"])
 
     keys = {
@@ -496,7 +497,7 @@ def test_c18_distinct_instants_are_not_merged_by_stamp_normalisation() -> None:
 
 def test_c18_symbol_case_variant_is_one_key() -> None:
     """A redelivery spelling the symbol in another case is the same producer event."""
-    from live_runner.daemon import _trade_signal_to_live_signal
+    from live_runner.daemon import trade_signal_to_live_signal
 
     keys = set()
     for symbol in ("EURUSD", "Eurusd", "eurusd"):
@@ -509,7 +510,7 @@ def test_c18_symbol_case_variant_is_one_key() -> None:
             timeframe="1h",
             metadata={"signal_timestamp": "2026-07-15T10:00:00+00:00"},
         )
-        keys.add(_trade_signal_to_live_signal(trade, _deployment()).metadata["idempotency_key"])
+        keys.add(trade_signal_to_live_signal(trade, _deployment()).metadata["idempotency_key"])
     assert len(keys) == 1, keys
 
 

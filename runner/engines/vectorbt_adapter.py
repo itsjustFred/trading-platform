@@ -19,7 +19,6 @@ import math
 import traceback
 from collections.abc import Mapping
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, TypedDict
@@ -33,12 +32,8 @@ from runner.engines._indicator_series import _build_indicator_series
 from runner.engines._shared import (
     resolve_ask_high_low,
     resolve_bar_spread,
-)
-from runner.engines._shared import (
-    resolve_max_leverage as _resolve_max_leverage,
-)
-from runner.engines._shared import (
-    resolve_max_position_exposure_pct as _resolve_max_position_exposure_pct,
+    resolve_max_leverage,
+    resolve_max_position_exposure_pct,
 )
 from runner.engines._shared import (
     serialize_meta_value as _shared_serialize_meta_value,
@@ -197,10 +192,10 @@ def _size_trade(
 
     if config.risk_per_trade_pct is not None and config.risk_per_trade_pct > 0:
         sizing_mode = "risk_pct"
-        max_position_exposure_pct = _resolve_max_position_exposure_pct(
+        max_position_exposure_pct = resolve_max_position_exposure_pct(
             config.max_position_exposure_pct, asset_class
         )
-        max_leverage = _resolve_max_leverage(config.max_leverage)
+        max_leverage = resolve_max_leverage(config.max_leverage)
         # D10/16-E (F7/F35): max_position_exposure_pct is the per-position
         # notional cap; it is an INDEPENDENT cap, not an implicit leverage
         # floor — a conservative max_leverage < max_position_exposure_pct is
@@ -810,7 +805,7 @@ def _process_symbol(
 def _frozen_signal_exit_fill(config: BacktestConfig) -> BacktestConfig:
     """Refuse the native-only ``next_open`` exit model on this frozen adapter.
 
-    ADR ``docs/adr/0001-native-single-strategy-engine.md``: frozen engines
+    ADR ``docs/adr/0002-native-single-strategy-engine.md``: frozen engines
     keep their existing semantics until removal and get fail-loud guards, not
     silent re-interpretation. ``next_open`` is the native default, so a
     ``BacktestConfig`` that never touched the field would otherwise simulate
@@ -830,9 +825,6 @@ def _frozen_signal_exit_fill(config: BacktestConfig) -> BacktestConfig:
             "signal_exit_fill='close' explicitly, or run the native engine"
         )
     return config
-
-
-@dataclass
 
 
 class VectorbtAdapter(EngineAdapter):
@@ -1269,6 +1261,31 @@ def _exit_order_type_at(
     return order_type, invalid
 
 
+#: Signal keys this adapter executes natively (``require_explicit_roles``
+#: allowlist in :func:`_prepare_next_open_execution_data`). The subset other
+#: engines ignore lives in ``shared.strategy_registry.VECTORBT_ONLY_SIGNAL_KEYS``
+#: — the matrix queue excludes strategies emitting them off vectorbt (#318).
+#: ``tests/test_strategy_registry_static.py`` pins the two sets together, so a
+#: new execution key must be registered there (or justified as shared) or CI
+#: fails.
+_EXECUTION_SIGNAL_KEYS = frozenset(
+    {
+        "entries",
+        "exits",
+        "stop_loss",
+        "sl_price",
+        "take_profit",
+        "tp_price",
+        "atr",
+        "direction",
+        "entry_stop",
+        "exit_price",
+        "exit_reason",
+        "exit_order_type",
+    }
+)
+
+
 def _prepare_next_open_execution_data(
     signals: pd.DataFrame,
     indicators: IndicatorMap,
@@ -1288,20 +1305,12 @@ def _prepare_next_open_execution_data(
     """
     roles = dict(explicit_roles or {})
     if require_explicit_roles:
-        canonical = {
-            "entries",
-            "exits",
-            "stop_loss",
-            "sl_price",
-            "take_profit",
-            "tp_price",
-            "atr",
-            "direction",
-            "entry_stop",
-            "exit_price",
-            "exit_reason",
-            "exit_order_type",
-        }
+        # Signal keys this adapter executes but other engines ignore live in
+        # ``shared.strategy_registry.VECTORBT_ONLY_SIGNAL_KEYS`` — the matrix
+        # queue excludes strategies emitting them off vectorbt (#318). When a
+        # new execution key is added to ``_EXECUTION_SIGNAL_KEYS``, register it
+        # there too; the registry test pins the two sets together.
+        canonical = _EXECUTION_SIGNAL_KEYS
         for column in signals.columns:
             if str(column).lower() not in canonical and str(column) not in roles:
                 raise ValueError(
@@ -1405,8 +1414,8 @@ def _indicator_meta_key(name: str) -> str:
 #: Protective-level aliases in canonical-first order (#237). A strategy that
 #: publishes both spellings of one level must resolve identically in every
 #: engine, so the winner can never depend on the indicators dict's insertion
-#: order. The order is the one ``risk.live._LIVE_SL_KEYS``/``_LIVE_TP_KEYS``
-#: and the native ``TradeEngine._extract_levels`` use.
+#: order. The order is the one ``risk.signal_levels.SL_METADATA_KEYS``/
+#: ``TP_METADATA_KEYS`` and the native ``TradeEngine._extract_levels`` use.
 _LEVEL_ALIASES: dict[str, tuple[str, ...]] = {
     "sizing_stop": ("sizing_stop", "sizing_sl_price", "sizing_sl"),
     "stop_loss": ("stop_loss", "sl_price"),
@@ -1589,7 +1598,7 @@ def _resolve_exit_price(
     direction: str | None = None,
     gap_open: bool = False,
 ) -> float:
-    # Frozen engine (ADR 0001): signal exits stay on the trigger bar (see
+    # Frozen engine (ADR 0002): signal exits stay on the trigger bar (see
     # _prepare_next_open_execution_data) and fill at its close — the frozen
     # adapter refuses ``next_open`` upstream and the lookahead-prone ``open``
     # mode was removed (issue #153). Stop/TP
@@ -1998,15 +2007,15 @@ def _extract_trade_meta(
 
 
 def _resolve_max_position_pct(explicit: float | None, asset_class: str) -> float:
-    """Deprecated alias of :func:`_resolve_max_position_exposure_pct` (16-E rename)."""
+    """Deprecated alias of :func:`resolve_max_position_exposure_pct` (16-E rename)."""
     import warnings
 
     warnings.warn(
-        "_resolve_max_position_pct is deprecated; use _resolve_max_position_exposure_pct",
+        "_resolve_max_position_pct is deprecated; use resolve_max_position_exposure_pct",
         DeprecationWarning,
         stacklevel=2,
     )
-    return _resolve_max_position_exposure_pct(explicit, asset_class)
+    return resolve_max_position_exposure_pct(explicit, asset_class)
 
 
 def _serialize_meta_value(value: Any) -> Any | None:

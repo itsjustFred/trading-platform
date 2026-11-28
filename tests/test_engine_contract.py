@@ -67,6 +67,7 @@ from runner.engines.signal_replay_adapter import (
 from runner.engines.vectorbt_adapter import VectorbtAdapter
 from runner.stats import compute_stats
 from shared.models import VALID_TIMEFRAMES, Trade, TradeExit
+from tests.conftest import sandboxed_env
 from tests.helpers import with_zero_fees
 
 # ─── Shared fixture builders ─────────────────────────────────────────────────
@@ -1274,7 +1275,12 @@ def main(
         workdir.mkdir(exist_ok=True)
         trade_csv = tmp_path / "trades.csv"
         stats_csv = tmp_path / "stats.csv"
-        pyne_bin = shutil.which("pyne") or str(Path(sys.executable).parent / "pyne")
+        # The interpreter's own console script first, PATH second: the child runs with the
+        # sandboxed environment, whose HOME is the session directory, so a user-site install
+        # cannot resolve its packages - and the venv is the dependency set under test.
+        pyne_bin = str(Path(sys.executable).parent / "pyne")
+        if not Path(pyne_bin).exists():
+            pyne_bin = shutil.which("pyne") or pyne_bin
         cmd = [
             pyne_bin,
             "--workdir",
@@ -1291,7 +1297,9 @@ def main(
             "--strat",
             str(stats_csv),
         ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=300, env=sandboxed_env()
+        )
         if result.returncode != 0:
             pytest.fail(f"pyne CLI failed: {result.stderr[-500:]}")
         return trade_csv
@@ -1695,10 +1703,9 @@ def test_intrabar_resolution_equal_to_base_resolves_to_none():
 class TestProtectiveExitGapHelpers:
     """``level_gapped_at_open`` / ``level_fill_price`` / ``resolve_protective_exit``.
 
-    The replay flip workflow (#364) routes its stop/TP1 checks through these;
-    #208 ports the same helpers to the native engine, so they are pinned here
-    directly — including the SHORT mirror the flip tests cannot reach
-    (``test_flip_workflow_is_long_only``).
+    Both replay engines route their stop/TP checks through these; #208 ports
+    the same helpers to the native engine, so they are pinned here directly —
+    including the SHORT mirror the signal-replay tests cannot reach.
     """
 
     def test_long_stop_gap_and_tp_gap_at_the_open(self):

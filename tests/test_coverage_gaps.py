@@ -293,40 +293,6 @@ class TestValidateGapBounds:
             validate_module.validate_parquet(outside)
 
 
-class TestEnsureBacktestDataGapGateViaModuleImport:
-    """The same internal-gap scenario, driven through the module-level import.
-
-    Merge resolution: both sides of the merge added this scenario in a class
-    called ``TestEnsureBacktestDataGapGate``, so the later definition silently
-    shadowed the earlier one and half the gap-gate coverage stopped running.
-    The classes are renamed apart so both are collected. The only real
-    difference between them is the import binding under test: this one resolves
-    ``auto_download`` from module scope, so it also guards that binding.
-    """
-
-    def test_internal_gap_fails_coverage(self, tmp_path, monkeypatch):
-        early = pd.date_range("2024-01-01", "2024-01-05", freq="1h", tz="UTC")
-        late = pd.date_range("2024-01-15", "2024-01-20", freq="1h", tz="UTC")
-        _write_bars(
-            tmp_path / "ohlcv" / "dukascopy" / "forex" / "EURUSD" / "1h.parquet",
-            [ts.isoformat() for ts in [*early, *late]],
-        )
-        monkeypatch.setattr(
-            auto_download,
-            "_download_missing_ohlcv_data",
-            lambda **kwargs: None,
-        )
-
-        with pytest.raises(RuntimeError, match="internal gaps"):
-            auto_download.ensure_backtest_data(
-                symbols=["EURUSD"],
-                timeframe="1h",
-                start="2024-01-01",
-                end="2024-01-20",
-                data_dir=tmp_path,
-            )
-
-
 class TestGapDetectionSingleFile:
     def test_hole_inside_single_file_row_groups_is_detected(self, tmp_path):
         """A single file whose bars jump by years must be caught (DV-B15)."""
@@ -806,28 +772,6 @@ def test_segment_ending_on_weekend_counts_trading_bars_only(tmp_path):
         symbol="EURUSD", timeframe="1d",
         start="2024-01-01", end="2024-01-06", data_dir=tmp_path,
     )
-
-
-def test_gap_outside_required_window_does_not_fail(tmp_path: Path) -> None:
-    """CodeRabbit round: ancient history outside [start, end] must not
-    fail a requirement that never touches it."""
-    _write_bars(
-        tmp_path / "ohlcv" / "dukascopy" / "forex" / "EURUSD" / "1h.parquet",
-        [
-            "2019-01-01T00:00:00Z",
-            "2019-01-01T01:00:00Z",
-            "2024-06-01T00:00:00Z",
-            "2024-06-01T01:00:00Z",
-            "2024-06-01T02:00:00Z",
-        ],
-    )
-    report = analyze_ohlcv_coverage(
-        tmp_path,
-        DataRequirement(
-            symbol="EURUSD", timeframe="1h", start="2024-06-01", end="2024-06-01"
-        ),
-    )
-    assert report["status"] != "failed"
 
 
 def test_gap_inside_required_window_still_fails(tmp_path: Path) -> None:

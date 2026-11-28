@@ -5,11 +5,6 @@ from unittest.mock import MagicMock, patch
 from scheduler.jobs.signal_bot_health_check import run
 
 
-def test_signal_bot_health_check_job_imports() -> None:
-    """Test that the scheduler job module imports correctly."""
-    assert callable(run)
-
-
 def test_signal_bot_health_check_job_runs_successfully() -> None:
     """Test that the scheduler job runs without error when signal bots are healthy."""
     async def _run_test():

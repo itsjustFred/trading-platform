@@ -13,10 +13,10 @@ from pathlib import Path
 from typing import Any
 
 from live_runner.alpaca_adapter import (
-    _alpaca_acc_indexes,
-    _alpaca_credential_block,
-    _alpaca_credential_blocks,
-    _default_alpaca_credentials,
+    alpaca_acc_indexes,
+    alpaca_credential_block,
+    alpaca_credential_blocks,
+    default_alpaca_credentials,
 )
 from live_runner.base_adapter import money_digits_from_trader, money_scale
 from live_runner.credential_env import load_accounts_env_values, resolve_accounts_env_path
@@ -237,13 +237,13 @@ def _iter_alpaca_credentials(env: dict[str, str]) -> list[dict[str, Any]]:
             "secret_key": str(block["secret_key"]),
             "paper": bool(block["paper"]),
         }
-        for block in _alpaca_credential_blocks(env, _alpaca_acc_indexes(env))
+        for block in alpaca_credential_blocks(env, alpaca_acc_indexes(env))
     )
 
     if indexed:
         return indexed
 
-    default_credentials = _default_alpaca_credentials(env)
+    default_credentials = default_alpaca_credentials(env)
     if default_credentials is None:
         return []
     api_key, secret_key, paper = default_credentials
@@ -262,9 +262,9 @@ def _iter_alpaca_credentials_safe(env: dict[str, str]) -> list[dict[str, Any]]:
     typo'd ALPACA_PAPER_ACC{N}) skips that block instead of aborting the whole
     discovery run, which would also drop accounts from the other broker."""
     blocks: list[dict[str, Any]] = []
-    for idx in _alpaca_acc_indexes(env):
+    for idx in alpaca_acc_indexes(env):
         try:
-            block = _alpaca_credential_block(env, idx)
+            block = alpaca_credential_block(env, idx)
         except ValueError as exc:
             logger.warning(
                 "Skipping malformed Alpaca credential block during discovery",
@@ -286,7 +286,7 @@ def _iter_alpaca_credentials_safe(env: dict[str, str]) -> list[dict[str, Any]]:
         return blocks
 
     try:
-        default_credentials = _default_alpaca_credentials(env)
+        default_credentials = default_alpaca_credentials(env)
     except ValueError as exc:
         logger.warning(
             "Skipping malformed default Alpaca credentials during discovery",

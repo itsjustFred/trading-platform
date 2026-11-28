@@ -2,15 +2,12 @@
 Unit + Integration tests for Intraday Volatility Breakout strategy.
 """
 
-import sys
 from datetime import timedelta
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import pytest
-
-sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from runner.engines.vectorbt_adapter import _normalize_signal_output
 
@@ -741,12 +738,12 @@ def test_exit_signals_never_depend_on_later_bars(freq):
 
 def _run_engine(frame, mod, params, signal_exit_fill):
     from runner.engine import TradeEngine
-    from runner.engines.base import BacktestConfig
+    from tests.builders import make_backtest_config
 
     def strategy_fn(df, _params):
         return mod.generate_signals(df, params)
 
-    config = BacktestConfig(
+    config = make_backtest_config(
         strategy_name="ivb-exit-fill",
         symbols=["T"],
         timeframe="1m",

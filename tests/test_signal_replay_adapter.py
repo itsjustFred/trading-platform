@@ -109,10 +109,9 @@ def _run_replay(signals: list[ReplaySignal]):
     )
 
 
-def test_replay_executes_supertrend_flip() -> None:
-    """#168 (decided change of the #150 rejection): replay now executes
-    supertrend_flip instead of rejecting it. The workflow itself is covered
-    in ``tests/test_replay_supertrend_flip.py``."""
+def test_replay_rejects_removed_supertrend_flip() -> None:
+    """The workflow is removed: a complete flip config is refused at signal
+    time with a "removed" message — never executed, never silently untrailed."""
     signal = ReplaySignal.from_payload(
         {
             "timestamp": "2026-01-01T00:00:00Z",
@@ -135,19 +134,8 @@ def test_replay_executes_supertrend_flip() -> None:
         },
         default_timeframe="1m",
     )
-    adapter = SignalReplayAdapter(fee_params={"fees": "zero"}, slippage_params={"slippage": "none"}, default_timeframe="1m")
-    result = adapter.run(
-        signals=[signal],
-        ohlcv_by_symbol={"AAPL": _one_bar_frame()},
-        timeframe="1m",
-        backtest_start="2026-01-01",
-        backtest_end="2026-01-01",
-    )
-    assert len(result.trades) == 1
-    trade = result.trades[0]
-    assert trade.exits[0].reason == "tp1"
-    assert trade.exits[0].price == 102.0
-    assert trade.meta["supertrend_flip"]["tp1_time"] is not None
+    with pytest.raises(ValueError, match="removed"):
+        _run_replay([signal])
 
 
 def test_replay_rejects_supertrend_flip_without_its_parameters() -> None:
@@ -626,3 +614,8 @@ def test_replay_fallback_stop_entry_bounded_by_leverage(
     )
     assert len(result.trades) == 1
     assert result.trades[0].quantity == pytest.approx(expected_notional / 100.5, rel=0.01)
+    # The stopless signal keeps the engine-resolved fallback stop (ATR 0.05 ×
+    # 2.0 = 0.1 below the 100.0 fill) on the opened position. Reading the
+    # signal back instead would leave the position unprotected (G03).
+    assert result.trades[0].meta["signal_stop_loss"] == pytest.approx(99.9)
+    assert result.trades[0].meta["final_stop_loss"] == pytest.approx(99.9)

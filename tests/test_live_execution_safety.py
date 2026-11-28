@@ -110,17 +110,22 @@ def test_fallback_stop_is_below_entry_for_buys_and_above_for_sells():
         action="sell", symbol="AAPL", entry_price=100.0, stop_loss=None,
         take_profit=None, timeframe="1h", metadata={"atr": 1.5},
     )
-    _engine().calculate_position_size(
+    sized_buy = _engine().calculate_position_size(
         signal=buy, account_balance=10_000.0, pip_value=1.0, current_exposure=0.0
     )
-    _engine().calculate_position_size(
+    sized_sell = _engine().calculate_position_size(
         signal=sell, account_balance=10_000.0, pip_value=1.0, current_exposure=0.0
     )
 
-    assert buy.stop_loss is not None, "the long leg must carry a stop loss"
-    assert buy.stop_loss < buy.entry_price, "a long stop must sit below entry"
-    assert sell.stop_loss is not None, "the short leg must carry a stop loss"
-    assert sell.stop_loss > sell.entry_price, "a short stop must sit above entry"
+    long_stop = sized_buy.resolved_stop_loss
+    short_stop = sized_sell.resolved_stop_loss
+    assert long_stop is not None, "the long leg must carry a stop loss"
+    assert long_stop < buy.entry_price, "a long stop must sit below entry"
+    assert short_stop is not None, "the short leg must carry a stop loss"
+    assert short_stop > sell.entry_price, "a short stop must sit above entry"
+    # The resolved stop is returned, not written back onto the signal.
+    assert buy.stop_loss is None
+    assert sell.stop_loss is None
 
 
 def test_fallback_stop_without_atr_is_percent_of_price():
@@ -138,7 +143,8 @@ def test_fallback_stop_without_atr_is_percent_of_price():
     )
 
     expected_distance = 100_000.0 * 0.02
-    assert signal.stop_loss == pytest.approx(100_000.0 - expected_distance)
+    assert sized.resolved_stop_loss == pytest.approx(100_000.0 - expected_distance)
+    assert signal.stop_loss is None
     # risk_amount (1% of 10k) = 100; the 20% notional cap (2000 / 100k entry)
     # binds at 0.02 units — far below the uncapped 0.05, not hundreds of BTC.
     assert sized.position_size == pytest.approx(0.02)
@@ -4485,7 +4491,7 @@ def test_exit_only_orders_close_short_positions_with_a_buy(monkeypatch):
 def test_trade_signal_conversion_rejects_unknown_action_instead_of_selling():
     """The daemon-side conversion site must whitelist, not default: an action
     outside {buy, long, sell, short} is rejected rather than mapped to SELL."""
-    from live_runner.daemon import _trade_signal_to_live_signal
+    from live_runner.daemon import trade_signal_to_live_signal
 
     deployment = _deployment()
     base = TradeSignal(
@@ -4505,15 +4511,15 @@ def test_trade_signal_conversion_rejects_unknown_action_instead_of_selling():
         object.__setattr__(close, field_name, value)
 
     with pytest.raises(ValueError, match=r"Unsupported (signal )?action"):
-        _trade_signal_to_live_signal(close, deployment)
+        trade_signal_to_live_signal(close, deployment)
 
-    converted = _trade_signal_to_live_signal(base, deployment)
+    converted = trade_signal_to_live_signal(base, deployment)
     assert converted.action == "sell"
 
 
 def test_conversion_mints_key_only_with_producer_stamp():
     """CodeRabbit round: timestamp-less signals must not share a minted key."""
-    from live_runner.daemon import _trade_signal_to_live_signal
+    from live_runner.daemon import trade_signal_to_live_signal
 
     deployment = _deployment()
 
@@ -4528,13 +4534,13 @@ def test_conversion_mints_key_only_with_producer_stamp():
             metadata=metadata,
         )
 
-    naked = _trade_signal_to_live_signal(_signal({}), deployment)
+    naked = trade_signal_to_live_signal(_signal({}), deployment)
     assert "idempotency_key" not in naked.metadata
 
-    stamped = _trade_signal_to_live_signal(
+    stamped = trade_signal_to_live_signal(
         _signal({"signal_timestamp": "2026-07-15T10:00:00+00:00"}), deployment
     )
-    restamped = _trade_signal_to_live_signal(
+    restamped = trade_signal_to_live_signal(
         _signal({"signal_timestamp": "2026-07-15T10:00:00+00:00"}), deployment
     )
     assert stamped.metadata["idempotency_key"]

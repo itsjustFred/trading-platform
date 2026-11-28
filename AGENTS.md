@@ -1,7 +1,7 @@
 # AGENTS.md
 
 This repo executes live trades as well as critical backtests and has a very high standard for correctness, reliability, clarity, maintainability and testing.
-Keep scripts and paths portable across Linux, Windows and macOS.
+Production and CI run on Linux only; Windows is used only for MT5 backtests, so scripts need not be Windows/macOS-portable — Windows-specific code is kept only where the MT5 backtest path needs it.
 When creating an issue or PR, mention model as well as harness at the bottom of its body. If using t3code, include that as well, but don't leave out original harness.
 Unless explicitly told, never push directly to main.
 Use conventional commit style messages unless not appropriate.
@@ -11,8 +11,8 @@ If making changes, also check if you need to update other things such as docs, s
 
 Do NOT weaken, remove, bypass or rewrite a test just to achieve a passing result, instead fix the underlying problem. Change tests only when the task changes or you can independently identify that the test is wrong.
 Bug fixes start with a test that fails on the unfixed code; say in the PR that it failed before the fix. New behaviour on the money path (`live_runner`, `risk`, the backtest engines, sizing) is written test-first: the test lands in the same PR and fails without the change.
-Install the dev tooling with `uv sync --frozen --extra dev` and run `uv run ruff check <changed files>` and `uv run mypy` (no arguments) before a PR.
-The test sandbox (see `tests/conftest.py`) guards only the pytest process: a test that starts a Python subprocess must give it a sandboxed environment explicitly, or a child importing `shared.constants` loads the checkout's real `.env`.
+Install the dev tooling with `uv sync --frozen --all-extras` and run `uv run ruff check <changed files>` and `uv run mypy` (no arguments) before a PR.
+The test sandbox (see `tests/conftest.py`) guards only the pytest process: a test that starts a Python subprocess must hand it `sandboxed_env()` (from `tests/conftest.py`; the static scan in `tests/test_subprocess_env_contract.py` fails a spawn call without it), or a child importing `shared.constants` loads the checkout's real `.env` and resolves the real `.accounts.env` path.
 
 ## Issues
 

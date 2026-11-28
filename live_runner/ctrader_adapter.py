@@ -12,7 +12,6 @@ from collections import deque
 from collections.abc import Collection, Iterator, Mapping
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
-from decimal import ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP, Decimal
 from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
@@ -30,7 +29,6 @@ from live_runner.base_adapter import (
     ControlOutcome,
     LivePipValue,
     LiveQuote,
-    ProtectiveStop,
     coerce_positive_live_qty,
     commission_from_signed_cash_flow,
     is_unbounded_tp,
@@ -39,8 +37,19 @@ from live_runner.base_adapter import (
     order_not_submitted,
     validate_live_quote_prices,
 )
-from live_runner.credential_env import resolve_accounts_env_path, resolve_env_value
+from live_runner.credential_env import (
+    parse_bool_env,
+    read_accounts_env_file,
+    resolve_accounts_env_path,
+    resolve_env_value,
+)
 from live_runner.exit_signals import ExitBelowStepError
+from risk.signal_levels import (
+    SL_METADATA_KEYS,
+    TP_METADATA_KEYS,
+    LevelParsing,
+    resolve_signal_level,
+)
 from shared import venue_calendar
 from shared.constants import DATA_DIR
 from shared.database import (
@@ -103,6 +112,19 @@ class CTraderAuthTerminalError(RuntimeError):
         super().__init__(message)
 
 
+class CTraderConnectionLostError(ConnectionError):
+    """An in-flight cTrader request was abandoned by a session teardown.
+
+    Upstream ``Client._disconnected`` clears pending response Deferreds
+    without errbacking them, which would leave every in-flight
+    ``_send_request`` waiting out its own response timeout after the socket
+    is already gone. Teardown fails them with this instead. It is
+    deliberately a plain connection error: the request may already have been
+    written, so callers must treat the outcome as unknown - never as
+    provably-not-submitted and never as a broker refusal.
+    """
+
+
 class _PendingCloseFillRetentionError(ValueError):
     """A position-close fill retained while its own close submit is unresolved.
 
@@ -114,24 +136,6 @@ class _PendingCloseFillRetentionError(ValueError):
     listener - delaying every other fill on the account - for that whole
     window.
     """
-
-
-_TRUE_BOOL_TOKENS = {"1", "true", "yes", "y", "on"}
-_FALSE_BOOL_TOKENS = {"0", "false", "no", "n", "off"}
-
-
-def _parse_bool_env(name: str, value: str | None, *, default: bool) -> bool:
-    if value is None:
-        return default
-    token = value.strip().lower()
-    if token in _TRUE_BOOL_TOKENS:
-        return True
-    if token in _FALSE_BOOL_TOKENS:
-        return False
-    valid = ", ".join(sorted(_TRUE_BOOL_TOKENS | _FALSE_BOOL_TOKENS))
-    raise ValueError(
-        f"Invalid boolean value for {name}: {value!r}. Valid values are: {valid}."
-    )
 
 
 def _format_key_quantity(value: float) -> str:
@@ -166,21 +170,6 @@ def _to_float(value: Any, *, default: float = 0.0) -> float:
         return default
 
 
-def _first_metadata_float(
-    metadata: Mapping[str, Any], keys: tuple[str, ...]
-) -> float | None:
-    for key in keys:
-        if key not in metadata:
-            continue
-        value = metadata.get(key)
-        if value is None:
-            continue
-        try:
-            parsed = float(value)
-        except (TypeError, ValueError, OverflowError) as exc:
-            raise ValueError(f"Invalid {key}: {value!r}") from exc
-        return parsed
-    return None
 # ── cTrader volume unit contract ───────────────────────────────────────────────
 #
 # ONE unit contract for every quantity in the cTrader path:
@@ -240,16 +229,60 @@ _PENDING_CLOSE_POSITION_TTL_SECONDS = 3600.0
 #: its submit's mark is still live. Budget-free parking would otherwise never
 #: re-arm the pass that can recover the close's broker order id.
 _PENDING_CLOSE_FILL_RECONCILE_SECONDS = 30.0
-#: Bounded broker-state confirmation for ProtoOAAmendPositionSLTPReq (#168):
-#: the request has no dedicated response, so the amended stop is confirmed by
-#: re-reading the position. The broker applies the amend asynchronously, so a
-#: few short-interval reads cover the apply window without stalling the trail.
-_AMEND_CONFIRM_ATTEMPTS = 8
-_AMEND_CONFIRM_INTERVAL_SECONDS = 0.4
 #: Sentinel queued on ``_execution_queue`` to wake ``listen_executions`` for a
 #: pending broker reconciliation instead of letting it sleep out the 30 s
 #: ``queue.get`` timeout. Never a real execution payload.
 _EXECUTION_RECONCILE_WAKE = object()
+
+#: How long after our own token rotation (refresh or adoption of a sibling's
+#: persisted pair) a ``ProtoOAAccountsTokenInvalidatedEvent`` is treated as
+#: the echo of THAT rotation rather than a fresh invalidation of the current
+#: token. cTrader emits the event when a token is refreshed, so the echo can
+#: arrive after our re-auth and even after the resent request; tearing the
+#: session down then would turn a recoverable submit into an unknown outcome.
+#: A genuinely invalidated current token still surfaces through the next
+#: request's auth error, which drives the refresh path - so a bounded window
+#: errs toward keeping a healthy session. The window must stay larger than
+#: cTrader's invalidation-event delivery latency or a late echo for the OLD
+#: token would tear down the re-authenticated session. The grace applies ONLY
+#: when the session already re-authenticated on the current token
+#: (``_session_access_token == access_token``): while a rotation+re-auth is
+#: still in flight the explicit ``_own_token_rotation_in_flight`` flag is the
+#: skip signal instead, and a stale session token means the session is dead.
+_TOKEN_INVALIDATION_OWN_ROTATION_GRACE_SECONDS = 60.0
+
+#: Minimum interval between ``listen_executions`` reconnect attempts after a
+#: session teardown. The teardown wakes the listener immediately (it used to
+#: wait out the 30 s queue timeout); without a floor, a broker that keeps
+#: dropping the session right after auth would produce an unbounded
+#: connect/auth/disconnect loop bounded only by connect latency.
+_LISTENER_RECONNECT_MIN_INTERVAL_SECONDS = 2.0
+
+#: One refresh lock per (event loop, accounts env file). Every cTrader
+#: adapter in the process shares the same persisted token pair, and a cTrader
+#: refresh token is single-use: without serialization two adapters could
+#: spend the same refresh token concurrently and the loser would latch
+#: terminal. Keyed by loop because ``asyncio.Lock`` binds to the loop that
+#: first contends it; the daemon runs a single loop, so this is exact there.
+#: Adapters refreshing from more than one event loop in the same process are
+#: NOT serialized by this dict - that configuration is unsupported.
+_SHARED_TOKEN_REFRESH_LOCKS: dict[tuple[asyncio.AbstractEventLoop, str], asyncio.Lock] = {}
+
+
+def _shared_token_refresh_lock(accounts_env_path: Path) -> asyncio.Lock:
+    # Canonicalize so adapters constructed with differently-formed paths to
+    # the same env file (relative vs absolute, symlink variants) share one
+    # lock - otherwise their refreshes are not serialized.
+    key = (
+        asyncio.get_running_loop(),
+        str(accounts_env_path.expanduser().resolve()),
+    )
+    lock = _SHARED_TOKEN_REFRESH_LOCKS.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _SHARED_TOKEN_REFRESH_LOCKS[key] = lock
+    return lock
+
 
 # ── Trendbar market data (#168) ────────────────────────────────────────────────
 #
@@ -303,11 +336,9 @@ _TRENDBAR_PERIOD_SECONDS: dict[str, int] = {
     "MN1": 2_592_000,
 }
 
-#: Canonical deployment timeframes the cTrader adapter can serve for the
-#: live ``supertrend_flip`` workflow (#168). Only sub-day bars: the broker
-#: anchors ``4h``/``1d``/``1w`` to its server day/week, which is not provably
-#: the UTC alignment replay uses, so the flip workflow refuses them. The
-#: per-broker live-trailing table in ``shared.trailing`` mirrors this set.
+#: Canonical deployment timeframes the cTrader adapter can serve for market
+#: data (#168). Only sub-day bars: the broker anchors ``4h``/``1d``/``1w`` to
+#: its server day/week, which is not provably the UTC alignment replay uses.
 CTRADER_MARKET_DATA_TIMEFRAMES: frozenset[str] = frozenset(
     {"1m", "5m", "15m", "30m", "1h"}
 )
@@ -1046,11 +1077,39 @@ def _payload_ctid_trader_account_id(payload: Any) -> int:
     ``ProtoOAErrorRes.ctidTraderAccountId`` is proto3-optional: unset reads back
     as ``0``, which is never a real cTrader account id, so ``0`` doubles as
     "not set" and the caller only compares when the result is non-zero.
+    Non-positive values are clamped to ``0`` for the same reason
+    ``_payload_ctid_trader_account_ids`` drops them: a negative id cannot be
+    proven foreign, and treating it as a foreign account would silently drop
+    (e.g.) a disconnect event that should tear the session down.
     """
     try:
-        return int(getattr(payload, "ctidTraderAccountId", 0) or 0)
+        account_id = int(getattr(payload, "ctidTraderAccountId", 0) or 0)
     except (TypeError, ValueError):
         return 0
+    return account_id if account_id > 0 else 0
+
+
+def _payload_ctid_trader_account_ids(payload: Any) -> tuple[int, ...]:
+    """``ctidTraderAccountIds`` on an inbound payload, ``()`` when unset.
+
+    ``ProtoOAAccountsTokenInvalidatedEvent`` carries a *repeated* account-id
+    field, so the singular ``_payload_ctid_trader_account_id`` helper cannot
+    read it. Non-positive entries are dropped for the same reason the
+    singular helper treats ``0`` as unset: ``0`` is never a real cTrader
+    account id. An empty tuple means the event names no account: it cannot be
+    proven foreign, so callers treat it like an own-account event.
+    """
+    try:
+        return tuple(
+            account_id
+            for account_id in (
+                int(raw_id)
+                for raw_id in (getattr(payload, "ctidTraderAccountIds", None) or ())
+            )
+            if account_id > 0
+        )
+    except (TypeError, ValueError):
+        return ()
 
 
 _CTRADER_AUTH_FAILURE_FALLBACK = "cTrader account authorization failed"
@@ -1282,13 +1341,6 @@ class CTraderLiveAdapter(BaseLiveAdapter):
     """cTrader live adapter backed by OpenApiPy."""
 
     broker_name = "ctrader"
-    # `supports_stop_amendment` (#168): a cTrader position's SL/TP is amended
-    # in place through ProtoOAAmendPositionSLTPReq - the broker replaces the
-    # protective levels atomically, so the previous stop keeps working until
-    # the new one is accepted and stays if the request is refused. The adapter
-    # confirms every amendment by re-reading the position from the broker
-    # before reporting success; an unconfirmed outcome raises instead of
-    # claiming the stop moved.
 
     def __init__(
         self,
@@ -1326,7 +1378,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             "CTRADER_DEMO" in os.environ
         )
         self.demo = (
-            _parse_bool_env(
+            parse_bool_env(
                 "CTRADER_DEMO",
                 resolve_env_value(env_values, "CTRADER_DEMO") if demo_configured else None,
                 default=True,
@@ -1376,6 +1428,43 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._authenticated = False
         self._connect_lock = asyncio.Lock()
         self._refresh_lock = asyncio.Lock()
+        # The access token the CURRENT session authenticated with ("" when no
+        # session is authenticated). ``ProtoOAAccountsTokenInvalidatedEvent``
+        # names accounts, not tokens, so the invalidation handler compares
+        # this against ``self.access_token`` to tell "our own refresh already
+        # replaced the dead token" apart from "the session's token died".
+        self._session_access_token = ""
+        # ``time.monotonic()`` of the last token-pair rotation this adapter
+        # knows about (own refresh or adoption of a sibling's persisted pair);
+        # 0.0 when none happened this process.
+        self._token_pair_rotated_at = 0.0
+        # Depth counter: ``> 0`` from the moment an own token rotation
+        # starts until its re-auth completes. A counter, not a bool, so two
+        # concurrent auth-error rotations cannot clear each other's
+        # in-flight marker. ``ProtoOAAccountsTokenInvalidatedEvent`` names
+        # accounts, not tokens, so this explicit in-flight signal - not the
+        # token comparison - is what protects the window between refresh
+        # completion and the AccountAuthRes from a teardown.
+        self._own_token_rotation_in_flight = 0
+        # ``time.monotonic()`` of the last session teardown or transport
+        # loss; ``listen_executions`` waits out
+        # ``_LISTENER_RECONNECT_MIN_INTERVAL_SECONDS`` from it before
+        # reconnecting so a flapping broker cannot spin the loop. This is
+        # monotonic history for the process lifetime - never reset on
+        # (re)connect, or the floor silently disappears.
+        self._last_session_teardown_at = 0.0
+        # Deferreds handed out by ``_client.send`` and still awaiting a
+        # response. Upstream ``Client._disconnected`` clears
+        # ``_responseDeferreds`` BEFORE our disconnect callback runs, so a
+        # plain transport loss cannot enumerate them there - the adapter
+        # tracks them itself to errback promptly instead of letting each
+        # caller wait out its response timeout.
+        self._in_flight_request_deferreds: set[Any] = set()
+        # Bumped by every ``_fail_in_flight_requests`` run; ``_send_request``
+        # compares it across the send→track window so a deferred created
+        # while teardown was already failing the previous batch is failed
+        # promptly instead of sitting out its response timeout.
+        self._in_flight_fail_generation = 0
         self._symbol_name_to_id: dict[str, int] = {}
         # #125: pending get_quote calls by symbolId, and one lock per symbol
         # (cTrader allows a single spot subscription per symbol and session).
@@ -1466,6 +1555,8 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._ProtoOAExecutionEvent: Any = None
         self._ProtoOAOrderErrorEvent: Any = None
         self._ProtoOAErrorRes: Any = None
+        self._ProtoOAAccountDisconnectEvent: Any = None
+        self._ProtoOAAccountsTokenInvalidatedEvent: Any = None
         self._ProtoOATraderReq: Any = None
         self._ProtoOATraderRes: Any = None
         self._ProtoOAOrderDetailsReq: Any = None
@@ -1498,13 +1589,14 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._ProtoOAGetTrendbarsReq: Any = None
         self._ProtoOAGetTrendbarsRes: Any = None
         self._ProtoOATrendbarPeriod: Any = None
-        self._ProtoOAAmendPositionSLTPReq: Any = None
 
         self._heartbeat_payload_type: int | None = None
         self._spot_payload_type: int | None = None
         self._execution_payload_type: int | None = None
         self._error_payload_type: int | None = None
         self._order_error_payload_type: int | None = None
+        self._account_disconnect_payload_type: int | None = None
+        self._accounts_token_invalidated_payload_type: int | None = None
 
     def _load_openapi_types(self) -> None:
         if self._client_class is not None:
@@ -1517,7 +1609,8 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             from ctrader_open_api.messages.OpenApiMessages_pb2 import (
                 ProtoOAAccountAuthReq,
                 ProtoOAAccountAuthRes,
-                ProtoOAAmendPositionSLTPReq,
+                ProtoOAAccountDisconnectEvent,
+                ProtoOAAccountsTokenInvalidatedEvent,
                 ProtoOAApplicationAuthReq,
                 ProtoOAApplicationAuthRes,
                 ProtoOACancelOrderReq,
@@ -1584,6 +1677,8 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._ProtoOAExecutionEvent = ProtoOAExecutionEvent
         self._ProtoOAOrderErrorEvent = ProtoOAOrderErrorEvent
         self._ProtoOAErrorRes = ProtoOAErrorRes
+        self._ProtoOAAccountDisconnectEvent = ProtoOAAccountDisconnectEvent
+        self._ProtoOAAccountsTokenInvalidatedEvent = ProtoOAAccountsTokenInvalidatedEvent
         self._ProtoOATraderReq = ProtoOATraderReq
         self._ProtoOATraderRes = ProtoOATraderRes
         self._ProtoOAOrderDetailsReq = ProtoOAOrderDetailsReq
@@ -1614,7 +1709,6 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._ProtoOAUnsubscribeSpotsReq = ProtoOAUnsubscribeSpotsReq
         self._ProtoOAGetTrendbarsReq = ProtoOAGetTrendbarsReq
         self._ProtoOAGetTrendbarsRes = ProtoOAGetTrendbarsRes
-        self._ProtoOAAmendPositionSLTPReq = ProtoOAAmendPositionSLTPReq
         self._ProtoOATrendbarPeriod = ProtoOATrendbarPeriod
 
         self._heartbeat_payload_type = ProtoHeartbeatEvent().payloadType
@@ -1622,6 +1716,10 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._execution_payload_type = ProtoOAExecutionEvent().payloadType
         self._error_payload_type = ProtoOAErrorRes().payloadType
         self._order_error_payload_type = ProtoOAOrderErrorEvent().payloadType
+        self._account_disconnect_payload_type = ProtoOAAccountDisconnectEvent().payloadType
+        self._accounts_token_invalidated_payload_type = (
+            ProtoOAAccountsTokenInvalidatedEvent().payloadType
+        )
 
     def _raise_if_terminal_auth_failed(self) -> None:
         if not self._terminal_auth_failure_reason:
@@ -1637,6 +1735,159 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._terminal_auth_failure_code = _normalize_error_code(error_code)
         self._authenticated = False
 
+    def _note_session_access_token(self, access_token: str | None = None) -> None:
+        """Record the access token the current session authenticated with.
+
+        ``access_token`` overrides the recorded value: callers that just
+        confirmed an ``AccountAuthRes`` pass the token the request actually
+        carried, so a sibling-pair adoption during the flight cannot make
+        the record describe a token the session never authenticated with.
+        """
+        self._session_access_token = (
+            access_token if access_token is not None else self.access_token
+        )
+
+    def _clear_session_rotation_state(self) -> None:
+        """Drop the recorded session token and any in-flight rotation marker.
+
+        Every session-death path (``_teardown_client``, ``_on_disconnected``,
+        ``disconnect``) must call this: a stale ``_session_access_token`` or
+        a latched ``_own_token_rotation_in_flight`` would let
+        ``_token_invalidation_skip_reason`` treat a genuine invalidation as
+        our own rotation echo and never tear the dead session down. The
+        invalidation handler also self-heals a latched flag on a dead
+        session as a backstop for any future path that forgets.
+        """
+        self._session_access_token = ""
+        self._own_token_rotation_in_flight = 0
+
+    def _self_heal_rotation_marker_on_dead_session(self) -> None:
+        """Clear stale session-rotation state on a dead session.
+
+        ``_session_access_token`` and ``_own_token_rotation_in_flight`` only
+        mean something while a session is connected: no live session can be
+        mid-rotation, and the recorded token describes a session that no
+        longer exists. A session-death path that forgets
+        ``_clear_session_rotation_state`` leaves both behind, which would
+        let ``_token_invalidation_skip_reason`` treat a genuine invalidation
+        as our own rotation echo (latched counter, or the grace branch on a
+        stale session token) and never tear the session down. Kept out of
+        the skip-reason check itself so that check stays pure.
+        """
+        if not self._connected and (
+            self._own_token_rotation_in_flight or self._session_access_token
+        ):
+            self._clear_session_rotation_state()
+
+    def _adopt_persisted_token_pair(self) -> bool:
+        """Adopt the token pair persisted in the accounts env file when it differs.
+
+        Every cTrader adapter in the process shares ONE
+        ``CTRADER_ACCESS_TOKEN``/``CTRADER_REFRESH_TOKEN`` pair, and a cTrader
+        refresh rotates BOTH tokens and invalidates the old ones - so a
+        sibling adapter's refresh leaves this adapter's in-memory copy dead.
+        The accounts env file is the only place the rotated pair survives
+        (file-first credential precedence), so it is re-read here rather than
+        trusting memory. Token values are never logged.
+
+        Returns True when a different complete pair was adopted; the caller
+        then knows the previously held pair was stale and must not spend its
+        (possibly already-consumed) refresh token.
+        """
+        try:
+            file_values = read_accounts_env_file(self.accounts_env_path)
+        except Exception as exc:  # except-kind: money-decision
+            logger.warning(
+                "Could not re-read cTrader accounts env file for token adoption",
+                extra={
+                    "data": {
+                        "account_id": self.ctid_trader_account_id,
+                        "env_path": str(self.accounts_env_path),
+                        "error": str(exc),
+                    }
+                },
+            )
+            return False
+        file_access = str(file_values.get("CTRADER_ACCESS_TOKEN") or "").strip()
+        file_refresh = str(file_values.get("CTRADER_REFRESH_TOKEN") or "").strip()
+        if not file_access or not file_refresh:
+            return False
+        if file_access == self.access_token and file_refresh == self.refresh_token:
+            return False
+        self.access_token = file_access
+        self.refresh_token = file_refresh
+        self._token_pair_rotated_at = time.monotonic()
+        logger.info(
+            "Adopted newer persisted cTrader token pair",
+            extra={
+                "data": {
+                    "account_id": self.ctid_trader_account_id,
+                    "account_config_id": self.account_config_id,
+                    "env_path": str(self.accounts_env_path),
+                }
+            },
+        )
+        return True
+
+    def _token_rotation_in_flight(self) -> bool:
+        """A token refresh or own rotation+re-auth is in flight here.
+
+        ``_refresh_lock`` covers the refresh itself; the lock is released
+        before the re-auth await, which ``_own_token_rotation_in_flight``
+        (a depth counter) spans instead.
+        """
+        return self._refresh_lock.locked() or (
+            self._own_token_rotation_in_flight > 0
+        )
+
+    def _token_invalidation_skip_reason(self) -> str | None:
+        """Why a token-invalidation event must NOT tear down this session.
+
+        ``ProtoOAAccountsTokenInvalidatedEvent`` names accounts, not tokens,
+        and cTrader emits it for EVERY token rotation - including the
+        ``_refresh_access_token`` this adapter (or a sibling sharing the same
+        persisted pair) just performed and the re-auth that followed. Tearing
+        down a session the refresh path already re-authenticated - or is
+        re-authenticating right now - would turn a recoverable submit into an
+        unknown outcome, so the teardown is skipped when:
+
+        - a refresh is in flight on this adapter (``_refresh_lock`` held);
+        - this adapter's own token rotation is still being re-authenticated
+          (``_own_token_rotation_in_flight``: a depth counter incremented
+          when the refresh starts and decremented when the rotation's
+          re-auth completes - this covers the gap between refresh
+          completion and re-auth that a token comparison cannot);
+        - the session already re-authenticated on the current access token
+          and a token-pair rotation completed within
+          ``_TOKEN_INVALIDATION_OWN_ROTATION_GRACE_SECONDS`` (a late event
+          for the OLD token arriving after our re-auth).
+
+        A session token that differs from the current access token is NOT a
+        skip reason: it means the session authenticated with a token that a
+        rotation has since replaced, so the session is dead (a sibling's
+        rotation terminates every account session on the pair) and must be
+        torn down so the next ``connect()`` re-authenticates.
+        """
+        if self._token_rotation_in_flight():
+            if self._refresh_lock.locked():
+                return "a token refresh is in flight on this adapter"
+            return (
+                "this adapter's own token rotation is being "
+                "re-authenticated"
+            )
+        rotated_at = self._token_pair_rotated_at
+        if (
+            self._session_access_token
+            and self.access_token == self._session_access_token
+            and rotated_at
+            and (
+                time.monotonic() - rotated_at
+                < _TOKEN_INVALIDATION_OWN_ROTATION_GRACE_SECONDS
+            )
+        ):
+            return "a token rotation completed moments ago"
+        return None
+
     async def _refresh_access_token(self, *, failed_access_token: str | None = None) -> bool:
         """Refresh cTrader OAuth tokens via Open API and persist them safely."""
         if not self.refresh_token or self._ProtoOARefreshTokenReq is None:
@@ -1645,8 +1896,45 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 extra={"data": {"account_id": self.ctid_trader_account_id}},
             )
             return False
+        # Defensive: the adapter holds an access token the session never
+        # authenticated with and no OTHER own rotation is in flight - the
+        # session is dead (a sibling rotated the shared pair, or our own
+        # earlier rotation's re-auth failed after its refresh succeeded),
+        # not the token. The caller re-authenticates with the adopted pair;
+        # spending the shared single-use refresh token here would rotate
+        # the pair AGAIN and invalidate every sibling account on it.
+        # ``<= 1`` because the production caller
+        # (``_rotate_token_pair_and_reauthenticate``) increments
+        # ``_own_token_rotation_in_flight`` BEFORE calling this, so "no own
+        # rotation in flight" can only mean "no rotation but this one" -
+        # a plain truthiness check would make this guard dead on the real
+        # path. A count above 1 means a concurrent rotation is also in
+        # flight; it adopts-or-refreshes inside the lock below instead.
+        if (
+            self._session_access_token
+            and self.access_token != self._session_access_token
+            and self._own_token_rotation_in_flight <= 1
+        ):
+            # Adopt before re-authenticating: a sibling may have persisted
+            # an even newer pair since this adapter's in-memory copy, and
+            # re-authenticating with a stale access token would just fail
+            # again. Read-only - no refresh token is spent either way.
+            self._adopt_persisted_token_pair()
+            return True
         refresh_token_before_lock = self.refresh_token
-        async with self._refresh_lock:
+        # All cTrader adapters share one persisted token pair and a cTrader
+        # refresh token is single-use: the per-file lock serializes refreshes
+        # so two adapters never spend the same refresh token concurrently.
+        async with _shared_token_refresh_lock(
+            self.accounts_env_path
+        ), self._refresh_lock:
+            # A sibling adapter may already have rotated the shared pair;
+            # the persisted file is the freshest truth. Adopting it IS the
+            # refresh outcome the callers need (they re-authenticate with
+            # ``self.access_token``), and it must happen BEFORE spending a
+            # refresh token that may already have been consumed.
+            if self._adopt_persisted_token_pair():
+                return True
             if failed_access_token is not None and self.access_token != failed_access_token:
                 return True
             if self.refresh_token != refresh_token_before_lock and self.access_token:
@@ -1711,6 +1999,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
 
             self.access_token = access_token
             self.refresh_token = refresh_token
+            self._token_pair_rotated_at = time.monotonic()
             # The accounts file is the source of truth (file-first precedence):
             # refreshed tokens are persisted above and must NOT be mirrored into
             # os.environ, where a stale copy would shadow the fresh file value
@@ -1769,6 +2058,27 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._authenticated = False
         self._already_logged_in_notified = False
         self._connected_event.clear()
+        # The session is dead with the transport: drop the recorded session
+        # token and any in-flight rotation marker so a stale value cannot
+        # make a later invalidation event look like our own rotation echo.
+        # (An in-flight rotation cannot survive this anyway - its pending
+        # send is errbacked by ``_fail_in_flight_requests`` below and the
+        # helper's ``finally`` clears the flag on the way out.)
+        self._clear_session_rotation_state()
+        self._last_session_teardown_at = time.monotonic()
+        # Upstream ``Client._disconnected`` clears ``_responseDeferreds``
+        # BEFORE invoking this callback, so the dict enumeration in
+        # ``_fail_in_flight_requests`` finds nothing - the adapter-side
+        # ``_in_flight_request_deferreds`` set is what still names the
+        # pending requests. Without the errback each in-flight caller would
+        # wait out its own response timeout on a socket that is already gone;
+        # the error is a connection-lost, which every caller classifies as
+        # an UNKNOWN outcome - never as not-submitted.
+        self._fail_in_flight_requests()
+        # Executions may have been missed while the transport was down; flag
+        # broker reconciliation and wake the listener now rather than after
+        # its 30 s queue timeout, same as a session teardown.
+        self._flag_reconciliation_and_wake_listener()
         logger.warning(
             "cTrader transport disconnected",
             extra={
@@ -1803,6 +2113,24 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                     payload_type, payload, payload_account_id
                 )
                 return
+
+        # Server-initiated lifecycle events are not in
+        # ``_account_scoped_payload_types``: they do their own account check
+        # (the invalidation event carries a repeated id list) and log foreign
+        # events at DEBUG rather than the WARNING drop path.
+        if (
+            self._account_disconnect_payload_type is not None
+            and payload_type == self._account_disconnect_payload_type
+        ):
+            self._handle_account_disconnect_event(payload)
+            return
+
+        if (
+            self._accounts_token_invalidated_payload_type is not None
+            and payload_type == self._accounts_token_invalidated_payload_type
+        ):
+            self._handle_accounts_token_invalidated_event(payload)
+            return
 
         if self._spot_payload_type is not None and payload_type == self._spot_payload_type:
             self._handle_spot_event(payload)
@@ -1882,14 +2210,133 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             },
         )
 
+    def _handle_account_disconnect_event(self, payload: Any) -> None:
+        """Server ended this account's session (``ProtoOAAccountDisconnectEvent``).
+
+        Transient by contract: the event carries no terminal reason, so the
+        session state is dropped and the ordinary ``connect()`` path - with
+        its existing retry backoff - re-authenticates on next use. No
+        terminal auth latch is set. Foreign-account events are ignored at
+        DEBUG: a lifecycle event for another account says nothing about this
+        session.
+        """
+        payload_account_id = _payload_ctid_trader_account_id(payload)
+        if payload_account_id and payload_account_id != self.ctid_trader_account_id:
+            logger.debug(
+                "Ignoring cTrader account-disconnect event for a different account",
+                extra={
+                    "data": {
+                        "account_id": self.ctid_trader_account_id,
+                        "payload_account_id": payload_account_id,
+                    }
+                },
+            )
+            return
+        logger.warning(
+            "cTrader account disconnect event: the broker ended this account's "
+            "session; re-authenticating on the next connect",
+            extra={
+                "data": {
+                    "account_id": self.ctid_trader_account_id,
+                    "account_config_id": self.account_config_id,
+                    "payload_account_id": payload_account_id,
+                }
+            },
+        )
+        self._teardown_client()
+
+    def _handle_accounts_token_invalidated_event(self, payload: Any) -> None:
+        """Server invalidated this account's access token
+        (``ProtoOAAccountsTokenInvalidatedEvent``).
+
+        The event names accounts, not tokens, and cTrader emits it for EVERY
+        token rotation - including the ``_refresh_access_token`` this adapter
+        just performed on this same connection. Tearing down a session the
+        refresh path already re-authenticated (or is re-authenticating right
+        now) would turn a recoverable submit into an unknown outcome, so the
+        teardown is skipped when ``_token_invalidation_skip_reason`` finds
+        the event is the echo of a rotation we already handled. Otherwise
+        the dead token must never carry another order: the session is torn
+        down and the next ``connect()`` re-authenticates.
+
+        Sibling caveat: every cTrader adapter shares ONE persisted token
+        pair, and a refresh by adapter A invalidates the tokens adapter B
+        holds in memory AND terminates B's account session. B cannot heal
+        that by spending the shared refresh token again - it is
+        single-use and may already be consumed, so B would rotate the pair
+        a second time and invalidate every sibling in turn. Instead B
+        adopts the persisted pair here (``_adopt_persisted_token_pair``)
+        and drops the dead session; the next ``connect()``
+        re-authenticates with the adopted access token through
+        ``_send_account_auth_with_recovery`` and spends no refresh token.
+        """
+        account_ids = _payload_ctid_trader_account_ids(payload)
+        if account_ids and self.ctid_trader_account_id not in account_ids:
+            logger.debug(
+                "Ignoring cTrader token-invalidation event for different accounts",
+                extra={
+                    "data": {
+                        "account_id": self.ctid_trader_account_id,
+                        "payload_account_ids": list(account_ids),
+                    }
+                },
+            )
+            return
+        reason = str(getattr(payload, "reason", "") or "").strip()
+        # A sibling adapter may already have rotated the shared pair; adopt
+        # the persisted pair BEFORE deciding, so the token comparison below
+        # sees the freshest credentials. Skipped while our own rotation is
+        # in flight - ``_refresh_lock`` held during the refresh, or
+        # ``_own_token_rotation_in_flight`` during the re-auth await (the
+        # lock is already released by then): mutating the pair mid-rotation
+        # could clobber the credentials the in-flight AccountAuthReq carries
+        # and the rotation the refresh is about to persist, and the event is
+        # our own rotation echo anyway (``_token_invalidation_skip_reason``
+        # skips it either way).
+        self._self_heal_rotation_marker_on_dead_session()
+        if not self._token_rotation_in_flight():
+            self._adopt_persisted_token_pair()
+        skip_reason = self._token_invalidation_skip_reason()
+        if skip_reason is not None:
+            logger.info(
+                "cTrader accounts token invalidated event ignored: %s",
+                skip_reason,
+                extra={
+                    "data": {
+                        "account_id": self.ctid_trader_account_id,
+                        "account_config_id": self.account_config_id,
+                        "reason": reason,
+                        "payload_account_ids": list(account_ids),
+                    }
+                },
+            )
+            return
+        logger.warning(
+            "cTrader accounts token invalidated event (reason: %s); "
+            "dropping the session so the next connect refreshes the token "
+            "and re-authenticates",
+            reason or "not given",
+            extra={
+                "data": {
+                    "account_id": self.ctid_trader_account_id,
+                    "account_config_id": self.account_config_id,
+                    "reason": reason,
+                    "payload_account_ids": list(account_ids),
+                }
+            },
+        )
+        self._teardown_client()
+
     def _account_scoped_payload_types(self) -> frozenset[int]:
         """Inbound payload types that name a ``ctidTraderAccountId``.
 
-        These are the only payloads ``_on_message`` acts on (spot quotes,
-        executions, order errors, error responses); a payload of any other
-        type is ignored here anyway, so the foreign-account guard only needs
-        to cover this set. Computed per message because tests bind the
-        ``_*_payload_type`` attributes directly without ``_load_openapi_types``.
+        These are the payloads the foreign-account drop guard in
+        ``_on_message`` covers (spot quotes, executions, order errors, error
+        responses); the server lifecycle events do their own account check
+        with DEBUG-level foreign logging. A payload of any other type is
+        ignored here anyway. Computed per message because tests bind the
+        ``_*_payload_type`` attributes directly without
+        ``_load_openapi_types``.
         """
         return frozenset(
             payload_type
@@ -1978,11 +2425,33 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             f"{self.ctid_trader_account_id}-{self._client_msg_token}-"
             f"{type(request).__name__}-{self._client_msg_seq}"
         )
-        deferred = self._client.send(
+        client = self._client
+        # Capture BEFORE send: moving this after ``client.send`` would miss a
+        # ``_fail_in_flight_requests`` that ran during the send, leaving the
+        # new deferred untracked until its response timeout.
+        fail_generation = self._in_flight_fail_generation
+        deferred = client.send(
             request,
             clientMsgId=client_msg_id,
             responseTimeoutInSeconds=timeout_seconds,
         )
+        self._in_flight_request_deferreds.add(deferred)
+        if self._in_flight_fail_generation != fail_generation:
+            # ``_fail_in_flight_requests`` ran between send() returning and
+            # the deferred being tracked: it can no longer see this deferred,
+            # which would sit until its own response timeout. Fail it now.
+            self._in_flight_request_deferreds.discard(deferred)
+            errback = getattr(deferred, "errback", None)
+            if callable(errback):
+                with contextlib.suppress(Exception):
+                    errback(
+                        CTraderConnectionLostError(
+                            "cTrader connection lost before the response arrived"
+                        )
+                    )
+            raise CTraderConnectionLostError(
+                "cTrader connection lost before the response arrived"
+            )
         try:
             response_message = await deferred.asFuture(self._loop)
         except Exception as exc:  # except-kind: money-decision
@@ -2009,6 +2478,8 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                     },
                 )
             raise
+        finally:
+            self._in_flight_request_deferreds.discard(deferred)
         payload = self._Protobuf.extract(response_message)
         # Upstream resolves the pending Deferred by clientMsgId alone; the
         # ``_on_message`` foreign-account guard never sees this path. A
@@ -2056,26 +2527,81 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         except CTraderApiError as exc:
             error_code = _normalize_error_code(exc.error_code)
             error_text = str(exc)
-            if _is_terminal_auth_error(error_code, error_text) and await self._refresh_access_token(
+            if not _is_terminal_auth_error(error_code, error_text):
+                raise
+            if not await self._rotate_token_pair_and_reauthenticate(
                 failed_access_token=access_token_before_send
             ):
-                # Token was refreshed successfully; re-authorize the account and
-                # retry once with the new token.
-                if (
-                    self._ProtoOAAccountAuthReq is not None
-                    and self._ProtoOAAccountAuthRes is not None
-                ):
-                    account_auth_res = await self._send_account_auth_request(timeout_seconds=15)
-                    if not isinstance(account_auth_res, self._ProtoOAAccountAuthRes):
-                        raise RuntimeError(
-                            "Unexpected account auth response after refresh: "
-                            f"{type(account_auth_res).__name__}"
-                        ) from exc
-                    self._authenticated = True
-                return await self._send_request_with_refresh_retry(
-                    request, timeout_seconds=timeout_seconds, _depth=_depth + 1
+                raise
+            if (
+                self._ProtoOAAccountAuthReq is not None
+                and self._ProtoOAAccountAuthRes is not None
+            ):
+                self._authenticated = True
+            return await self._send_request_with_refresh_retry(
+                request, timeout_seconds=timeout_seconds, _depth=_depth + 1
+            )
+
+    async def _rotate_token_pair_and_reauthenticate(
+        self, *, failed_access_token: str | None = None
+    ) -> bool:
+        """Refresh-or-adopt the shared token pair and re-authenticate the account.
+
+        Returns True when the pair is usable: either the account re-auth
+        request was confirmed (``_note_session_access_token`` records the
+        token the request actually carried), or the OpenAPI auth types are
+        not loaded and the caller retries the original request. Returns
+        False when no usable pair could be produced; whatever the refresh
+        or re-auth raised propagates.
+
+        ``_own_token_rotation_in_flight`` spans the whole refresh+re-auth
+        window - incremented here and decremented unconditionally by the
+        ``finally``. It is a depth counter, not a bool: two requests can hit
+        an auth error concurrently and run overlapping rotations, and a
+        bool would let the first ``finally`` clear the second rotation's
+        marker. While the count is non-zero a
+        ``ProtoOAAccountsTokenInvalidatedEvent`` landing anywhere inside the
+        window (including between refresh completion and the AccountAuthRes)
+        is recognised as our own rotation echo, not a fresh invalidation.
+        The ``finally`` is deliberate: a count left set makes
+        ``_token_invalidation_skip_reason`` ignore every later invalidation
+        event, so a dead session would never be torn down.
+        """
+        self._own_token_rotation_in_flight += 1
+        try:
+            refreshed = await self._refresh_access_token(
+                failed_access_token=failed_access_token
+            )
+            if not refreshed:
+                return False
+            if (
+                self._ProtoOAAccountAuthReq is None
+                or self._ProtoOAAccountAuthRes is None
+            ):
+                # No re-auth will run, so nothing will note the new session
+                # token; the flag must not outlive this rotation attempt.
+                return True
+            # The token the AccountAuthReq carries is fixed at send time; a
+            # sibling-pair adoption during the flight must not make the
+            # session record describe a token the session never
+            # authenticated with.
+            auth_token = self.access_token
+            account_auth_res = await self._send_account_auth_request(
+                timeout_seconds=15
+            )
+            if not isinstance(account_auth_res, self._ProtoOAAccountAuthRes):
+                raise RuntimeError(
+                    "Unexpected account auth response after refresh: "
+                    f"{type(account_auth_res).__name__}"
                 )
-            raise
+            self._note_session_access_token(auth_token)
+            return True
+        finally:
+            # Clamped: a session-death path may have zeroed the counter
+            # while this rotation was still unwinding.
+            self._own_token_rotation_in_flight = max(
+                0, self._own_token_rotation_in_flight - 1
+            )
 
     async def _send_account_auth_request(self, *, timeout_seconds: int = 15) -> Any:
         account_auth_req = self._ProtoOAAccountAuthReq()
@@ -2102,6 +2628,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             )
 
     async def _send_account_auth_with_recovery(self) -> None:
+        auth_token = self.access_token
         try:
             account_auth_res = await self._send_account_auth_request(timeout_seconds=15)
         except CTraderApiError as exc:
@@ -2111,6 +2638,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 raise RuntimeError(
                     f"Unexpected account auth response: {type(account_auth_res).__name__}"
                 )
+            self._note_session_access_token(auth_token)
 
     async def _recover_account_auth_failure(self, exc: CTraderApiError) -> None:
         error_code = _normalize_error_code(exc.error_code)
@@ -2123,16 +2651,10 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             return
         if not _is_terminal_auth_error(error_code, error_text):
             raise exc
-        if not await self._refresh_access_token():
+        if not await self._rotate_token_pair_and_reauthenticate():
             reason = exc.description or error_text or _CTRADER_AUTH_FAILURE_FALLBACK
             self._mark_terminal_auth_failure(reason, error_code=error_code)
             raise CTraderAuthTerminalError(reason, error_code=error_code) from exc
-        account_auth_res = await self._send_account_auth_request(timeout_seconds=15)
-        if not isinstance(account_auth_res, self._ProtoOAAccountAuthRes):
-            raise RuntimeError(
-                "Unexpected account auth response after refresh: "
-                f"{type(account_auth_res).__name__}"
-            )
 
     def _scale_for(self, symbol: str) -> SymbolScale:
         """Return the per-symbol broker scale, failing closed (#80).
@@ -2345,6 +2867,10 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         # _scale_for fall back to static scales that can misstate size.
         await self._load_symbol_props_into_cache(symbol_name_to_id)
         self._authenticated = True
+        # Covers the ALREADY_LOGGED_IN path too: no AccountAuthRes was
+        # confirmed there, so the current access token is the best record of
+        # what the session runs on (a wrong guess only errs toward teardown).
+        self._note_session_access_token()
 
     async def _load_symbol_props_into_cache(self, symbol_name_to_id: dict[str, int]) -> None:
         """Fetch full ProtoOASymbol properties per symbol id (#80).
@@ -2804,6 +3330,85 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         client.setMessageReceivedCallback(self._on_message)
         return client
 
+    def _fail_in_flight_requests(self, client: Any | None = None) -> None:
+        """Errback every pending request deferred.
+
+        Sources: the adapter-side ``_in_flight_request_deferreds`` set (which
+        survives upstream's ``_responseDeferreds.clear()`` on disconnect) and,
+        when ``client`` is given and not yet cleared, the client's
+        ``_responseDeferreds`` dict. Upstream ``Client._disconnected`` only
+        ``clear()``s ``_responseDeferreds`` without errbacking them, so each
+        in-flight ``_send_request`` would otherwise sit until its own
+        ``addTimeout`` fires (up to the request timeout) even though the
+        socket is already gone. Failing them promptly frees callers sooner;
+        the error is a connection-lost, which every caller classifies as an
+        UNKNOWN outcome (the request may already have been written) - never
+        as not-submitted and never as a broker refusal.
+        """
+        self._in_flight_fail_generation += 1
+        pending: list[Any] = []
+        seen: set[int] = set()
+        adapter_pending = list(self._in_flight_request_deferreds)
+        self._in_flight_request_deferreds.clear()
+        client_pending: list[Any] = []
+        if client is not None:
+            try:
+                deferreds = getattr(client, "_responseDeferreds", None)
+                if deferreds is None:
+                    # The attribute itself is gone (ctrader-open-api bump):
+                    # adapter-tracked deferreds are still errbacked below,
+                    # but the miss must not be silent.
+                    logger.warning(
+                        "cTrader client exposes no _responseDeferreds; "
+                        "only adapter-tracked in-flight requests are failed",
+                        extra={"data": {"account_id": self.ctid_trader_account_id}},
+                    )
+                elif deferreds:
+                    # Tolerate a non-mapping shape (list/set) in case a
+                    # ctrader-open-api bump changes the container type.
+                    values = (
+                        deferreds.values()
+                        if hasattr(deferreds, "values")
+                        else deferreds
+                    )
+                    client_pending = list(values)
+            except Exception as exc:  # except-kind: loop-survival
+                # A ctrader-open-api bump that renames or reshapes
+                # ``_responseDeferreds`` must not abort the rest of teardown
+                # (``stopService``, the event clear and the listener wake),
+                # but the missed errbacks must not be silent either.
+                logger.warning(
+                    "Could not enumerate in-flight cTrader requests during teardown",
+                    extra={"data": {"error": str(exc)}},
+                )
+        for deferred in adapter_pending + client_pending:
+            if id(deferred) in seen:
+                continue
+            seen.add(id(deferred))
+            pending.append(deferred)
+        if not pending:
+            return
+        errback_failures = 0
+        for deferred in pending:
+            if getattr(deferred, "called", False):
+                # Already resolved (response arrived or timed out); errback
+                # would raise AlreadyCalledError.
+                continue
+            try:
+                deferred.errback(
+                    CTraderConnectionLostError(
+                        "cTrader connection lost before the response arrived"
+                    )
+                )
+            except Exception:  # except-kind: loop-survival
+                errback_failures += 1
+        if errback_failures:
+            logger.warning(
+                "Could not errback %d in-flight cTrader request(s) during "
+                "teardown; their awaiters will hit their own timeout",
+                errback_failures,
+            )
+
     def _teardown_client(self) -> None:
         """Drop the current client and ask Twisted to stop its service so a later
         connect() attempt can build a fresh one. Safe to call when no client exists.
@@ -2813,7 +3418,10 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._connected = False
         self._authenticated = False
         self._already_logged_in_notified = False
+        self._clear_session_rotation_state()
+        self._last_session_teardown_at = time.monotonic()
         if client is not None:
+            self._fail_in_flight_requests(client)
             try:
                 stop = getattr(client, "stopService", None)
                 if stop is not None:
@@ -2824,6 +3432,28 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             self._connected_event.clear()
         except Exception:  # except-kind: loop-survival
             pass
+        self._flag_reconciliation_and_wake_listener()
+
+    def _flag_reconciliation_and_wake_listener(self) -> None:
+        """Flag broker reconciliation and wake ``listen_executions`` now.
+
+        The teardown/disconnect wakes the listener so the gap is reconciled
+        immediately - it would otherwise sleep out its 30 s ``queue.get``
+        timeout before reconnecting and reconciling. If the queue is full
+        the wake is dropped, so reconciliation is flagged explicitly. Any
+        stale retry backoff is cleared too, or the flagged reconcile would
+        wait out a prior failure's ``_reconciliation_retry_at``.
+        """
+        self._reconciliation_required = True
+        self._reconciliation_retry_at = 0.0
+        try:
+            self._execution_queue.put_nowait(_EXECUTION_RECONCILE_WAKE)
+        except asyncio.QueueFull:
+            logger.warning(
+                "cTrader execution queue full on session loss; "
+                "listener wake dropped, reconciliation already flagged",
+                extra={"data": {"account_id": self.ctid_trader_account_id}},
+            )
 
     async def _recover_broker_order_id(
         self,
@@ -3242,6 +3872,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._connected = False
         self._connected_event.clear()
         self._already_logged_in_notified = False
+        self._clear_session_rotation_state()
         self._symbol_name_to_id.clear()
         self._order_id_to_signal_id.clear()
         self._pending_close_positions.clear()
@@ -3260,12 +3891,29 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             self._asset_names_task.cancel()
             self._asset_names_task = None
         self._order_id_to_symbol.clear()
+        # The queue swap and clears below discard unprocessed execution
+        # events, stored unresolved events and any pending reconcile wake;
+        # if any existed, flag broker reconciliation so the next listener
+        # run reconciles the gap instead of losing the fills silently.
+        had_pending_execution_work = (
+            not self._execution_queue.empty()
+            or bool(self._unresolved_execution_events)
+        )
         self._execution_queue = asyncio.Queue(maxsize=5000)
         self._execution_retry_counts.clear()
         self._unresolved_execution_events.clear()
+        if had_pending_execution_work:
+            self._reconciliation_required = True
+            self._reconciliation_retry_at = 0.0
         self._pending_close_fill_event_ids.clear()
         self._terminal_auth_failure_reason = ""
         self._terminal_auth_failure_code = ""
+        # A deliberate disconnect leaves the same in-flight requests pending
+        # as a transport loss: fail them now instead of letting each caller
+        # wait out its response timeout. ``_on_disconnected`` cannot cover
+        # this path - ``self._client`` is already None here, so its
+        # identity check returns early.
+        self._fail_in_flight_requests(client)
 
         if client is None:
             return
@@ -3669,10 +4317,16 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         request.volume = self._resolve_order_volume(signal)
         request.timeInForce = self._ProtoOATimeInForce.IMMEDIATE_OR_CANCEL
         request.clientOrderId = str(signal.id)
-        stop_loss = _first_metadata_float(
-            metadata, ("stop_loss", "sl_price", "stop_price", "resolved_stop_loss")
-        )
-        take_profit = _first_metadata_float(metadata, ("take_profit", "tp_price"))
+        # One allowlist and one resolver for both levels (G19). ANY_FLOAT keeps
+        # this adapter's own leniency: it refuses non-finite and non-positive
+        # levels itself, in _resolve_relative_sl_tp, after the missing-level
+        # guard below.
+        stop_loss = resolve_signal_level(
+            metadata, SL_METADATA_KEYS, parsing=LevelParsing.ANY_FLOAT
+        ).price
+        take_profit = resolve_signal_level(
+            metadata, TP_METADATA_KEYS, parsing=LevelParsing.ANY_FLOAT
+        ).price
         unbounded_tp = take_profit is None and is_unbounded_tp(metadata)
         if stop_loss is None or (take_profit is None and not unbounded_tp):
             missing = [
@@ -4057,12 +4711,12 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 await self._unsubscribe_spot(symbol_id)
 
     def supports_market_data_timeframe(self, timeframe: str) -> bool:
-        """Whether :meth:`get_market_data` can serve ``timeframe`` (#168).
+        """Whether :meth:`get_market_data` can serve ``timeframe``.
 
-        Only canonical deployment spellings count: the per-broker trailing
-        table and the deployment gates compare the raw timeframe string, so
-        an alias like ``60min`` must not pass here and then fail there (or
-        vice versa). ``get_market_data`` itself accepts the aliases.
+        Only canonical deployment spellings count: the per-broker gates
+        compare the raw timeframe string, so an alias like ``60min`` must
+        not pass here and then fail there (or vice versa).
+        ``get_market_data`` itself accepts the aliases.
         """
         normalized = str(timeframe or "").strip().lower()
         return normalized in CTRADER_MARKET_DATA_TIMEFRAMES
@@ -4074,7 +4728,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         timeframe: str,
         limit: int = 200,
     ) -> pd.DataFrame:
-        """Recent closed trendbars for ``symbol`` on ``timeframe`` (#168).
+        """Recent closed trendbars for ``symbol`` on ``timeframe``.
 
         Fetches ``ProtoOAGetTrendbarsReq`` history and decodes the
         delta-encoded ``ProtoOATrendbar`` rows into the same OHLCV frame
@@ -4113,8 +4767,8 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         now = _utc_now()
         # The window is wider than count*period on purpose: weekends and
         # session gaps mean `count` calendar periods hold fewer bars, and a
-        # too-narrow window would silently truncate the history the
-        # supertrend warm-up needs.
+        # too-narrow window would silently truncate the history a strategy's
+        # indicator warm-up needs.
         window_seconds = period_seconds * bounded_limit * 3
         request = self._ProtoOAGetTrendbarsReq()
         request.ctidTraderAccountId = self.ctid_trader_account_id
@@ -5046,6 +5700,26 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             return ORDER_STATE_TERMINAL
         return None
 
+    async def get_order_details(self, order_id: int, *, timeout_seconds: int = 20) -> Any:
+        """Raw ``ProtoOAOrderDetailsRes`` for one order on this account.
+
+        Public read seam for operator tooling (``scripts/verify_ctrader_order.py``);
+        the caller must already be connected and authenticated. Unlike
+        :meth:`get_order_state` this does not fail closed - transport and auth
+        errors propagate so the verifier can report them.
+        """
+        if self._ProtoOAOrderDetailsReq is None:
+            raise RuntimeError(
+                "cTrader order-details protobuf is unavailable; "
+                "the ctrader-open-api package failed to load."
+            )
+        details_req = self._ProtoOAOrderDetailsReq()
+        details_req.ctidTraderAccountId = self.ctid_trader_account_id
+        details_req.orderId = int(order_id)
+        return await self._send_request_with_refresh_retry(
+            details_req, timeout_seconds=timeout_seconds
+        )
+
     def position_qty_tolerance(self, symbol: str) -> float:
         """Half of one broker volume unit, in qty units, for ``symbol``.
 
@@ -5377,10 +6051,10 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         if int(getattr(trade_data, "tradeSide", 0) or 0) == self._ProtoOATradeSide.SELL:
             qty = -qty
         normalized_symbol = str(symbol).strip().upper()
-        # The flip workflow's fallback-TP removal verifies the broker TP
-        # is the one it placed before clearing anything (#168 review):
-        # the position read must carry the TP so a foreign TP fails
-        # closed instead of being silently removed.
+        # The position read carries the broker TP so a caller that manages
+        # the position's exits can verify the TP is the one it placed before
+        # changing anything: a foreign TP fails closed instead of being
+        # silently overwritten.
         broker_tp = (
             parse_optional(getattr(position, "takeProfit", None))
             if self._has_proto_field(position, "takeProfit")
@@ -5407,566 +6081,6 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             "position_id": position_id if position_id > 0 else 0,
             "volume": int(volume),
         }
-
-    # ── Protective stops / in-place SL-TP amendment (#168) ──────────────────────
-    #
-    # cTrader has no standalone protective-stop order: a position's stopLoss /
-    # takeProfit live on the position itself and are amended atomically through
-    # ProtoOAAmendPositionSLTPReq. The previous levels keep working until the
-    # broker accepts the new ones, and a refused request changes nothing.
-    # These primitives exist ONLY for the opt-in live ``supertrend_flip``
-    # workflow on demo/paper accounts: the adapter deliberately does NOT
-    # declare ``supports_stop_amendment``, so the percent-trailing path and
-    # the broker reconciler treat every cTrader account exactly as on main.
-    # ``supports_supertrend_flip`` is the single capability the flip manager
-    # and the daemon's signal gates check, and it is demo-only.
-
-    @property
-    def supports_supertrend_flip(self) -> bool:
-        """Live flip workflow requires a provably demo/paper account."""
-        return self.demo is True
-
-    async def list_protective_stops(self) -> list[ProtectiveStop]:
-        """One amendable protective stop per open position that has one.
-
-        Synthesized from ``ProtoOAPosition.stopLoss``: ``order_id`` is the
-        broker ``positionId`` (there is no separate stop order to name), and
-        ``side`` is the order side that would reduce the position - ``sell``
-        for a long, ``buy`` for a short. Read from the broker on every call,
-        so a restart continues from broker state.
-
-        A position with no stop is simply not listed - the caller reports the
-        missing protection. A position whose broker-native trailing stop is
-        active is also not listed: that mechanism is not an absolute-price
-        amend, so offering it would let a trail overwrite a level the broker
-        manages itself. Anything structurally unreadable (no trade data, an
-        unknown symbol or side) raises: a stop that cannot be named cannot be
-        safely amended, and the whole listing failing is the loud answer.
-        """
-        open_positions = await self._fetch_open_positions()
-        stops: list[ProtectiveStop] = []
-        for position in open_positions:
-            stop = self._position_protective_stop(position)
-            if stop is not None:
-                stops.append(stop)
-        return stops
-
-    def _position_protective_stop(self, position: Any) -> ProtectiveStop | None:
-        """The amendable protective stop of one open position, or ``None``.
-
-        ``None`` covers the two skip cases - a broker-native trailing stop
-        (not an absolute-price amend) and a position carrying no stopLoss at
-        all. Anything structurally unreadable raises instead: a stop that
-        cannot be named cannot be safely amended.
-        """
-        position_id = self._positive_int(getattr(position, "positionId", 0))
-        trade_data = getattr(position, "tradeData", None)
-        if position_id is None or trade_data is None:
-            raise ValueError(
-                "cTrader open position is missing positionId or tradeData; "
-                "refusing to report protective stops for an unattributable position"
-            )
-        if bool(getattr(position, "trailingStopLoss", False)):
-            return None
-        if not self._has_proto_field(position, "stopLoss"):
-            return None
-        stop_price = parse_optional(getattr(position, "stopLoss", None))
-        if stop_price is None or stop_price <= 0:
-            raise ValueError(
-                f"cTrader position {position_id} carries an unreadable stopLoss "
-                f"({getattr(position, 'stopLoss', None)!r}); refusing to guess it"
-            )
-        symbol_id = self._positive_int(getattr(trade_data, "symbolId", 0))
-        if symbol_id is None:
-            raise ValueError(
-                f"cTrader position {position_id} has no readable symbolId; "
-                "refusing to report its protective stop"
-            )
-        symbol = self._symbol_name_for_id(symbol_id).strip().upper()
-        stop_side = self._stop_side_for_position(position_id, trade_data)
-        qty: float | None = None
-        try:
-            volume = parse_money(getattr(trade_data, "volume", 0))
-            qty = _broker_volume_to_qty(
-                volume, self._scale_for(symbol).volume_per_qty
-            )
-        except (TypeError, ValueError):
-            qty = None
-        return ProtectiveStop(
-            order_id=str(position_id),
-            symbol=symbol,
-            side=stop_side,
-            stop_price=stop_price,
-            qty=qty,
-        )
-
-    def _stop_side_for_position(self, position_id: int, trade_data: Any) -> str:
-        """The order side that reduces this position - ``sell`` long, ``buy`` short."""
-        trade_side = self._positive_int(getattr(trade_data, "tradeSide", 0))
-        if trade_side == int(self._ProtoOATradeSide.BUY):
-            return "sell"
-        if trade_side == int(self._ProtoOATradeSide.SELL):
-            return "buy"
-        raise ValueError(
-            f"cTrader position {position_id} has unreadable tradeSide "
-            f"({getattr(trade_data, 'tradeSide', None)!r}); cannot tell "
-            "which side its stop protects"
-        )
-
-    def round_stop_price(self, stop: ProtectiveStop, price: float) -> float:
-        """Round a computed stop onto the symbol's price grid, away from market.
-
-        Same convention as the Alpaca adapter: floor for a ``sell`` stop,
-        ceiling for a ``buy`` stop, so the rounded stop is never tighter than
-        the computed one.
-        """
-        value = float(price)
-        if not math.isfinite(value) or value <= 0:
-            raise ValueError(
-                f"Invalid stop price for {stop.symbol}: {price!r}; refusing to amend."
-            )
-        digits = self._scale_for(stop.symbol).price_digits
-        tick = Decimal(1).scaleb(-max(0, int(digits)))
-        # Float noise is removed first (101.96999999999998 is 101.97): flooring
-        # the raw float would otherwise give away a whole tick to a rounding
-        # artefact of the stop arithmetic.
-        rounding = ROUND_FLOOR if stop.side == "sell" else ROUND_CEILING
-        rounded = float(Decimal(repr(round(value, 8))).quantize(tick, rounding=rounding))
-        if rounded <= 0:
-            raise ValueError(
-                f"Stop price for {stop.symbol} rounds to {rounded!r}; refusing to amend."
-            )
-        return rounded
-
-    async def _fetch_open_position(self, position_id: int) -> Any | None:
-        """The open ``ProtoOAPosition`` with this id, or ``None`` when closed."""
-        for position in await self._fetch_open_positions():
-            if self._positive_int(getattr(position, "positionId", 0)) == position_id:
-                return position
-        return None
-
-    async def _confirm_position_stop(
-        self, position_id: int, expected_price: float, *, digits: int
-    ) -> float | None:
-        """The broker-reported stop once it matches ``expected_price``.
-
-        ``None`` while the broker has not yet shown the amended stop; the
-        caller bounds the wait. A position that is gone returns a separate
-        sentinel through the caller's own read - this only answers "does the
-        open position carry the new stop".
-        """
-        position = await self._fetch_open_position(position_id)
-        if position is None:
-            return None
-        if not self._has_proto_field(position, "stopLoss"):
-            return None
-        broker_price = parse_optional(getattr(position, "stopLoss", None))
-        if broker_price is None or broker_price <= 0:
-            return None
-        tolerance = float(Decimal(1).scaleb(-max(0, int(digits)))) * 0.5 + 1e-12
-        if math.isclose(broker_price, expected_price, rel_tol=0.0, abs_tol=tolerance):
-            return broker_price
-        return None
-
-    async def amend_protective_stop(
-        self, stop: ProtectiveStop, new_stop_price: float
-    ) -> ProtectiveStop:
-        """Move a position's stop loss to ``new_stop_price``, TP preserved.
-
-        Sends ``ProtoOAAmendPositionSLTPReq`` with the new absolute stop and
-        the position's current take profit echoed back unchanged (unset when
-        the position has none, which the broker reads as "no TP" either way).
-        The request has no dedicated response message, so the outcome is
-        confirmed by re-reading the position: only a broker-reported stop at
-        the requested price counts as amended. Any send failure that is not a
-        definite broker refusal (timeout, dropped connection, malformed
-        response) is verified the same way - if the state shows the new stop
-        the amendment did land; if it cannot be confirmed this raises and the
-        caller keeps treating the previous broker state as the truth.
-        """
-        position_id = self._positive_int(getattr(stop, "order_id", None))
-        if position_id is None:
-            raise ValueError(
-                f"cTrader protective stop for {stop.symbol} has no usable "
-                f"position id ({stop.order_id!r}); refusing to amend."
-            )
-        if self._ProtoOAAmendPositionSLTPReq is None:
-            raise RuntimeError("cTrader amend-position-SLTP request type is not loaded")
-        # Read the position first: it connects/authenticates (so the symbol
-        # scale is broker-sourced), proves the position is still open, and
-        # supplies the TP and protection flags to echo back unchanged.
-        position = await self._fetch_open_position(position_id)
-        if position is None:
-            raise RuntimeError(
-                f"cTrader position {position_id} ({stop.symbol}) is no longer open; "
-                "there is no stop to amend."
-            )
-        digits = self._scale_for(stop.symbol).price_digits
-        price = self.round_stop_price(stop, new_stop_price)
-
-        request = self._build_amend_position_request(position_id, price, position)
-        send_error = await self._send_amend_position_request(request)
-        return await self._confirmed_amendment(
-            position_id=position_id,
-            price=price,
-            digits=digits,
-            stop=stop,
-            send_error=send_error,
-        )
-
-    def _build_amend_position_request(
-        self, position_id: int, price: float, position: Any
-    ) -> Any:
-        """The SLTP amendment: new absolute stop, TP and flags echoed back."""
-        request = self._ProtoOAAmendPositionSLTPReq()
-        request.ctidTraderAccountId = self.ctid_trader_account_id
-        request.positionId = position_id
-        request.stopLoss = float(price)
-        if self._has_proto_field(position, "takeProfit"):
-            current_tp = parse_optional(getattr(position, "takeProfit", None))
-            if current_tp is not None and current_tp > 0:
-                request.takeProfit = float(current_tp)
-        for field_name in (
-            "guaranteedStopLoss",
-            "trailingStopLoss",
-            "stopLossTriggerMethod",
-        ):
-            if self._has_proto_field(position, field_name):
-                setattr(request, field_name, getattr(position, field_name))
-        return request
-
-    async def _send_amend_position_request(self, request: Any) -> BaseException | None:
-        """Send the amendment; the send error when the outcome is ambiguous.
-
-        ``None`` means the broker answered without an order-error event. A
-        definite ``CTraderApiError`` refusal propagates (the broker changed
-        nothing); anything else - timeout, transport failure, malformed
-        response - comes back as the exception for the caller to resolve
-        against broker state.
-        """
-        try:
-            response = await self._send_request_with_refresh_retry(
-                request, timeout_seconds=10
-            )
-            self._raise_if_order_error_event(response)
-        except CTraderApiError as exc:
-            # A definite refusal: the broker changed nothing, the previous
-            # stop is still in force.
-            self._raise_terminal_auth_from_api_error(exc)
-            raise
-        except Exception as exc:  # except-kind: money-decision
-            # Timeout, transport failure or an unparseable response: the
-            # request may or may not have landed. Broker state decides below.
-            return exc
-        return None
-
-    async def _confirmed_amendment(
-        self,
-        *,
-        position_id: int,
-        price: float,
-        digits: int,
-        stop: ProtectiveStop,
-        send_error: BaseException | None,
-    ) -> ProtectiveStop:
-        """Poll broker state until the new stop shows, or fail closed."""
-        confirmed_price: float | None = None
-        for attempt in range(_AMEND_CONFIRM_ATTEMPTS):
-            try:
-                confirmed_price = await self._confirm_position_stop(
-                    position_id, price, digits=digits
-                )
-            except asyncio.CancelledError:
-                raise
-            except Exception:  # except-kind: money-decision
-                confirmed_price = None
-            if confirmed_price is not None:
-                break
-            if attempt + 1 < _AMEND_CONFIRM_ATTEMPTS:
-                await asyncio.sleep(_AMEND_CONFIRM_INTERVAL_SECONDS)
-        if confirmed_price is None:
-            position_now = await self._fetch_open_position(position_id)
-            if position_now is None:
-                raise RuntimeError(
-                    f"cTrader position {position_id} ({stop.symbol}) closed while its "
-                    "stop was being amended; the amendment outcome is moot but the "
-                    "close itself must be reconciled."
-                )
-            detail = f" send error: {send_error!r}" if send_error is not None else ""
-            raise RuntimeError(
-                f"cTrader did not confirm the stop amendment for position "
-                f"{position_id} ({stop.symbol}): broker still reports stopLoss "
-                f"{getattr(position_now, 'stopLoss', None)!r}, requested {price!r}.{detail}"
-            )
-        return ProtectiveStop(
-            order_id=str(position_id),
-            symbol=stop.symbol,
-            side=stop.side,
-            stop_price=confirmed_price,
-            qty=stop.qty,
-        )
-
-    async def amend_position_take_profit(
-        self, position_id: int, take_profit: float | None
-    ) -> float | None:
-        """Set (or clear) a position's take profit; the stop is preserved exactly.
-
-        ``take_profit=None`` removes the TP; a price sets it. The position's
-        current ``stopLoss`` is echoed back verbatim into the same atomic
-        ``ProtoOAAmendPositionSLTPReq``, so the stop can never be dropped or
-        loosened by this call - and a position whose stop cannot be read is
-        refused outright. Exists for the flip workflow's fallback TP (#168):
-        placed when the workflow halts or gives up so the position keeps an
-        upside exit, and amended away again before the workflow resumes.
-
-        Confirmed by re-reading the position: only a broker-reported
-        ``takeProfit`` at the requested level (or absent/zero for a clear)
-        counts. Same ambiguity rule as :meth:`amend_protective_stop`: a send
-        failure that is not a definite broker refusal is verified against
-        broker state, and an unconfirmed outcome raises.
-        """
-        pid = self._positive_int(position_id)
-        if pid is None:
-            raise ValueError(
-                f"cTrader position id {position_id!r} is not usable; "
-                "refusing to amend its take profit."
-            )
-        if self._ProtoOAAmendPositionSLTPReq is None:
-            raise RuntimeError("cTrader amend-position-SLTP request type is not loaded")
-        position, symbol, digits, stop_price, current_tp = (
-            await self._position_tp_amend_context(pid)
-        )
-        target = (
-            self._round_take_profit(symbol, take_profit)
-            if take_profit is not None
-            else None
-        )
-        tolerance = float(Decimal(1).scaleb(-max(0, int(digits)))) * 0.5 + 1e-12
-        noop, noop_result = self._tp_amend_noop(target, current_tp, tolerance)
-        if noop:
-            return noop_result
-
-        request = self._build_position_tp_request(pid, position, stop_price, target)
-        send_error = await self._send_amend_position_request(request)
-        confirmed = await self._confirmed_tp_amendment(
-            position_id=pid,
-            symbol=symbol,
-            expected=target,
-            digits=digits,
-            expected_stop=stop_price,
-            send_error=send_error,
-        )
-        return None if target is None else float(confirmed)
-
-    async def _position_tp_amend_context(
-        self, pid: int
-    ) -> tuple[Any, str, int, float, float | None]:
-        """``(position, symbol, price_digits, stop, current TP)`` for an amend.
-
-        Every refusal lives here: a gone position, an unreadable symbolId,
-        or a missing/non-positive ``stopLoss`` (the amend echoes the stop
-        verbatim, so without a readable one it could clear protection).
-        """
-        position = await self._fetch_open_position(pid)
-        if position is None:
-            raise RuntimeError(
-                f"cTrader position {pid} is no longer open; "
-                "there is no take profit to amend."
-            )
-        trade_data = getattr(position, "tradeData", None)
-        symbol_id = (
-            self._positive_int(getattr(trade_data, "symbolId", 0))
-            if trade_data is not None
-            else None
-        )
-        if symbol_id is None:
-            raise ValueError(
-                f"cTrader position {pid} has no readable symbolId; "
-                "refusing to amend its take profit."
-            )
-        symbol = self._symbol_name_for_id(symbol_id).strip().upper()
-        digits = self._scale_for(symbol).price_digits
-        stop_price = (
-            parse_optional(getattr(position, "stopLoss", None))
-            if self._has_proto_field(position, "stopLoss")
-            else None
-        )
-        if stop_price is None or stop_price <= 0:
-            raise ValueError(
-                f"cTrader position {pid} ({symbol}) has no readable stopLoss "
-                "to preserve; refusing to amend its take profit."
-            )
-        current_tp = (
-            parse_optional(getattr(position, "takeProfit", None))
-            if self._has_proto_field(position, "takeProfit")
-            else None
-        )
-        return position, symbol, digits, stop_price, current_tp
-
-    @staticmethod
-    def _tp_amend_noop(
-        target: float | None, current_tp: float | None, tolerance: float
-    ) -> tuple[bool, float | None]:
-        """``(handled, result)``: True when the broker already matches - no write."""
-        if target is None:
-            if current_tp is None or current_tp <= 0:
-                return True, None  # already clear: idempotent, no write
-            return False, None
-        if (
-            current_tp is not None
-            and current_tp > 0
-            and math.isclose(current_tp, target, rel_tol=0.0, abs_tol=tolerance)
-        ):
-            return True, float(current_tp)  # already at the target: no write
-        return False, None
-
-    def _round_take_profit(self, symbol: str, price: float) -> float:
-        """Quantize a take-profit onto the symbol's price grid (nearest tick)."""
-        value = float(price)
-        if not math.isfinite(value) or value <= 0:
-            raise ValueError(
-                f"Invalid take-profit price for {symbol}: {price!r}; "
-                "refusing to amend."
-            )
-        digits = self._scale_for(symbol).price_digits
-        tick = Decimal(1).scaleb(-max(0, int(digits)))
-        rounded = float(
-            Decimal(repr(round(value, 8))).quantize(tick, rounding=ROUND_HALF_UP)
-        )
-        if rounded <= 0:
-            raise ValueError(
-                f"Take-profit price for {symbol} rounds to {rounded!r}; "
-                "refusing to amend."
-            )
-        return rounded
-
-    def _build_position_tp_request(
-        self,
-        position_id: int,
-        position: Any,
-        stop_price: float,
-        take_profit: float | None,
-    ) -> Any:
-        """The SLTP amendment: stop echoed verbatim, TP set or cleared."""
-        request = self._ProtoOAAmendPositionSLTPReq()
-        request.ctidTraderAccountId = self.ctid_trader_account_id
-        request.positionId = position_id
-        request.stopLoss = float(stop_price)
-        if take_profit is not None:
-            request.takeProfit = float(take_profit)
-        for field_name in (
-            "guaranteedStopLoss",
-            "trailingStopLoss",
-            "stopLossTriggerMethod",
-        ):
-            if self._has_proto_field(position, field_name):
-                setattr(request, field_name, getattr(position, field_name))
-        return request
-
-    async def _confirm_position_tp(
-        self,
-        position_id: int,
-        expected: float | None,
-        *,
-        digits: int,
-        expected_stop: float,
-    ) -> float | None:
-        """The broker-reported TP once it matches ``expected`` AND the stop survived.
-
-        ``expected=None`` confirms an absent/zero ``takeProfit`` and reports
-        ``0.0``; ``None`` means "not yet" (or the position is gone - the
-        caller's final read distinguishes the two, same as the stop path).
-        The amend echoes ``stopLoss`` verbatim, so confirmation also requires
-        the broker stop to still sit at ``expected_stop`` within tick
-        tolerance: a TP that landed while the stop was dropped or moved is
-        NOT a confirmed amendment.
-        """
-        position = await self._fetch_open_position(position_id)
-        if position is None:
-            return None
-        broker_tp = (
-            parse_optional(getattr(position, "takeProfit", None))
-            if self._has_proto_field(position, "takeProfit")
-            else None
-        )
-        tp_ok = (
-            (broker_tp is None or broker_tp <= 0)
-            if expected is None
-            else (
-                broker_tp is not None
-                and broker_tp > 0
-                and math.isclose(
-                    broker_tp,
-                    expected,
-                    rel_tol=0.0,
-                    abs_tol=float(Decimal(1).scaleb(-max(0, int(digits)))) * 0.5
-                    + 1e-12,
-                )
-            )
-        )
-        if not tp_ok:
-            return None
-        broker_stop = (
-            parse_optional(getattr(position, "stopLoss", None))
-            if self._has_proto_field(position, "stopLoss")
-            else None
-        )
-        if broker_stop is None or not math.isclose(
-            broker_stop,
-            expected_stop,
-            rel_tol=0.0,
-            abs_tol=float(Decimal(1).scaleb(-max(0, int(digits)))) * 0.5 + 1e-12,
-        ):
-            return None
-        if expected is None:
-            return 0.0
-        return float(broker_tp) if broker_tp is not None else None
-
-    async def _confirmed_tp_amendment(
-        self,
-        *,
-        position_id: int,
-        symbol: str,
-        expected: float | None,
-        digits: int,
-        expected_stop: float,
-        send_error: BaseException | None,
-    ) -> float:
-        """Poll broker state until the TP shows (or clears), or fail closed."""
-        confirmed: float | None = None
-        for attempt in range(_AMEND_CONFIRM_ATTEMPTS):
-            try:
-                confirmed = await self._confirm_position_tp(
-                    position_id,
-                    expected,
-                    digits=digits,
-                    expected_stop=expected_stop,
-                )
-            except asyncio.CancelledError:
-                raise
-            except Exception:  # except-kind: money-decision
-                confirmed = None
-            if confirmed is not None:
-                break
-            if attempt + 1 < _AMEND_CONFIRM_ATTEMPTS:
-                await asyncio.sleep(_AMEND_CONFIRM_INTERVAL_SECONDS)
-        if confirmed is None:
-            position_now = await self._fetch_open_position(position_id)
-            if position_now is None:
-                raise RuntimeError(
-                    f"cTrader position {position_id} ({symbol}) closed while its "
-                    "take profit was being amended; the amendment outcome is moot "
-                    "but the close itself must be reconciled."
-                )
-            detail = f" send error: {send_error!r}" if send_error is not None else ""
-            raise RuntimeError(
-                f"cTrader did not confirm the take-profit amendment for position "
-                f"{position_id} ({symbol}): broker still reports takeProfit "
-                f"{getattr(position_now, 'takeProfit', None)!r} and stopLoss "
-                f"{getattr(position_now, 'stopLoss', None)!r}, requested TP "
-                f"{expected!r} with stop {expected_stop!r}.{detail}"
-            )
-        return confirmed
 
     async def _persist_execution_event(self, event: Any) -> None:
         execution_type = int(event.executionType)
@@ -6371,27 +6485,6 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         if not candidates:
             return None, "no_opening_order"
         return None, "ambiguous_parent"
-
-    async def opening_signal_id_for_position(self, position_id: int) -> str | None:
-        """Public provenance read for the flip manager's first-sight bind (#168).
-
-        Reuses the broker-close attribution path: exactly one persisted
-        opening signal may claim the position. ``None`` means proven
-        foreign/ambiguous - the broker read the position's orders and none
-        (or several) resolve to a persisted signal. An UNREADABLE order list
-        raises ``CTraderApiError`` instead: the caller retries a transient
-        read failure rather than treating it as proven foreign ownership.
-        """
-        signal_id, cause = await self._resolve_position_parent_signal(
-            int(position_id)
-        )
-        if cause == "position_orders_unreadable":
-            raise CTraderApiError(
-                "ORDER_LIST_UNREADABLE",
-                f"cTrader position orders for position {position_id} are "
-                "unreadable; provenance cannot be proven this pass",
-            )
-        return signal_id
 
     @staticmethod
     def _broker_close_dedupe_key(deal: Any | None) -> str | None:
@@ -8230,12 +8323,31 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             return False
         return True
 
+    def _listener_reconnect_delay_seconds(self) -> float:
+        """Seconds ``listen_executions`` should still wait before reconnecting.
+
+        A teardown (or transport loss) wakes the listener immediately so the
+        gap is reconciled now rather than after the 30 s queue timeout, but a
+        broker that keeps dropping the session right after auth would
+        otherwise spin connect/auth/disconnect with no floor. Returns the
+        remaining fraction of ``_LISTENER_RECONNECT_MIN_INTERVAL_SECONDS``.
+        """
+        if not self._last_session_teardown_at:
+            return 0.0
+        elapsed = time.monotonic() - self._last_session_teardown_at
+        return max(
+            0.0, _LISTENER_RECONNECT_MIN_INTERVAL_SECONDS - elapsed
+        )
+
     async def listen_executions(self) -> None:
         backoff_seconds = 2
         while True:
             event: Any | None = None
             try:
                 if not self._connected or not self._authenticated:
+                    reconnect_delay = self._listener_reconnect_delay_seconds()
+                    if reconnect_delay > 0:
+                        await asyncio.sleep(reconnect_delay)
                     await self.connect()
 
                 await self._run_pending_reconciliation(backoff_seconds)

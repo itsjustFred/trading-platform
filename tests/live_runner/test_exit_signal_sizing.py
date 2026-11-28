@@ -192,6 +192,7 @@ def _save_signal_with_fill(database, *, deployment_id, symbol, action, qty):
             broker_order_id=f"order-{uuid.uuid4().hex[:8]}",
         )
     )
+    return signal_id
 
 
 def test_ledger_nets_only_this_deployments_fills(isolated_db) -> None:
@@ -354,21 +355,21 @@ def _patch_ledger(
 
 def test_exit_signal_is_exit_only_even_when_shorting_is_allowed() -> None:
     """On a long+short deployment a plain sell is a real short. An exit is not."""
-    from live_runner.daemon import _trade_signal_to_live_signal
+    from live_runner.daemon import trade_signal_to_live_signal
 
-    live = _trade_signal_to_live_signal(_exit_trade_signal(), _deployment(allow_short=True))
+    live = trade_signal_to_live_signal(_exit_trade_signal(), _deployment(allow_short=True))
     assert live.metadata["exit_only"] is True
     assert live.metadata["risk_sizing_mode"] == "exit_only"
     assert live.metadata["signal_intent"] == "exit"
 
 
 def test_prepare_sizes_an_exit_from_the_own_ledger(monkeypatch) -> None:
-    from live_runner.daemon import _trade_signal_to_live_signal, prepare_order_with_risk
+    from live_runner.daemon import prepare_order_with_risk, trade_signal_to_live_signal
 
     deployment = _deployment(allow_short=True)
     calls = _patch_ledger(monkeypatch, deployment, 10.0, others={_OTHER: 15.0})
     adapter = _Adapter([{"symbol": "AAPL", "qty": 25.0}])
-    live = _trade_signal_to_live_signal(_exit_trade_signal(), deployment)
+    live = trade_signal_to_live_signal(_exit_trade_signal(), deployment)
 
     prepared, qty = asyncio.run(prepare_order_with_risk(adapter, deployment, live))
 
@@ -392,8 +393,8 @@ def test_exit_drops_spoofed_entry_gate_fields(monkeypatch) -> None:
     """
     from live_runner.daemon import (
         _ENTRY_QUOTE_METADATA_KEYS,
-        _trade_signal_to_live_signal,
         prepare_order_with_risk,
+        trade_signal_to_live_signal,
     )
 
     deployment = _deployment(allow_short=True)
@@ -404,7 +405,7 @@ def test_exit_drops_spoofed_entry_gate_fields(monkeypatch) -> None:
     trade_signal = dataclasses.replace(
         trade_signal, metadata={**trade_signal.metadata, **spoofed}
     )
-    live = _trade_signal_to_live_signal(trade_signal, deployment)
+    live = trade_signal_to_live_signal(trade_signal, deployment)
     assert all(live.metadata.get(key) == "spoofed" for key in _ENTRY_QUOTE_METADATA_KEYS)
 
     prepared, qty = asyncio.run(prepare_order_with_risk(adapter, deployment, live))
@@ -415,12 +416,12 @@ def test_exit_drops_spoofed_entry_gate_fields(monkeypatch) -> None:
 
 
 def test_prepare_takes_the_close_side_from_the_position(monkeypatch) -> None:
-    from live_runner.daemon import _trade_signal_to_live_signal, prepare_order_with_risk
+    from live_runner.daemon import prepare_order_with_risk, trade_signal_to_live_signal
 
     deployment = _deployment(allow_short=True)
     _patch_ledger(monkeypatch, deployment, -4.0)
     adapter = _Adapter([{"symbol": "AAPL", "qty": -4.0}])
-    live = _trade_signal_to_live_signal(_exit_trade_signal(side=None), deployment)
+    live = trade_signal_to_live_signal(_exit_trade_signal(side=None), deployment)
 
     prepared, qty = asyncio.run(prepare_order_with_risk(adapter, deployment, live))
 
@@ -429,12 +430,12 @@ def test_prepare_takes_the_close_side_from_the_position(monkeypatch) -> None:
 
 
 def test_prepare_partial_exit(monkeypatch) -> None:
-    from live_runner.daemon import _trade_signal_to_live_signal, prepare_order_with_risk
+    from live_runner.daemon import prepare_order_with_risk, trade_signal_to_live_signal
 
     deployment = _deployment()
     _patch_ledger(monkeypatch, deployment, 10.0)
     adapter = _Adapter([{"symbol": "AAPL", "qty": 10.0}])
-    live = _trade_signal_to_live_signal(_exit_trade_signal(fraction=0.5), deployment)
+    live = trade_signal_to_live_signal(_exit_trade_signal(fraction=0.5), deployment)
 
     _prepared, qty = asyncio.run(prepare_order_with_risk(adapter, deployment, live))
 
@@ -810,7 +811,7 @@ def test_claim_submit_records_the_decision_reason_for_definitive_refusals(
 
     deployment = _deployment()
     trade_signal = _exit_trade_signal() if is_exit else _discord_entry_trade_signal()
-    live_signal = daemon._trade_signal_to_live_signal(trade_signal, deployment)
+    live_signal = daemon.trade_signal_to_live_signal(trade_signal, deployment)
     adapter = _Adapter([])
     if broker_rejected:
         adapter.submit_order = _submit_raising(
@@ -935,7 +936,7 @@ def test_parsed_exit_message_end_to_end(monkeypatch) -> None:
     """The issue's first row, from Discord text to the broker call."""
     from types import SimpleNamespace
 
-    from live_runner.signal_sources.discord_source import _parse_trade_signal_from_message
+    from live_runner.signal_sources.discord_source import parse_trade_signal_from_message
 
     message = SimpleNamespace(
         id="900000000000000122",
@@ -944,7 +945,7 @@ def test_parsed_exit_message_end_to_end(monkeypatch) -> None:
         author=SimpleNamespace(id="bot-121", bot=True),
         created_at=datetime.now(timezone.utc),
     )
-    trade_signal = _parse_trade_signal_from_message(message, default_timeframe="1h")
+    trade_signal = parse_trade_signal_from_message(message, default_timeframe="1h")
     assert trade_signal is not None
 
     deployment = _deployment(allow_short=True)
@@ -1138,10 +1139,10 @@ def test_a_sell_exit_of_an_own_short_buys_it_back(monkeypatch) -> None:
 
 def test_a_sell_on_a_long_and_short_deployment_is_still_an_entry() -> None:
     """Only a deployment that cannot short turns a plain SELL into an exit."""
-    from live_runner.daemon import _trade_signal_to_live_signal
+    from live_runner.daemon import trade_signal_to_live_signal
     from live_runner.exit_signals import is_exit_order
 
-    live = _trade_signal_to_live_signal(
+    live = trade_signal_to_live_signal(
         _sell_trade_signal(), _deployment(allow_short=True)
     )
     assert not is_exit_order(live.action, live.metadata)
@@ -1440,18 +1441,17 @@ def test_usable_qty_tolerance_is_bounded_to_one_whole_unit() -> None:
     assert usable_qty_tolerance(100.0) == DEFAULT_QTY_TOLERANCE
 
 
-def test_exit_metadata_uses_the_shared_exit_only_constant(monkeypatch) -> None:
-    import live_runner.exit_signals as exit_signals
+def test_exit_metadata_marks_the_exit_only_risk_sizing_mode() -> None:
+    """The persisted marker value is the contract the adapters key on.
+
+    ``risk_sizing_mode == "exit_only"`` is what the broker adapters read to
+    treat the order as a close rather than an entry; the constant it is spelled
+    with is an implementation detail."""
     from live_runner.exit_signals import ExitInstruction, exit_intent_metadata
 
     assert exit_intent_metadata(ExitInstruction(fraction=1.0, position_side=None))[
         "risk_sizing_mode"
     ] == "exit_only"
-    # The persisted marker follows the constant, not a second spelling.
-    monkeypatch.setattr(exit_signals, "EXIT_ONLY_RISK_SIZING_MODE", "sentinel_mode")
-    assert exit_intent_metadata(ExitInstruction(fraction=1.0, position_side=None))[
-        "risk_sizing_mode"
-    ] == "sentinel_mode"
 
 
 def test_ledgers_must_match_broker_pure() -> None:
@@ -1624,7 +1624,16 @@ def test_no_unfilled_previous_exit_never_asks_the_broker(monkeypatch) -> None:
     assert len(adapter.submitted) == 1
 
 
-def _save_exit_signal(database, *, deployment_id, symbol, qty, filled, broker_order_id="ord"):
+def _save_exit_signal(
+    database,
+    *,
+    deployment_id,
+    symbol,
+    qty,
+    filled,
+    broker_order_id="ord",
+    metadata_extra: dict | None = None,
+):
     signal = LiveSignal(
         id=uuid.uuid4(),
         deployment_id=deployment_id,
@@ -1639,6 +1648,7 @@ def _save_exit_signal(database, *, deployment_id, symbol, qty, filled, broker_or
             "qty": qty,
             "explicit_qty": qty,
             "broker_order_id": broker_order_id,
+            **(metadata_extra or {}),
         },
     )
     signal_id, created = database.save_live_signal(signal)
@@ -2035,23 +2045,60 @@ def test_once_the_other_deployments_exit_is_done_this_exit_is_capped_to_the_fres
     assert not _records_at(caplog, logging.WARNING, "previous exit")
 
 
-def test_the_guard_asks_for_the_account_but_not_for_this_deployment(monkeypatch) -> None:
-    import live_runner.daemon as daemon
+def test_own_working_exit_of_another_lot_is_not_a_reservation(isolated_db) -> None:
+    """Real DB end to end: this deployment's own working exit of lot A must
+    neither block nor reserve against the exit of lot B (#382).
 
+    Only *other* deployments' working exits are subtracted from the broker
+    position; the deployment's own exits are already inside its own ledger.
+    The account-level pending-exit query runs for real here, so a regression
+    that let this deployment's rows back into the reservation shows up as a
+    smaller close.
+    """
+    from tests.conftest import seed_live_deployments
+
+    database, _engine, _data_dir = isolated_db
     deployment = _deployment(allow_short=False)
-    _patch_ledger(monkeypatch, deployment, 10.0)
-    seen: list[tuple] = []
+    dep_id = str(deployment.id)
+    seed_live_deployments(
+        database, [dep_id], account_id=deployment.account_id
+    )
+    entry_a = _save_signal_with_fill(
+        database, deployment_id=dep_id, symbol="AAPL", action="buy", qty=2.0
+    )
+    entry_b = _save_signal_with_fill(
+        database, deployment_id=dep_id, symbol="AAPL", action="buy", qty=3.0
+    )
+    # This deployment's own exit of lot A: still working at the broker, and
+    # asking for more than the broker position minus lot B's residual - if it
+    # were counted as a reservation the exit of lot B would be cut to 1.
+    _save_exit_signal(
+        database,
+        deployment_id=dep_id,
+        symbol="AAPL",
+        qty=4.0,
+        filled=0.0,
+        broker_order_id="ord-own-lot-a",
+        metadata_extra={"exit_target_signal_id": entry_a},
+    )
 
-    def _account_unfilled(account_id, symbol, **kwargs):
-        seen.append((account_id, symbol, kwargs))
-        return []
+    trade_signal = dataclasses.replace(
+        _exit_trade_signal(),
+        metadata={
+            **_exit_trade_signal().metadata,
+            "exit_target_signal_id": entry_b,
+        },
+    )
+    adapter = _WorkingOrdersAdapter(
+        [{"symbol": "AAPL", "qty": 5.0}], {"ord-own-lot-a"}
+    )
 
-    monkeypatch.setattr(daemon, "list_account_unfilled_exit_orders", _account_unfilled)
-    _run_submit(_Adapter([{"symbol": "AAPL", "qty": 10.0}]), deployment, _exit_trade_signal())
+    _run_submit(adapter, deployment, trade_signal)
 
-    assert seen == [
-        (deployment.account_id, "AAPL", {"exclude_deployment_id": str(deployment.id)})
-    ]
+    assert len(adapter.submitted) == 1
+    signal, qty = adapter.submitted[0]
+    assert signal.metadata["exit_target_signal_id"] == entry_b
+    assert qty == pytest.approx(3.0)
 
 
 def test_concurrent_exits_of_two_deployments_are_sized_one_after_the_other(
