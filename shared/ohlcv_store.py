@@ -44,6 +44,7 @@ __all__ = [
     "platform_timeframe",
     "read_frame",
     "read_manifest",
+    "segment_for_path",
     "source_dir",
     "store_root",
     "tf_token",
@@ -515,6 +516,20 @@ def entry_for_path(data_root: str | Path, path: str | Path) -> DatasetEntry | No
             if any(segment.resolve() == resolved for segment in entry.segments):
                 return entry
     return None
+
+
+def segment_for_path(data_root: str | Path, path: str | Path) -> str:
+    """The manifest segment label for a stored parquet path (``""`` if none)."""
+    entry = entry_for_path(data_root, path)
+    if entry is None:
+        return ""
+    prefix = f"{entry.symbol}_{tf_token(entry.timeframe)}"
+    stem = Path(path).stem
+    if stem == prefix:
+        return ""
+    if stem.startswith(f"{prefix}_"):
+        return stem[len(prefix) + 1 :]
+    return ""
 
 
 def _read_segment_frames(paths: list[Path]) -> list[pd.DataFrame]:
