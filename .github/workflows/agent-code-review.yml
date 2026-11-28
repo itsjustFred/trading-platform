@@ -175,18 +175,36 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      # The shared scripts run with the agent's secrets in reach, so they are
+      # taken from the base branch when it has them - the same trust model as
+      # the rules ("read from the base branch"). This consolidation's own runs
+      # predate that: the base has no scripts/agents yet, so the head copy -
+      # the change under test - is the fallback. Once this is on main every
+      # PR's base has them and the head copy is never used.
+      - name: Materialise trusted agent scripts
+        run: |
+          set -euo pipefail
+          dest="$RUNNER_TEMP/agent-scripts"
+          mkdir -p "$dest"
+          if git cat-file -e "${BASE_SHA}:scripts/agents/run_agent.sh" 2>/dev/null; then
+            git archive "$BASE_SHA" scripts/agents | tar -x -C "$dest"
+          else
+            git archive HEAD scripts/agents | tar -x -C "$dest"
+          fi
+          echo "AGENT_SCRIPTS=$dest" >> "$GITHUB_ENV"
+
       - name: Install opencode
-        run: bash scripts/agents/install_opencode.sh
+        run: bash "$AGENT_SCRIPTS/scripts/agents/install_opencode.sh"
 
       # Review rules: the base branch's skill if it has one. Otherwise (only
       # while the skill is not merged yet) the PR's own copy.
       - name: Select skill revision
-        run: bash scripts/agents/select_skill.sh review "review skill"
+        run: bash "$AGENT_SCRIPTS/scripts/agents/select_skill.sh" review "review skill"
 
       # The agent lives in the global config, not in the checkout. Its system
       # prompt is the skill body (the skill's own frontmatter is dropped).
       - name: Configure review agent
-        run: bash scripts/agents/configure_agent.sh review
+        run: bash "$AGENT_SCRIPTS/scripts/agents/configure_agent.sh" review
 
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
@@ -198,7 +216,7 @@ jobs:
         env:
           OPENCODE_DISABLE_PROJECT_CONFIG: "1"
           NVIDIA_API_KEY: ${{ startsWith(env.MODEL, 'nvidia/') && secrets.ACTIONS_NVIDIA_API_KEY || '' }}
-        run: bash scripts/agents/run_agent.sh review
+        run: bash "$AGENT_SCRIPTS/scripts/agents/run_agent.sh" review
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -227,7 +245,26 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          fetch-depth: 0
           persist-credentials: false
+
+      # Same trusted-copy rule as the agent job: the posting scripts run with
+      # GH_TOKEN in reach, so they come from the base branch's copy when it
+      # has one (this PR's own runs predate that and fall back to HEAD, the
+      # merge ref this checkout already is).
+      - name: Materialise trusted agent scripts
+        env:
+          BASE_SHA: ${{ needs.resolve.outputs.base }}
+        run: |
+          set -euo pipefail
+          dest="$RUNNER_TEMP/agent-scripts"
+          mkdir -p "$dest"
+          if git cat-file -e "${BASE_SHA}:scripts/agents/post_comment.py" 2>/dev/null; then
+            git archive "$BASE_SHA" scripts/agents | tar -x -C "$dest"
+          else
+            git archive HEAD scripts/agents | tar -x -C "$dest"
+          fi
+          echo "AGENT_SCRIPTS=$dest" >> "$GITHUB_ENV"
 
       # The probe-skip path has no agent artifact: the agent job never ran, so
       # the "not run: quota" comment is written here instead. The mid-run quota
@@ -239,7 +276,7 @@ jobs:
           BASE_SHA: ${{ needs.resolve.outputs.base }}
           HEAD_SHA: ${{ needs.resolve.outputs.head }}
         run: |
-          python3 scripts/agents/quota_comment.py --stage review --when probe > comment.md
+          python3 "$AGENT_SCRIPTS/scripts/agents/quota_comment.py" --stage review --when probe > comment.md
           cat comment.md >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
@@ -259,4 +296,4 @@ jobs:
           PR_NUMBER: ${{ needs.resolve.outputs.number }}
           HEAD_SHA: ${{ needs.resolve.outputs.head }}
           QUOTA_SKIP: ${{ needs.review.outputs.quota == 'true' || needs.quota-probe.outputs.available == 'false' }}
-        run: python3 scripts/agents/post_comment.py --stage review --marker '<!-- actions-code-review -->'
+        run: python3 "$AGENT_SCRIPTS/scripts/agents/post_comment.py" --stage review --marker '<!-- actions-code-review -->'

@@ -237,7 +237,8 @@ def _run(step: dict) -> str:
 # drifted copy used to.
 AGENTS_DIR = REPO_ROOT / "scripts" / "agents"
 _SCRIPT_CALL = re.compile(
-    r"^(?P<interp>bash|python3)\s+(?P<path>scripts/agents/[\w./-]+\.(?:sh|py))\s*(?P<rest>.*)$",
+    r'^(?P<interp>bash|python3)\s+(?:"\$AGENT_SCRIPTS/)?'
+    r"(?P<path>scripts/agents/[\w./-]+\.(?:sh|py))\"?\s*(?P<rest>.*)$",
     re.M,
 )
 
@@ -2865,9 +2866,59 @@ def test_the_comment_guards_live_in_one_shared_script() -> None:
     for name, stage in ((REVIEW, "review"), (MUTATION, "mutation"), (PREMORTEM, "premortem")):
         _job_name, agent = _agent_job(_load(name))
         body = _run(_find_step(agent, r"^Run .* agent$"))
-        assert body.strip() == f"bash scripts/agents/run_agent.sh {stage}", (
+        assert body.strip() == f'bash "$AGENT_SCRIPTS/scripts/agents/run_agent.sh" {stage}', (
             f"{name}: the agent step does not call the shared run_agent.sh: {body!r}"
         )
+
+
+def test_agent_and_post_jobs_run_the_shared_scripts_from_a_trusted_copy() -> None:
+    """The shared scripts run with the agent's secrets (and the poster's
+    GH_TOKEN) in reach, so they must not resolve against the PR-head checkout:
+    a head older than this consolidation has no scripts/agents/ and every such
+    PR's bots would break the day this merges. Each job that invokes a shared
+    script first materialises a trusted copy - the base branch's when it has
+    one, HEAD only while the base lacks them (this PR's own pre-merge runs) -
+    and every call goes through $AGENT_SCRIPTS."""
+    for name in AGENT_WORKFLOWS:
+        for job_name, job in _load(name)["jobs"].items():
+            steps = _steps(job)
+            invokes = [
+                (i, s)
+                for i, s in enumerate(steps)
+                if re.search(r"(?:bash|python3)\s+[^\n]*scripts/agents/", _run(s))
+            ]
+            if not invokes:
+                continue
+            materialise = [
+                (i, s)
+                for i, s in enumerate(steps)
+                if s.get("name") == "Materialise trusted agent scripts"
+            ]
+            assert materialise, (
+                f"{name}/{job_name}: shared-script calls without the trusted-copy step"
+            )
+            idx, step = materialise[0]
+            assert idx < invokes[0][0], (
+                f"{name}/{job_name}: the trusted copy is materialised after a script call"
+            )
+            body = _run(step)
+            assert 'git archive "$BASE_SHA" scripts/agents' in body, (
+                f"{name}/{job_name}: no base-branch archive in the materialise step"
+            )
+            assert "git archive HEAD scripts/agents" in body, (
+                f"{name}/{job_name}: no HEAD fallback in the materialise step"
+            )
+            assert 'echo "AGENT_SCRIPTS=$dest" >> "$GITHUB_ENV"' in body, (
+                f"{name}/{job_name}: AGENT_SCRIPTS is not exported"
+            )
+            for _, s in invokes:
+                call_body = _run(s)
+                assert '"$AGENT_SCRIPTS/scripts/agents/' in call_body, (
+                    f"{name}/{job_name}: a script call does not use $AGENT_SCRIPTS: {call_body!r}"
+                )
+                assert not re.search(r"(?:bash|python3)\s+scripts/agents/", call_body), (
+                    f"{name}/{job_name}: a script call resolves against the head checkout"
+                )
 
 
 def test_the_agent_jobs_hold_no_token_and_verify_the_tree() -> None:

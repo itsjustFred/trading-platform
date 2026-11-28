@@ -425,31 +425,49 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      # The shared scripts run with the agent's secrets in reach, so they are
+      # taken from the base branch when it has them - the same trust model as
+      # the rules ("read from the base branch"). This consolidation's own runs
+      # predate that: the base has no scripts/agents yet, so the head copy -
+      # the change under test - is the fallback. Once this is on main every
+      # PR's base has them and the head copy is never used.
+      - name: Materialise trusted agent scripts
+        run: |
+          set -euo pipefail
+          dest="$RUNNER_TEMP/agent-scripts"
+          mkdir -p "$dest"
+          if git cat-file -e "${BASE_SHA}:scripts/agents/run_agent.sh" 2>/dev/null; then
+            git archive "$BASE_SHA" scripts/agents | tar -x -C "$dest"
+          else
+            git archive HEAD scripts/agents | tar -x -C "$dest"
+          fi
+          echo "AGENT_SCRIPTS=$dest" >> "$GITHUB_ENV"
+
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: agent-pre-mortem-meta
           path: ${{ runner.temp }}/premortem
 
       - name: Install opencode
-        run: bash scripts/agents/install_opencode.sh
+        run: bash "$AGENT_SCRIPTS/scripts/agents/install_opencode.sh"
 
       # Rules: the base branch's skill if it has one. Otherwise (only while the
       # skill is not merged yet) the PR's own copy.
       - name: Select skill revision
-        run: bash scripts/agents/select_skill.sh premortem "pre-mortem skill"
+        run: bash "$AGENT_SCRIPTS/scripts/agents/select_skill.sh" premortem "pre-mortem skill"
 
       # The agent lives in the global config, not in the checkout. Its system
       # prompt is the skill body (the skill's own frontmatter is dropped). It is
       # read-only; .env reads stay denied.
       - name: Configure pre-mortem agent
-        run: bash scripts/agents/configure_agent.sh premortem
+        run: bash "$AGENT_SCRIPTS/scripts/agents/configure_agent.sh" premortem
 
       - name: Run pre-mortem agent
         id: run
         env:
           OPENCODE_DISABLE_PROJECT_CONFIG: "1"
           NVIDIA_API_KEY: ${{ startsWith(env.MODEL, 'nvidia/') && secrets.ACTIONS_NVIDIA_API_KEY || '' }}
-        run: bash scripts/agents/run_agent.sh premortem
+        run: bash "$AGENT_SCRIPTS/scripts/agents/run_agent.sh" premortem
 
       # A separate step, so the verdict reaches $GITHUB_OUTPUT from a file the
       # agent never had this step's env file to append to. A quota skip wrote no
@@ -506,7 +524,24 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          fetch-depth: 0
           persist-credentials: false
+
+      # Same trusted-copy rule as the agent job: the posting scripts run with
+      # GH_TOKEN in reach, so they come from the base branch's copy when it
+      # has one (this PR's own runs predate that and fall back to HEAD, the
+      # merge ref this checkout already is).
+      - name: Materialise trusted agent scripts
+        run: |
+          set -euo pipefail
+          dest="$RUNNER_TEMP/agent-scripts"
+          mkdir -p "$dest"
+          if git cat-file -e "${BASE_SHA}:scripts/agents/post_comment.py" 2>/dev/null; then
+            git archive "$BASE_SHA" scripts/agents | tar -x -C "$dest"
+          else
+            git archive HEAD scripts/agents | tar -x -C "$dest"
+          fi
+          echo "AGENT_SCRIPTS=$dest" >> "$GITHUB_ENV"
 
       - name: Report failed pre-mortem run
         if: needs.premortem.result == 'failure'
@@ -551,7 +586,7 @@ jobs:
       # probe path's alone.
       - name: Write quota comment
         if: needs.quota-probe.outputs.available == 'false'
-        run: python3 scripts/agents/quota_comment.py --stage premortem --when probe > comment.md
+        run: python3 "$AGENT_SCRIPTS/scripts/agents/quota_comment.py" --stage premortem --when probe > comment.md
 
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         if: needs.premortem.result == 'success'
@@ -571,7 +606,7 @@ jobs:
           # post_comment.py can keep it from overwriting a real verdict for
           # this same head.
           QUOTA_SKIP: ${{ needs.premortem.outputs.quota == 'true' || needs.quota-probe.outputs.available == 'false' }}
-        run: python3 scripts/agents/post_comment.py --stage premortem --marker '<!-- actions-pre-mortem -->'
+        run: python3 "$AGENT_SCRIPTS/scripts/agents/post_comment.py" --stage premortem --marker '<!-- actions-pre-mortem -->'
 
       - name: Set status
         if: needs.premortem.result == 'success' && needs.premortem.outputs.quota != 'true'

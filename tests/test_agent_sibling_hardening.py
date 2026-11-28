@@ -92,7 +92,8 @@ def _run(step: dict) -> str:
 # call to an absolute path (for the tests that execute the body).
 AGENTS_DIR = REPO_ROOT / "scripts" / "agents"
 _SCRIPT_CALL = re.compile(
-    r"^(?P<interp>bash|python3)\s+(?P<path>scripts/agents/[\w./-]+\.(?:sh|py))\s*(?P<rest>.*)$",
+    r'^(?P<interp>bash|python3)\s+(?:"\$AGENT_SCRIPTS/)?'
+    r"(?P<path>scripts/agents/[\w./-]+\.(?:sh|py))\"?\s*(?P<rest>.*)$",
     re.M,
 )
 
