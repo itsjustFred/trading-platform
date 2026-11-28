@@ -9,7 +9,7 @@ import pytest
 
 SCRIPT = (
     Path(__file__).resolve().parents[1]
-    / "strategy-comparisons/intraday_volatility_breakout/audit/score_parity.py"
+    / "scripts/intraday_volatility_breakout_audit/score_parity.py"
 )
 
 

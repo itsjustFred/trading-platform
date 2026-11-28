@@ -53,6 +53,45 @@ def test_iter_strategy_entries_does_not_execute_strategy_files(
     assert not no_strategy_imports
 
 
+def test_strategy_folder_auxiliary_dirs_are_not_strategies(tmp_path: Path) -> None:
+    """``mt5/``, ``reference/`` and ``_template/`` never load as strategies."""
+    from shared.strategy_registry import iter_strategy_entries, iter_strategy_files
+
+    strategies_dir = tmp_path / "strategies"
+    strategy_dir = strategies_dir / "foldered_strategy"
+    strategy_dir.mkdir(parents=True)
+    (strategy_dir / "foldered_strategy.py").write_text(
+        "STRATEGY_META = {'name': 'Folded Strategy'}\n",
+        encoding="utf-8",
+    )
+    (strategy_dir / "SOURCE.md").write_text("# source\n", encoding="utf-8")
+    (strategy_dir / "__init__.py").write_text("", encoding="utf-8")
+
+    mt5_dir = strategy_dir / "mt5"
+    mt5_dir.mkdir()
+    (mt5_dir / "mt5.py").write_text(
+        "STRATEGY_META = {'name': 'MT5 Helper'}\n",
+        encoding="utf-8",
+    )
+    reference_dir = strategy_dir / "reference"
+    reference_dir.mkdir()
+    (reference_dir / "reference.py").write_text(
+        "STRATEGY_META = {'name': 'Reference Helper'}\n",
+        encoding="utf-8",
+    )
+    template_dir = strategies_dir / "_template"
+    template_dir.mkdir()
+    (template_dir / "_template.py").write_text(
+        "STRATEGY_META = {'name': 'Template'}\n",
+        encoding="utf-8",
+    )
+
+    assert iter_strategy_files(strategies_dir) == [strategy_dir / "foldered_strategy.py"]
+    entries = iter_strategy_entries(strategies_dir)
+    assert [entry.slug for entry in entries] == ["foldered_strategy"]
+    assert entries[0].display_name == "Folded Strategy"
+
+
 def test_find_strategy_entry_does_not_execute_strategy_files(
     tmp_path: Path, no_strategy_imports
 ) -> None:

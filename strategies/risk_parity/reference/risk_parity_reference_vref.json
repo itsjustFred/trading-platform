@@ -28,7 +28,7 @@
     "recovery_factor": 0.0
   },
   "raw_metadata": {
-    "source": "strategy-comparisons/risk_parity/risk_parity_report_quantconnect.pdf",
+    "source": "strategies/risk_parity/reference/risk_parity_report_quantconnect.pdf",
     "note": "PDF contains only summary statistics and charts; no trade table available. Stats extracted via OCR.",
     "pdf_stats": {
       "Runtime Days": 3287,

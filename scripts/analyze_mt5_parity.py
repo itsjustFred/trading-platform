@@ -71,9 +71,9 @@ class CasePaths:
 
 
 MT5_REPORTS = {
-    "EURUSD_H1": Path("strategy-comparisons/intraday_volatility_breakout/EURUSD_H1.xlsx"),
-    "NAS100_M15": Path("strategy-comparisons/intraday_volatility_breakout/NAS100_M15.xlsx"),
-    "SP500_M1": Path("strategy-comparisons/intraday_volatility_breakout/SP500_M1.xlsx"),
+    "EURUSD_H1": Path("strategies/intraday_volatility_breakout/reference/EURUSD_H1.xlsx"),
+    "NAS100_M15": Path("strategies/intraday_volatility_breakout/reference/NAS100_M15.xlsx"),
+    "SP500_M1": Path("strategies/intraday_volatility_breakout/reference/SP500_M1.xlsx"),
 }
 
 

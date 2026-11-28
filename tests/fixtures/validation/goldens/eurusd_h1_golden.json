@@ -20274,7 +20274,7 @@
       "avg_consecutive_losses": 2
     }
   },
-  "source_path": "/home/ubuntu/Desktop/trading-platform/strategy-comparisons/intraday_volatility_breakout/EURUSD_H1.xlsx",
+  "source_path": "/home/ubuntu/Desktop/trading-platform/strategies/intraday_volatility_breakout/reference/EURUSD_H1.xlsx",
   "source_hash": null,
   "imported_at": "2026-06-24T13:49:21.341667",
   "validation_status": "pending",

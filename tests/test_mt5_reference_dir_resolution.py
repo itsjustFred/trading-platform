@@ -17,9 +17,8 @@ import pytest
 
 _AUDIT_SCRIPT = (
     pathlib.Path(__file__).resolve().parent.parent
-    / "strategy-comparisons"
-    / "intraday_volatility_breakout"
-    / "audit"
+    / "scripts"
+    / "intraday_volatility_breakout_audit"
     / "parse_mt5_reference.py"
 )
 _ENV_VAR = "TRADING_PLATFORM_REFERENCES"
@@ -247,7 +246,7 @@ def test_main_reads_logs_from_the_resolved_reference_dir(tmp_path, monkeypatch, 
     monkeypatch.setattr(_PARSER, "parse_xlsx_trades", _recording_parse_xlsx_trades)
     monkeypatch.setattr(_PARSER, "parse_xlsx_summary", lambda df: dict(_XLSX_SUMMARY))
     monkeypatch.setattr(pandas, "read_excel", lambda *args, **kwargs: None)
-    # --out must resolve inside cwd or the strategy-comparison directory, so keep
+    # --out must resolve inside cwd or the audit script directory, so keep
     # the run inside tmp_path instead of writing into the checkout.
     monkeypatch.chdir(tmp_path)
     argv = ["parse_mt5_reference.py", "--out", "out"]
@@ -260,7 +259,7 @@ def test_main_reads_logs_from_the_resolved_reference_dir(tmp_path, monkeypatch, 
     assert _PARSER.main() == 0
 
     assert read_logs == [ref / log_rel for log_rel, _name, _c in _PARSER.JOBS.values()]
-    assert read_xlsx == [_PARSER.CMP / name for _rel, name, _c in _PARSER.JOBS.values()]
+    assert read_xlsx == [_PARSER.REFERENCE_DIR / name for _rel, name, _c in _PARSER.JOBS.values()]
     assert ref / "mt5-eurusd-h1/eurusd_h1.log" in read_logs
 
     out = tmp_path / "out"

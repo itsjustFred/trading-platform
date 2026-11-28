@@ -2,7 +2,7 @@
 
 **Datum:** 2026-06-24
 **Branch:** `kimchi-kimi-continue`
-**Quelle:** `strategy-comparisons/intraday_volatility_breakout/`
+**Quelle:** `strategies/intraday_volatility_breakout/reference/`
 **Berichtssprache:** Deutsch (MT5 Build 5836)
 
 ---
@@ -10,7 +10,7 @@
 ## Verify-Befehl
 
 ```bash
-python -c "import pandas as pd; df = pd.read_excel('strategy-comparisons/intraday_volatility_breakout/EURUSD_H1.xlsx'); print(list(df.columns))"
+python -c "import pandas as pd; df = pd.read_excel('strategies/intraday_volatility_breakout/reference/EURUSD_H1.xlsx'); print(list(df.columns))"
 ```
 
 **Ausgabe:**

@@ -110,12 +110,12 @@ target-version = "py312"
 #   tests/fixtures/invalid_strategies/syntax_error.py is an explicit negative
 #     control -- "deliberately unparseable" -- for the invalid-strategy path, so
 #     repairing it would destroy the thing it exists to test.
-#   strategy-comparisons/ holds QuantConnect algorithms, which the QC platform
-#     requires to use `from AlgorithmImports import *`; rewriting that import
-#     would break them on the platform.
+#   strategies/*/reference/ holds frozen external references, including
+#     QuantConnect algorithms whose `from AlgorithmImports import *` import is
+#     required by the QC platform and cannot be rewritten safely here.
 extend-exclude = [
     "tests/fixtures",
-    "strategy-comparisons",
+    "strategies/*/reference",
 ]
 
 [tool.ruff.lint]

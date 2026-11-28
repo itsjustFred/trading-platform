@@ -20,7 +20,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 def test_cross_platform_matrix_includes_reference_metrics():
     matrix = build_comparison_matrix(
-        comparisons_dir=PROJECT_ROOT / "strategy-comparisons",
+        strategies_dir=PROJECT_ROOT / "strategies",
         reports_dir=PROJECT_ROOT / "reports",
     )
 
@@ -62,7 +62,7 @@ def test_cross_platform_matrix_includes_reference_metrics():
 
 def test_cross_platform_matrix_marks_missing_platform_artifact(tmp_path):
     matrix = build_comparison_matrix(
-        comparisons_dir=PROJECT_ROOT / "strategy-comparisons",
+        strategies_dir=PROJECT_ROOT / "strategies",
         reports_dir=tmp_path,
     )
 
@@ -72,7 +72,7 @@ def test_cross_platform_matrix_marks_missing_platform_artifact(tmp_path):
 
 def test_cross_platform_matrix_honors_explicit_platform_data_dir(tmp_path):
     matrix = build_comparison_matrix(
-        comparisons_dir=PROJECT_ROOT / "strategy-comparisons",
+        strategies_dir=PROJECT_ROOT / "strategies",
         reports_dir=PROJECT_ROOT / "reports",
         platform_data_dir=tmp_path,
     )
@@ -114,7 +114,7 @@ def test_cross_platform_matrix_recomputes_sharpe_with_reference_risk_free_rate(t
     result.save(tmp_path / "intraday_volatility_breakout_sp500_m1.json")
 
     matrix = build_comparison_matrix(
-        comparisons_dir=PROJECT_ROOT / "strategy-comparisons",
+        strategies_dir=PROJECT_ROOT / "strategies",
         reports_dir=PROJECT_ROOT / "reports",
         platform_data_dir=tmp_path,
     )
@@ -127,7 +127,7 @@ def test_cross_platform_matrix_recomputes_sharpe_with_reference_risk_free_rate(t
 @pytest.fixture(scope="module")
 def matrix() -> dict:
     return build_comparison_matrix(
-        comparisons_dir=PROJECT_ROOT / "strategy-comparisons",
+        strategies_dir=PROJECT_ROOT / "strategies",
         reports_dir=PROJECT_ROOT / "reports",
     )
 
@@ -195,7 +195,7 @@ def test_comparison_matrix_parses_each_mt5_report_on_its_case_broker_clock(monke
     monkeypatch.setattr(MT5XLSXImporter, "load", recording_load)
 
     build_comparison_matrix(
-        comparisons_dir=PROJECT_ROOT / "strategy-comparisons",
+        strategies_dir=PROJECT_ROOT / "strategies",
         reports_dir=PROJECT_ROOT / "reports",
     )
 
@@ -231,7 +231,7 @@ def test_cross_platform_matrix_always_recomputes_canonical_stats(tmp_path):
     result.save(tmp_path / "risk_parity_quantconnect_reimplementation.json")
 
     matrix = build_comparison_matrix(
-        comparisons_dir=PROJECT_ROOT / "strategy-comparisons",
+        strategies_dir=PROJECT_ROOT / "strategies",
         reports_dir=PROJECT_ROOT / "reports",
         platform_data_dir=tmp_path,
     )
@@ -270,7 +270,7 @@ def test_cross_platform_matrix_ignores_malformed_qc_attribution_stats(tmp_path):
     result.save(tmp_path / "risk_parity_quantconnect_reimplementation.json")
 
     matrix = build_comparison_matrix(
-        comparisons_dir=PROJECT_ROOT / "strategy-comparisons",
+        strategies_dir=PROJECT_ROOT / "strategies",
         reports_dir=PROJECT_ROOT / "reports",
         platform_data_dir=tmp_path,
     )
@@ -471,7 +471,7 @@ def test_mt5_row_keeps_platform_mtm_sharpe_as_a_separate_field(tmp_path):
         MT5ComparisonCase(
             case_id="intraday_volatility_breakout_sp500_m1",
             reference_path=PROJECT_ROOT
-            / "strategy-comparisons/intraday_volatility_breakout/SP500_M1.xlsx",
+            / "strategies/intraday_volatility_breakout/reference/SP500_M1.xlsx",
             platform_path=platform_path,
             broker_clock="dukascopy_mt5_index",
         )
@@ -532,7 +532,7 @@ def test_mt5_row_reports_printed_sharpe_separately_from_the_comparison(matrix):
 
 def test_regenerator_outputs_match_cross_platform_matrix_paths():
     matrix = build_comparison_matrix(
-        comparisons_dir=PROJECT_ROOT / "strategy-comparisons",
+        strategies_dir=PROJECT_ROOT / "strategies",
         reports_dir=PROJECT_ROOT / "reports",
     )
     rows = {row["case_id"]: Path(row["platform_path"]).resolve() for row in matrix["rows"]}

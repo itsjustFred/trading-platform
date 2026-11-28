@@ -1,7 +1,7 @@
 # Intraday Volatility Breakout
 
 ## Quelle
-- Original: MQL5 (MetaTrader 5), `strategy-comparisons/intraday_volatility_breakout/IntradayVolatilityBreakout.mq5`
+- Original: MQL5 (MetaTrader 5), `strategies/intraday_volatility_breakout/mt5/IntradayVolatilityBreakout.mq5`
 - Version: 1.2.0 (1.2.0: Time-Exit-Signal eine Bar vor dem Exit-Open für `signal_exit_fill="next_open"`; Stale-Exit am ersten Bar des Tages statt Last-Bar-Look-ahead)
 - Konvertiert: 2026-06-24
 
@@ -136,7 +136,7 @@ Hinweis: Die EA-Logik berechnet ATR und Regime-Filter immer auf `PERIOD_D1`, una
 | `daily_weekend_bars` | `"auto"` | `"auto"`: Sa/So-D1-Zeilen verwerfen, außer die Broker-Uhr meldet sie für den Zeitraum; `"drop"`/`"keep"` erzwingen. |
 | `daily_skip_filler_bars` | `true` | Flache Bars mit Volumen ≤ 0 (Feed-Padding an Wochenenden/Feiertagen/geschlossenen Stunden) bilden keine D1-Bars. |
 
-Evidenz und Parität pro Symbol: `strategy-comparisons/intraday_volatility_breakout/audit/README.md`.
+Evidenz und Parität pro Symbol: `scripts/intraday_volatility_breakout_audit/README.md`.
 
 ## Bekannte Abweichungen
 - `ORDER_FILLING_FOK` wird nicht explizit simuliert; vectorbt nutzt Market-Order am Open der nächsten Bar.

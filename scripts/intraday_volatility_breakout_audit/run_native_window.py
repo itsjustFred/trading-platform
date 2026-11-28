@@ -6,7 +6,7 @@ the MT5-logged daily ATR is injected (``Stop / Stop_ATR_Multiplier`` of the EA's
 ``Levels calculated`` line), and the native engine runs with fixed-risk sizing from the
 ATR stop distance and the bid/ask spread model (``spread_price_col``).
 
-  .venv/bin/python strategy-comparisons/intraday_volatility_breakout/audit/run_native_window.py \
+  .venv/bin/python scripts/intraday_volatility_breakout_audit/run_native_window.py \
       --ref-dir data/audit_ref --symbols nas100 sp500 [--signal-exit-fill next_open|close] \
       [--strategy-file <older strategy .py to compare against>]
 
@@ -27,7 +27,7 @@ import tempfile
 
 import pandas as pd
 
-REPO = pathlib.Path(__file__).resolve().parents[3]
+REPO = pathlib.Path(__file__).resolve().parents[2]
 HERE = pathlib.Path(__file__).resolve().parent
 for entry in (str(REPO), str(HERE)):
     if entry not in sys.path:

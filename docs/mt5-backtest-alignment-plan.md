@@ -3,7 +3,7 @@
 ## Purpose
 
 Make platform backtests comparable against the MT5 strategy reports in
-`strategy-comparisons/intraday_volatility_breakout/` without replacing the
+`strategies/intraday_volatility_breakout/reference/` without replacing the
 current backtest engine. The target is an explicit MT5-alignment mode with
 deterministic report ingestion, MT5-like fixed-risk sizing, instrument contract
 metadata, confirmation-timeframe support, and a comparison report that explains
@@ -11,9 +11,9 @@ remaining differences.
 
 Current MT5 reference files:
 
-- `strategy-comparisons/intraday_volatility_breakout/EURUSD_H1.html`
-- `strategy-comparisons/intraday_volatility_breakout/SP500_M1.html`
-- `strategy-comparisons/intraday_volatility_breakout/US100_M15.html`
+- `strategies/intraday_volatility_breakout/reference/EURUSD_H1.xlsx`
+- `strategies/intraday_volatility_breakout/reference/SP500_M1.xlsx`
+- `strategies/intraday_volatility_breakout/reference/NAS100_M15.xlsx`
 
 Important data-source constraint: Dukascopy does provide intraday US index CFD
 data. Keep `SP500`/`US500` and `US100`/`NAS100`/`USTEC` routed through
@@ -22,7 +22,7 @@ Dukascopy index-CFD aliases.
 ## Current Baseline
 
 The first strategy-alignment pass is documented in
-`reports/strategy-comparison-platform-check-2026-06-23.md` (historisch, mit `reports/`-Ordner entfernt; Vergleichsbasis heute: `strategy-comparisons/`).
+`reports/strategy-comparison-platform-check-2026-06-23.md` (historisch, mit `reports/`-Ordner entfernt; Vergleichsbasis heute: `strategies/`).
 
 Main remaining gaps:
 
@@ -417,7 +417,7 @@ Proposed command:
 
 ```bash
 python -m scripts.compare_mt5_report \
-  --mt5 strategy-comparisons/intraday_volatility_breakout/SP500_M1.html \
+  --mt5 strategies/intraday_volatility_breakout/reference/SP500_M1.xlsx \
   --platform [entfernt] reports/strategy_comparison_backtest_SP500_M1_after_align_20260623.trades.json \
   --output docs/reports/mt5_alignment_SP500_M1_YYYYMMDD.md
 ```

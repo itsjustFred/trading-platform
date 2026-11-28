@@ -4,7 +4,7 @@ Pairs every MT5 tester trade with the platform trade of the same *server* tradin
 day and direction (the EA takes at most one trade per day), converting platform
 UTC entry times onto the broker's server clock with ``shared.broker_clock``.
 
-  .venv/bin/python strategy-comparisons/intraday_volatility_breakout/audit/score_parity.py \
+  .venv/bin/python scripts/intraday_volatility_breakout_audit/score_parity.py \
       --ref-dir <dir with mt5_trades_*.csv from parse_mt5_reference.py> \
       [--artifact eurusd=data/backtests/intraday_volatility_breakout_eurusd_h1.json ...] \
       [--clock eurusd=dukascopy_mt5_forex ...] [--out <dir for per-trade CSVs>]
@@ -24,7 +24,7 @@ import sys
 
 import pandas as pd
 
-REPO = pathlib.Path(__file__).resolve().parents[3]
+REPO = pathlib.Path(__file__).resolve().parents[2]
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 

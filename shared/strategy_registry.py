@@ -149,6 +149,12 @@ def atr_sizing_keys_without_stop(path: Path) -> frozenset[str]:
     return frozenset(key for key in published if key.startswith("atr"))
 
 
+#: Directories inside ``strategies/`` that hold source/reference material, not
+#: runnable strategies. They are ignored even when a contained file happens to
+#: match the folder/file naming rule (for example ``mt5/mt5.py``).
+_STRATEGY_IGNORED_DIRS = frozenset({"mt5", "reference", "_template"})
+
+
 def iter_strategy_files(strategies_dir: Path = DEFAULT_STRATEGIES_DIR) -> list[Path]:
     if not strategies_dir.exists():
         return []
@@ -156,6 +162,9 @@ def iter_strategy_files(strategies_dir: Path = DEFAULT_STRATEGIES_DIR) -> list[P
     files: list[Path] = []
     for path in strategies_dir.rglob("*.py"):
         if path.name.startswith("__") or path.stem.endswith("_context"):
+            continue
+        relative_parts = path.relative_to(strategies_dir).parts[:-1]
+        if _STRATEGY_IGNORED_DIRS.intersection(relative_parts):
             continue
         if path.parent != strategies_dir and path.parent.name != path.stem:
             continue

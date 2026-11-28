@@ -10,9 +10,8 @@ import pytest
 
 _SCRIPT = (
     pathlib.Path(__file__).resolve().parent.parent
-    / "strategy-comparisons"
-    / "intraday_volatility_breakout"
-    / "audit"
+    / "scripts"
+    / "intraday_volatility_breakout_audit"
     / "score_parity.py"
 )
 

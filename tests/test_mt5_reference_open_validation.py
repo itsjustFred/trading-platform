@@ -18,9 +18,8 @@ import pytest
 
 _AUDIT_SCRIPT = (
     pathlib.Path(__file__).resolve().parent.parent
-    / "strategy-comparisons"
-    / "intraday_volatility_breakout"
-    / "audit"
+    / "scripts"
+    / "intraday_volatility_breakout_audit"
     / "parse_mt5_reference.py"
 )
 

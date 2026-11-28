@@ -18,22 +18,25 @@ FIXTURE_DIR = PROJECT_ROOT / "tests" / "fixtures" / "validation" / "goldens"
 REPORTS = [
     (
         PROJECT_ROOT
-        / "strategy-comparisons"
+        / "strategies"
         / "intraday_volatility_breakout"
+        / "reference"
         / "EURUSD_H1.xlsx",
         "eurusd_h1_golden.json",
     ),
     (
         PROJECT_ROOT
-        / "strategy-comparisons"
+        / "strategies"
         / "intraday_volatility_breakout"
+        / "reference"
         / "NAS100_M15.xlsx",
         "nas100_m15_golden.json",
     ),
     (
         PROJECT_ROOT
-        / "strategy-comparisons"
+        / "strategies"
         / "intraday_volatility_breakout"
+        / "reference"
         / "SP500_M1.xlsx",
         "sp500_m1_golden.json",
     ),

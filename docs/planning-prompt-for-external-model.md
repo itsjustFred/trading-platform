@@ -85,10 +85,10 @@ Das bedeutet:
 
 ## Strategie-Vergleiche — Daten-Anforderungen
 
-Im Repo existieren bereits ausgearbeitete Strategie-Vergleiche unter `strategy-comparisons/` mit HTML-Reports und Charts. Diese müssen mit OHLCV-Daten unterfüttert werden, damit die Strategien in der Plattform lauffähig sind.
+Im Repo existieren bereits ausgearbeitete Strategie-Vergleiche unter `strategies/` mit Referenz-Reports und Daten. Diese müssen mit OHLCV-Daten unterfüttert werden, damit die Strategien in der Plattform lauffähig sind.
 
 ### 1. Intraday Volatility Breakout
-- **Pfade:** `strategy-comparisons/intraday_volatility_breakout/`
+- **Pfade:** `strategies/intraday_volatility_breakout/`
 - **Benötigte Daten:**
   - `EURUSD` — H1 (1-Stunden-Candles), Zeitraum: 2018-01-01 bis heute
   - `SP500` — M1 (1-Minuten-Candles), Zeitraum: 2018-01-01 bis heute
@@ -103,7 +103,7 @@ Im Repo existieren bereits ausgearbeitete Strategie-Vergleiche unter `strategy-c
 - **Hinweis:** Nicht auf yfinance-Proxies ausweichen, solange die Dukascopy-CFDs verfügbar sind.
 
 ### 2. Risk Parity
-- **Pfad:** `strategy-comparisons/risk_parity/`
+- **Pfad:** `strategies/risk_parity/reference/`
 - **Benötigte Daten:**
   - Täglich (D1) für: `SPY`, `QQQ`, `EFA`, `EEM`, `TLT`, `IEF`, `LQD`, `TIP`, `GLD`, `DBC`, `VNQ`
   - Zeitraum: 2016-01-01 bis 2024-12-31
