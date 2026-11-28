@@ -772,7 +772,7 @@ def test_the_quota_probe_agent_is_denied_every_tool_and_the_probe_is_identical()
         assert call.get("uses") == "./.github/workflows/agent-quota-probe.yml", (
             f"{name}: quota-probe does not call the shared workflow"
         )
-        for key in ("model", "variant", "opencode-version"):
+        for key in ("model", "variant", "opencode-version", "opencode-sha256"):
             assert (call.get("with") or {}).get(key), (
                 f"{name}: quota-probe passes no {key}"
             )

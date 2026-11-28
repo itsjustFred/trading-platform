@@ -2376,7 +2376,7 @@ def test_the_quota_probe_is_identical_in_every_workflow_that_has_one() -> None:
             f"{name}: quota-probe does not call the shared workflow"
         )
         with_inputs = call.get("with") or {}
-        for key in ("model", "variant", "opencode-version"):
+        for key in ("model", "variant", "opencode-version", "opencode-sha256"):
             assert with_inputs.get(key), f"{name}: quota-probe passes no {key}"
         secrets = call.get("secrets") or {}
         assert "ACTIONS_NVIDIA_API_KEY" in secrets, (
@@ -2942,13 +2942,30 @@ def test_the_agent_jobs_hold_no_token_and_verify_the_tree() -> None:
         assert "git status --porcelain" in bodies, f"{name}: no tree-clean guard"
 
 
+def _install_lines(body: str) -> list[str]:
+    """Executable lines of an install body: comments and blanks dropped."""
+    return [
+        line.rstrip()
+        for line in body.splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+
+
 def test_opencode_is_installed_as_a_checksum_verified_binary() -> None:
     """opencode comes from the pinned GitHub release binary, verified against
-    the release's SHA256SUMS - the same pattern as gitleaks and actionlint.
-    `npm install -g` is gone on purpose: it resolves transitive dependencies
-    with no lockfile, which SonarCloud rates a security issue."""
+    the sha256 pinned in the workflow next to OPENCODE_VERSION - the same
+    pattern as gitleaks and actionlint. The release's own SHA256SUMS is not
+    fetched: it only proves the download matches what the release published,
+    and this step runs with NVIDIA_API_KEY in reach. `npm install -g` is gone
+    on purpose: it resolves transitive dependencies with no lockfile, which
+    SonarCloud rates a security issue."""
     for name in AGENT_WORKFLOWS:
-        _job_name, job = _agent_job(_load(name))
+        data = _load(name)
+        sha = (data.get("env") or {}).get("OPENCODE_SHA256", "")
+        assert re.fullmatch(r"[0-9a-f]{64}", sha), (
+            f"{name}: OPENCODE_SHA256 is not a sha256"
+        )
+        _job_name, job = _agent_job(data)
         body = _run_source(_find_step(job, r"^Install opencode$"))
         assert not any(
             line.lstrip().startswith("npm install") for line in body.splitlines()
@@ -2956,22 +2973,54 @@ def test_opencode_is_installed_as_a_checksum_verified_binary() -> None:
         assert "releases/download/v${OPENCODE_VERSION}" in body, (
             f"{name}: the binary is not fetched for the pinned OPENCODE_VERSION"
         )
-        assert "SHA256SUMS" in body
-        assert "sha256sum -c" in body, (
-            f"{name}: the downloaded binary is not checksum-verified"
+        install = "\n".join(_install_lines(body))
+        assert "SHA256SUMS" not in install, (
+            f"{name}: the release's own checksum file is still trusted"
+        )
+        assert '"${OPENCODE_SHA256}  ${asset}" | (cd "$dest" && sha256sum -c -)' in install, (
+            f"{name}: the downloaded binary is not checked against the pinned sha256"
         )
         assert '"$dest/opencode" --version' in body or "opencode --version" in body, (
             f"{name}: the installed binary's version is not printed"
         )
     # The probe cannot call the script (no checkout), so its inline copy is
-    # held to the same standard.
-    probe_body = _run_source(_find_step(_load(PROBE)["jobs"]["probe"], r"^Install opencode"))
+    # held to the same standard - and to the script itself, below.
+    probe = _load(PROBE)
+    probe_on = probe.get(True) or probe.get("on") or {}
+    probe_inputs = (probe_on.get("workflow_call") or {}).get("inputs") or {}
+    assert (probe_inputs.get("opencode-sha256") or {}).get("required") is True, (
+        "the probe does not take the pinned sha256 as an input"
+    )
+    for name in AGENT_WORKFLOWS:
+        call = _load(name)["jobs"].get("quota-probe") or {}
+        assert (call.get("with") or {}).get("opencode-sha256") == (
+            (_load(name).get("env") or {}).get("OPENCODE_SHA256")
+        ), f"{name}: the probe's sha256 input does not match the workflow's pin"
+    probe_body = _run_source(_find_step(probe["jobs"]["probe"], r"^Install opencode"))
     assert not any(
         line.lstrip().startswith("npm install") for line in probe_body.splitlines()
     )
-    assert "releases/download/v${OPENCODE_VERSION}" in probe_body
-    assert "SHA256SUMS" in probe_body
-    assert "sha256sum -c" in probe_body
+    probe_install = "\n".join(_install_lines(probe_body))
+    assert "releases/download/v${OPENCODE_VERSION}" in probe_install
+    assert "SHA256SUMS" not in probe_install
+    assert "${OPENCODE_SHA256}  ${asset}" in probe_install
+    assert "sha256sum -c" in probe_install
+
+
+def test_the_probe_install_body_is_the_shared_script() -> None:
+    """The probe runs without a checkout, so its install step is an inline
+    copy of scripts/agents/install_opencode.sh. Like the configure blocks, the
+    two must stay identical - comments and blank lines aside - or a fix to
+    the install (a flag, a checksum line) silently misses the probe."""
+    script_lines = _install_lines(
+        _script_source("scripts/agents/install_opencode.sh")
+    )
+    probe_body = _run(
+        _find_step(_load(PROBE)["jobs"]["probe"], r"^Install opencode CLI$")
+    )
+    assert _install_lines(probe_body) == script_lines, (
+        "the probe's inline install drifted from scripts/agents/install_opencode.sh"
+    )
 
 
 def _premortem_verdict(output: str, tmp_path) -> str:

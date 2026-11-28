@@ -23,7 +23,11 @@ on:
         type: string
         default: ""
       opencode-version:
-        description: "pinned @opencode/cli version"
+        description: "pinned opencode release version"
+        required: true
+        type: string
+      opencode-sha256:
+        description: "sha256 of opencode-linux-x64.tar.gz for that release, pinned in the caller"
         required: true
         type: string
     secrets:
@@ -52,28 +56,35 @@ jobs:
       available: ${{ steps.probe.outputs.available }}
     env:
       OPENCODE_VERSION: ${{ inputs.opencode-version }}
+      OPENCODE_SHA256: ${{ inputs.opencode-sha256 }}
       MODEL: ${{ inputs.model }}
       VARIANT: ${{ inputs.variant }}
     steps:
-      # The GitHub release binary, verified against the release's own
-      # SHA256SUMS - the same pinned-binary pattern as gitleaks and
-      # actionlint. npm's global install is not used: it resolves transitive
-      # dependencies with no lockfile. This is the inline copy of
+      # The GitHub release binary, verified against the sha256 the caller
+      # pins next to OPENCODE_VERSION - the same pinned-binary pattern as
+      # gitleaks and actionlint. npm's global install is not used: it resolves
+      # transitive dependencies with no lockfile. This is the inline copy of
       # scripts/agents/install_opencode.sh - the probe runs without a
-      # checkout, so it cannot call it.
+      # checkout, so it cannot call it; the contract test asserts the two
+      # stay identical.
       - name: Install opencode CLI
         run: |
           set -euo pipefail
+          : "${OPENCODE_VERSION:?OPENCODE_VERSION is required}"
+          : "${OPENCODE_SHA256:?OPENCODE_SHA256 is required}"
           asset="opencode-linux-x64.tar.gz"
           base="https://github.com/anomalyco/opencode/releases/download/v${OPENCODE_VERSION}"
-          dest="${RUNNER_TEMP}/opencode"
+          dest="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/opencode"
           mkdir -p "$dest"
           curl -fsSL --proto '=https' --proto-redir '=https' -o "$dest/$asset" "$base/$asset"
-          curl -fsSL --proto '=https' --proto-redir '=https' "$base/SHA256SUMS" |
-            grep "  ${asset}\$" | (cd "$dest" && sha256sum -c -)
+          echo "${OPENCODE_SHA256}  ${asset}" | (cd "$dest" && sha256sum -c -)
           tar -xzf "$dest/$asset" -C "$dest" opencode
           chmod +x "$dest/opencode"
-          echo "$dest" >> "$GITHUB_PATH"
+          if [[ -n "${GITHUB_PATH:-}" ]]; then
+            echo "$dest" >> "$GITHUB_PATH"
+          else
+            echo "::warning::GITHUB_PATH is unset; opencode is at $dest/opencode but not on PATH"
+          fi
           "$dest/opencode" --version
 
       # The probe agent lives in the global config, like the real one, so the

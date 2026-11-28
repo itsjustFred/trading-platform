@@ -204,6 +204,7 @@ env:
   # verdict line" until a human reads a log. So a bump means reading the
   # extraction against the new version's output before it lands, not after.
   OPENCODE_VERSION: "2.2.7"
+  OPENCODE_SHA256: "89a6cee227b54bc011179c528a5e63176032462b1a5e21723b616801cddc2ca7"
   MODEL: ${{ vars.PREMORTEM_MODEL || 'opencode/inkling-2-small-free' }}
   VARIANT: ${{ vars.PREMORTEM_VARIANT || 'max' }}
   SKILL_PATH: .agents/skills/actions-pre-mortem/SKILL.md
@@ -376,6 +377,7 @@ jobs:
       model: ${{ vars.PREMORTEM_MODEL || 'opencode/inkling-2-small-free' }}
       variant: ${{ vars.PREMORTEM_VARIANT || 'max' }}
       opencode-version: "2.2.7"
+      opencode-sha256: "89a6cee227b54bc011179c528a5e63176032462b1a5e21723b616801cddc2ca7"
     secrets:
       ACTIONS_NVIDIA_API_KEY: ${{ secrets.ACTIONS_NVIDIA_API_KEY }}
 
