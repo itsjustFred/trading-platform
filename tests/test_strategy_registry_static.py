@@ -115,6 +115,56 @@ def test_real_strategies_tree_nested_dirs_are_declared_auxiliary() -> None:
     assert undeclared == []
 
 
+def test_real_strategies_tree_top_level_dirs_are_strategies_or_auxiliary() -> None:
+    """Top-level ``strategies/`` dirs must be strategy folders or declared aux.
+
+    A strategy folder contains ``<name>.py``; a declared auxiliary dir is in
+    ``_STRATEGY_IGNORED_DIRS``; anything else must hold no Python at all
+    (e.g. a docs-only folder). A new auxiliary dir carrying ``.py`` files
+    would otherwise ship in the wheel and be linted as platform code.
+    """
+    from shared.strategy_registry import _STRATEGY_IGNORED_DIRS, DEFAULT_STRATEGIES_DIR
+
+    undeclared = []
+    for dirpath in DEFAULT_STRATEGIES_DIR.iterdir():
+        if not dirpath.is_dir() or dirpath.name in _STRATEGY_IGNORED_DIRS:
+            continue
+        if (dirpath / f"{dirpath.name}.py").exists():
+            continue
+        if not any(dirpath.rglob("*.py")):
+            continue
+        undeclared.append(dirpath.name)
+
+    assert undeclared == []
+
+
+def test_auxiliary_dir_exclusions_cover_ignore_set() -> None:
+    """Wheel, ruff and mypy excludes must cover ``_STRATEGY_IGNORED_DIRS``.
+
+    Discovery ignores aux dirs by name; the pyproject excludes keep the same
+    material out of the wheel and the lint/type surface. A name added to only
+    some of the sites ships restricted code or fails CI loudly — pin the
+    contract here instead.
+    """
+    import re
+    import tomllib
+
+    from shared.strategy_registry import _STRATEGY_IGNORED_DIRS
+
+    root = Path(__file__).resolve().parents[1]
+    config = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
+    wheel_exclude = config["tool"]["hatch"]["build"]["targets"]["wheel"]["exclude"]
+    ruff_exclude = config["tool"]["ruff"]["extend-exclude"]
+    mypy_exclude = config["tool"]["mypy"]["exclude"]
+
+    for name in _STRATEGY_IGNORED_DIRS:
+        assert any(name in pattern for pattern in wheel_exclude), name
+    # Only `reference` holds Python today; it must stay excluded at any depth.
+    assert "strategies/**/reference" in ruff_exclude
+    assert re.search(mypy_exclude, "strategies/s/reference/x.py")
+    assert re.search(mypy_exclude, "strategies/s/nested/reference/x.py")
+
+
 def test_find_strategy_entry_does_not_execute_strategy_files(
     tmp_path: Path, no_strategy_imports
 ) -> None:
