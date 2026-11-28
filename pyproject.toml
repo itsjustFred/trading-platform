@@ -102,7 +102,7 @@ packages = [
 ]
 # Third-party sources and frozen references are repo material, not package code
 # (an EA marked `restricted` in its SOURCE.md must not ship in the wheel).
-exclude = ["strategies/**/mt5", "strategies/**/reference", "strategies/_template"]
+exclude = ["strategies/**/mt5", "strategies/**/reference", "strategies/**/_template"]
 
 [tool.ruff]
 line-length = 100
@@ -118,7 +118,9 @@ target-version = "py312"
 #     required by the QC platform and cannot be rewritten safely here.
 extend-exclude = [
     "tests/fixtures",
+    "strategies/**/mt5",
     "strategies/**/reference",
+    "strategies/**/_template",
 ]
 
 [tool.ruff.lint]
@@ -247,7 +249,7 @@ explicit-preview-rules = true
 python_version = "3.12"
 # Frozen third-party reference material under strategies/**/reference is not
 # platform code; keep it out of the checked surface like the ruff excludes.
-exclude = "^strategies/(?:[^/]+/)*reference/"
+exclude = "^strategies/(?:[^/]+/)*(?:mt5|reference|_template)/"
 # Scope is deliberately narrow: the packages whose type errors can become a
 # wrong order. Widen by adding paths here, not by loosening the flags.
 files = ["risk", "live_runner", "shared/models.py", "shared/market_calendar.py", "signal_bots", "strategies"]

@@ -163,11 +163,17 @@ def iter_strategy_files(strategies_dir: Path = DEFAULT_STRATEGIES_DIR) -> list[P
     if not strategies_dir.exists():
         return []
 
+    root = strategies_dir.resolve()
     files: list[Path] = []
     for path in strategies_dir.rglob("*.py"):
         if path.name.startswith("__") or path.stem.endswith("_context"):
             continue
-        relative_parts = path.relative_to(strategies_dir).parts[:-1]
+        try:
+            # Resolve before the ignore check: a strategy-named symlink into an
+            # auxiliary dir (or outside the tree) must not be discovered.
+            relative_parts = path.resolve().relative_to(root).parts[:-1]
+        except (OSError, ValueError):
+            continue
         if _STRATEGY_IGNORED_DIRS.intersection(relative_parts):
             continue
         if path.parent != strategies_dir and path.parent.name != path.stem:

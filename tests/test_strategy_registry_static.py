@@ -126,8 +126,16 @@ def test_real_strategies_tree_top_level_dirs_are_strategies_or_auxiliary() -> No
     from shared.strategy_registry import _STRATEGY_IGNORED_DIRS, DEFAULT_STRATEGIES_DIR
 
     undeclared = []
+    collisions = []
     for dirpath in DEFAULT_STRATEGIES_DIR.iterdir():
-        if not dirpath.is_dir() or dirpath.name in _STRATEGY_IGNORED_DIRS:
+        if not dirpath.is_dir():
+            continue
+        if dirpath.name in _STRATEGY_IGNORED_DIRS:
+            # A reserved aux dir holding <name>.py is never discovered — it
+            # would only masquerade as a strategy. Fail so the collision is
+            # renamed or the ignore set is revisited deliberately.
+            if (dirpath / f"{dirpath.name}.py").exists():
+                collisions.append(dirpath.name)
             continue
         if (dirpath / f"{dirpath.name}.py").exists():
             continue
@@ -136,6 +144,21 @@ def test_real_strategies_tree_top_level_dirs_are_strategies_or_auxiliary() -> No
         undeclared.append(dirpath.name)
 
     assert undeclared == []
+    assert collisions == []
+
+
+def test_iter_strategy_files_skips_symlinked_auxiliary_code(tmp_path: Path) -> None:
+    """A strategy-named symlink into an ignored dir must not be discovered."""
+    from shared.strategy_registry import iter_strategy_files
+
+    strategies_dir = tmp_path / "strategies"
+    aux_dir = strategies_dir / "foo" / "reference"
+    aux_dir.mkdir(parents=True)
+    hidden = aux_dir / "hidden.py"
+    hidden.write_text("STRATEGY_META = {'name': 'Hidden'}\n", encoding="utf-8")
+    (strategies_dir / "foo" / "foo.py").symlink_to(hidden)
+
+    assert iter_strategy_files(strategies_dir) == []
 
 
 def test_auxiliary_dir_exclusions_cover_ignore_set() -> None:
@@ -158,11 +181,10 @@ def test_auxiliary_dir_exclusions_cover_ignore_set() -> None:
     mypy_exclude = config["tool"]["mypy"]["exclude"]
 
     for name in _STRATEGY_IGNORED_DIRS:
-        assert any(name in pattern for pattern in wheel_exclude), name
-    # Only `reference` holds Python today; it must stay excluded at any depth.
-    assert "strategies/**/reference" in ruff_exclude
-    assert re.search(mypy_exclude, "strategies/s/reference/x.py")
-    assert re.search(mypy_exclude, "strategies/s/nested/reference/x.py")
+        assert f"strategies/**/{name}" in wheel_exclude, name
+        assert f"strategies/**/{name}" in ruff_exclude, name
+        assert re.search(mypy_exclude, f"strategies/s/nested/{name}/x.py"), name
+        assert re.search(mypy_exclude, f"strategies/{name}/x.py"), name
 
 
 def test_find_strategy_entry_does_not_execute_strategy_files(
