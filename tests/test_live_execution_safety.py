@@ -2044,17 +2044,6 @@ def test_alpaca_invalid_action_never_persists_signal(monkeypatch):
         asyncio.run(submission)
 
 
-def test_processor_market_data_refuses_synthetic_fabrication():
-    from live_runner.daemon import _build_processor_market_data
-
-    signal = TradeSignal(
-        action="buy", symbol="AAPL", entry_price=100.0, stop_loss=98.0,
-        take_profit=None, timeframe="5m", metadata={},
-    )
-
-    with pytest.raises(ValueError, match="refusing to fabricate"):
-        _build_processor_market_data(signal, timeframe="5m")
-
 
 # ── Persistence durability / idempotency / recovery reads ─────────────────────
 
@@ -3991,7 +3980,7 @@ def test_recover_failed_services_respects_paused_and_stopped(monkeypatch):
     def _service(name: str, status: ServiceStatus) -> Service:
         return Service(
             name=name,
-            type=ServiceType.DISCORD_BOT,
+            type=ServiceType.SCHEDULED_JOB,
             status=status,
             config={},
             created_at=datetime.now(timezone.utc),
@@ -6344,33 +6333,6 @@ def test_ctrader_broker_write_failure_is_not_marked_as_not_submitted(
     assert is_order_not_submitted(raised.value) is False
 
 
-def test_recover_failed_services_arms_reconnect_floor(monkeypatch) -> None:
-    """B2: resuscitation is bounded — a flipped service backs off first."""
-    from live_runner import daemon as module
-    from shared.models import Service, ServiceStatus, ServiceType
-
-    service = Service(
-        name="failed-bot",
-        type=ServiceType.DISCORD_BOT,
-        status=ServiceStatus.FAILED,
-        config={},
-        created_at=datetime.now(timezone.utc),
-    )
-    monkeypatch.setattr(module, "list_services", lambda: [service])
-    # The recovery path now only arms the floor when the conditional status
-    # write actually moved the row to RUNNING.
-    monkeypatch.setattr(
-        module,
-        "update_service_status",
-        lambda *_args, **_kwargs: service.model_copy(
-            update={"status": ServiceStatus.RUNNING}
-        ),
-    )
-
-    module._recover_failed_services()
-
-    assert str(service.id) in module._DISCORD_SERVICE_RECONNECT_RETRY_NOT_BEFORE
-
 
 def test_create_live_deployment_validates_against_the_broker_identity(
     isolated_db, monkeypatch
@@ -6390,21 +6352,28 @@ def test_create_live_deployment_validates_against_the_broker_identity(
             "ALPACA_ACCOUNT_NUMBER_ACC1": "PA-LABELLED-RAMJET",
         },
     )
-    deployment = LiveDeploymentConfig(
-        id=str(uuid4()),
-        strategy_name="discord::ramjet",
-        account_id="acc-1",
-        symbols=["AAPL"],
-        timeframe="1h",
-        status="ACTIVE",
-        signal_source="discord",
-        signal_source_type="discord",
-        signal_source_id="RAMJET",
-        signal_config={
-            "service_name": "ramjet",
-            "channel_id": "100000000000000002",
+    from shared.models import STORED_ROW_CONTEXT
+
+    # Discord ingestion is retired, so the source only exists on stored rows;
+    # the route check in create_live_deployment still guards them.
+    deployment = LiveDeploymentConfig.model_validate(
+        {
+            "id": str(uuid4()),
+            "strategy_name": "discord::ramjet",
+            "account_id": "acc-1",
+            "symbols": ["AAPL"],
+            "timeframe": "1h",
+            "status": "ACTIVE",
+            "signal_source": "discord",
+            "signal_source_type": "discord",
+            "signal_source_id": "RAMJET",
+            "signal_config": {
+                "service_name": "ramjet",
+                "channel_id": "100000000000000002",
+            },
+            "settings": {"max_risk_per_trade": 0.01, "max_total_exposure": 0.05},
         },
-        settings={"max_risk_per_trade": 0.01, "max_total_exposure": 0.05},
+        context={STORED_ROW_CONTEXT: True},
     )
 
     database.ensure_live_account("acc-1", "alpaca", broker_login="PA-LABELLED-RAMJET")

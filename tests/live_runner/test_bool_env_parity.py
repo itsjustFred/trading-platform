@@ -191,7 +191,8 @@ def _deployment_with_signal_config(
         account_id="ctrader-demo",
         symbols=["EURUSD"],
         timeframe="15m",
-        signal_source="discord",
+        signal_source="internal",
+        signal_source_type="internal",
         signal_config=signal_config,
         settings=settings or {},
     )
@@ -253,18 +254,6 @@ def _daemon_allow_short() -> None:
     )
 
 
-def _daemon_wait_for_candle_close() -> None:
-    daemon._deployment_wait_for_candle_close(
-        _deployment_with_signal_config({"wait_candle_close": "ture"}), {}
-    )
-
-
-def _daemon_wait_for_candle_close_env() -> None:
-    daemon._deployment_wait_for_candle_close(
-        _deployment_with_signal_config({}), {"DISCORD_WAIT_FOR_CANDLE_CLOSE": "ture"}
-    )
-
-
 # (the caller, the variable it names, the message it must raise)
 CALLERS: list[tuple[Callable[[], None], str]] = [
     (_preflight_ctrader_credentials, "CTRADER_DEMO"),
@@ -274,8 +263,6 @@ CALLERS: list[tuple[Callable[[], None], str]] = [
     (_alpaca_credential_block, "ALPACA_PAPER_ACC1"),
     (_alpaca_adapter_constructor, "ALPACA_PAPER"),
     (_daemon_allow_short, "allow_short"),
-    (_daemon_wait_for_candle_close, "wait_candle_close"),
-    (_daemon_wait_for_candle_close_env, "DISCORD_WAIT_FOR_CANDLE_CLOSE"),
 ]
 
 

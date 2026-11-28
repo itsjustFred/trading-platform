@@ -26,7 +26,6 @@ from live_runner.credential_env import (
 from live_runner.ctrader_adapter import DEFAULT_ACCOUNTS_ENV, CTraderLiveAdapter
 from live_runner.deployment_policy import (
     normalize_deployment_status,
-    signal_source_can_trade,
     untradeable_signal_source_reason,
 )
 from live_runner.promotion import enforce_promotion_gate, is_real_money
@@ -426,20 +425,17 @@ def _validate_deployments(
             errors.append(f"{label}: has no symbols configured.")
         if not str(deployment.timeframe).strip():
             errors.append(f"{label}: has no timeframe configured.")
-        if signal_source_can_trade(deployment.signal_source):
-            channel_id = str(deployment.signal_config.get("channel_id") or "").strip()
-            if not channel_id:
-                warnings.append(f"{label}: Discord deployment has no channel_id in signal_config.")
-        elif normalize_deployment_status(deployment.status) == "ACTIVE":
-            # #242: the daemon only trades Discord signals; an ACTIVE row on any
-            # other signal source is a deployment that will never place an order.
+        if normalize_deployment_status(deployment.status) == "ACTIVE":
+            # #242: an ACTIVE row on a signal source the daemon cannot run is a
+            # deployment that will never place an order.
             # The reason and the source test are the daemon's own definitions, so
             # this preflight cannot call a row clean that the daemon then ignores.
             reason = untradeable_signal_source_reason(deployment.signal_source)
             if reason is not None:
                 warnings.append(
                     f"{label}: ACTIVE deployment has {reason}; the live daemon will "
-                    "never trade it. Stop it or move it to a Discord signal source."
+                    "never trade it. Stop it or repoint it to a signal source the "
+                    "daemon runs."
                 )
 
     return errors, warnings

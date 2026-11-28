@@ -6610,7 +6610,7 @@ def create_live_deployment(deployment: LiveDeploymentConfig) -> LiveDeploymentCo
         # account labels rather than a hardcoded table.
         try:
             from live_runner.credential_env import load_accounts_env_values
-            from live_runner.service_discovery import DEFAULT_ACCOUNTS_ENV
+            from live_runner.credential_env import DEFAULT_ACCOUNTS_ENV
 
             route_env = load_accounts_env_values(DEFAULT_ACCOUNTS_ENV)
         except Exception as exc:

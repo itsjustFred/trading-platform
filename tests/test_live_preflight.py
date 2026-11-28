@@ -680,7 +680,7 @@ _ENV_REF_CONFIG = """
         account_id: alpaca-paper
         symbols: [AAPL]
         timeframe: 1h
-        signal_source: discord
+        signal_source: internal
         signal_config:
           channel_id: "${PREFLIGHT_TEST_CHANNEL_ID}"
     """
@@ -1309,7 +1309,7 @@ def test_live_preflight_crash_path_redacts_expanded_values_in_json(
             account_id: alpaca-paper
             symbols: [AAPL]
             timeframe: 1h
-            signal_source: discord
+            signal_source: internal
             signal_config:
               channel_id: "${PREFLIGHT_TEST_SECRET_REF}"
         """,
@@ -1367,7 +1367,7 @@ def test_preflight_main_uses_accounts_env_flag_for_result_and_redaction(
             account_id: alpaca-paper
             symbols: [AAPL]
             timeframe: 1h
-            signal_source: discord
+            signal_source: internal
             signal_config:
               channel_id: "${PREFLIGHT_TEST_SECRET_REF}"
         """,
@@ -1490,7 +1490,7 @@ def test_live_preflight_crash_traceback_redacts_expanded_values_everywhere(
             account_id: alpaca-paper
             symbols: [AAPL]
             timeframe: 1h
-            signal_source: discord
+            signal_source: internal
             signal_config:
               channel_id: "${PREFLIGHT_TEST_SECRET_REF}"
         """,

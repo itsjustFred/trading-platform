@@ -601,6 +601,8 @@ export interface Service {
    * "is it still trying?". Mirrors `shared.models.Service`.
    */
   last_attempt_at?: string | null;
+  /** discord_bot rows are retired: Discord signal ingestion was removed. */
+  retired?: boolean;
   created_at: string;
 }
 

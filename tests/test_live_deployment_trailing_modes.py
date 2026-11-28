@@ -54,14 +54,21 @@ def _deployment(
     *,
     timeframe: str = "5m",
 ) -> LiveDeploymentConfig:
-    return LiveDeploymentConfig(
-        strategy_name="ramjet-live",
-        account_id="acct-1",
-        symbols=["AAPL"],
-        timeframe=timeframe,
-        signal_source_type="discord",
-        signal_source="discord",
-        signal_config=signal_config or {},
+    # Discord ingestion is retired: the source only exists on stored rows, so
+    # these fixtures load through the stored-row path the DB read uses.
+    from shared.models import STORED_ROW_CONTEXT
+
+    return LiveDeploymentConfig.model_validate(
+        {
+            "strategy_name": "ramjet-live",
+            "account_id": "acct-1",
+            "symbols": ["AAPL"],
+            "timeframe": timeframe,
+            "signal_source_type": "discord",
+            "signal_source": "discord",
+            "signal_config": signal_config or {},
+        },
+        context={STORED_ROW_CONTEXT: True},
     )
 
 
@@ -131,37 +138,6 @@ def test_creating_a_percent_default_on_an_untrailable_timeframe_is_refused(
     with pytest.raises(ValueError, match="cannot be executed live on timeframe"):
         database.create_live_deployment(deployment)
     assert database.get_live_deployment(str(deployment.id)) is None
-
-
-def test_yaml_percent_default_on_an_untrailable_timeframe_is_refused(
-    tmp_path, monkeypatch
-) -> None:
-    from live_runner.config_parser import parse_live_deployments_config
-
-    _bot_defaulting_to(monkeypatch, trailing_mode="percent", trailing_percent=0.02)
-    config = tmp_path / "live.yaml"
-    config.write_text(
-        """
-accounts:
-  - id: alp
-    broker: alpaca
-
-deployments:
-  - strategy_name: ramjet-live
-    account_id: alp
-    symbols: [AAPL]
-    timeframe: 1d
-    status: PAUSED
-    signal_source: discord
-    signal_config:
-      channel_id: "123"
-      signal_processor: ramjet
-""",
-        encoding="utf-8",
-    )
-
-    with pytest.raises(ValueError, match="cannot be executed live on timeframe"):
-        parse_live_deployments_config(config)
 
 
 def test_a_stored_row_with_a_percent_default_on_an_untrailable_timeframe_is_reported(
@@ -323,37 +299,6 @@ def test_creating_a_deployment_whose_bot_default_live_cannot_run_is_refused(
     with pytest.raises(ValueError, match="supertrend_flip"):
         database.create_live_deployment(deployment)
     assert database.get_live_deployment(str(deployment.id)) is None
-
-
-def test_yaml_deployment_whose_bot_default_live_cannot_run_is_refused(
-    tmp_path, monkeypatch
-) -> None:
-    from live_runner.config_parser import parse_live_deployments_config
-
-    _bot_defaulting_to(monkeypatch, **_FLIP_OVERRIDES)
-    config = tmp_path / "live.yaml"
-    config.write_text(
-        """
-accounts:
-  - id: alp
-    broker: alpaca
-
-deployments:
-  - strategy_name: ramjet-live
-    account_id: alp
-    symbols: [AAPL]
-    timeframe: 5m
-    status: PAUSED
-    signal_source: discord
-    signal_config:
-      channel_id: "123"
-      signal_processor: ramjet
-""",
-        encoding="utf-8",
-    )
-
-    with pytest.raises(ValueError, match="supertrend_flip"):
-        parse_live_deployments_config(config)
 
 
 def test_re_pointing_to_a_broker_that_cannot_run_the_bot_default_is_refused(

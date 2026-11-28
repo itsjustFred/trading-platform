@@ -576,7 +576,7 @@ def _create(
     settings: dict | None = None,
     signal_processor: str | None = None,
 ):
-    """POST /api/live/deployments for an Alpaca Discord deployment of STRATEGY_NAME."""
+    """POST /api/live/deployments for an internal Alpaca deployment of STRATEGY_NAME."""
     import viewer.main as viewer
     from shared.models import Service, ServiceStatus, ServiceType
 
@@ -619,10 +619,8 @@ def _create(
             "account_id": "acc-1",
             "symbols": ["AAPL"],
             "timeframe": "1h",
-            "signal_source_type": "discord",
-            "signal_source_id": STRATEGY_NAME,
+            "signal_source_type": "internal",
             "signal_config": {
-                "channel_id": "1431465140905185452",
                 **({"signal_processor": signal_processor} if signal_processor else {}),
             },
             "settings": settings or {},
@@ -667,18 +665,7 @@ def test_viewer_create_accepts_a_promoted_signal_bot_on_real_money(
     assert len(created) == 1
 
 
-def test_viewer_create_refuses_a_discord_deployment_without_a_processor_on_real_money(
-    strategies_dir: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The raw channel signal is traded, not the same-named strategy file (#165)."""
-    promote_strategy_file(strategies_dir)
-    response, created = _create(monkeypatch, _LIVE, settings={"risk_per_trade_pct": 0.01})
-    assert response.status_code == 409, response.text
-    assert "raw channel signals" in response.json()["detail"]
-    assert created == []
-
-
-def _paused_discord_deployment(database_module, *, signal_processor: str | None = None) -> str:
+def _paused_internal_deployment(database_module, *, strategy_name: str = STRATEGY_NAME) -> str:
     database_module.ensure_live_account(
         "acc-1", "alpaca", is_demo=True, broker_login="PA3T0MQAGQ51"
     )
@@ -686,17 +673,15 @@ def _paused_discord_deployment(database_module, *, signal_processor: str | None 
     database_module.create_live_deployment(
         database_module.LiveDeploymentConfig(
             id=uuid.UUID(did),
-            strategy_name=STRATEGY_NAME,
+            strategy_name=strategy_name,
             account_id="acc-1",
             symbols=["AAPL"],
             timeframe="1h",
             status="PAUSED",
-            signal_source_type="discord",
-            signal_source="discord",
-            signal_config={
-                "channel_id": "1431465140905185452",
-                **({"signal_processor": signal_processor} if signal_processor else {}),
-            },
+            signal_source_type="internal",
+            signal_source="internal",
+            signal_config={},
+            settings={"internal_runner_enabled": True},
         )
     )
     return did
@@ -705,36 +690,44 @@ def _paused_discord_deployment(database_module, *, signal_processor: str | None 
 def _activate(monkeypatch: pytest.MonkeyPatch, did: str, *, broker_confirms_demo: bool):
     import viewer.main as viewer
 
-    async def _reverify(_account_id: str) -> bool:
+    broker_calls: list[str] = []
+
+    async def _reverify(account_id: str) -> bool:
+        broker_calls.append(account_id)
         return broker_confirms_demo
 
     monkeypatch.setattr(viewer, "_reverify_account_against_broker", _reverify)
-    return TestClient(viewer.app).put(
+    response = TestClient(viewer.app).put(
         f"/api/live/deployments/{did}/status",
         json={"status": "ACTIVE", "confirmation": {"confirmed_deployment_id": did}},
     )
+    return response, broker_calls
 
 
-def test_viewer_activation_on_demo_passes_without_promotion(
+def test_viewer_activation_of_an_internal_deployment_is_refused_before_the_broker(
+    strategies_dir: Path, isolated_db_sandbox, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Internal has no viewer arm path (main's behaviour, kept by the Discord
+    removal): the 409 lands before the broker round-trip, so promotion and
+    demo state are never consulted."""
+    database_module, _engine, _data_dir = isolated_db_sandbox
+    did = _paused_internal_deployment(database_module)
+    response, broker_calls = _activate(monkeypatch, did, broker_confirms_demo=True)
+    assert response.status_code == 409, response.text
+    assert "no live evaluator" in response.json()["detail"]
+    assert broker_calls == []
+    assert database_module.get_live_deployment(did).status == "PAUSED"
+
+
+def test_viewer_activation_refusal_is_audited_without_broker_contact(
     strategies_dir: Path, isolated_db_sandbox, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     database_module, _engine, _data_dir = isolated_db_sandbox
-    did = _paused_discord_deployment(database_module)
-    response = _activate(monkeypatch, did, broker_confirms_demo=True)
-    assert response.status_code == 200, response.text
-    assert database_module.get_live_deployment(did).status == "ACTIVE"
-
-
-def test_viewer_activation_on_unconfirmed_account_names_the_promotion_refusal(
-    strategies_dir: Path, isolated_db_sandbox, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    database_module, _engine, _data_dir = isolated_db_sandbox
-    did = _paused_discord_deployment(database_module)
-    response = _activate(monkeypatch, did, broker_confirms_demo=False)
+    did = _paused_internal_deployment(database_module)
+    response, broker_calls = _activate(monkeypatch, did, broker_confirms_demo=False)
     assert response.status_code == 409
-    detail = response.json()["detail"]
-    assert "refusing to activate" in detail
-    assert "Promotion gate refused" in detail
+    assert "no live evaluator" in response.json()["detail"]
+    assert broker_calls == []
     assert database_module.get_live_deployment(did).status == "PAUSED"
 
     from shared.database import list_live_control_audit
@@ -744,21 +737,23 @@ def test_viewer_activation_on_unconfirmed_account_names_the_promotion_refusal(
         for item in list_live_control_audit()
         if item.get("target_id") == did and not item.get("succeeded")
     ]
-    assert "Promotion gate refused" in entry["detail"]["promotion_gate"]
+    assert "no live evaluator" in entry["detail"]["reason"]
 
 
-def test_viewer_demo_only_block_still_refuses_a_promoted_signal_bot_on_real_money(
-    bots_root: Path, isolated_db_sandbox, monkeypatch: pytest.MonkeyPatch
+def test_viewer_activation_refusal_does_not_consult_promotion_state(
+    strategies_dir: Path, isolated_db_sandbox, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Promotion is necessary, not sufficient: the demo-only block stays (#165)."""
+    """Promotion is still enforced at create/top-N; on the arm path the source
+    gate fires first, so a promoted strategy changes nothing."""
     database_module, _engine, _data_dir = isolated_db_sandbox
-    promote_ramjet_bot()
-    did = _paused_discord_deployment(database_module, signal_processor="ramjet")
-    response = _activate(monkeypatch, did, broker_confirms_demo=False)
+    promote_strategy_file(strategies_dir)
+    did = _paused_internal_deployment(database_module)
+    response, broker_calls = _activate(monkeypatch, did, broker_confirms_demo=False)
     assert response.status_code == 409
     detail = response.json()["detail"]
-    assert "refusing to activate" in detail
+    assert "no live evaluator" in detail
     assert "Promotion gate" not in detail
+    assert broker_calls == []
     assert database_module.get_live_deployment(did).status == "PAUSED"
 
 

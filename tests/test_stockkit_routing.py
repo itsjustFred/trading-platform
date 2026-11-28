@@ -36,16 +36,24 @@ def _deployment(
     account_id: str | None = None,
     signal_source: str = "discord",
 ) -> LiveDeploymentConfig:
-    return LiveDeploymentConfig(
-        id=str(uuid4()),
-        strategy_name=f"discord::{route}",
-        account_id=account_id or str(uuid4()),
-        symbols=["AAPL"],
-        timeframe="1h",
-        status="PAUSED",
-        signal_source=signal_source,
-        signal_config={"service_name": route, "channel_id": channel_id},
-    )
+    fields = {
+        "id": str(uuid4()),
+        "strategy_name": f"discord::{route}",
+        "account_id": account_id or str(uuid4()),
+        "symbols": ["AAPL"],
+        "timeframe": "1h",
+        "status": "PAUSED",
+        "signal_source": signal_source,
+        "signal_config": {"service_name": route, "channel_id": channel_id},
+    }
+    if str(signal_source).lower() == "discord":
+        # Discord ingestion is retired: the source only exists on stored rows.
+        from shared.models import STORED_ROW_CONTEXT
+
+        return LiveDeploymentConfig.model_validate(
+            fields, context={STORED_ROW_CONTEXT: True}
+        )
+    return LiveDeploymentConfig(**fields)
 
 
 # ─── Route inference: the right bot for the right channel ────────────────────

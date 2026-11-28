@@ -33,7 +33,6 @@ from live_runner.trailing_stops import (
     LiveTrailingStopManager,
     adapter_live_trailing_modes,
 )
-from risk import TradeSignal
 from risk.config import RiskConfig
 from runner.engines.signal_replay_adapter import ReplaySignal, SignalReplayAdapter
 from shared.models import LiveDeploymentConfig, LiveExecution, LiveSignal
@@ -987,9 +986,6 @@ def test_a_running_stop_amendment_is_drained_not_cancelled(
             daemon._shutdown_cleanup(
                 loop_tasks=(loop_task,),
                 active_listener_tasks={},
-                active_discord_tasks={},
-                active_discord_bot_tasks={},
-                active_discord_bots={},
                 active_adapters={},
                 scheduler=_RecordingScheduler(),  # type: ignore[arg-type]
                 shutdown=coordinator,
@@ -1654,7 +1650,6 @@ def test_sync_loop_publishes_the_shared_deployment_snapshot(monkeypatch) -> None
             daemon.sync_deployments_loop(
                 {},
                 {},
-                {},
                 accounts_env=Path("/nonexistent/accounts.env"),
                 interval_seconds=0,
                 deployment_snapshot=snapshot,
@@ -1664,50 +1659,13 @@ def test_sync_loop_publishes_the_shared_deployment_snapshot(monkeypatch) -> None
     assert snapshot == deployments
 
 
-def test_discord_dispatch_threads_the_adapter_into_the_processor_gate(monkeypatch) -> None:
-    seen: list[object] = []
-
-    def _processor(signal, deployment, *, adapter=None, decision=None):
-        seen.append(adapter)
-        return signal
-
-    monkeypatch.setattr(daemon, "_apply_signal_processor", _processor)
-    monkeypatch.setattr(daemon, "_validate_signal_age_before_wait", lambda *a, **k: None)
-    monkeypatch.setattr(daemon, "signal_is_fresh", lambda *a, **k: True)
-    monkeypatch.setattr(daemon, "_deployment_can_dispatch", lambda _deployment, **_k: True)
-    adapter = _adapter(_ReplacingClient())
-    signal = TradeSignal(
-        action="buy",
-        symbol="AAPL",
-        entry_price=100.0,
-        stop_loss=98.0,
-        take_profit=None,
-        timeframe="1m",
-        metadata={"source": "discord"},
-    )
-
-    prepared = asyncio.run(
-        daemon._prepare_discord_signal_for_submission(
-            ACCOUNT,
-            live_deployment(),
-            signal,
-            signal_timeframe="1m",
-            wait_enabled=False,
-            adapter=adapter,
-        )
-    )
-
-    assert prepared is not None
-    assert seen == [adapter]
-
-
 def live_deployment() -> LiveDeploymentConfig:
     return LiveDeploymentConfig(
         strategy_name="discord-probe",
         account_id=ACCOUNT,
         symbols=["AAPL"],
         timeframe="1m",
-        signal_source="discord",
+        signal_source="internal",
     )
 
 

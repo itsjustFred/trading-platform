@@ -377,3 +377,23 @@ class TestStrategyMeta:
         assert "tags" not in d
         assert "source_url" not in d
         assert "notes" not in d
+
+
+def test_new_discord_live_deployment_is_refused() -> None:
+    """Discord signal ingestion is retired: a NEW deployment naming it fails
+    closed at the model, while stored rows still load via STORED_ROW_CONTEXT."""
+    from shared.models import LiveDeploymentConfig
+
+    for fields in (
+        {"signal_source": "discord"},
+        {"signal_source_type": "discord"},
+        {"signal_source": "discord", "signal_source_type": "discord"},
+    ):
+        with pytest.raises(ValueError, match="discord"):
+            LiveDeploymentConfig(
+                strategy_name="discord::nitro",
+                account_id="acc-1",
+                symbols=["AAPL"],
+                timeframe="1h",
+                **fields,
+            )
