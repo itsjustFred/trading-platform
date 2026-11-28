@@ -482,7 +482,7 @@ def _message_to_debug_fields(message: Any) -> dict[str, Any]:
             )
             if isinstance(payload, dict):
                 return payload
-        except Exception:  # except-kind: loop-survival
+        except Exception:  # except-kind: loop-survival  # noqa: S110
             pass
     if not hasattr(message, "ListFields"):
         return {}

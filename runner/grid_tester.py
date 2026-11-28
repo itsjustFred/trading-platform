@@ -72,7 +72,7 @@ def _run_grid_cell(
             if errors:
                 raise ValueError("; ".join(errors))
         result = engine.run(config, strategy_path)
-    except Exception as exc:  # noqa: BLE001 — a failing cell must not abort the grid
+    except Exception as exc:  # noqa: BLE001  # except-kind: loop-survival - cell error row
         return {"status": "error", "error": str(exc)}
 
     return _cell_from_stats(

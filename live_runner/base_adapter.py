@@ -59,7 +59,7 @@ def order_not_submitted() -> Iterator[None]:
     except BaseException as exc:  # except-kind: money-decision
         try:
             setattr(exc, _ORDER_NOT_SUBMITTED_ATTR, True)
-        except Exception:  # pragma: no cover  # except-kind: money-decision
+        except Exception:  # pragma: no cover  # except-kind: money-decision  # noqa: S110
             # An exception that refuses attributes (exotic exception types)
             # degrades to "outcome unknown", the safe default for every caller.
             pass
@@ -397,8 +397,8 @@ def coerce_positive_live_qty(value: Any, *, field_name: str = "qty") -> float:
 #: Values :meth:`BaseLiveAdapter.get_order_state` may return. ``None`` means
 #: "unknown" and always fails closed in the reconciler. ``ORDER_STATE_FILLED``
 #: distinguishes a fully executed order from other terminal outcomes so
-#: fill-aware workflows (the supertrend_flip closes, #168) can tell "filled"
-#: from "died unfilled" without a second broker call.
+#: fill-aware workflows can tell "filled" from "died unfilled" without a
+#: second broker call.
 ORDER_STATE_WORKING = "working"
 ORDER_STATE_TERMINAL = "terminal"
 ORDER_STATE_FILLED = "filled"
@@ -584,16 +584,6 @@ class BaseLiveAdapter(ABC):
         """Whether this adapter can safely amend a broker-side protective stop."""
         return False
 
-    @property
-    def supports_supertrend_flip(self) -> bool:
-        """Whether this adapter instance can run the live ``supertrend_flip``
-        workflow (#168): native partial closes, protective-stop listing and
-        in-place amendment, market data for the signal timeframe, and a
-        provably demo/paper account. Default ``False``: an adapter that cannot
-        prove every one of those must never be managed by the flip loop.
-        """
-        return False
-
     async def list_protective_stops(self) -> list[ProtectiveStop]:
         """Working stop orders on the reducing side of each open position.
 
@@ -640,22 +630,6 @@ class BaseLiveAdapter(ABC):
         confirmed.
         """
         raise NotImplementedError(f"{type(self).__name__} cannot amend protective stops")
-
-    async def amend_position_take_profit(
-        self, position_id: int, take_profit: float | None
-    ) -> float | None:
-        """Set (``take_profit`` price) or clear (``None``) a position's broker-side
-        take profit while preserving its stop loss exactly.
-
-        Exists for the live ``supertrend_flip`` fallback TP (#168): placed when
-        the workflow halts or gives up so the position keeps an upside exit,
-        amended away again before the workflow resumes. The confirmed TP is
-        returned (``None`` when cleared); an unconfirmed outcome must raise
-        with the previous broker state still in force.
-        """
-        raise NotImplementedError(
-            f"{type(self).__name__} cannot amend position take profits"
-        )
 
     # ── Operator safety controls ──────────────────────────────────────────────────────────────
     #
@@ -722,25 +696,6 @@ class BaseLiveAdapter(ABC):
         """
         raise NotImplementedError(
             f"{type(self).__name__} cannot identify orphaned protections"
-        )
-
-    async def opening_signal_id_for_position(self, position_id: int) -> str | None:
-        """The persisted entry signal whose order opened ``position_id`` (#168).
-
-        The live ``supertrend_flip`` manager binds its plan to a broker
-        position only when this read proves the position was opened by the
-        entry's own order - never by size or timing coincidence. ``None``
-        means PROVEN foreign/ambiguous (the broker read the position's
-        orders and none, or several, resolve to a persisted signal); an
-        unreadable order list or a failed read must RAISE so the caller can
-        retry a transient failure instead of treating it as foreign
-        ownership. Callers must treat ``None`` as fail-closed. The default
-        cannot prove anything, so it RAISES: returning ``None`` would read
-        as "proven foreign" and silently end every first-sight plan on an
-        adapter that never implemented the read.
-        """
-        raise NotImplementedError(
-            f"{type(self).__name__} cannot prove which signal opened a position"
         )
 
     async def backfill_commissions(self) -> int:

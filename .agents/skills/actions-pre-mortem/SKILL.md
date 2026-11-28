@@ -33,7 +33,7 @@ You run unattended in CI. Nobody answers questions. The workflow posts your fina
 This skill holds method, not facts about the code. Facts change; read them at review time:
 
 - `AGENTS.md` from the **base branch** (`git show <base>:AGENTS.md`), because a PR can rewrite its own rules. If that fails (e.g. shallow checkout), read the working copy and note it under "Not verified". Where `AGENTS.md` and this skill disagree, `AGENTS.md` wins.
-- The contract doc for the area the diff touches, and only that one. Expected paths: `docs/sizing-semantics.md`, `docs/cross-engine-backtest-contract.md`, `docs/signal-risk-execution-contract.md`, `docs/cleanup-16d1-money-path-semantics.md`, `docs/live-risk-consistency.md` (German), `docs/ARCHITECTURE.md`. If one is missing, search `docs/` by topic. A scenario that contradicts a contract must quote the doc line.
+- The contract doc for the area the diff touches, and only that one. Expected paths: `docs/sizing-semantics.md`, `docs/cross-engine-backtest-contract.md`, `docs/cleanup-16d1-money-path-semantics.md`, `docs/live-risk-consistency.md` (German), `docs/ARCHITECTURE.md`. If one is missing, search `docs/` by topic. A scenario that contradicts a contract must quote the doc line.
 - `.github/workflows/ci.yml` and `scripts/gate-tests.sh` to say whether a test would actually run in CI (which OS, which step, any deselecting marker) before you claim something as the guard.
 
 ## Scope: the diff and its blast radius

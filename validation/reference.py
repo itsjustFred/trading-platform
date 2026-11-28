@@ -18,7 +18,6 @@ from shared.models import BacktestMeta, BacktestResult, EquityPoint, Trade
 ALLOWED_FRAMEWORKS = frozenset(
     {
         "mt5_xlsx",
-        "mt5_html",
         "stockkit",
         "lean",
         "vectorbt",

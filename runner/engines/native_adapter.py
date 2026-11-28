@@ -291,7 +291,7 @@ class NativeAdapter(EngineAdapter):
         duration_days = 0
         try:
             duration_days = (date.fromisoformat(config.end_date) - date.fromisoformat(config.start_date)).days
-        except Exception:
+        except Exception:  # except-kind: best-effort - bad dates yield duration_days=0
             duration_days = 0
 
         strategy_name = config.strategy_name

@@ -68,7 +68,7 @@ def _stats_from_values(
     """Build canonical TradeStatistics from a raw stats mapping."""
     allowed_fields = set(TradeStatistics.model_fields.keys())
     filtered = {k: v for k, v in values.items() if k in allowed_fields}
-    if source_framework in {"mt5_xlsx", "mt5_html"}:
+    if source_framework == "mt5_xlsx":
         for field in ("win_rate", "max_drawdown_pct"):
             value = filtered.get(field)
             if isinstance(value, (int, float)) and not isinstance(value, bool):

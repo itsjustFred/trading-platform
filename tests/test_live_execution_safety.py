@@ -1722,7 +1722,9 @@ def test_ctrader_direct_persistence_strips_raw_broker_volume_keys(monkeypatch):
     # The request build now runs before persistence; this test is about the
     # persisted metadata, not the wire request.
     monkeypatch.setattr(
-        adapter, "_build_new_order_request", lambda _signal, *, symbol_id: object()
+        adapter,
+        "_build_new_order_request",
+        lambda _signal, *, symbol_id, volume: object(),
     )
 
     with pytest.raises(_PersistenceCaptured):
@@ -3509,7 +3511,9 @@ def test_ctrader_discord_redelivery_uses_canonical_signal_without_resubmitting(m
     # The request build runs before the dedupe save; this test is about the
     # canonical-id recovery, not the wire request.
     monkeypatch.setattr(
-        adapter, "_build_new_order_request", lambda _signal, *, symbol_id: object()
+        adapter,
+        "_build_new_order_request",
+        lambda _signal, *, symbol_id, volume: object(),
     )
 
     async def _unexpected_send(*_args, **_kwargs):
@@ -3791,7 +3795,8 @@ def test_ctrader_request_build_refusal_persists_no_signal_row(monkeypatch):
         "save_live_signal",
         lambda saved_signal: saved.append(saved_signal) or (str(signal.id), True),
     )
-    monkeypatch.setattr(adapter, "_resolve_order_volume", lambda _signal: 1.0)
+    # Whole broker volume units, as the resolver always returns.
+    monkeypatch.setattr(adapter, "_resolve_order_volume", lambda _signal: 1)
 
     class _NewOrderReq:
         def __init__(self) -> None:
@@ -4085,6 +4090,16 @@ def _make_ctrader_request_builder_adapter():
     return module, adapter
 
 
+def _submit_resolved_volume(adapter, signal: LiveSignal) -> int:
+    """The broker volume ``submit_order`` resolves once and passes down.
+
+    ``_build_new_order_request`` receives that volume instead of resolving it
+    again, so a direct caller hands it the same value the submit path would -
+    which keeps these tests honest about the volume the request carries.
+    """
+    return adapter._resolve_order_volume(signal)
+
+
 def test_alpaca_rejects_unknown_signal_action_instead_of_selling():
     from live_runner import alpaca_adapter as module
 
@@ -4179,7 +4194,9 @@ def test_ctrader_new_order_request_carries_sl_tp_prices():
         metadata={"qty": 1.0, "stop_loss": 1.05, "take_profit": 1.2},
     )
 
-    request = adapter._build_new_order_request(signal, symbol_id=7)
+    request = adapter._build_new_order_request(
+        signal, symbol_id=7, volume=_submit_resolved_volume(adapter, signal)
+    )
 
     assert request.symbolId == 7
     # MARKET orders ignore the absolute stopLoss/takeProfit fields; the
@@ -4203,8 +4220,9 @@ def test_ctrader_rejects_malformed_stop_alias(alias: str) -> None:
         metadata={"qty": 1.0, alias: "not-a-price", "take_profit": 1.2},
     )
 
+    volume = _submit_resolved_volume(adapter, signal)
     with pytest.raises(ValueError, match=f"Invalid {alias}"):
-        adapter._build_new_order_request(signal, symbol_id=7)
+        adapter._build_new_order_request(signal, symbol_id=7, volume=volume)
 
 
 def test_ctrader_relative_sl_tp_direction_and_rejections():
@@ -4223,27 +4241,31 @@ def test_ctrader_relative_sl_tp_direction_and_rejections():
             metadata={"qty": 1.0, "stop_loss": stop_loss, "take_profit": take_profit},
         )
 
-    buy_request = adapter._build_new_order_request(_signal("buy", 1.05, 1.2), symbol_id=7)
+    buy_request = adapter._build_new_order_request(
+        _signal("buy", 1.05, 1.2), symbol_id=7, volume=1000
+    )
     assert buy_request.relativeStopLoss == round(0.05 * 100_000)
     assert buy_request.relativeTakeProfit == round(0.1 * 100_000)
 
-    sell_request = adapter._build_new_order_request(_signal("sell", 1.2, 1.0), symbol_id=7)
+    sell_request = adapter._build_new_order_request(
+        _signal("sell", 1.2, 1.0), symbol_id=7, volume=1000
+    )
     assert sell_request.relativeStopLoss == round(0.1 * 100_000)
     assert sell_request.relativeTakeProfit == round(0.1 * 100_000)
 
     wrong_side = adapter._build_new_order_request
     wrong_side_signal = _signal("buy", 1.2, 1.05)
     with pytest.raises(ValueError, match="wrong side of the reference price"):
-        wrong_side(wrong_side_signal, symbol_id=7)
+        wrong_side(wrong_side_signal, symbol_id=7, volume=1000)
     nan_signal = _signal("buy", float("nan"), 1.2)
     with pytest.raises(ValueError, match="Invalid SL price"):
-        wrong_side(nan_signal, symbol_id=7)
+        wrong_side(nan_signal, symbol_id=7, volume=1000)
     zero_distance_signal = _signal("buy", 1.1, 1.2)
     with pytest.raises(ValueError, match="wrong side of the reference price"):
-        wrong_side(zero_distance_signal, symbol_id=7)
+        wrong_side(zero_distance_signal, symbol_id=7, volume=1000)
     sub_unit_signal = _signal("buy", 1.099995, 1.2)
     with pytest.raises(ValueError, match="below one 1/100000 price unit"):
-        wrong_side(sub_unit_signal, symbol_id=7)
+        wrong_side(sub_unit_signal, symbol_id=7, volume=1000)
 
 
 def test_ctrader_new_order_request_fails_closed_without_sl_tp():
@@ -4258,18 +4280,98 @@ def test_ctrader_new_order_request_fails_closed_without_sl_tp():
         metadata={"qty": 1.0},
     )
 
+    volume = _submit_resolved_volume(adapter, signal)
     request = adapter._build_new_order_request
     with pytest.raises(ValueError, match="without stop_loss"):
-        request(signal, symbol_id=7)
+        request(signal, symbol_id=7, volume=volume)
 
 
 def test_ctrader_build_new_order_request_rejects_unknown_signal_action():
     """The request-builder guard must hold even when submit_order is bypassed."""
     _module, adapter = _make_ctrader_request_builder_adapter()
     bad_signal = _live_signal_with_action("close")
+    volume = _submit_resolved_volume(adapter, bad_signal)
 
     with pytest.raises(ValueError, match=r"[Uu]nsupported .*action: close"):
-        adapter._build_new_order_request(bad_signal, symbol_id=7)
+        adapter._build_new_order_request(bad_signal, symbol_id=7, volume=volume)
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "position_id",
+        "requested_position_id",
+        "exit_target_signal_id",
+        "exit_only",
+        "broker_position_id",
+    ],
+)
+def test_ctrader_resolved_volume_ignores_exit_position_metadata(key: str) -> None:
+    """The exit path no longer re-resolves its volume after ``position_id`` is
+    written into the signal, and that is only safe because the resolver reads
+    no position metadata: adding the keys a close carries cannot change the
+    volume it resolves. A resolver that started reading them would size the
+    close from something other than the normalized qty - silently, because the
+    submit-level idempotency guard compares against this same resolver. This
+    test is what makes that a visible change instead.
+    """
+    from live_runner.base_adapter import EXIT_ONLY_RISK_SIZING_MODE
+
+    _module, adapter = _make_ctrader_adapter()
+    base = _ctrader_signal(
+        "EURUSD", {"qty": 1.3336, "risk_sizing_mode": EXIT_ONLY_RISK_SIZING_MODE}
+    )
+    addressed = base.model_copy(
+        update={"metadata": {**base.metadata, key: "position-7"}}
+    )
+
+    assert adapter._resolve_order_volume(addressed) == adapter._resolve_order_volume(base)
+
+
+@pytest.mark.parametrize(
+    "volume", [0, -1, False, float("nan"), 1.5, 1000.5, 0.5, "1000", 1000.0, 1.0]
+)
+def test_ctrader_new_order_request_fails_closed_on_an_unusable_volume(volume) -> None:
+    """The volume reaches this seam from the submit path, so it must be
+    validated here: a non-positive volume is a broker rejection at best and a
+    wrong-size order at worst, and a fractional or non-int one is a unit
+    confusion (qty, or a scaled value handed over as broker units) whose
+    rounding or coercion would put a size on the wire that nobody decided on.
+    None of them may be silently turned into an order."""
+    _module, adapter = _make_ctrader_request_builder_adapter()
+    signal = LiveSignal(
+        deployment_id="dep-1",
+        symbol="EURUSD",
+        action="buy",
+        theoretical_price=1.1,
+        timestamp=datetime.now(timezone.utc),
+        metadata={"qty": 1.0, "stop_loss": 1.05, "take_profit": 1.2},
+    )
+
+    with pytest.raises(ValueError, match="volume"):
+        adapter._build_new_order_request(signal, symbol_id=7, volume=volume)
+
+
+@pytest.mark.parametrize(
+    "volume", [0, -1, False, float("nan"), 1.5, 1000.5, 0.5, "3000", 3000.0, 1.0]
+)
+def test_ctrader_close_position_request_fails_closed_on_an_unusable_volume(
+    volume,
+) -> None:
+    """The same contract on the close seam, because the two builders must not
+    disagree: the close builder used to round a fractional volume, which a
+    future edit "aligning" the two would reintroduce into the entry path.
+    """
+    _module, adapter = _make_ctrader_request_builder_adapter()
+
+    class _CloseReq:
+        def __init__(self) -> None:
+            self.volume = 0
+
+    adapter._ProtoOAClosePositionReq = _CloseReq
+
+    with pytest.raises(ValueError, match="close volume"):
+        adapter._build_close_position_request(position_id=77, volume=volume)
 
 
 def test_alpaca_rejects_non_finite_sl_tp_prices():
@@ -4659,7 +4761,9 @@ def test_ctrader_exit_only_uses_position_addressed_close():
         metadata={"ctrader_volume": 3000, "risk_sizing_mode": "exit_only"},
     )
     with pytest.raises(ValueError, match="position-addressed"):
-        adapter._build_new_order_request(signal, symbol_id=7)
+        # The raw-volume override key makes this signal unresolvable by
+        # design; the exit-only guard must refuse it before any volume is used.
+        adapter._build_new_order_request(signal, symbol_id=7, volume=3000)
 
 
 def test_ctrader_submit_exit_only_uses_broker_position_request(monkeypatch) -> None:
@@ -4793,9 +4897,10 @@ def test_ctrader_entry_guard_still_blocks_naked_non_exit_orders():
         metadata={"qty": 2.0},
     )
 
+    volume = _submit_resolved_volume(adapter, signal)
     builder = adapter._build_new_order_request
     with pytest.raises(ValueError, match="without stop_loss"):
-        builder(signal, symbol_id=7)
+        builder(signal, symbol_id=7, volume=volume)
 
 
 def test_submit_order_with_risk_resolves_fallback_sl_tp_into_metadata():
@@ -4919,6 +5024,56 @@ def test_alpaca_listen_clean_return_backs_off_instead_of_spinning(monkeypatch):
 
 # ── #80: per-symbol cTrader volume + SL/TP scales ─────────────────────────────
 
+#: Volumes spanning the low range, a mid range and the whole int32 upper
+#: bound the protocol can express.
+_ROUND_TRIP_VOLUMES = [1, 999, 2_001, 123_457, 999_999, 2_147_483_000, 2_147_483_647]
+
+
+@pytest.mark.parametrize("symbol", ["EURUSD", "USDJPY", "XAUUSD", "XAGUSD", "US500"])
+@pytest.mark.parametrize("volume", _ROUND_TRIP_VOLUMES)
+def test_ctrader_volume_qty_round_trip_is_exact_for_every_fallback_scale(
+    symbol: str, volume: int
+) -> None:
+    """The submit path's exact-int idempotency guard rests on this round trip.
+
+    ``submit_order`` normalizes the signal qty from the resolved volume and
+    fails closed when resolving that qty again does not reproduce the volume,
+    so ``volume -> qty -> volume`` must be exact for every volume the cTrader
+    protocol can express (int32) *and every scale a submit can resolve
+    against*. A scale whose conversion did not round-trip would make the guard
+    refuse every valid submit for that symbol - a silent failure that only a
+    pin across the scales can surface. It is the decimal lot-grid floor that
+    makes the round trip exact; a change to ``_broker_volume_to_qty``,
+    ``_qty_to_broker_volume`` or the floor's noise band would otherwise make
+    the guard false-positive (refusing valid submits) or false-negative (wire
+    volume and persisted qty diverging silently).
+    """
+    from live_runner import ctrader_adapter as module
+
+    volume_per_qty = module._fallback_symbol_scale(symbol).volume_per_qty
+
+    qty = module._broker_volume_to_qty(volume, volume_per_qty)
+
+    assert module._qty_to_broker_volume(qty, volume_per_qty) == volume
+
+
+@pytest.mark.parametrize(
+    "volume_per_qty", [100_000.0, 10.0, 1.0]
+)
+@pytest.mark.parametrize("volume", _ROUND_TRIP_VOLUMES)
+def test_ctrader_volume_qty_round_trip_is_exact_for_broker_scales(
+    volume_per_qty: float, volume: int
+) -> None:
+    """Same bound on broker scales: entries are only sized from a broker-sent
+    lotSize, and the demo's EURUSD scale (``lotSize`` 10_000_000 -> 100_000
+    units per qty) is the one every real submit resolves against."""
+    from live_runner import ctrader_adapter as module
+
+    qty = module._broker_volume_to_qty(volume, volume_per_qty)
+
+    assert module._qty_to_broker_volume(qty, volume_per_qty) == volume
+
+
 def _ctrader_signal(symbol: str, metadata: dict) -> "LiveSignal":
     return LiveSignal(
         deployment_id="dep-1",
@@ -5015,7 +5170,9 @@ def test_ctrader_jpy_relative_sl_tp_uses_fixed_protocol_divisor() -> None:
         metadata={"qty": 1.0, "stop_loss": 149.95, "take_profit": 150.10},
     )
     adapter._symbol_name_to_id = {"USDJPY": 9}
-    request = adapter._build_new_order_request(signal, symbol_id=9)
+    request = adapter._build_new_order_request(
+        signal, symbol_id=9, volume=_submit_resolved_volume(adapter, signal)
+    )
     assert request.relativeStopLoss == 5000
     assert request.relativeTakeProfit == 10000
 
@@ -5045,7 +5202,9 @@ def test_ctrader_relative_sl_tp_snaps_to_symbol_price_grid(digits: int, grid: in
         # 9.62751 below / 9.62749 above: both off-grid below 5 digits.
         metadata={"qty": 1.0, "stop_loss": 1925.50 - 9.62751, "take_profit": 1925.50 + 9.62749},
     )
-    request = adapter._build_new_order_request(signal, symbol_id=9)
+    request = adapter._build_new_order_request(
+        signal, symbol_id=9, volume=_submit_resolved_volume(adapter, signal)
+    )
     assert request.relativeStopLoss % grid == 0
     assert request.relativeTakeProfit % grid == 0
     # Snapping floors toward the entry: never beyond the requested distance, and by
@@ -5082,7 +5241,7 @@ def test_ctrader_sub_tick_take_profit_is_sent_as_one_tick_never_zero() -> None:
     module, adapter = _make_ctrader_request_builder_adapter()
     _seed_digits(module, adapter, 2)
     request = adapter._build_new_order_request(
-        _ethusd_signal(1925.50 - 5.0, 1925.504), symbol_id=9
+        _ethusd_signal(1925.50 - 5.0, 1925.504), symbol_id=9, volume=1
     )
     assert request.relativeTakeProfit == 1000
 
@@ -5093,9 +5252,13 @@ def test_ctrader_sub_tick_stop_loss_is_refused_not_widened() -> None:
     module, adapter = _make_ctrader_request_builder_adapter()
     _seed_digits(module, adapter, 2)
     with pytest.raises(ValueError, match=r"SL distance .* below one tick"):
-        adapter._build_new_order_request(_ethusd_signal(1925.496, 1925.50 + 5.0), symbol_id=9)
+        adapter._build_new_order_request(
+            _ethusd_signal(1925.496, 1925.50 + 5.0), symbol_id=9, volume=1
+        )
     # Exactly one tick is accepted.
-    request = adapter._build_new_order_request(_ethusd_signal(1925.49, 1925.60), symbol_id=9)
+    request = adapter._build_new_order_request(
+        _ethusd_signal(1925.49, 1925.60), symbol_id=9, volume=1
+    )
     assert request.relativeStopLoss == 1000
 
 
@@ -5104,15 +5267,19 @@ def test_ctrader_sub_tick_stop_loss_is_refused_for_each_sub_tick_price(stop: flo
     module, adapter = _make_ctrader_request_builder_adapter()
     _seed_digits(module, adapter, 2)
     with pytest.raises(ValueError, match="below one tick"):
-        adapter._build_new_order_request(_ethusd_signal(stop, 1925.50 + 5.0), symbol_id=9)
+        adapter._build_new_order_request(
+            _ethusd_signal(stop, 1925.50 + 5.0), symbol_id=9, volume=1
+        )
 
 
 def test_ctrader_sub_tick_stop_loss_is_refused_on_stop_only_order() -> None:
     module, adapter = _make_ctrader_request_builder_adapter()
     _seed_digits(module, adapter, 2)
     with pytest.raises(ValueError, match=r"SL distance .* below one tick"):
-        adapter._build_new_order_request(_ethusd_signal(1925.50 - 0.004, None), symbol_id=9)
-    request = adapter._build_new_order_request(_ethusd_signal(1925.49, None), symbol_id=9)
+        adapter._build_new_order_request(
+            _ethusd_signal(1925.50 - 0.004, None), symbol_id=9, volume=1
+        )
+    request = adapter._build_new_order_request(_ethusd_signal(1925.49, None), symbol_id=9, volume=1)
     assert request.relativeStopLoss == 1000
     # "No take profit" is an ABSENT field, never a present zero: the broker
     # rejects a present relativeTakeProfit <= 0 ("SL/TP have to be positive").
@@ -5135,7 +5302,9 @@ def test_ctrader_relative_distances_floor_toward_entry(
     module, adapter = _make_ctrader_request_builder_adapter()
     _seed_digits(module, adapter, 2)
     request = adapter._build_new_order_request(
-        _ethusd_signal(1925.50 - 0.01 * stop_ticks, 1925.50 + 0.01 * take_ticks), symbol_id=9
+        _ethusd_signal(1925.50 - 0.01 * stop_ticks, 1925.50 + 0.01 * take_ticks),
+        symbol_id=9,
+        volume=1,
     )
     assert request.relativeStopLoss == expected_stop
     assert request.relativeTakeProfit == expected_take
@@ -5145,7 +5314,9 @@ def test_ctrader_relative_distance_error_names_the_leg() -> None:
     module, adapter = _make_ctrader_request_builder_adapter()
     _seed_digits(module, adapter, 2)
     with pytest.raises(ValueError, match="TP price"):
-        adapter._build_new_order_request(_ethusd_signal(1925.50 - 5.0, float("nan")), symbol_id=9)
+        adapter._build_new_order_request(
+            _ethusd_signal(1925.50 - 5.0, float("nan")), symbol_id=9, volume=1
+        )
 
 
 @pytest.mark.parametrize(("scale", "exp"), [(100_000, 5), (10, 1), (1, 0)])
@@ -5169,7 +5340,7 @@ def test_ctrader_relative_sl_tp_handles_price_digits_above_five(digits: int) -> 
     module, adapter = _make_ctrader_request_builder_adapter()
     _seed_digits(module, adapter, digits)
     request = adapter._build_new_order_request(
-        _ethusd_signal(1925.50 - 9.62751, 1925.50 + 9.62749), symbol_id=9
+        _ethusd_signal(1925.50 - 9.62751, 1925.50 + 9.62749), symbol_id=9, volume=1
     )
     assert isinstance(request.relativeStopLoss, int)
     assert isinstance(request.relativeTakeProfit, int)
@@ -5305,7 +5476,9 @@ def test_unbounded_tp_policy_builds_stop_only_requests() -> None:
             "take_profit_policy": "unbounded_exit_on_opposite_signal",
         },
     )
-    request = cadapter._build_new_order_request(csignal, symbol_id=7)
+    request = cadapter._build_new_order_request(
+        csignal, symbol_id=7, volume=_submit_resolved_volume(cadapter, csignal)
+    )
     assert request.relativeStopLoss == 5000
     # Absent, not zero: a present relativeTakeProfit of 0 is a broker rejection.
     assert not request.HasField("relativeTakeProfit")
@@ -5343,7 +5516,9 @@ def test_ctrader_unbounded_tp_leaves_relative_take_profit_unset_on_the_wire() ->
             "take_profit_policy": "unbounded_exit_on_opposite_signal",
         },
     )
-    request = adapter._build_new_order_request(unbounded, symbol_id=7)
+    request = adapter._build_new_order_request(
+        unbounded, symbol_id=7, volume=_submit_resolved_volume(adapter, unbounded)
+    )
     assert request.HasField("relativeStopLoss")
     assert request.relativeStopLoss == 5000
     assert not request.HasField("relativeTakeProfit")
@@ -5356,7 +5531,9 @@ def test_ctrader_unbounded_tp_leaves_relative_take_profit_unset_on_the_wire() ->
         timestamp=datetime.now(timezone.utc),
         metadata={"qty": 1.0, "stop_loss": 1.05, "take_profit": 1.2},
     )
-    bounded_request = adapter._build_new_order_request(bounded, symbol_id=7)
+    bounded_request = adapter._build_new_order_request(
+        bounded, symbol_id=7, volume=_submit_resolved_volume(adapter, bounded)
+    )
     assert bounded_request.HasField("relativeTakeProfit")
     assert bounded_request.relativeTakeProfit == 10_000
 
@@ -5789,6 +5966,304 @@ def test_ctrader_exit_submit_refuses_when_qty_normalization_is_not_idempotent(
     assert saved == []
 
 
+def _ctrader_volume_resolution_spy(adapter, monkeypatch, seen_qty: list[float]):
+    """Count and record every ``_resolve_order_volume`` call of one submit.
+
+    Wraps the real resolver so the recorded volumes and the qty each call read
+    are the genuine ones: the call COUNT is what the single-resolution
+    invariant pins, and the recorded qty is what shows which signal state each
+    call resolved from.
+    """
+    resolver = adapter._resolve_order_volume
+
+    def _spy(signal):
+        seen_qty.append(float((signal.metadata or {}).get("qty")))
+        return resolver(signal)
+
+    monkeypatch.setattr(adapter, "_resolve_order_volume", _spy)
+
+
+def test_ctrader_submit_resolves_order_volume_once_and_sends_that_volume(
+    monkeypatch,
+) -> None:
+    """The entry path resolves the broker volume ONCE and hands that value to
+    the request builder.
+
+    Resolution is deliberate exactly twice: the binding qty (what the risk
+    engine sized upstream), then the volume-grid quantity the submit persists -
+    the qty CHANGED between the two, so the second call is the idempotency
+    guard, not a duplicate. Anything else (a third resolution for the wire
+    request) would let a symbol scale that moved during an intervening await
+    put a different size on the wire than the persisted qty describes.
+    """
+    _module, adapter, saved, volumes = _ctrader_submit_harness(monkeypatch)
+    seen_qty: list[float] = []
+    _ctrader_volume_resolution_spy(adapter, monkeypatch, seen_qty)
+
+    assert asyncio.run(adapter.submit_order(_ctrader_entry_signal(), qty=2.0007)) == "777"
+
+    assert len(seen_qty) == 2
+    # First from the binding qty, second from the normalized one the submit
+    # persists - the state the guard re-resolves.
+    assert seen_qty[0] == pytest.approx(2.0007)
+    assert seen_qty[1] == pytest.approx(2.0)
+    # The wire volume is the once-resolved volume (2000.7 floored to 2000) and
+    # the persisted qty is exactly the quantity that volume represents.
+    assert volumes == [2000]
+    assert saved[0].metadata["qty"] == pytest.approx(2.0)
+    assert saved[0].metadata["explicit_qty"] == pytest.approx(2.0)
+
+
+def test_ctrader_exit_submit_resolves_order_volume_once_and_sends_that_volume(
+    monkeypatch,
+) -> None:
+    """Same invariant on the exit path: one resolution, one idempotency guard,
+    and the close request carries the resolved volume. A second resolution for
+    the close is a duplicate - nothing the close needs changes in between.
+    """
+    _module, adapter, saved, _volumes = _ctrader_submit_harness(monkeypatch)
+    adapter._position_ids_by_symbol = {"EURUSD": (7,)}
+    close_volumes: list[int] = []
+
+    def _close_request(*, position_id: int, volume: int):
+        close_volumes.append(volume)
+        return SimpleNamespace(volume=volume)
+
+    monkeypatch.setattr(adapter, "_build_close_position_request", _close_request)
+    seen_qty: list[float] = []
+    _ctrader_volume_resolution_spy(adapter, monkeypatch, seen_qty)
+    signal = LiveSignal(
+        deployment_id="dep-1",
+        symbol="EURUSD",
+        action="sell",
+        theoretical_price=1.1,
+        timestamp=datetime.now(timezone.utc),
+        metadata={"exit_only": True, "risk_sizing_mode": "exit_only"},
+    )
+
+    assert asyncio.run(adapter.submit_order(signal, qty=1.3336)) == "777"
+
+    assert len(seen_qty) == 2
+    assert seen_qty[0] == pytest.approx(1.3336)
+    assert seen_qty[1] == pytest.approx(1.333)
+    assert close_volumes == [1333]
+    assert saved[0].metadata["qty"] == pytest.approx(1.333)
+
+
+def test_ctrader_exit_submit_keeps_the_resolved_close_volume_when_the_scale_moves(
+    monkeypatch,
+) -> None:
+    """The exit variant of the mid-submit scale move - and the live one.
+
+    The daemon strips every pip-value key from an exit (``_PIP_VALUE_METADATA_KEYS``
+    in ``live_runner/daemon.py``: a close is sized from the broker book, so no
+    pip value can describe it), so a close is units-less and cannot fail closed on
+    a scale move. It must also not be resized by one. On main the close request
+    re-resolved its volume and read the moved scale, sending 200 broker units
+    against a position holding 2000 - closing a tenth of it; the close now carries
+    the volume resolved once, which is the position's own broker volume.
+    """
+    from live_runner import ctrader_adapter as module
+
+    _module, adapter, saved, _volumes = _ctrader_submit_harness(monkeypatch)
+    adapter._position_ids_by_symbol = {"EURUSD": (7,)}
+    close_volumes: list[int] = []
+
+    def _close_request(*, position_id: int, volume: int):
+        close_volumes.append(volume)
+        return SimpleNamespace(volume=volume)
+
+    monkeypatch.setattr(adapter, "_build_close_position_request", _close_request)
+
+    async def _refresh_then_resolve(symbol: str) -> int:
+        # A concurrent reconnect/props refresh lands during the submit's await:
+        # the cached scale moves from 1000 to 100 units per qty.
+        adapter._symbol_props["EURUSD"] = module.SymbolScale(
+            volume_per_qty=100.0,
+            price_digits=5,
+            min_volume=1,
+            lot_size=10_000.0,
+            source="broker",
+        )
+        return 1
+
+    monkeypatch.setattr(adapter, "_resolve_symbol_id", _refresh_then_resolve)
+    signal = LiveSignal(
+        deployment_id="dep-1",
+        symbol="EURUSD",
+        action="sell",
+        theoretical_price=1.1,
+        timestamp=datetime.now(timezone.utc),
+        metadata={"exit_only": True, "risk_sizing_mode": "exit_only"},
+    )
+
+    assert asyncio.run(adapter.submit_order(signal, qty=2.0)) == "777"
+
+    # The position's own broker volume (qty 2.0 at 1000 units per qty), NOT the
+    # 200 a re-resolution against the moved scale would have produced.
+    assert close_volumes == [2000]
+    assert saved[0].metadata["qty"] == pytest.approx(2.0)
+
+
+def test_ctrader_submit_refuses_a_volume_input_that_changes_after_normalization(
+    monkeypatch,
+) -> None:
+    """The one re-resolution is the guard for a state change between the two
+    calls: the symbol scale moves (a props refresh landing between the binding
+    resolution and the normalized one), so the volume the normalized qty
+    resolves to no longer reproduces the volume the submit normalized to. The
+    submit must refuse instead of persisting a qty that describes a different
+    order than the one sent.
+    """
+    from live_runner import ctrader_adapter as module
+
+    _module, adapter, saved, volumes = _ctrader_submit_harness(monkeypatch)
+    resolutions = {"n": 0}
+    resolver = adapter._resolve_order_volume
+
+    def _move_scale_then_resolve(signal):
+        resolutions["n"] += 1
+        if resolutions["n"] == 2:
+            # A reconnect's props fetch replaces the cached scale mid-submit.
+            adapter._symbol_props["EURUSD"] = module.SymbolScale(
+                volume_per_qty=100.0,
+                price_digits=5,
+                min_volume=1,
+                lot_size=10_000.0,
+                source="broker",
+            )
+        return resolver(signal)
+
+    monkeypatch.setattr(adapter, "_resolve_order_volume", _move_scale_then_resolve)
+    submit = adapter.submit_order(_ctrader_entry_signal(), qty=2.0007)
+
+    with pytest.raises(RuntimeError, match="not idempotent") as excinfo:
+        asyncio.run(submit)
+
+    assert is_order_not_submitted(excinfo.value)
+    assert saved == []
+    assert volumes == []
+
+
+def test_ctrader_submit_keeps_the_resolved_volume_when_the_scale_moves_mid_submit(
+    monkeypatch,
+) -> None:
+    """A scale change AFTER the normalization guard must not reach the wire.
+
+    The persisted qty has already been normalized to the volume resolved once;
+    resolving again for the request build would read the moved scale and send a
+    different size than the signal records. The submit therefore hands the
+    request builder the volume it resolved and validated, so wire volume and
+    persisted qty cannot diverge.
+    """
+    from live_runner import ctrader_adapter as module
+
+    _module, adapter, saved, volumes = _ctrader_submit_harness(monkeypatch)
+
+    async def _refresh_then_resolve(symbol: str) -> int:
+        # A concurrent reconnect/props refresh lands during the submit's await:
+        # the cached scale moves from 1000 to 100 units per qty.
+        adapter._symbol_props["EURUSD"] = module.SymbolScale(
+            volume_per_qty=100.0,
+            price_digits=5,
+            min_volume=1,
+            lot_size=10_000.0,
+            source="broker",
+        )
+        return 1
+
+    monkeypatch.setattr(adapter, "_resolve_symbol_id", _refresh_then_resolve)
+
+    assert asyncio.run(adapter.submit_order(_ctrader_entry_signal(), qty=2.0007)) == "777"
+
+    # 2000 units (the volume resolved once from the binding qty), NOT the 200 a
+    # re-resolution against the moved scale would have produced.
+    assert volumes == [2000]
+    assert saved[0].metadata["qty"] == pytest.approx(2.0)
+
+
+def test_ctrader_submit_keeps_the_sizing_pip_value_through_normalization(
+    monkeypatch,
+) -> None:
+    """The pre-build #146 re-check reads ``pip_value_units_per_qty`` off the
+    normalized signal, so normalization must not strip it.
+
+    A broader metadata cleanup that dropped the key would leave the re-check
+    with no units and silently skip - sending a pre-move volume on a daemon
+    entry, with nothing on the wire to show the scale moved. This pins that the
+    key the refusal rests on survives to the persisted signal.
+    """
+    _module, adapter, saved, volumes = _ctrader_submit_harness(monkeypatch)
+    entry_metadata = dict(_ctrader_entry_signal().metadata or {})
+    entry_metadata.update(
+        {"pip_value_units_per_qty": 10.0, "pip_value_source": "broker"}
+    )
+    daemon_signal = _ctrader_entry_signal().model_copy(
+        update={"metadata": entry_metadata}
+    )
+
+    assert asyncio.run(adapter.submit_order(daemon_signal, qty=2.0007)) == "777"
+
+    assert volumes == [2000]
+    assert saved[0].metadata["pip_value_units_per_qty"] == 10.0
+    assert saved[0].metadata["pip_value_source"] == "broker"
+
+
+def test_ctrader_submit_refuses_a_daemon_entry_whose_scale_moved_mid_submit(
+    monkeypatch,
+) -> None:
+    """#146: a scale move in that same window must still refuse a daemon entry.
+
+    Daemon entries carry ``pip_value_units_per_qty`` (``live_runner/daemon.py``
+    writes it), and the builder's own resolution used to re-run the "scale
+    changed since sizing" check after ``submit_order``'s awaits - so on main a
+    scale refresh landing in this window refused the order instead of sending
+    it. The builder no longer re-resolves, so the check is re-run explicitly
+    before the request is built: the size the risk engine covered was computed
+    against the old scale, so the submit must fail closed rather than send the
+    pre-move volume.
+
+    This is the daemon variant of
+    ``test_ctrader_submit_keeps_the_resolved_volume_when_the_scale_moves_mid_submit``,
+    which pins the units-less variant that main sent.
+    """
+    from live_runner import ctrader_adapter as module
+
+    _module, adapter, saved, volumes = _ctrader_submit_harness(monkeypatch)
+
+    async def _refresh_then_resolve(symbol: str) -> int:
+        # A concurrent reconnect/props refresh lands during the submit's await:
+        # the cached scale moves from 1000 to 100 units per qty, i.e. from 10.0
+        # to 1.0 pip-value units per qty.
+        adapter._symbol_props["EURUSD"] = module.SymbolScale(
+            volume_per_qty=100.0,
+            price_digits=5,
+            min_volume=1,
+            lot_size=10_000.0,
+            source="broker",
+        )
+        return 1
+
+    monkeypatch.setattr(adapter, "_resolve_symbol_id", _refresh_then_resolve)
+    daemon_signal = _ctrader_entry_signal().model_copy(
+        update={
+            "metadata": {
+                "pip_value_units_per_qty": 10.0,
+                "pip_value_source": "broker",
+            }
+        }
+    )
+    submit = adapter.submit_order(daemon_signal, qty=2.0007)
+
+    with pytest.raises(ValueError, match="changed since sizing") as excinfo:
+        asyncio.run(submit)
+
+    assert "10.0 -> 1.0" in str(excinfo.value)
+    assert is_order_not_submitted(excinfo.value)
+    assert saved == []
+    assert volumes == []
+
+
 def test_ctrader_volume_resolution_is_idempotent_at_the_int32_bound(
     monkeypatch,
 ) -> None:
@@ -5851,7 +6326,7 @@ def test_ctrader_broker_write_failure_is_not_marked_as_not_submitted(
     monkeypatch.setattr(adapter, "_validate_pre_persistence", lambda _signal: None)
     monkeypatch.setattr(adapter, "_resolve_order_volume", lambda _signal: 1.0)
     monkeypatch.setattr(
-        adapter, "_build_new_order_request", lambda signal, *, symbol_id: object()
+        adapter, "_build_new_order_request", lambda signal, *, symbol_id, volume: object()
     )
 
     async def _resolve_symbol_id(_symbol: str) -> int:
@@ -6032,7 +6507,13 @@ def test_ctrader_new_order_request_volume_is_on_broker_step() -> None:
         metadata={"qty": 1.4, "stop_loss": 1.10304, "take_profit": 1.10904},
     )
 
-    request = adapter._build_new_order_request(signal, symbol_id=1)
+    # The submit path resolves the volume once (1.4 qty floored onto the
+    # 100_000-unit broker grid) and hands that value to the request builder,
+    # which must put exactly it on the wire.
+    resolved_volume = _submit_resolved_volume(adapter, signal)
+    assert resolved_volume == 100_000
+
+    request = adapter._build_new_order_request(signal, symbol_id=1, volume=resolved_volume)
 
     assert request.volume == 100_000
 

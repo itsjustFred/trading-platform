@@ -178,10 +178,16 @@ def _ctrader(metadata: dict[str, Any], *, action: str = "buy"):
     ``theoretical_price`` (100.0), so the effective levels are read back off
     them: a coerced ``True`` stop is 99.0 away from the reference, not 5.0.
     """
+    adapter = _ctrader_adapter()
     signal = _signal(
         {"qty": 1.0, **metadata}, action=action, price=100.0, symbol=CTRADER_SYMBOL
     )
-    request = _ctrader_adapter()._build_new_order_request(signal, symbol_id=7)
+    # The builder takes the volume the submit path resolves once and hands it
+    # down; this file is about the SL/TP levels, so the volume is the one the
+    # signal itself resolves to.
+    request = adapter._build_new_order_request(
+        signal, symbol_id=7, volume=adapter._resolve_order_volume(signal)
+    )
     reference = 100.0
     scale = 100_000
     # cTrader sends distances, not prices: a BUY's stop is below its reference

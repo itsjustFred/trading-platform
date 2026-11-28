@@ -77,7 +77,7 @@ class NIMProvider:
                 temperature=temperature,
             )
             return content
-        except Exception as exc:
+        except Exception as exc:  # except-kind: propagate - records error metadata, then re-raises
             _apply_metadata(
                 metadata,
                 model=selected_model or "",
