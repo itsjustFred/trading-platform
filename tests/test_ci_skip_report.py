@@ -224,30 +224,43 @@ def test_is_money_path_covers_live_runner_and_engine_tests() -> None:
             f"{path.name} must not ignore collection: deselected tests "
             "never reach the skip report"
         )
-    # Deselection can also come from outside tests/fakes: an --ignore or a
-    # collect_ignore aimed at the fakes would hide every contract test just
-    # as thoroughly. Pin the CI invocation and the root conftest.
+    # Deselection can also come from outside tests/fakes: an --ignore, a
+    # collect_ignore, a collection hook or a pytest-config knob aimed at the
+    # fakes would hide every contract test just as thoroughly. Scan whole
+    # files with whitespace collapsed so a YAML line-fold, a split flag or
+    # an env-var route cannot smuggle the deselection past a per-line check.
+    _DESELECT_TOKENS = (
+        "--ignore",
+        "--deselect",
+        "addopts",
+        "norecursedirs",
+        "python_files",
+        "python_classes",
+        "python_functions",
+        "pytest_ignore_collect",
+        "pytest_collection_modifyitems",
+        "collect_ignore",
+        "PYTEST_ADDOPTS",
+    )
     repo_root = Path(__file__).resolve().parents[1]
-    deselection_sources = sorted(
-        (repo_root / ".github" / "workflows").glob("*.yml")
-    ) + [
-        repo_root / name
-        for name in ("pytest.ini", "pyproject.toml", "setup.cfg", "tox.ini")
-        if (repo_root / name).is_file()
-    ]
+    deselection_sources = (
+        sorted((repo_root / ".github" / "workflows").glob("*.y*ml"))
+        + [
+            repo_root / name
+            for name in ("pytest.ini", "pyproject.toml", "setup.cfg", "tox.ini")
+            if (repo_root / name).is_file()
+        ]
+        + [fakes_root.parent / "conftest.py"]
+        + sorted(fakes_root.rglob("*.py"))
+    )
     for source_path in deselection_sources:
-        for line in source_path.read_text(encoding="utf-8").splitlines():
-            if "--ignore" in line or "--deselect" in line or "addopts" in line:
-                assert "fakes" not in line, (
-                    f"{source_path.name} deselects tests/fakes: {line.strip()}"
+        squashed = re.sub(r"\s+", "", source_path.read_text(encoding="utf-8"))
+        for token in _DESELECT_TOKENS:
+            for match in re.finditer(re.escape(token), squashed):
+                window = squashed[match.start() : match.start() + 200]
+                assert "fakes" not in window, (
+                    f"{source_path.name} may deselect tests/fakes via {token!r}"
                 )
-    for line in (fakes_root.parent / "conftest.py").read_text(
-        encoding="utf-8"
-    ).splitlines():
-        if "collect_ignore" in line:
-            assert "fakes" not in line, (
-                f"tests/conftest.py ignores fakes collection: {line.strip()}"
-            )
     assert not is_money_path("tests.test_safe_path")
     assert not is_money_path("tests.strategies.test_channel_breakout")
 
