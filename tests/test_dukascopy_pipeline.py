@@ -252,6 +252,17 @@ def test_combine_sides_sorts_minutes_present_on_one_side_only():
     assert bool(out["ask_open"].isna().iloc[0])
 
 
+def test_split_combined_m1_rejects_partial_side_nan():
+    df = _valid_frame()
+    df.loc[0, "bid_close"] = np.nan  # one missing bid column: partial side
+    with pytest.raises(ValueError, match="partial-side"):
+        convert.split_combined_m1(df)
+
+
+def test_file_entry_handles_empty_frame():
+    assert convert.file_entry(_valid_frame().iloc[0:0]) == {"rows": 0}
+
+
 # ─── validation ──────────────────────────────────────────────────────────────
 
 

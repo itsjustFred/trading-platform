@@ -53,6 +53,7 @@ REC_NATIVE = REC.newbyteorder("<")
 AGG = {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
 TIMEFRAMES = ("M1", "M5", "M15", "H1", "H4", "D1", "W1")
 RULES = {"M5": "5min", "M15": "15min", "H1": "1h", "H4": "4h", "D1": "1D", "W1": "W1"}
+assert set(RULES) == set(TIMEFRAMES) - {"M1"}, "RULES must cover every non-M1 timeframe"
 OHLCV = ("open", "high", "low", "close", "volume")
 SIDE_COLUMNS = [f"{side}_{c}" for side in ("bid", "ask") for c in OHLCV]
 M1_COLUMNS = ["timestamp", *SIDE_COLUMNS]
@@ -187,6 +188,11 @@ def split_combined_m1(combined: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFram
     Rows where a side's ``open`` is NaN simply did not trade that minute on
     that side, so dropping them loses nothing the resamplers could use.
     """
+    for side in ("bid", "ask"):
+        cols = [f"{side}_{c}" for c in OHLCV]
+        na = combined[cols].isna().sum(axis=1)
+        if ((na > 0) & (na < len(OHLCV))).any():
+            raise ValueError(f"combined M1 has partial-side NaN rows ({side})")
     bid = combined.loc[combined["bid_open"].notna()].copy()
     ask = combined.loc[combined["ask_open"].notna()].copy()
 
@@ -225,6 +231,8 @@ def bin_floor(tf: str, ts: pd.Timestamp) -> pd.Timestamp:
 
 
 def file_entry(df: pd.DataFrame) -> dict:
+    if df.empty:
+        return {"rows": 0}
     return {
         "rows": len(df),
         "first": str(df.timestamp.iloc[0]),
