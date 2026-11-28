@@ -236,9 +236,24 @@ def test_save_and_load_roundtrip(tmp_path: Path):
 
 
 def _write_bars(root: Path, rel_parts: list[str], timestamps: list[str]) -> None:
-    path = root.joinpath(*rel_parts)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame(
+    """Write bars through ``ohlcv_store.write_frame``.
+
+    ``rel_parts`` keeps the legacy ``ohlcv/<source>/<asset_class>/[<region>/]<symbol>/<tf>.parquet``
+    spelling; the dataset lands at the manifest location
+    ``ohlcv/<source>/<SYMBOL>/<SYMBOL>_<TF>.parquet``.
+    """
+    from shared import ohlcv_store
+
+    tail = list(rel_parts)[1:]  # drop the leading "ohlcv"
+    source = tail[0]
+    asset_class = tail[1]
+    if len(tail) == 5:
+        region, symbol, timeframe_file = tail[2], tail[3], tail[4]
+    else:
+        symbol, timeframe_file = tail[2], tail[3]
+        region = ""
+    timeframe = timeframe_file.removesuffix(".parquet")
+    frame = pd.DataFrame(
         {
             "timestamp": pd.to_datetime(timestamps, utc=True),
             "open": [1.0] * len(timestamps),
@@ -247,7 +262,12 @@ def _write_bars(root: Path, rel_parts: list[str], timestamps: list[str]) -> None
             "close": [1.0] * len(timestamps),
             "volume": [10] * len(timestamps),
         }
-    ).to_parquet(path, index=False)
+    )
+    ohlcv_store.write_frame(
+        root, source, symbol, timeframe, frame,
+        asset_class=asset_class,
+        region=region,
+    )
 
 
 def _coverage(**kwargs) -> bool:

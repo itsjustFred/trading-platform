@@ -24,7 +24,19 @@ from data_tools.auto_download import (
 
 
 def _write_bars(path: Path, timestamps: list[str]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    """Write bars through ``ohlcv_store.write_frame``.
+
+    ``path`` keeps the legacy ``<root>/ohlcv/<source>/<asset_class>/<symbol>/<tf>.parquet``
+    spelling so call sites stay readable; the dataset is stored at the manifest
+    location ``ohlcv/<source>/<SYMBOL>/<SYMBOL>_<TF>.parquet``.
+    """
+    from shared import ohlcv_store
+
+    parts = path.parts
+    ohlcv_at = parts.index("ohlcv")
+    source, asset_class, symbol, timeframe_file = parts[ohlcv_at + 1 : ohlcv_at + 5]
+    timeframe = timeframe_file.removesuffix(".parquet")
+    data_root = Path(*parts[:ohlcv_at])
     frame = pd.DataFrame(
         {
             "timestamp": pd.to_datetime(timestamps, utc=True),
@@ -35,7 +47,64 @@ def _write_bars(path: Path, timestamps: list[str]) -> None:
             "volume": [10] * len(timestamps),
         }
     )
-    frame.to_parquet(path, index=False)
+    ohlcv_store.write_frame(
+        data_root, source, symbol, timeframe, frame, asset_class=asset_class
+    )
+
+
+def _declare_dataset(
+    data_root: Path,
+    source: str,
+    symbol: str,
+    timeframe: str,
+    filename: str,
+    *,
+    rows: int = 0,
+    asset_class: str = "",
+) -> Path:
+    """Write ``frame``-less manifest entry for a parquet written directly.
+
+    For fixtures whose timestamps violate the ``write_frame`` contract but
+    that must still be visible to manifest-driven readers.
+    """
+    from shared import ohlcv_store
+
+    path = ohlcv_store.data_path(data_root, source, symbol, timeframe)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    manifest = ohlcv_store.read_manifest(data_root, source)
+    meta = manifest.get(symbol, {})
+    meta.setdefault("files", {})[filename] = {"rows": rows, "first": "", "last": ""}
+    meta["asset_class"] = asset_class
+    meta.setdefault("source_symbol", symbol)
+    manifest[symbol] = meta
+    ohlcv_store.write_manifest(data_root, source, manifest)
+    return path
+
+
+def _write_store_bars(
+    data_root: Path,
+    source: str,
+    symbol: str,
+    timeframe: str,
+    asset_class: str,
+    timestamps: list[str],
+) -> Path:
+    """Valid-timestamp bars through ``write_frame``; returns the parquet path."""
+    from shared import ohlcv_store
+
+    frame = pd.DataFrame(
+        {
+            "timestamp": pd.to_datetime(timestamps, utc=True),
+            "open": [100.0] * len(timestamps),
+            "high": [101.0] * len(timestamps),
+            "low": [99.0] * len(timestamps),
+            "close": [100.5] * len(timestamps),
+            "volume": [1000.0] * len(timestamps),
+        }
+    )
+    return ohlcv_store.write_frame(
+        data_root, source, symbol, timeframe, frame, asset_class=asset_class
+    )
 
 
 def test_a_hole_of_exactly_the_fail_threshold_warns_rather_than_fails(tmp_path):
@@ -71,7 +140,7 @@ class TestInternalGapDetection:
                 "2024-06-01T01:00:00Z",
             ],
         )
-        gaps = find_internal_gaps(tmp_path / "ohlcv" / "dukascopy" / "forex" / "EURUSD")
+        gaps = find_internal_gaps(tmp_path, "EURUSD")
         assert gaps, "a 5-year internal hole must be detected"
         assert gaps[0]["gap_days"] > 1000
 
@@ -263,9 +332,15 @@ class TestValidateGapBounds:
                 "volume": [10] * 4,
             }
         )
-        target = tmp_path / "ohlcv" / "dukascopy" / "forex" / "EURUSD" / "1h.parquet"
+        from shared import ohlcv_store
+
+        target = ohlcv_store.data_path(tmp_path, "dukascopy", "EURUSD", "1h")
         target.parent.mkdir(parents=True, exist_ok=True)
         frame.to_parquet(target, index=False)
+        _declare_dataset(
+            tmp_path, "dukascopy", "EURUSD", "1h", target.name,
+            rows=len(frame), asset_class="forex",
+        )
         result = validate_parquet(target, ohlcv_root=tmp_path / "ohlcv")
         assert result.gaps, "the 4-day hole must be reported"
         assert "2024-01-01" in result.gaps[0]["start"] and "01:00" in result.gaps[0]["start"]
@@ -299,7 +374,9 @@ class TestGapDetectionSingleFile:
         import pyarrow as pa
         import pyarrow.parquet as pq
 
-        target = tmp_path / "ohlcv" / "dukascopy" / "forex" / "EURUSD" / "1h.parquet"
+        from shared import ohlcv_store
+
+        target = ohlcv_store.data_path(tmp_path, "dukascopy", "EURUSD", "1h")
         target.parent.mkdir(parents=True)
         frame = pd.DataFrame(
             {
@@ -322,8 +399,12 @@ class TestGapDetectionSingleFile:
         pq.write_table(
             pa.Table.from_pandas(frame, preserve_index=False), target, row_group_size=2
         )
+        _declare_dataset(
+            tmp_path, "dukascopy", "EURUSD", "1h", target.name,
+            rows=len(frame), asset_class="forex",
+        )
 
-        gaps = find_internal_gaps(target.parent, "1h")
+        gaps = find_internal_gaps(tmp_path, "EURUSD", "1h")
         assert gaps, "hole inside one file must be detected"
         assert gaps[0]["gap_days"] > 1000
 
@@ -335,7 +416,7 @@ class TestSegmentCoverageWeekends:
         # Mon 2024-01-01 .. Fri 2024-01-12, weekdays only (real equity feed).
         stamps = pd.date_range("2024-01-01", "2024-01-12", freq="B", tz="UTC")
         _write_bars(
-            tmp_path / "ohlcv" / "test" / "AAPL" / "1d.parquet",
+            tmp_path / "ohlcv" / "test" / "equity" / "AAPL" / "1d.parquet",
             [ts.isoformat() for ts in stamps],
         )
         assert has_sufficient_segment_coverage(
@@ -513,10 +594,8 @@ class TestValidateHolidayCalendar:
         )
 
     def _write_equity_bars(self, root: Path, timestamps: list[str]) -> Path:
-        import pandas as pd
+        from shared import ohlcv_store
 
-        target = root / "ohlcv" / "test" / "equity" / "AAPL" / "1d.parquet"
-        target.parent.mkdir(parents=True, exist_ok=True)
         frame = pd.DataFrame(
             {
                 "timestamp": pd.to_datetime(timestamps, utc=True),
@@ -527,8 +606,9 @@ class TestValidateHolidayCalendar:
                 "volume": [1000.0] * len(timestamps),
             }
         )
-        frame.to_parquet(target, index=False)
-        return target
+        return ohlcv_store.write_frame(
+            root, "test", "AAPL", "1d", frame, asset_class="equity"
+        )
 
     def test_session_overlap_starts_after_prior_bar_close(self) -> None:
         from data_tools.validate import _gap_classification
@@ -588,7 +668,9 @@ class TestValidateHolidayCalendar:
         monkeypatch.setattr(validate_module, "DATA_DIR", tmp_path)
         # 1h bars: the 2-day span exceeds the 180-minute threshold even
         # though Thursday is a holiday (FX prints through it).
-        target = tmp_path / "ohlcv" / "test" / "forex" / "EURUSD" / "1h.parquet"
+        from shared import ohlcv_store
+
+        target = ohlcv_store.data_path(tmp_path, "test", "EURUSD", "1h")
         target.parent.mkdir(parents=True, exist_ok=True)
         pd.DataFrame(
             {
@@ -602,6 +684,10 @@ class TestValidateHolidayCalendar:
                 "volume": [10, 10],
             }
         ).to_parquet(target, index=False)
+        _declare_dataset(
+            tmp_path, "test", "EURUSD", "1h", target.name,
+            rows=2, asset_class="forex",
+        )
         result = validate_module.validate_parquet(target)
         assert len(result.gaps) == 1
 
@@ -611,20 +697,10 @@ class TestValidateHolidayCalendar:
         import data_tools.validate as validate_module
 
         monkeypatch.setattr(validate_module, "DATA_DIR", tmp_path)
-        target = tmp_path / "ohlcv" / "test" / "equity" / "AAPL" / "1h.parquet"
-        target.parent.mkdir(parents=True)
-        pd.DataFrame(
-            {
-                "timestamp": pd.to_datetime(
-                    ["2024-01-09T16:00:00Z", "2024-01-10T09:30:00Z"], utc=True
-                ),
-                "open": [100.0, 100.0],
-                "high": [100.5, 100.5],
-                "low": [99.5, 99.5],
-                "close": [100.0, 100.0],
-                "volume": [10, 10],
-            }
-        ).to_parquet(target, index=False)
+        target = _write_store_bars(
+            tmp_path, "test", "AAPL", "1h", "equity",
+            ["2024-01-09T16:00:00Z", "2024-01-10T09:30:00Z"],
+        )
 
         result = validate_module.validate_parquet(
             target,
@@ -640,20 +716,10 @@ class TestValidateHolidayCalendar:
         import data_tools.validate as validate_module
 
         monkeypatch.setattr(validate_module, "DATA_DIR", tmp_path)
-        target = tmp_path / "ohlcv" / "test" / "equity" / "AAPL" / "1h.parquet"
-        target.parent.mkdir(parents=True)
-        pd.DataFrame(
-            {
-                "timestamp": pd.to_datetime(
-                    ["2024-01-09T10:00:00Z", "2024-01-09T14:00:00Z"], utc=True
-                ),
-                "open": [100.0, 100.0],
-                "high": [100.5, 100.5],
-                "low": [99.5, 99.5],
-                "close": [100.0, 100.0],
-                "volume": [10, 10],
-            }
-        ).to_parquet(target, index=False)
+        target = _write_store_bars(
+            tmp_path, "test", "AAPL", "1h", "equity",
+            ["2024-01-09T10:00:00Z", "2024-01-09T14:00:00Z"],
+        )
 
         result = validate_module.validate_parquet(
             target,
@@ -848,21 +914,27 @@ def test_observed_session_uses_an_interior_window_at_boundary_cuts() -> None:
 # ─── the allowed hole length must scale with the timeframe ──────────────────
 
 
-def _write_series(directory, filename, timestamps):
-    import pandas as pd
+def _write_series(
+    data_root, source, symbol, timeframe, timestamps, *, asset_class=""
+):
+    """Bars through the manifest store; returns ``data_root``."""
+    from shared import ohlcv_store
 
-    directory.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame(
-        {
-            "timestamp": timestamps,
-            "open": 1.0,
-            "high": 1.0,
-            "low": 1.0,
-            "close": 1.0,
-            "volume": 1.0,
-        }
-    ).to_parquet(directory / filename)
-    return directory
+    ohlcv_store.write_frame(
+        data_root, source, symbol, timeframe,
+        pd.DataFrame(
+            {
+                "timestamp": timestamps,
+                "open": 1.0,
+                "high": 1.0,
+                "low": 1.0,
+                "close": 1.0,
+                "volume": 1.0,
+            }
+        ),
+        asset_class=asset_class,
+    )
+    return data_root
 
 
 def test_regular_weekly_data_is_not_reported_as_a_gap(tmp_path):
@@ -875,25 +947,34 @@ def test_regular_weekly_data_is_not_reported_as_a_gap(tmp_path):
 
     from data_tools.auto_download import find_internal_gaps
 
-    symbol_dir = _write_series(
-        Path(tmp_path) / "GOLD1",
-        "1w.parquet",
+    _write_series(
+        tmp_path, "dukascopy", "GOLD1", "1w",
         pd.date_range("2024-01-05", periods=60, freq="7D", tz="UTC"),
+        asset_class="metals",
     )
-    assert find_internal_gaps(symbol_dir, "1w") == []
+    assert find_internal_gaps(tmp_path, "GOLD1", "1w") == []
 
 
-def test_regular_monthly_data_is_not_reported_as_a_gap(tmp_path):
+def test_monthly_spaced_bars_under_the_coarsest_timeframe_are_reported(tmp_path):
+    """``1mo`` is not a platform timeframe, so the manifest store cannot
+    declare it — the old ``1mo.parquet`` filename convention is gone. The
+    90-day threshold it exercised is still covered by
+    ``scaled_gap_threshold_days`` unit tests; what remains checkable is that
+    monthly spacing stored under the coarsest real timeframe (``1w``, 21-day
+    threshold) IS a real hole and must be reported."""
     import pandas as pd
 
     from data_tools.auto_download import find_internal_gaps
 
-    symbol_dir = _write_series(
-        Path(tmp_path) / "GOLD1",
-        "1mo.parquet",
+    _write_series(
+        tmp_path, "dukascopy", "GOLD1", "1w",
         pd.date_range("2024-01-01", periods=36, freq="30D", tz="UTC"),
+        asset_class="metals",
     )
-    assert find_internal_gaps(symbol_dir, "1mo") == []
+    gaps = find_internal_gaps(tmp_path, "GOLD1", "1w")
+    assert gaps and gaps[0]["gap_days"] > 21, (
+        f"30-day spacing under a weekly label must be reported: {gaps}"
+    )
 
 
 def test_regular_daily_data_still_tolerates_a_weekend(tmp_path):
@@ -902,12 +983,12 @@ def test_regular_daily_data_still_tolerates_a_weekend(tmp_path):
     from data_tools.auto_download import find_internal_gaps
 
     # Business-day cadence leaves 2-day weekend holes.
-    symbol_dir = _write_series(
-        Path(tmp_path) / "GOLD1",
-        "1d.parquet",
+    _write_series(
+        tmp_path, "dukascopy", "GOLD1", "1d",
         pd.bdate_range("2024-01-01", periods=60, tz="UTC"),
+        asset_class="metals",
     )
-    assert find_internal_gaps(symbol_dir, "1d") == []
+    assert find_internal_gaps(tmp_path, "GOLD1", "1d") == []
 
 
 def test_a_real_hole_in_daily_data_is_still_reported(tmp_path):
@@ -917,8 +998,8 @@ def test_a_real_hole_in_daily_data_is_still_reported(tmp_path):
 
     ts = list(pd.date_range("2024-01-01", periods=20, freq="1D", tz="UTC"))
     ts += list(pd.date_range("2024-03-01", periods=20, freq="1D", tz="UTC"))
-    symbol_dir = _write_series(Path(tmp_path) / "GOLD1", "1d.parquet", ts)
-    gaps = find_internal_gaps(symbol_dir, "1d")
+    _write_series(tmp_path, "dukascopy", "GOLD1", "1d", ts, asset_class="metals")
+    gaps = find_internal_gaps(tmp_path, "GOLD1", "1d")
     assert gaps and gaps[0]["gap_days"] > 30, f"a six-week hole must still fail: {gaps}"
 
 
@@ -968,9 +1049,8 @@ def test_weekly_coverage_analysis_does_not_fail_on_regular_data(tmp_path):
     from data_tools.auto_download import DataRequirement, analyze_ohlcv_coverage
 
     root = tmp_path / "data"
-    symbol_dir = root / "ohlcv" / "GOLD1"
     ts = pd.date_range("2024-01-05", periods=60, freq="7D", tz="UTC")
-    _write_series(symbol_dir, "1w.parquet", ts)
+    _write_series(root, "dukascopy", "GOLD1", "1w", ts, asset_class="metals")
     report = analyze_ohlcv_coverage(
         root,
         DataRequirement(
@@ -1023,13 +1103,15 @@ def test_gap_analysis_without_a_timeframe_keeps_the_fixed_floor(tmp_path):
     from data_tools.auto_download import find_internal_gaps
 
     # 2 days apart with no timeframe given: must still be reported. Scaling
-    # would raise the bar to 3 days and hide it.
-    symbol_dir = _write_series(
-        Path(tmp_path) / "GOLD1",
-        "custom.parquet",
+    # would raise the bar to 3 days and hide it. Every manifest dataset has a
+    # timeframe, so "no timeframe" means the caller scans all of the symbol's
+    # datasets under the fixed 1-day floor.
+    _write_series(
+        tmp_path, "dukascopy", "GOLD1", "1d",
         pd.date_range("2024-01-01", periods=12, freq="2D", tz="UTC"),
+        asset_class="metals",
     )
-    gaps = find_internal_gaps(symbol_dir, None)
+    gaps = find_internal_gaps(tmp_path, "GOLD1")
     assert gaps and gaps[0]["gap_days"] == pytest.approx(2.0), (
         f"a 2-day hole must be reported when no timeframe is known: {gaps}"
     )
@@ -1058,7 +1140,7 @@ def test_long_weekend_closure_does_not_fail_coverage(tmp_path):
     # through Monday, so those bars should exist. Asserting a US closure on a
     # non-US venue is the same confusion that let a four-day FX outage be excused
     # as a holiday, so the symbol is corrected rather than the assertion.
-    _write_series(root / "ohlcv" / "AAPL", "1h.parquet", stamps)
+    _write_series(root, "test", "AAPL", "1h", stamps, asset_class="equity")
     report = analyze_ohlcv_coverage(
         root,
         DataRequirement(
@@ -1078,8 +1160,8 @@ def test_a_real_multi_day_hole_in_intraday_data_is_still_reported(tmp_path):
     stamps = list(pd.date_range("2024-03-01", periods=5, freq="1h", tz="UTC")) + list(
         pd.date_range("2024-03-09", periods=5, freq="1h", tz="UTC")
     )
-    symbol_dir = _write_series(Path(tmp_path) / "GOLD1", "1h.parquet", stamps)
-    gaps = find_internal_gaps(symbol_dir, "1h")
+    _write_series(tmp_path, "dukascopy", "GOLD1", "1h", stamps, asset_class="metals")
+    gaps = find_internal_gaps(tmp_path, "GOLD1", "1h")
     assert gaps and gaps[0]["gap_days"] > 4, f"an 8-day hole must be reported: {gaps}"
 
 # ── The long-weekend allowance must be a calendar term, not a flat floor ──────
@@ -1113,7 +1195,7 @@ def _around(before: str, after: str, *, minutes: int = 20) -> list:
 
 def _one_minute_report(tmp_path, before: str, after: str, start: str, end: str):
     root = tmp_path / "data"
-    _write_series(root / "ohlcv" / "AAPL", "1m.parquet", _around(before, after))
+    _write_series(root, "test", "AAPL", "1m", _around(before, after), asset_class="equity")
     return analyze_ohlcv_coverage(
         root,
         DataRequirement(symbol="AAPL", timeframe="1m", start=start, end=end),
@@ -1448,7 +1530,7 @@ def test_a_four_day_fx_hole_fails_coverage_end_to_end(tmp_path):
         *pd.date_range("2026-01-16 15:00", "2026-01-16 21:00", freq="1h", tz="UTC"),
         pd.Timestamp("2026-01-20 22:00", tz="UTC"),
     ]
-    _write_series(root / "ohlcv" / "EURUSD", "1h.parquet", stamps)
+    _write_series(root, "dukascopy", "EURUSD", "1h", stamps, asset_class="forex")
 
     report = analyze_ohlcv_coverage(
         root,
@@ -1524,7 +1606,7 @@ def _two_holes_one_excusable(tmp_path):
         )
         + list(pd.date_range("2026-01-20 12:00", "2026-01-20 23:00", freq="1h", tz="UTC"))
     )
-    _write_series(root / "ohlcv" / "AAPL", "1h.parquet", stamps)
+    _write_series(root, "test", "AAPL", "1h", stamps, asset_class="equity")
     report = analyze_ohlcv_coverage(
         root,
         DataRequirement(
@@ -1582,9 +1664,9 @@ def test_every_hole_above_the_threshold_is_returned_largest_first(tmp_path):
         )
         + list(pd.date_range("2026-01-20 12:00", "2026-01-20 23:00", freq="1h", tz="UTC"))
     )
-    _write_series(root / "ohlcv" / "AAPL", "1h.parquet", stamps)
+    _write_series(root, "test", "AAPL", "1h", stamps, asset_class="equity")
 
-    gaps = find_internal_gaps(root / "ohlcv" / "AAPL", "1h", threshold_days=1.0)
+    gaps = find_internal_gaps(root, "AAPL", "1h", threshold_days=1.0)
 
     assert len(gaps) == 2, f"expected both holes, got {gaps}"
     assert [round(float(gap["gap_days"]), 2) for gap in gaps] == [4.0, 3.5], (
@@ -1592,12 +1674,13 @@ def test_every_hole_above_the_threshold_is_returned_largest_first(tmp_path):
     )
 
 
-def _segmented_gap_file(tmp_path, name: str):
-    """One 1-minute file with a 30-minute hole, written under `name`."""
+def _segmented_gap_file(tmp_path, segment: str):
+    """One 1-minute file with a 30-minute hole; ``segment`` "" or e.g. "2024_03"."""
     import numpy as np
     import pandas as pd
 
     from data_tools.validate import validate_parquet
+    from shared import ohlcv_store
 
     idx = pd.date_range("2024-03-01 14:30", periods=240, freq="1min", tz="UTC")
     idx = idx.delete(slice(120, 150))
@@ -1612,12 +1695,11 @@ def _segmented_gap_file(tmp_path, name: str):
             "volume": 1.0,
         }
     )
-    root = tmp_path / "ohlcv"
-    directory = root / "nasdaq" / "NQ" / name
-    directory.mkdir(parents=True)
-    path = directory / f"{name}.parquet"
-    frame.to_parquet(path, index=False)
-    return validate_parquet(path, ohlcv_root=root)
+    path = ohlcv_store.write_frame(
+        tmp_path, "nasdaq", "NQ", "1m", frame,
+        asset_class="futures", segment=segment,
+    )
+    return validate_parquet(path, ohlcv_root=tmp_path / "ohlcv")
 
 
 def test_a_segmented_dataset_is_validated_at_its_own_timeframe(tmp_path):
@@ -1645,8 +1727,8 @@ def test_a_segmented_dataset_is_validated_at_its_own_timeframe(tmp_path):
     Both files now report the same timeframe and the same gap, and the segmented
     name is still recognised as segmented by the shared parser.
     """
-    plain = _segmented_gap_file(tmp_path, "1m")
-    segmented = _segmented_gap_file(tmp_path, "1m_2024_03")
+    plain = _segmented_gap_file(tmp_path, "")
+    segmented = _segmented_gap_file(tmp_path, "2024_03")
 
     assert segmented.timeframe == plain.timeframe == "1m", (
         f"segmented reported {segmented.timeframe!r} and plain {plain.timeframe!r}; "
@@ -1676,11 +1758,8 @@ def test_a_tick_segmented_dataset_is_still_recognised(tmp_path):
     import numpy as np
     import pandas as pd
 
-    from data_tools.catalog_builder import _extract_timeframe_and_segment
     from data_tools.validate import validate_parquet
-
-    timeframe, segment = _extract_timeframe_and_segment("tick_2024_01")
-    assert (timeframe, segment) == ("tick", "2024_01")
+    from shared import ohlcv_store
 
     idx = pd.date_range("2024-01-02 09:00", periods=200, freq="min", tz="UTC")
     base = np.arange(len(idx), dtype=float)
@@ -1694,13 +1773,16 @@ def test_a_tick_segmented_dataset_is_still_recognised(tmp_path):
             "volume": 1.0,
         }
     )
-    root = tmp_path / "ohlcv"
-    directory = root / "nasdaq" / "NQ" / "tick_2024_01"
-    directory.mkdir(parents=True)
-    path = directory / "tick_2024_01.parquet"
-    frame.to_parquet(path, index=False)
+    path = ohlcv_store.write_frame(
+        tmp_path, "nasdaq", "NQ", "tick", frame,
+        asset_class="futures", segment="2024_01",
+    )
 
-    result = validate_parquet(path, ohlcv_root=root)
+    entry = ohlcv_store.entry_for_path(tmp_path, path)
+    assert entry is not None and entry.timeframe == "tick"
+    assert ohlcv_store.segment_for_path(tmp_path, path) == "2024_01"
+
+    result = validate_parquet(path, ohlcv_root=tmp_path / "ohlcv")
 
     assert result.timeframe == "tick", (
         f"a monthly tick layout was read as {result.timeframe!r}"
@@ -1718,6 +1800,7 @@ def _many_expected_gaps_plus_one_real_hole(tmp_path):
     import pandas as pd
 
     from data_tools.validate import validate_parquet
+    from shared import ohlcv_store
 
     days = pd.date_range("2024-01-01", "2024-02-05", freq="D", tz="UTC")
     stamps: list[pd.Timestamp] = []
@@ -1742,12 +1825,10 @@ def _many_expected_gaps_plus_one_real_hole(tmp_path):
             "volume": 1.0,
         }
     )
-    root = tmp_path / "ohlcv"
-    directory = root / "nasdaq" / "NQ" / "1m"
-    directory.mkdir(parents=True)
-    path = directory / "1m.parquet"
-    frame.to_parquet(path, index=False)
-    return validate_parquet(path, ohlcv_root=root)
+    path = ohlcv_store.write_frame(
+        tmp_path, "nasdaq", "NQ", "1m", frame, asset_class="futures"
+    )
+    return validate_parquet(path, ohlcv_root=tmp_path / "ohlcv")
 
 
 def test_a_gap_after_the_twentieth_is_still_examined(tmp_path):
@@ -1798,6 +1879,7 @@ def test_a_file_with_only_expected_gaps_reports_none(tmp_path):
     import pandas as pd
 
     from data_tools.validate import validate_parquet
+    from shared import ohlcv_store
 
     # One continuous session, no hole anywhere. The first version of this fixture
     # used a 30-minute window per weekday, which makes the weekday-to-weekday
@@ -1815,13 +1897,10 @@ def test_a_file_with_only_expected_gaps_reports_none(tmp_path):
             "volume": 1.0,
         }
     )
-    root = tmp_path / "ohlcv"
-    directory = root / "nasdaq" / "NQ" / "1m"
-    directory.mkdir(parents=True)
-    path = directory / "1m.parquet"
-    frame.to_parquet(path, index=False)
-
-    result = validate_parquet(path, ohlcv_root=root)
+    path = ohlcv_store.write_frame(
+        tmp_path, "nasdaq", "NQ", "1m", frame, asset_class="futures"
+    )
+    result = validate_parquet(path, ohlcv_root=tmp_path / "ohlcv")
 
     assert not result.gaps, (
         f"weekend and overnight gaps must stay expected, got {result.gaps[:3]}"
@@ -1857,15 +1936,13 @@ def test_source_meta_is_found_under_the_key_the_downloader_actually_writes(
 
     from data_tools import validate as validate_module
     from data_tools.validate import _dataset_metadata
+    from shared import ohlcv_store
 
     key = "dukascopy/forex/EURUSD/1h"
     declared = {"session": {"start": "08:00", "end": "16:00"}, "calendar": "FX"}
 
     root = tmp_path
-    (root / "ohlcv").mkdir()
-    target = root / "ohlcv" / "dukascopy" / "forex" / "EURUSD" / "1h.parquet"
-    target.parent.mkdir(parents=True)
-    pd.DataFrame(
+    frame = pd.DataFrame(
         {
             "timestamp": [pd.Timestamp("2024-01-02 09:00", tz="UTC")],
             "open": [1.0],
@@ -1874,11 +1951,16 @@ def test_source_meta_is_found_under_the_key_the_downloader_actually_writes(
             "close": [1.0],
             "volume": [1.0],
         }
-    ).to_parquet(target, index=False)
+    )
+    target = ohlcv_store.write_frame(
+        root, "dukascopy", "EURUSD", "1h", frame, asset_class="forex"
+    )
     (root / "source_meta.json").write_text(json.dumps({key: declared}))
     monkeypatch.setattr(validate_module, "DATA_DIR", root)
 
-    assert _dataset_metadata(target) == declared, (
+    assert _dataset_metadata(
+        root, target, ohlcv_store.entry_for_path(root, target)
+    ) == declared, (
         f"the dataset metadata was not found under the key the downloader writes "
         f"({key!r}), so validation fell back to inferring the session from the data"
     )
@@ -1894,12 +1976,10 @@ def test_a_legacy_path_shaped_source_meta_key_is_still_accepted(
 
     from data_tools import validate as validate_module
     from data_tools.validate import _dataset_metadata
+    from shared import ohlcv_store
 
     root = tmp_path
-    (root / "ohlcv").mkdir()
-    target = root / "ohlcv" / "dukascopy" / "forex" / "EURUSD" / "1h.parquet"
-    target.parent.mkdir(parents=True)
-    pd.DataFrame(
+    frame = pd.DataFrame(
         {
             "timestamp": [pd.Timestamp("2024-01-02 09:00", tz="UTC")],
             "open": [1.0],
@@ -1908,13 +1988,18 @@ def test_a_legacy_path_shaped_source_meta_key_is_still_accepted(
             "close": [1.0],
             "volume": [1.0],
         }
-    ).to_parquet(target, index=False)
+    )
+    target = ohlcv_store.write_frame(
+        root, "dukascopy", "EURUSD", "1h", frame, asset_class="forex"
+    )
     (root / "source_meta.json").write_text(
         json.dumps({str(target): {"calendar": "legacy"}})
     )
     monkeypatch.setattr(validate_module, "DATA_DIR", root)
 
-    assert _dataset_metadata(target) == {"calendar": "legacy"}, (
+    assert _dataset_metadata(
+        root, target, ohlcv_store.entry_for_path(root, target)
+    ) == {"calendar": "legacy"}, (
         "an existing path-shaped key stopped resolving, which would discard metadata "
         "for any dataset written before the canonical scheme"
     )
@@ -1938,12 +2023,10 @@ def test_a_segmented_source_meta_key_is_looked_up_under_the_dataset_timeframe(
 
     from data_tools import validate as validate_module
     from data_tools.validate import _dataset_metadata
+    from shared import ohlcv_store
 
     root = tmp_path
-    (root / "ohlcv").mkdir()
-    target = root / "ohlcv" / "dukascopy" / "forex" / "EURUSD" / "1h_2024_03.parquet"
-    target.parent.mkdir(parents=True)
-    pd.DataFrame(
+    frame = pd.DataFrame(
         {
             "timestamp": [pd.Timestamp("2024-03-01 09:00", tz="UTC")],
             "open": [1.0],
@@ -1952,14 +2035,20 @@ def test_a_segmented_source_meta_key_is_looked_up_under_the_dataset_timeframe(
             "close": [1.0],
             "volume": [1.0],
         }
-    ).to_parquet(target, index=False)
+    )
+    target = ohlcv_store.write_frame(
+        root, "dukascopy", "EURUSD", "1h", frame,
+        asset_class="forex", segment="2024_03",
+    )
     # The writer keys on the dataset timeframe, i.e. `1h`, not the file name.
     key = "dukascopy/forex/EURUSD/1h"
     declared = {"session": {"start": "08:00", "end": "16:00"}, "calendar": "FX"}
     (root / "source_meta.json").write_text(json.dumps({key: declared}))
     monkeypatch.setattr(validate_module, "DATA_DIR", root)
 
-    assert _dataset_metadata(target) == declared, (
+    assert _dataset_metadata(
+        root, target, ohlcv_store.entry_for_path(root, target)
+    ) == declared, (
         "a segmented file did not find the metadata keyed under its dataset "
         "timeframe, so validation fell back to inferring the session from the data"
     )

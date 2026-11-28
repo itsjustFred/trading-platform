@@ -750,8 +750,22 @@ def validate_all(data_dir: Path, symbol_filter: str | None = None) -> list[Valid
         if symbol_filter and dataset.symbol.upper() != symbol_filter.upper():
             continue
         for parquet in dataset.segments or (dataset.path,):
-            logger.info("Validating %s ...", parquet.relative_to(ohlcv_root))
-            r = validate_parquet(parquet, ohlcv_root=ohlcv_root)
+            try:
+                rel_parquet = parquet.relative_to(ohlcv_root)
+            except ValueError:
+                rel_parquet = parquet
+            logger.info("Validating %s ...", rel_parquet)
+            try:
+                r = validate_parquet(parquet, ohlcv_root=ohlcv_root)
+            except ValueError as exc:
+                r = ValidationResult(
+                    path=str(rel_parquet),
+                    symbol=dataset.symbol,
+                    timeframe=dataset.timeframe,
+                    source=dataset.source,
+                    status="error",
+                )
+                r.errors.append(str(exc))
 
             status_icon = {"ok": "✅", "warning": "⚠️", "error": "❌"}.get(r.status, "?")
             logger.info(

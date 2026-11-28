@@ -150,13 +150,23 @@ def _write_ohlcv_bars(
         ohlcv_store.write_frame(
             data_dir, "test", symbol, "1d", frame, asset_class="equities"
         )
-    # Legacy fixture path, identical to what this helper wrote before #471:
-    # ``ohlcv/<source>/<symbol>/<tf>.parquet``. ``auto_download``'s venue
-    # resolver only recognises this shallow shape (or a recognised singular
-    # asset class) for ``has_sufficient_segment_coverage``.
-    legacy_path = data_dir / "ohlcv" / "test" / symbol / "1d.parquet"
-    legacy_path.parent.mkdir(parents=True, exist_ok=True)
-    frame.to_parquet(legacy_path, index=False)
+    else:
+        # Manifest-declared but written directly so malformed timestamps reach
+        # the reader: list_datasets only sees manifest entries, and the legacy
+        # shallow path is no longer scanned by auto_download.
+        from shared import ohlcv_store as _store
+
+        path = _store.data_path(data_dir, "test", symbol, "1d")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        frame.to_parquet(path, index=False)
+        manifest = _store.read_manifest(data_dir, "test")
+        meta = manifest.get(symbol, {})
+        meta.setdefault("files", {})[path.name] = {"rows": len(frame), "first": "", "last": ""}
+        meta["asset_class"] = "equities"
+        meta.setdefault("source_symbol", symbol)
+        manifest[symbol] = meta
+        _store.write_manifest(data_dir, "test", manifest)
+    return
 
 
 def test_has_ohlcv_bars_in_range_uses_exact_valid_utc_timestamps(tmp_path: Path):
