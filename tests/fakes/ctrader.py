@@ -118,6 +118,7 @@ _SIDE_SELL = 2
 
 _EXECUTION_ORDER_ACCEPTED = 2
 _EXECUTION_ORDER_FILLED = 3
+_EXECUTION_ORDER_REPLACED = 4
 _EXECUTION_ORDER_CANCELLED = 5
 _EXECUTION_ORDER_EXPIRED = 6
 _EXECUTION_ORDER_REJECTED = 7
@@ -162,18 +163,21 @@ class FakeCTraderSymbol:
     """One tradable symbol, as ``ProtoOALightSymbol`` + ``ProtoOASymbol`` see it.
 
     ``volume_per_qty`` is the broker's ``lotSize``: cTrader volumes are in
-    1/1000 of a lot, so the adapter's ``qty`` units map through it. Defaults
-    match the FX convention (1 lot = 100_000 units, minimum 0.01 lot = 1000
-    volume units).
+    CENTS of the base asset, so the adapter's ``qty`` units map through
+    ``volume_per_qty = lotSize / 100``. Defaults are the demo-verified EURUSD
+    values from ``ctrader_adapter``'s volume contract (#184): ``lotSize``
+    10_000_000 (100,000 EUR), a 0.01-lot minimum of 100_000 and a matching
+    100_000 step - NOT the static fallback table's base-unit values, which
+    sit 100x below the broker's cents.
     """
 
     name: str
     symbol_id: int
     digits: int = 5
-    lot_size: float = 100_000.0
-    min_volume: int = 1_000
-    max_volume: int = 500_000_000
-    step_volume: int = 1
+    lot_size: float = 10_000_000.0
+    min_volume: int = 100_000
+    max_volume: int = 1_000_000_000
+    step_volume: int = 100_000
     base_asset_id: int = 1
     quote_asset_id: int = 2
     leverage_id: int = 0
@@ -209,12 +213,20 @@ class _FakeOrder:
 
 @dataclass
 class _FakePosition:
-    """An open position: the proto row plus the entry price the proto lacks."""
+    """An open position: the proto row, whose ``price`` IS the entry.
+
+    ``ProtoOAPosition.price`` carries the position's weighted average entry
+    price - the same value ``ReconcileReq`` and execution events report - so
+    the fake keeps it there rather than inventing a side channel.
+    """
 
     proto: Any
     symbol_name: str
     symbol_id: int
-    entry_price: float
+
+    @property
+    def entry_price(self) -> float:
+        return _float(getattr(self.proto, "price", 0.0))
 
 
 class FakeCTraderBroker:
@@ -305,7 +317,7 @@ class FakeCTraderBroker:
         proto = _mm.ProtoOAPosition()
         proto.positionId = position_id
         proto.positionStatus = _POSITION_STATUS_OPEN
-        proto.price = self.mark_price(symbol.name)
+        proto.price = entry
         proto.moneyDigits = self.money_digits
         proto.swap = 0
         td = proto.tradeData
@@ -321,7 +333,6 @@ class FakeCTraderBroker:
             proto=proto,
             symbol_name=symbol.name,
             symbol_id=symbol.symbol_id,
-            entry_price=entry,
         )
 
     def _next_order_id(self) -> int:
@@ -512,13 +523,28 @@ class FakeCTraderBroker:
         deal.commission = -1
         if closing:
             detail = deal.closePositionDetail
-            # Money fields are int64: prices in 1/100000 units, amounts in
-            # the account's money digits.
-            detail.entryPrice = round(price * _RELATIVE_PRICE_UNIT)
-            detail.grossProfit = 0
+            position = self.positions.get(position_id)
+            # ``entryPrice`` is a DOUBLE carrying the position's average
+            # entry; ``grossProfit`` is the realised P&L in the account's
+            # money digits: price move x base units (volume is in cents,
+            # so /100) x the position side's sign.
+            entry = position.entry_price if position is not None else price
+            position_side = (
+                _int(getattr(position.proto.tradeData, "tradeSide", _SIDE_BUY))
+                if position is not None
+                else (_SIDE_BUY if side == _SIDE_SELL else _SIDE_SELL)
+            )
+            direction = 1.0 if position_side == _SIDE_BUY else -1.0
+            gross_ccy = (price - entry) * direction * (volume / 100.0)
+            gross = int(round(gross_ccy * 10 ** self.money_digits))
+            detail.entryPrice = float(entry)
+            detail.grossProfit = gross
             detail.swap = 0
             detail.commission = -1
-            detail.balance = int(self.balance_ccy * 10 ** self.money_digits)
+            # The realised result lands on the account balance, so a later
+            # ``TraderReq`` reports the money the close actually made.
+            self.balance_ccy += (gross + detail.commission) / (10 ** self.money_digits)
+            detail.balance = int(round(self.balance_ccy * 10 ** self.money_digits))
             detail.closedVolume = int(volume)
             detail.balanceVersion = 1
             detail.moneyDigits = self.money_digits
@@ -552,7 +578,6 @@ class FakeCTraderBroker:
             proto=proto,
             symbol_name=symbol_name,
             symbol_id=symbol_id,
-            entry_price=float(price),
         )
         self.positions[position_id] = position
         self._apply_protection(position, record)
@@ -615,7 +640,9 @@ class FakeCTraderBroker:
         same_side = side == current_side and not is_closing
         if same_side:
             proto.tradeData.volume = current_volume + volume
-            position.entry_price = (
+            # ``price`` is the weighted average entry: a scale-in moves it,
+            # a reduce or a flip leaves the surviving entry untouched.
+            proto.price = (
                 position.entry_price * current_volume + price * volume
             ) / (current_volume + volume)
         else:
@@ -627,13 +654,12 @@ class FakeCTraderBroker:
                 # side with the overshoot at the fill price.
                 proto.tradeData.volume = -remaining
                 proto.tradeData.tradeSide = side
-                position.entry_price = price
+                proto.price = float(price)
             else:
                 self._close_position_record(position_id)
                 proto.positionStatus = _POSITION_STATUS_CLOSED
                 proto.utcLastUpdateTimestamp = self.now_ms
                 return proto
-        proto.price = float(price)
         proto.utcLastUpdateTimestamp = self.now_ms
         return proto
 
@@ -693,12 +719,21 @@ class FakeCTraderBroker:
             ))
         return emitted
 
-    def _closing_order_proto(self, position: _FakePosition, volume: int, side: int) -> Any:
+    def _closing_order_proto(
+        self,
+        position: _FakePosition,
+        volume: int,
+        side: int,
+        order_type: int = _ORDER_TYPE_MARKET,
+    ) -> Any:
         proto = _mm.ProtoOAOrder()
         proto.orderId = self._next_order_id()
-        proto.orderType = _ORDER_TYPE_SLTP
+        proto.orderType = order_type
         proto.orderStatus = _ORDER_STATUS_ACCEPTED
         proto.closingOrder = True
+        # ProtoOAOrder.timeInForce defaults to IOC in the .proto; a closing
+        # order must rest for its remainder like any other working order.
+        proto.timeInForce = _TIF_GOOD_TILL_CANCEL
         proto.positionId = _int(getattr(position.proto, "positionId", 0))
         proto.utcLastUpdateTimestamp = self.now_ms
         td = proto.tradeData
@@ -803,10 +838,11 @@ class FakeCTraderBroker:
                 _int(getattr(proto.tradeData, "tradeSide", _SIDE_BUY)) == _SIDE_BUY
             )
             volume = _int(getattr(proto.tradeData, "volume", 0))
-            spec = self._symbols.get(position.symbol_id)
-            lot = spec.lot_size if spec else 100_000.0
+            # Unrealised P&L is the price move x BASE units: volume is in
+            # cents of the base asset, so volume/100 is the base quantity
+            # (EURUSD volume 10_000_000 = 100_000 EUR = 1 lot).
             diff = (mark - position.entry_price) * (1 if side_buy else -1)
-            pnl_ccy = diff * volume / lot if lot else 0.0
+            pnl_ccy = diff * volume / 100.0
             entry = res.positionUnrealizedPnL.add()
             entry.positionId = _int(getattr(proto, "positionId", 0))
             gross = round(pnl_ccy * 10 ** self.money_digits)
@@ -847,6 +883,15 @@ class FakeCTraderBroker:
         if volume < spec.min_volume:
             return self._order_error(
                 "TRADING_BAD_VOLUME", f"volume below minimum {spec.min_volume}"
+            )
+        if spec.step_volume and volume % spec.step_volume:
+            return self._order_error(
+                "TRADING_BAD_VOLUME",
+                f"volume {volume} is not a multiple of step {spec.step_volume}",
+            )
+        if volume > spec.max_volume:
+            return self._order_error(
+                "TRADING_BAD_VOLUME", f"volume above maximum {spec.max_volume}"
             )
         record = self._accept_order(request, spec)
         return self._execution_event(
@@ -935,29 +980,14 @@ class FakeCTraderBroker:
             accepted_ms=self.now_ms,
             target_position_id=position_id,
         )
-        record.proto.orderStatus = _ORDER_STATUS_FILLED
+        # The broker ACKNOWLEDGES the closing order; the fill is a later
+        # execution event, exactly like a NewOrderReq - never inside the
+        # request. ``advance()`` runs it through the same partial-fill and
+        # fill-delay pipeline as any other order.
         self.orders[record.proto.orderId] = record
-        price = self.mark_price(position.symbol_name)
-        record.executed_volume = volume
-        record.avg_price = price
-        record.proto.executedVolume = volume
-        record.proto.executionPrice = price
-        record.proto.orderStatus = _ORDER_STATUS_FILLED
-        record.proto.utcLastUpdateTimestamp = self.now_ms
-        deal = self._record_deal(
-            record, volume, price, position_id=position_id, closing=True
-        )
-        remaining = current - volume
-        if remaining > 0:
-            position.proto.tradeData.volume = remaining
-            position.proto.utcLastUpdateTimestamp = self.now_ms
-        else:
-            self._close_position_record(position_id)
         return self._execution_event(
-            _EXECUTION_ORDER_FILLED,
+            _EXECUTION_ORDER_ACCEPTED,
             order=record.proto,
-            deal=deal,
-            position=position.proto,
         )
 
     def _req_AmendPositionSLTPReq(self, request: Any) -> Any:
@@ -967,21 +997,25 @@ class FakeCTraderBroker:
             return self._order_error(
                 "POSITION_NOT_FOUND", f"no open position {position_id}"
             )
-        if _has(request, "stopLoss"):
-            value = float(request.stopLoss)
-            if value > 0:
-                position.proto.stopLoss = value
-            elif position.proto.HasField("stopLoss"):
-                position.proto.ClearField("stopLoss")
-        if _has(request, "takeProfit"):
-            value = float(request.takeProfit)
-            if value > 0:
-                position.proto.takeProfit = value
-            elif position.proto.HasField("takeProfit"):
-                position.proto.ClearField("takeProfit")
+        # The request REPLACES both protective levels atomically: a level
+        # the request omits is cleared, not preserved. This is why the
+        # adapter echoes the current stopLoss back verbatim - a regression
+        # that stopped echoing it would silently drop the stop here.
+        for field in ("stopLoss", "takeProfit"):
+            if _has(request, field) and float(getattr(request, field)) > 0:
+                setattr(position.proto, field, float(getattr(request, field)))
+            elif position.proto.HasField(field):
+                position.proto.ClearField(field)
+        for field in (
+            "guaranteedStopLoss",
+            "trailingStopLoss",
+            "stopLossTriggerMethod",
+        ):
+            if _has(request, field):
+                setattr(position.proto, field, getattr(request, field))
         position.proto.utcLastUpdateTimestamp = self.now_ms
         return self._execution_event(
-            _EXECUTION_ORDER_ACCEPTED, position=position.proto
+            _EXECUTION_ORDER_REPLACED, position=position.proto
         )
 
     # listings ---------------------------------------------------------------

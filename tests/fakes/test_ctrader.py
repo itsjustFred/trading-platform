@@ -8,6 +8,7 @@ here first.
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import textwrap
@@ -92,8 +93,12 @@ def test_symbols_list_and_symbol_by_id_carry_the_broker_properties() -> None:
     symbol = detail.symbol[0]
     assert symbol.symbolId == SYMBOL_ID
     assert symbol.digits == 5
-    assert symbol.lotSize == 100_000
-    assert symbol.minVolume == 1_000
+    # Demo-verified EURUSD values, in CENTS of the base asset (#184): the
+    # adapter's volume_per_qty is lotSize/100 = 100_000, and the fallback
+    # table's base-unit lotSize would sit 100x below these.
+    assert symbol.lotSize == 10_000_000
+    assert symbol.minVolume == 100_000
+    assert symbol.stepVolume == 100_000
 
 
 def test_trader_reports_balance_digits_leverage_and_account_type() -> None:
@@ -179,14 +184,14 @@ def _entry(broker, m, *, side=1, volume=100_000):
 def test_a_netted_account_merges_opposite_fills_on_one_symbol() -> None:
     m, _mm = _types()
     broker = _broker(account_type="netted")
-    first = _entry(broker, m)
-    second = _entry(broker, m, side=2, volume=40_000)
+    first = _entry(broker, m, volume=200_000)
+    second = _entry(broker, m, side=2, volume=100_000)
 
     assert int(first.position.positionId) == int(second.position.positionId), (
         "a netted account reuses the symbol's open position"
     )
     position = broker.positions[int(first.position.positionId)]
-    assert int(position.proto.tradeData.volume) == 60_000
+    assert int(position.proto.tradeData.volume) == 100_000
     assert int(position.proto.tradeData.tradeSide) == 1
 
 
@@ -194,10 +199,10 @@ def test_a_netted_account_flips_side_when_a_fill_overshoots() -> None:
     m, _mm = _types()
     broker = _broker(account_type="netted")
     _entry(broker, m, volume=100_000)
-    flipped = _entry(broker, m, side=2, volume=150_000)
+    flipped = _entry(broker, m, side=2, volume=200_000)
 
     position = broker.positions[int(flipped.position.positionId)]
-    assert int(position.proto.tradeData.volume) == 50_000
+    assert int(position.proto.tradeData.volume) == 100_000
     assert int(position.proto.tradeData.tradeSide) == 2, "the overshoot reopens short"
 
 
@@ -263,6 +268,23 @@ def test_an_unknown_symbol_and_a_bad_volume_are_refused() -> None:
     assert tiny.errorCode == "TRADING_BAD_VOLUME"
 
 
+def test_step_and_max_volume_are_enforced_like_the_server() -> None:
+    """cTrader rejects off-step and oversized volumes with TRADING_BAD_VOLUME."""
+    m, _mm = _types()
+    broker = _broker()
+
+    off_step = broker.handle(_new_order(m, volume=150_000))
+    assert type(off_step).__name__ == "ProtoOAOrderErrorEvent"
+    assert off_step.errorCode == "TRADING_BAD_VOLUME"
+
+    too_big = broker.handle(_new_order(m, volume=2_000_000_000))
+    assert type(too_big).__name__ == "ProtoOAOrderErrorEvent"
+    assert too_big.errorCode == "TRADING_BAD_VOLUME"
+
+    on_step = broker.handle(_new_order(m, volume=200_000))
+    assert _execution_type(on_step) == 2
+
+
 def test_a_rejection_after_acceptance_lands_on_a_later_advance() -> None:
     """The #428 shape: ORDER_ACCEPTED on submit, ORDER_REJECTED on the next tick."""
     m, _mm = _types()
@@ -301,7 +323,13 @@ def test_a_cancel_settles_the_working_order() -> None:
     assert again.errorCode == "ORDER_NOT_FOUND"
 
 
-def test_close_position_fills_a_closing_order_and_records_close_detail() -> None:
+def test_close_position_is_accepted_then_fills_on_advance() -> None:
+    """``ClosePositionReq`` answers ORDER_ACCEPTED; the fill is a later event.
+
+    The adapter's in-flight attribution window exists precisely because the
+    real server never fills inside the request - a fake that did would let a
+    regression that trusts the submit response pass.
+    """
     m, _mm = _types()
     broker = _broker()
     entry = _entry(broker, m)
@@ -311,31 +339,64 @@ def test_close_position_fills_a_closing_order_and_records_close_detail() -> None
         m.ProtoOAClosePositionReq(ctidTraderAccountId=ACCOUNT, positionId=position_id, volume=0)
     )
 
-    assert _execution_type(res) == 3  # ORDER_FILLED
+    assert _execution_type(res) == 2  # ORDER_ACCEPTED, not a fill
+    assert int(res.order.orderStatus) == 1
     assert int(res.order.closingOrder) == 1 if res.order.HasField("closingOrder") else True
-    assert int(res.deal.positionId) == position_id
-    assert res.deal.HasField("closePositionDetail")
-    assert int(res.deal.closePositionDetail.closedVolume) == 100_000
+    assert position_id in broker.positions, "still open until the fill lands"
+
+    events = broker.advance(1.0)
+
+    assert len(events) == 1
+    assert _execution_type(events[0]) == 3  # ORDER_FILLED
+    assert int(events[0].deal.positionId) == position_id
+    assert events[0].deal.HasField("closePositionDetail")
+    assert int(events[0].deal.closePositionDetail.closedVolume) == 100_000
     assert position_id not in broker.positions, "a full close drops the position"
 
 
 def test_close_position_partial_volume_leaves_the_remainder() -> None:
     m, _mm = _types()
     broker = _broker()
-    entry = _entry(broker, m, volume=100_000)
+    entry = _entry(broker, m, volume=300_000)
     position_id = int(entry.position.positionId)
 
     broker.handle(
         m.ProtoOAClosePositionReq(
-            ctidTraderAccountId=ACCOUNT, positionId=position_id, volume=40_000
+            ctidTraderAccountId=ACCOUNT, positionId=position_id, volume=100_000
         )
     )
+    broker.advance(1.0)
 
     position = broker.positions[position_id]
-    assert int(position.proto.tradeData.volume) == 60_000
+    assert int(position.proto.tradeData.volume) == 200_000
 
 
-def test_amend_position_sltp_sets_and_clears_levels() -> None:
+def test_close_position_honours_partial_fill_ratio() -> None:
+    m, _mm = _types()
+    broker = _broker(
+        partial_fill_ratio=0.5,
+        positions=[{"symbol": "EURUSD", "volume": 200_000, "side": 1, "entry_price": 1.10}],
+    )
+    position_id = next(iter(broker.positions))
+
+    broker.handle(
+        m.ProtoOAClosePositionReq(ctidTraderAccountId=ACCOUNT, positionId=position_id, volume=0)
+    )
+    events = broker.advance(1.0)
+
+    assert _execution_type(events[0]) == 11  # ORDER_PARTIAL_FILL
+    position = broker.positions[position_id]
+    assert int(position.proto.tradeData.volume) == 100_000, "half the position closed"
+
+
+def test_amend_position_sltp_replaces_both_levels_atomically() -> None:
+    """An omitted level is CLEARED, and the answer is ORDER_REPLACED.
+
+    ``ProtoOAAmendPositionSLTPReq`` replaces the protective levels as a
+    pair - this is why the adapter echoes the untouched level back verbatim
+    (``ctrader_adapter._build_amend_position_request``). A fake that kept an
+    omitted level would let a regression that drops the stop pass.
+    """
     m, _mm = _types()
     broker = _broker()
     entry = _entry(broker, m)
@@ -349,15 +410,18 @@ def test_amend_position_sltp_sets_and_clears_levels() -> None:
     position = broker.positions[position_id]
     assert position.proto.stopLoss == pytest.approx(1.05)
     assert position.proto.takeProfit == pytest.approx(1.20)
-    assert _execution_type(res) == 2  # ORDER_ACCEPTED
+    assert _execution_type(res) == 4  # ORDER_REPLACED
 
+    # Amending only the stop (the TP field omitted) clears the TP.
     broker.handle(
         m.ProtoOAAmendPositionSLTPReq(
             ctidTraderAccountId=ACCOUNT, positionId=position_id, stopLoss=0.0
         )
     )
     assert not position.proto.HasField("stopLoss"), "an explicit 0 clears the stop"
-    assert position.proto.takeProfit == pytest.approx(1.20), "an absent TP is untouched"
+    assert not position.proto.HasField("takeProfit"), (
+        "the omitted takeProfit is cleared by the atomic replace"
+    )
 
 
 def test_amend_position_sltp_on_an_unknown_position_is_an_order_error() -> None:
@@ -413,6 +477,67 @@ def test_a_take_profit_closes_the_position_when_the_mark_reaches_it() -> None:
 
     assert len(events) == 1
     assert position_id not in broker.positions
+
+
+def test_position_price_is_the_weighted_average_entry() -> None:
+    """``ProtoOAPosition.price`` is the average entry, not the last fill."""
+    m, _mm = _types()
+    broker = _broker(mark_prices={"EURUSD": 1.10000})
+    broker.handle(_new_order(m, volume=100_000))
+    broker.advance(1.0)
+    broker.set_mark_price("EURUSD", 1.20000)
+    broker.handle(_new_order(m, volume=100_000))
+    broker.advance(1.0)
+
+    position = next(iter(broker.positions.values()))
+    # (1.10 * 100k + 1.20 * 100k) / 200k = 1.15 - NOT the 1.20 last fill.
+    assert position.proto.price == pytest.approx(1.15)
+    assert position.entry_price == pytest.approx(1.15)
+
+
+def test_unrealized_pnl_is_price_move_times_base_units() -> None:
+    """PnL = diff x volume/100 (cents -> base units), in money digits.
+
+    EURUSD volume 10_000_000 is 1 lot = 100_000 EUR; a 0.001 move is ~100 USD,
+    not 0.001 - the #184 unit bug this pins.
+    """
+    m, _mm = _types()
+    broker = _broker()
+    broker.handle(_new_order(m, volume=10_000_000))
+    broker.advance(1.0)
+    broker.set_mark_price("EURUSD", 1.10100)  # +0.001 on the 1.10 entry
+
+    res = broker.handle(m.ProtoOAGetPositionUnrealizedPnLReq(ctidTraderAccountId=ACCOUNT))
+
+    assert len(res.positionUnrealizedPnL) == 1
+    pnl = res.positionUnrealizedPnL[0]
+    # 0.001 * (10_000_000 / 100) = 0.001 * 100_000 = 100.00 USD -> 10000 cents.
+    assert int(pnl.grossUnrealizedPnL) == 10_000
+    assert int(pnl.netUnrealizedPnL) == 10_000
+
+
+def test_a_closing_deal_reports_entry_price_profit_and_balance() -> None:
+    m, _mm = _types()
+    broker = _broker(balance=10_000.0)
+    _entry(broker, m)  # 100_000 EURUSD at mark 1.10
+    broker.set_mark_price("EURUSD", 1.11)
+    position_id = next(iter(broker.positions))
+
+    broker.handle(
+        m.ProtoOAClosePositionReq(ctidTraderAccountId=ACCOUNT, positionId=position_id, volume=0)
+    )
+    broker.advance(1.0)
+
+    deal = broker.deals[-1]
+    detail = deal.closePositionDetail
+    assert detail.entryPrice == pytest.approx(1.10), "a double: the position's entry"
+    # (1.11 - 1.10) * (100_000 / 100) = 0.01 * 1_000 = 10.00 USD -> 1000 cents.
+    assert int(detail.grossProfit) == 1_000
+    assert int(detail.balance) == 1_000_000 + 1_000 - 1, (
+        "balance moved by grossProfit + the -1 commission, in money digits"
+    )
+    trader = broker.handle(m.ProtoOATraderReq(ctidTraderAccountId=ACCOUNT))
+    assert trader.trader.balance == 1_000_999
 
 
 def test_entry_relative_sltp_becomes_absolute_position_levels() -> None:
@@ -534,7 +659,7 @@ def test_deal_list_honours_max_rows_and_reports_has_more() -> None:
     m, _mm = _types()
     broker = _broker()
     for _ in range(5):
-        _entry(broker, m, side=1 if len(broker.deals) % 2 == 0 else 2, volume=10_000)
+        _entry(broker, m, side=1 if len(broker.deals) % 2 == 0 else 2, volume=100_000)
 
     req = m.ProtoOADealListReq(ctidTraderAccountId=ACCOUNT, maxRows=2)
     first = broker.handle(req)
@@ -609,13 +734,16 @@ def test_client_disconnect_clears_pending_deferreds_without_errbacking() -> None
 # ─-) the adapter seam (subprocess: the reactor must be clean) ────────────────
 
 
-def test_fake_ctrader_transport_drives_a_real_adapter_connect() -> None:
+def test_fake_ctrader_transport_drives_a_real_adapter_connect(tmp_path) -> None:
     """``connect`` must run auth -> symbols -> symbol props -> reconcile on the fake.
 
     Runs in a subprocess for the same reason the account-discovery reactor
     tests do: ``ctrader_open_api`` binds ``twisted.internet.reactor`` at
     import, and only a fresh interpreter guarantees the asyncio reactor the
-    adapter installs is the one the client package binds.
+    adapter installs is the one the client package binds. The child gets a
+    sandboxed environment - DATA_DIR/LOG_DIR/HOME under ``tmp_path`` and no
+    inherited credentials - because it imports ``shared.constants``, which
+    would otherwise load the checkout's real ``.env`` (AGENTS.md).
     """
     repo = Path(__file__).resolve().parents[2]
     code = textwrap.dedent(
@@ -650,16 +778,29 @@ def test_fake_ctrader_transport_drives_a_real_adapter_connect() -> None:
             assert adapter._authenticated is True
             assert adapter._symbol_name_to_id.get("EURUSD") == 1
             assert adapter._client is client
+            # The broker-sent lotSize (10_000_000 cents) must surface as the
+            # adapter's volume_per_qty = lotSize/100 = 100_000 (#184) - the
+            # unit every order volume is computed in.
+            assert adapter._scale_for("EURUSD").volume_per_qty == 100_000
             asyncio.run(adapter.disconnect())
         print("ok")
         """
     ).format(repo=str(repo))
+    env = {
+        "PATH": os.environ.get("PATH", ""),
+        "HOME": str(tmp_path),
+        "TMPDIR": str(tmp_path),
+        "DATA_DIR": str(tmp_path / "data"),
+        "LOG_DIR": str(tmp_path / "logs"),
+        "PYTHONUNBUFFERED": "1",
+    }
     result = subprocess.run(
         [sys.executable, "-c", code],
         capture_output=True,
         text=True,
         timeout=120,
         cwd=str(repo),
+        env=env,
     )
     assert result.returncode == 0, result.stderr
     assert "ok" in result.stdout
