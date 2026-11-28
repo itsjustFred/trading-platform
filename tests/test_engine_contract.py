@@ -1703,10 +1703,9 @@ def test_intrabar_resolution_equal_to_base_resolves_to_none():
 class TestProtectiveExitGapHelpers:
     """``level_gapped_at_open`` / ``level_fill_price`` / ``resolve_protective_exit``.
 
-    The replay flip workflow (#364) routes its stop/TP1 checks through these;
-    #208 ports the same helpers to the native engine, so they are pinned here
-    directly — including the SHORT mirror the flip tests cannot reach
-    (``test_flip_workflow_is_long_only``).
+    Both replay engines route their stop/TP checks through these; #208 ports
+    the same helpers to the native engine, so they are pinned here directly —
+    including the SHORT mirror the signal-replay tests cannot reach.
     """
 
     def test_long_stop_gap_and_tp_gap_at_the_open(self):

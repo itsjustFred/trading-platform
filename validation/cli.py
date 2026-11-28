@@ -17,7 +17,6 @@ from pathlib import Path
 from validation.comparison.comparison import TradeComparisonConfig
 from validation.comparison.delta_report import TradeDeltaReport
 from validation.comparison.matcher import MatchResult, TradeMatcher
-from validation.importers.mt5_html import MT5HTMLImporter
 from validation.importers.mt5_xlsx import MT5XLSXImporter
 from validation.importers.quantconnect_result import QuantConnectResultImporter
 from validation.readiness.models import ReadinessConfig, ReadinessReport
@@ -52,14 +51,19 @@ def _load_validation_reference(
     path: Path,
     importer_name: str,
     timeframe: str | None = None,
+    source_timezone: str | None = None,
+    broker_clock: str | None = None,
 ) -> ValidationReference:
     """Load a ValidationReference from a file path.
 
-    Supports JSON, XLSX and HTML.  JSON is parsed directly as a
-    ``ValidationReference``.  XLSX and HTML are dispatched to the MT5
-    importers.
+    Supports JSON and XLSX.  JSON is parsed directly as a
+    ``ValidationReference`` or as a QuantConnect result.  XLSX is handled by
+    the MT5 importer.
     """
     suffix = path.suffix.lower()
+
+    if suffix in {".html", ".htm"}:
+        raise ValueError("HTML reports are not parsed; export the XLSX report")
 
     if suffix == ".json" and importer_name == "quantconnect":
         importer = QuantConnectResultImporter()
@@ -87,8 +91,6 @@ def _load_validation_reference(
     if importer_name == "auto":
         if suffix == ".xlsx":
             importer_name = "mt5_xlsx"
-        elif suffix == ".html":
-            importer_name = "mt5_html"
         else:
             raise ValueError(
                 f"Cannot auto-detect importer for file '{path}' (unknown extension '{suffix}'). "
@@ -97,10 +99,11 @@ def _load_validation_reference(
 
     if importer_name == "mt5_xlsx":
         importer = MT5XLSXImporter()
-        return importer.load(path)
-    if importer_name == "mt5_html":
-        importer = MT5HTMLImporter()
-        return importer.load(path)
+        return importer.load(
+            path,
+            source_timezone=source_timezone,
+            broker_clock=broker_clock,
+        )
 
     raise ValueError(f"Unknown importer: {importer_name}")
 
@@ -114,12 +117,12 @@ def _build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--reference", "-r",
         required=True,
-        help="Path to the reference file (JSON, XLSX or HTML) or a ValidationReference JSON.",
+        help="Path to the reference file (JSON or XLSX) or a ValidationReference JSON.",
     )
     parser.add_argument(
         "--platform", "-p",
         required=True,
-        help="Path to the platform file (JSON, XLSX or HTML) or a ValidationReference JSON.",
+        help="Path to the platform file (JSON or XLSX) or a ValidationReference JSON.",
     )
     parser.add_argument(
         "--format", "-f",
@@ -134,13 +137,23 @@ def _build_argument_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--importer", "-i",
-        choices=["auto", "mt5_xlsx", "mt5_html", "quantconnect"],
+        choices=["auto", "mt5_xlsx", "quantconnect"],
         default="auto",
         help="Importer to use for non-canonical files (default: auto).",
     )
     parser.add_argument(
         "--timeframe",
         help="Explicit source timeframe for importers that cannot infer it safely.",
+    )
+    timezone_group = parser.add_mutually_exclusive_group()
+    timezone_group.add_argument(
+        "--source-timezone",
+        help="IANA timezone for naive MT5 XLSX report timestamps (e.g. Europe/Athens).",
+    )
+    timezone_group.add_argument(
+        "--broker-clock",
+        help="Named broker server clock for MT5 XLSX report timestamps "
+             "(e.g. dukascopy_mt5_index).",
     )
     parser.add_argument(
         "--time-tolerance", "-t",
@@ -310,6 +323,8 @@ def main(argv: list[str] | None = None) -> int:
             ref_path,
             args.importer,
             timeframe=args.timeframe,
+            source_timezone=args.source_timezone,
+            broker_clock=args.broker_clock,
         )
     except FileNotFoundError as exc:
         logger.error(str(exc))
@@ -324,6 +339,8 @@ def main(argv: list[str] | None = None) -> int:
             platform_path,
             args.importer,
             timeframe=args.timeframe,
+            source_timezone=args.source_timezone,
+            broker_clock=args.broker_clock,
         )
     except FileNotFoundError as exc:
         logger.error(str(exc))

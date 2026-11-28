@@ -100,6 +100,7 @@ class TestCliHelp:
         assert "--reference" in result.stdout
         assert "--platform" in result.stdout
         assert "quantconnect" in result.stdout
+        assert "mt5_html" not in result.stdout
 
 
 class TestCliAutoImporterFallback:
@@ -289,6 +290,81 @@ class TestCliAutoImporterXLSX:
         assert data["readiness"] is not None
 
 
+class TestCliMt5TimezoneOptions:
+    def test_load_forwards_source_timezone_to_xlsx_importer(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        source = tmp_path / "report.xlsx"
+        calls: list[dict[str, Any]] = []
+
+        class _Importer:
+            def load(self, path: Path, **kwargs: Any) -> ValidationReference:
+                calls.append({"path": path, **kwargs})
+                return _make_reference()
+
+        monkeypatch.setattr(validation_cli, "MT5XLSXImporter", _Importer)
+
+        validation_cli._load_validation_reference(
+            source,
+            "mt5_xlsx",
+            source_timezone="Europe/Athens",
+        )
+
+        assert calls == [
+            {
+                "path": source,
+                "source_timezone": "Europe/Athens",
+                "broker_clock": None,
+            }
+        ]
+
+    def test_cli_forwards_broker_clock_to_xlsx_importer(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        reference_path = tmp_path / "reference.xlsx"
+        platform_path = tmp_path / "platform.xlsx"
+        calls: list[dict[str, Any]] = []
+
+        class _Importer:
+            def load(self, path: Path, **kwargs: Any) -> ValidationReference:
+                calls.append({"path": path, **kwargs})
+                return _make_reference()
+
+        monkeypatch.setattr(validation_cli, "MT5XLSXImporter", _Importer)
+
+        rc, _ = _invoke_cli([
+            "--reference", str(reference_path),
+            "--platform", str(platform_path),
+            "--importer", "mt5_xlsx",
+            "--broker-clock", "dukascopy_mt5_index",
+            "--format", "json",
+        ], capsys)
+
+        assert rc == 1  # no readiness golden: fail-closed readiness check
+        assert calls == [
+            {
+                "path": reference_path,
+                "source_timezone": None,
+                "broker_clock": "dukascopy_mt5_index",
+            },
+            {
+                "path": platform_path,
+                "source_timezone": None,
+                "broker_clock": "dukascopy_mt5_index",
+            },
+        ]
+
+    def test_source_timezone_and_broker_clock_are_mutually_exclusive(self) -> None:
+        parser = validation_cli._build_argument_parser()
+        with pytest.raises(SystemExit):
+            parser.parse_args([
+                "--reference", "reference.json",
+                "--platform", "platform.json",
+                "--source-timezone", "Europe/Athens",
+                "--broker-clock", "dukascopy_mt5_index",
+            ])
+
+
 class TestCliExitCode0OnPerfectMatch:
     def test_cli_exit_code_0_on_perfect_match(
         self,
@@ -475,60 +551,23 @@ class TestCliStatsToleranceArgument:
         assert data["stat_passed"] is False
 
 
-class TestCliHtmlImporter:
-    def test_cli_html_importer(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
-        pytest.importorskip("bs4")
-        html_content = """<!DOCTYPE html>
-<html>
-<head><title>Report</title></head>
-<body>
-<table>
-  <tr><td>Expertenprogramm:</td><td>HtmlStrategy</td></tr>
-  <tr><td>Symbol:</td><td>EURUSD</td></tr>
-  <tr><td>Periode:</td><td>H1 (1 hour)</td></tr>
-  <tr><td>Ersteinlage:</td><td>10000</td></tr>
-</table>
-<h2>Orders</h2>
-<table>
-  <thead><tr><th>Auftrag</th><th>S / L</th><th>T / P</th></tr></thead>
-  <tbody><tr><td>1</td><td>1.0900</td><td>1.1200</td></tr></tbody>
-</table>
-<h2>Trades</h2>
-<table>
-  <thead>
-    <tr>
-      <th>Zeit</th><th>Trade</th><th>Symbol</th><th>Typ</th><th>Richtung</th>
-      <th>Volumen</th><th>Preis</th><th>Auftrag</th><th>Kommission</th>
-      <th>Swap</th><th>Gewinn</th><th>Kommentar</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td>2024.01.01 10:00:00</td><td>1</td><td>EURUSD</td><td>buy</td><td>in</td>
-      <td>0.1</td><td>1.10000</td><td>1</td><td>0</td><td>0</td><td>0</td><td></td>
-    </tr>
-    <tr>
-      <td>2024.01.01 11:00:00</td><td>1</td><td>EURUSD</td><td>sell</td><td>out</td>
-      <td>0.1</td><td>1.10500</td><td>1</td><td>0</td><td>0</td><td>50.00</td><td>tp 1</td>
-    </tr>
-  </tbody>
-</table>
-</body>
-</html>"""
-        html_path = tmp_path / "report.html"
-        html_path.write_text(html_content, encoding="utf-8")
+class TestCliMt5HtmlRejected:
+    @pytest.mark.parametrize("suffix", [".html", ".htm"])
+    @pytest.mark.parametrize("importer_name", ["auto", "mt5_xlsx"])
+    def test_html_input_fails_with_xlsx_message(
+        self,
+        tmp_path: Path,
+        suffix: str,
+        importer_name: str,
+    ) -> None:
+        report_path = tmp_path / f"report{suffix}"
+        report_path.write_text("<html></html>", encoding="utf-8")
 
-        rc, out = _invoke_cli([
-            "--reference", str(html_path),
-            "--platform", str(html_path),
-            "--format", "json",
-            "--importer", "mt5_html",
-        ], capsys)
-        assert rc == 1
-        data = json.loads(out)
-        assert data["strategy_name"] == "HtmlStrategy"
-        assert data["passed"] is False
-        assert data["equity_evidence_status"] == "missing"
+        with pytest.raises(
+            ValueError,
+            match="HTML reports are not parsed; export the XLSX report",
+        ):
+            validation_cli._load_validation_reference(report_path, importer_name)
 
 
 class TestCliStdinStdoutBehavior:

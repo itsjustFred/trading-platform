@@ -37,10 +37,7 @@ from risk import TradeSignal
 from risk.config import RiskConfig
 from runner.engines.signal_replay_adapter import ReplaySignal, SignalReplayAdapter
 from shared.models import LiveDeploymentConfig, LiveExecution, LiveSignal
-from shared.trailing import (
-    LIVE_SUPPORTED_TRAILING_MODES_BY_BROKER,
-    live_supported_trailing_modes,
-)
+from shared.trailing import LIVE_SUPPORTED_TRAILING_MODES_BY_BROKER
 from tests.test_alpaca_adapter import (
     _adapter,
     _FakeOrder,
@@ -654,23 +651,15 @@ def test_capability_and_central_broker_table_agree() -> None:
     assert adapter_live_trailing_modes(alpaca) == {"none", "percent"}
 
     assert CTraderLiveAdapter.broker_name == "ctrader"
-    # #168: cTrader's flip-workflow stop primitives deliberately do NOT declare
-    # ``supports_stop_amendment``, so the adapter-level mode set stays {"none"}
-    # for every cTrader account - the flip mode is added only by the daemon's
-    # deployment-aware gate for opted-in demo/paper deployments.
+    # cTrader declares no ``supports_stop_amendment`` and its broker table
+    # entry is {"none"} now that supertrend_flip is removed: no trailing mode
+    # is executable on cTrader at all.
     assert CTraderLiveAdapter.supports_stop_amendment is BaseLiveAdapter.supports_stop_amendment
-    # An amend-capable cTrader adapter sees the broker table's flip entry;
-    # the REAL CTraderLiveAdapter declares no stop-amendment capability, so it
-    # resolves to {"none"} - and the daemon's deployment gate strips the flip
-    # mode unless the deployment opted in on a demo/paper account.
     ctrader = SimpleNamespace(broker_name="ctrader", supports_stop_amendment=True)
-    assert adapter_live_trailing_modes(ctrader) == {"none", "supertrend_flip"}
+    assert adapter_live_trailing_modes(ctrader) == {"none"}
 
     assert "percent" in LIVE_SUPPORTED_TRAILING_MODES_BY_BROKER[AlpacaLiveAdapter.broker_name]
-    assert LIVE_SUPPORTED_TRAILING_MODES_BY_BROKER["ctrader"] == {
-        "none",
-        "supertrend_flip",
-    }
+    assert LIVE_SUPPORTED_TRAILING_MODES_BY_BROKER["ctrader"] == {"none"}
     assert adapter_live_trailing_modes(None) == {"none"}
     assert adapter_live_trailing_modes(SimpleNamespace(supports_stop_amendment=True)) == {"none"}
     # A truthy-but-not-True flag is not a declared capability.
@@ -1743,9 +1732,9 @@ def test_entry_signal_lookup_ignores_zero_fill_executions(isolated_db) -> None:
     assert found["AAPL"]["signal_id"] == str(probe.entry.id)
 
 
-# ── supertrend_flip stays refused live (#168) ────────────────────────────────
+# ── a persisted removed-mode entry has nothing to trail ─────────────────────
 
-_FULL_FLIP_CONFIG = {
+_REMOVED_FLIP_CONFIG = {
     "mode": "supertrend_flip",
     "breakeven_after_tp1": True,
     "activation_phase": "wait_for_first_green_after_tp1",
@@ -1755,34 +1744,18 @@ _FULL_FLIP_CONFIG = {
 }
 
 
-def test_supertrend_flip_is_ctrader_only_and_adapter_gated() -> None:
-    """#168: the broker table lists ``supertrend_flip`` for cTrader only. The
-    real CTraderLiveAdapter declares no stop-amendment capability so its
-    adapter-level modes stay {"none"}; reachability additionally requires the
-    daemon's deployment opt-in + demo/paper gate on top."""
-    assert "supertrend_flip" in live_supported_trailing_modes("ctrader")
-    for broker in ("alpaca", "unknown", None):
-        assert "supertrend_flip" not in live_supported_trailing_modes(broker)
-    # No real adapter resolves the flip mode today: cTrader's adapter has
-    # supports_stop_amendment=False (baseline {"none"}) and no other broker
-    # lists the mode.
-    for adapter in (
-        SimpleNamespace(broker_name="ctrader", supports_stop_amendment=False),
-        SimpleNamespace(broker_name="alpaca", supports_stop_amendment=True),
-        SimpleNamespace(broker_name="unknown", supports_stop_amendment=True),
-    ):
-        assert "supertrend_flip" not in adapter_live_trailing_modes(adapter)
-
-
-def test_persisted_supertrend_flip_entry_is_never_amended_by_percent_trail(
+def test_persisted_removed_mode_entry_is_not_trailed(
     live: _Live, surfaced
 ) -> None:
-    """#168: ``supertrend_flip`` belongs to LiveSupertrendFlipManager; the
-    percent trail ignores it entirely - no amend, no cancel, no surface."""
+    """A stored entry still naming the removed ``supertrend_flip`` mode can
+    never be trailed: the order is already at the broker, so the trail
+    treats the position as having no trailing config — the same skip the
+    percent trail gave flip positions on main — instead of recording a
+    failure on every pass for the life of the position."""
     manager = LiveTrailingStopManager()
     live.add_signal(
         "buy",
-        _FULL_FLIP_CONFIG,
+        _REMOVED_FLIP_CONFIG,
         at=T0 + timedelta(seconds=1),
         extra={"tp1_price": 110.0, "tp1_exit_percent": 0.5},
     )
@@ -1792,5 +1765,5 @@ def test_persisted_supertrend_flip_entry_is_never_amended_by_percent_trail(
     assert live.client.replace_calls == []
     assert live.client.cancelled == []
     assert live.client.stop_prices() == [98.0]
-    assert surfaced == []
+    assert not surfaced, "a persisted removed-mode row must not fail every pass"
 

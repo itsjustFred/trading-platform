@@ -179,7 +179,7 @@ Every importer should populate `raw_metadata` with at least:
 
 | Field | Meaning |
 |---|---|
-| `source_framework` | External framework, e.g. `mt5_xlsx`, `mt5_html`, `quantconnect`. |
+| `source_framework` | External framework, e.g. `mt5_xlsx`, `quantconnect`. |
 | `source_path` | Source path or stable artifact identifier. |
 | `source_timezone` | Original timestamp timezone or `UTC` when truly UTC; `null` when the times are broker server wall time and no civil zone applies. |
 | `broker_clock` | Named broker server clock the timestamps were read on, or `null` when a civil timezone applies. |
