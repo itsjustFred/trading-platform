@@ -62,6 +62,9 @@ MUST_NOT_SKIP_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
         # Live signal-level resolution shared by the broker adapters
         # (risk.signal_levels / risk.live).
         r"^tests\.test_signal_levels",
+        # tests/fakes/** — shared broker fakes with contract tests that drive
+        # the real live adapters; a silent skip would hide adapter breakage.
+        r"^tests\.fakes\.",
         # risk/ engine and its parity/validation coverage.
         r"^tests\.test_risk",
         r"^tests\.validation\.test_.*risk",
