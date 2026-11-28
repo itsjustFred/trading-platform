@@ -163,25 +163,76 @@ def test_equity_etf_collision_resolves_to_etf_with_longest_coverage(
     assert entry2.rows == 6
 
 
-def test_non_equity_etf_collision_still_fails_loudly(tmp_path: Path) -> None:
-    """Collisions outside {equity, etf} — including a third asset class —
-    are still reported and skipped."""
+def test_equity_etf_index_collision_resolves_to_etf(tmp_path: Path) -> None:
+    """SPY-style {equity, etf, index} collisions keep the longest-coverage
+    copy, canonicalised to asset_class "etf"."""
     src = tmp_path / "old" / "ohlcv"
-    _write_old(src, "yfinance", "equity", "US", "SPY", "1d.parquet", frame=_frame(freq="D"))
-    _write_old(src, "yfinance", "etf", "US", "SPY", "1h.parquet", frame=_frame())
-    _write_old(src, "yfinance", "index", "US", "SPY", "1d.parquet", frame=_frame(freq="D"))
+    # The index copy starts earliest → wins on coverage despite fewer rows.
+    _write_old(
+        src, "yfinance", "index", "US", "SPY", "1d.parquet",
+        frame=_frame(periods=2, start="2020-01-01", freq="D"),
+    )
+    _write_old(
+        src, "yfinance", "equity", "US", "SPY", "1d.parquet",
+        frame=_frame(periods=4, start="2024-01-01", freq="D"),
+    )
+    _write_old(
+        src, "yfinance", "etf", "US", "SPY", "1d.parquet",
+        frame=_frame(periods=6, start="2024-01-01", freq="D"),
+    )
+    # A second symbol where the etf copy itself has the longest coverage.
+    _write_old(
+        src, "yfinance", "equity", "US", "QQQ", "1d.parquet",
+        frame=_frame(periods=3, start="2024-01-01", freq="D"),
+    )
+    _write_old(
+        src, "yfinance", "etf", "US", "QQQ", "1d.parquet",
+        frame=_frame(periods=8, start="2024-01-01", freq="D"),
+    )
+    _write_old(
+        src, "yfinance", "index", "US", "QQQ", "1d.parquet",
+        frame=_frame(periods=2, start="2025-01-01", freq="D"),
+    )
+
+    dst = tmp_path / "new" / "ohlcv"
+    report = migrate(src, dst, sources=["yfinance"])
+
+    assert report.collisions == []
+    assert len(report.resolved) == 2
+
+    manifest = ohlcv_store.read_manifest(tmp_path / "new", "yfinance")
+    assert manifest["SPY"]["asset_class"] == "etf"
+    assert manifest["QQQ"]["asset_class"] == "etf"
+
+    spy = ohlcv_store.find_dataset(tmp_path / "new", "SPY", "1d", data_source="yfinance")
+    assert spy is not None
+    assert str(spy.first).startswith("2020-01-01")
+    qqq = ohlcv_store.find_dataset(tmp_path / "new", "QQQ", "1d", data_source="yfinance")
+    assert qqq is not None
+    assert qqq.rows == 8
+
+
+def test_non_equity_etf_index_collision_still_fails_loudly(tmp_path: Path) -> None:
+    """Collisions outside {equity, etf, index} — and {equity, index} with no
+    etf copy — are still reported and skipped."""
+    src = tmp_path / "old" / "ohlcv"
     _write_old(src, "testsrc", "forex", "COLL", "1h.parquet")
     _write_old(src, "testsrc", "metals", "COLL", "1h.parquet")
+    _write_old(src, "testsrc", "equity", "NOETF", "1d.parquet", frame=_frame(freq="D"))
+    _write_old(src, "testsrc", "index", "NOETF", "1d.parquet", frame=_frame(freq="D"))
+    _write_old(src, "testsrc", "etf", "BADMIX", "1d.parquet", frame=_frame(freq="D"))
+    _write_old(src, "testsrc", "crypto", "BADMIX", "1d.parquet", frame=_frame(freq="D"))
 
     dst = tmp_path / "new" / "ohlcv"
     report = migrate(src, dst)
 
-    assert any("SPY" in item and "multiple layouts" in item for item in report.collisions)
     assert any("COLL" in item and "multiple layouts" in item for item in report.collisions)
-    assert report.per_source["yfinance"]["collisions"] == 1
-    assert report.per_source["testsrc"]["collisions"] == 1
-    assert not (dst / "yfinance" / "SPY").exists()
+    assert any("NOETF" in item and "multiple layouts" in item for item in report.collisions)
+    assert any("BADMIX" in item and "multiple layouts" in item for item in report.collisions)
+    assert report.per_source["testsrc"]["collisions"] == 3
     assert not (dst / "testsrc" / "COLL").exists()
+    assert not (dst / "testsrc" / "NOETF").exists()
+    assert not (dst / "testsrc" / "BADMIX").exists()
 
 
 def test_collisions_and_skips_reported(old_tree: Path, tmp_path: Path) -> None:

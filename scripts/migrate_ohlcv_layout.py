@@ -17,11 +17,12 @@ New layout (written through :func:`shared.ohlcv_store.write_frame`)::
 (``bid_*``/``ask_*`` columns) before writing. ``asset_class``/``region`` are
 taken from the old path. A symbol that appears under more than one
 (asset_class, region) pair within a source is a collision. A collision whose
-asset classes are exactly ``{equity, etf}`` is resolved by keeping the copy
-with the longest coverage (earliest first timestamp, then most rows) and
-writing it with ``asset_class="etf"``; every other collision is skipped and
-reported, never silently merged — the new layout keys symbols uniquely per
-source. Nothing is ever deleted; ``--dry-run`` reports without writing.
+asset classes include ``etf`` and are otherwise only ``equity``/``index``
+(e.g. SPY filed under all three) is resolved by keeping the copy with the
+longest coverage (earliest first timestamp, then most rows) and writing it
+with ``asset_class="etf"``; every other collision is skipped and reported,
+never silently merged — the new layout keys symbols uniquely per source.
+Nothing is ever deleted; ``--dry-run`` reports without writing.
 
 Usage::
 
@@ -383,8 +384,9 @@ def migrate(
         report.per_source[source]["skipped"] += len(skipped)
 
         # Collisions: one symbol mapping to more than one (asset_class, region).
-        # {equity, etf} collisions resolve to the longest-coverage copy,
-        # canonicalised to asset_class "etf"; anything else fails loudly.
+        # Collisions whose classes include "etf" and are otherwise only
+        # equity/index resolve to the longest-coverage copy, canonicalised to
+        # asset_class "etf"; anything else fails loudly.
         symbol_meta: dict[str, set[tuple[str, str]]] = {}
         for target in targets.values():
             symbol_meta.setdefault(str(target["symbol"]), set()).add(
@@ -396,7 +398,8 @@ def migrate(
         resolved_winners: dict[str, tuple[str, str]] = {}
         for symbol in sorted(collided):
             metas = symbol_meta[symbol]
-            if {asset_class for asset_class, _region in metas} == {"equity", "etf"}:
+            classes = {asset_class for asset_class, _region in metas}
+            if "etf" in classes and classes <= {"equity", "etf", "index"}:
                 winner = _collision_winner(targets, symbol, metas)
                 resolved_winners[symbol] = winner
                 report.resolved.append(
