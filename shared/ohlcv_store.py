@@ -698,7 +698,13 @@ def read_frame(
     frame = normalize_ohlcv_frame(frame)
     if "timestamp" not in frame.columns:
         return pd.DataFrame()
-    frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True, errors="coerce")
+    parsed = pd.to_datetime(frame["timestamp"], utc=True, errors="coerce")
+    unparseable = int(parsed.isna().sum())
+    if unparseable:
+        logger.warning(
+            "OHLCV read dropped %d row(s) with unparseable timestamps", unparseable
+        )
+    frame["timestamp"] = parsed
     frame = frame.dropna(subset=["timestamp"]).sort_values("timestamp")
     frame = apply_date_filter(frame, start=start, end=end)
     for column in OHLCV_COLUMNS:

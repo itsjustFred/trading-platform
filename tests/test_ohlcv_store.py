@@ -465,6 +465,21 @@ class TestReadFrame:
         with pytest.raises(FileNotFoundError):
             ohlcv_store.read_frame(entry)
 
+    def test_read_frame_unparseable_timestamps_are_logged(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Rows whose timestamps cannot be parsed are dropped — the drop must
+        be visible in the log, not silent."""
+        path = _write(tmp_path, periods=3)
+        frame = pd.read_parquet(path)
+        frame["timestamp"] = frame["timestamp"].astype(str)
+        frame.loc[1, "timestamp"] = "not-a-timestamp"
+        frame.to_parquet(path, index=False)
+        with caplog.at_level("WARNING", logger="shared.ohlcv_store"):
+            out = ohlcv_store.read_frame(path)
+        assert len(out) == 2
+        assert any("unparseable" in record.getMessage() for record in caplog.records)
+
     def test_read_frame_segments_concatenated_in_order(self, tmp_path: Path) -> None:
         jan = _frame(periods=2, start="2024-01-01", freq="D")
         feb = _frame(periods=2, start="2024-02-01", freq="D")
