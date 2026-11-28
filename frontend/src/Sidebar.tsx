@@ -6,7 +6,6 @@ import {
   Briefcase,
   Bot,
   ScrollText,
-  Users,
   Radio,
   PanelLeftClose,
   PanelLeftOpen,
@@ -29,7 +28,6 @@ const navItems = [
   { path: "/data", label: "Data", icon: Database },
   { path: "/tasks", label: "Task Hub", icon: Activity },
   { path: "/logging", label: "Logging", icon: ScrollText },
-  { path: "/accounts", label: "Accounts", icon: Users, disabled: true },
 ];
 
 export function Sidebar() {
@@ -56,22 +54,6 @@ export function Sidebar() {
       <nav className="flex-1 py-1">
         {navItems.map((item) => {
           const Icon = item.icon;
-          if (item.disabled) {
-            return (
-              <div
-                key={item.path}
-                className={`flex items-center gap-3 h-10 text-text-muted/30 cursor-not-allowed ${
-                  collapsed ? "justify-center px-0" : "px-4"
-                }`}
-                title="Coming soon"
-              >
-                <Icon size={18} className="shrink-0" />
-                {!collapsed && (
-                  <span className="text-[0.82rem]">{item.label}</span>
-                )}
-              </div>
-            );
-          }
           return (
             <NavLink
               key={item.path}

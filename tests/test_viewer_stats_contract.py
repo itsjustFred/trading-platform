@@ -7,13 +7,10 @@ labeling the average winner/loser as an extreme.
 
 from __future__ import annotations
 
-import sys
 from pathlib import Path
 from types import SimpleNamespace
 
 from shared.models import BacktestMeta, BacktestResult, Trade, TradeExit
-
-sys.path.insert(0, str(Path(__file__).parent.parent))
 
 
 def _trade(trade_id: int, pnl: float) -> Trade:

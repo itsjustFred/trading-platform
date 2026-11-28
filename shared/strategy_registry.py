@@ -52,6 +52,104 @@ class StrategyEntry:
             return ""
 
 
+#: Signal-dict keys only the frozen vectorbt adapter executes (#318, ADR 0001).
+#: The native engine ignores them silently, so a strategy emitting one cannot
+#: be run faithfully off vectorbt — today that is ``entry_stop`` (the D2-strict
+#: stop-entry fill, which the maintainer decided does not survive as a native
+#: option). ``exit_reason`` is deliberately absent: it is a label the native
+#: engine replaces with its own exit reasons, not a fill-semantics input.
+#: This is NOT the only engine difference: vectorbt also treats any
+#: ``atr*``-prefixed signal as an implicit stop distance — it sizes risk AND
+#: places a 1xATR stop when the strategy emits no ``stop_loss``/``sl_price`` —
+#: while native never reads ``atr*`` series. That case is conditional on the
+#: missing stop key, so it is detected separately by
+#: :func:`atr_sizing_keys_without_stop` rather than listed here.
+VECTORBT_ONLY_SIGNAL_KEYS = frozenset({"entry_stop"})
+
+#: Stop-level spellings that keep vectorbt from falling back to the ``atr*``
+#: implicit stop distance. Mirrors the ``stop_loss`` and ``sizing_stop``
+#: tuples of ``runner.engines.vectorbt_adapter._LEVEL_ALIASES`` — the adapter
+#: resolves sizing distance from ``sizing_stop or stop_loss`` before trying
+#: ``atr*`` (pinned by a test; ``take_profit`` is not a stop distance).
+#: ``stop_distance`` is deliberately absent: vectorbt does not read that key.
+_STOP_LEVEL_SIGNAL_KEYS = frozenset(
+    {
+        "stop_loss",
+        "sl_price",
+        "sizing_stop",
+        "sizing_sl_price",
+        "sizing_sl",
+    }
+)
+
+
+def _published_signal_keys(path: Path) -> frozenset[str]:
+    """All signal-series keys a strategy file publishes, lowercased.
+
+    Same publication forms as :func:`vectorbt_only_signal_keys`: dict literal
+    keys, subscript indices, ``dict(key=...)`` keywords and
+    ``setdefault("key", ...)`` positionals. Dynamic keys are undetectable
+    statically — the scan is best-effort.
+    """
+    source = _read_source(path)
+    if source is None:
+        return frozenset()
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return frozenset()
+    found: set[str] = set()
+    for node in ast.walk(tree):
+        candidates: list[ast.expr] = []
+        if isinstance(node, ast.Dict):
+            candidates = [key for key in node.keys if key is not None]
+        elif isinstance(node, ast.Subscript):
+            candidates = [node.slice]
+        elif isinstance(node, ast.Call):
+            # ``dict(entry_stop=...)`` publishes the key as a keyword name;
+            # ``mapping.setdefault("entry_stop", ...)`` as a positional
+            # constant. Both are publication forms a dict literal misses.
+            if isinstance(node.func, ast.Name) and node.func.id == "dict":
+                candidates.extend(
+                    ast.Constant(value=keyword.arg)
+                    for keyword in node.keywords
+                    if keyword.arg is not None
+                )
+            if (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == "setdefault"
+                and node.args
+            ):
+                candidates.append(node.args[0])
+        else:
+            continue
+        for candidate in candidates:
+            if isinstance(candidate, ast.Constant) and isinstance(candidate.value, str):
+                found.add(candidate.value.lower())
+    return frozenset(found)
+
+
+def vectorbt_only_signal_keys(path: Path) -> frozenset[str]:
+    """Return the :data:`VECTORBT_ONLY_SIGNAL_KEYS` a strategy file emits."""
+    return _published_signal_keys(path) & VECTORBT_ONLY_SIGNAL_KEYS
+
+
+def atr_sizing_keys_without_stop(path: Path) -> frozenset[str]:
+    """``atr*``-prefixed signal keys emitted with no stop-level key.
+
+    Vectorbt uses any ``atr*`` column/indicator as an implicit stop distance —
+    sizing risk AND placing a 1xATR stop — only when the strategy publishes no
+    stop-level key (``stop_loss``/``sl_price`` or the ``sizing_stop`` family).
+    Native never reads ``atr*`` series, so such a strategy produces different
+    sizing and stops per engine. Returns the ``atr*`` keys found (empty when a
+    stop key is present or none are emitted).
+    """
+    published = _published_signal_keys(path)
+    if published & _STOP_LEVEL_SIGNAL_KEYS:
+        return frozenset()
+    return frozenset(key for key in published if key.startswith("atr"))
+
+
 def iter_strategy_files(strategies_dir: Path = DEFAULT_STRATEGIES_DIR) -> list[Path]:
     if not strategies_dir.exists():
         return []

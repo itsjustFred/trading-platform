@@ -14,22 +14,25 @@ import subprocess
 import sys
 from pathlib import Path
 
+from tests.conftest import sandboxed_env
+
 
 def _resolve_pyne_bin() -> str | None:
-    """The ``pyne`` CLI, from PATH or this interpreter's venv bin, else ``None``.
+    """The ``pyne`` CLI, from this interpreter's venv bin or PATH, else ``None``.
 
     The same two locations `runner.engines.pynecore_adapter` searches and the
-    engine-contract suite gates on. The venv-bin fallback matters: a `pyne`
-    installed into the venv only is invisible to a bare `shutil.which` when the
-    venv bin is not on PATH, and these modules would then skip - silently, since
-    their module-level `skipif` bypasses the conftest fixture that records and
-    counts skips.
+    engine-contract suite gates on. The venv bin comes first: the child runs with
+    the sandboxed environment, whose HOME is the session directory, so a
+    user-site ``pyne`` cannot resolve the packages it was installed next to -
+    and the venv is the dependency set under test. A `pyne` installed into the
+    venv only is invisible to a bare `shutil.which` when the venv bin is not on
+    PATH, and these modules would then skip - silently, since their module-level
+    `skipif` bypasses the conftest fixture that records and counts skips.
     """
-    on_path = shutil.which("pyne")
-    if on_path:
-        return on_path
     venv_bin = Path(sys.executable).parent / "pyne"
-    return str(venv_bin) if venv_bin.exists() else None
+    if venv_bin.exists():
+        return str(venv_bin)
+    return shutil.which("pyne")
 
 
 # The binary is resolved once here; each module's ``pytestmark`` skips when it
@@ -74,4 +77,5 @@ def run_pyne(strategy: Path, bars: Path, workdir: Path) -> subprocess.CompletedP
         text=True,
         timeout=TIMEOUT_SECONDS,
         cwd=str(workdir),
+        env=sandboxed_env(),
     )

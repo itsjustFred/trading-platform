@@ -8,6 +8,7 @@ import pytest
 from runner.engines.base import BacktestConfig
 from runner.engines.native_adapter import NativeAdapter
 from runner.engines.vectorbt_adapter import VectorbtAdapter
+from tests.builders import make_backtest_config
 
 STRATEGY = """
 import pandas as pd
@@ -25,7 +26,7 @@ def generate_signals(df: pd.DataFrame, params: dict):
 
 
 def _config(tmp_path: Path, symbols: list[str]) -> BacktestConfig:
-    return BacktestConfig(risk_per_trade_pct=0.01, parameters={"fees": "zero"},
+    return make_backtest_config(risk_per_trade_pct=0.01, parameters={"fees": "zero"},
         strategy_name="sma_demo",
         symbols=symbols,
         timeframe="1d",

@@ -9,15 +9,12 @@ Symbol/Timeframe: XAUUSD / 1h
 """
 
 import math
-import sys
 from pathlib import Path
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).parent.parent.parent))
-
-from runner.engines.base import BacktestConfig
 from runner.engines.vectorbt_adapter import VectorbtAdapter
+from tests.builders import make_backtest_config
 
 STRATEGY_PATH = str(
     Path(__file__).parent.parent.parent
@@ -47,7 +44,7 @@ EXPECTED_NET_PROFIT = 369.39
 @pytest.fixture(scope="module")
 def backtest_result():
     engine = VectorbtAdapter()
-    config = BacktestConfig(signal_exit_fill="close", parameters={"fees": "zero"},
+    config = make_backtest_config(signal_exit_fill="close", parameters={"fees": "zero"},
         strategy_name="qg_30min_es_breakout_strategy",
         symbols=[TEST_SYMBOL],
         timeframe=TEST_TIMEFRAME,

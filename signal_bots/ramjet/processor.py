@@ -14,7 +14,6 @@ from shared.trailing import (
     KNOWN_TRAILING_MODES,
     TRAILING_MODE_NONE,
     TRAILING_MODE_PERCENT,
-    TRAILING_MODE_SUPERTREND_FLIP,
     validate_trailing_mode,
 )
 
@@ -54,10 +53,10 @@ class RamJetSignalProcessor:
       ``trailing_percent`` in (0, 1). Executed by the replay backtest and,
       live, on brokers whose adapter can amend a stop (Alpaca; see
       ``shared.trailing.LIVE_SUPPORTED_TRAILING_MODES_BY_BROKER``).
-    - ``supertrend_flip``: TP1 partial exit, breakeven stop, exit on the first
-      red Supertrend bar after the first green one (#168). Executed by the
-      replay backtest; the live path rejects it on every broker (see
-      ``shared.trailing``), so it cannot trade live without its workflow.
+
+    ``supertrend_flip`` was removed (maintainer decision 2026-11-26): the mode
+    is refused at construction like any unknown mode, with a "removed"
+    message (``shared.trailing.REMOVED_TRAILING_MODES``).
     """
 
     def __init__(self, config: dict[str, Any]):
@@ -171,24 +170,10 @@ class RamJetSignalProcessor:
     def _trailing_sl_config_metadata(self) -> dict[str, Any]:
         """Trailing config emitted with every signal, from the bot setting.
 
-        - ``none`` (default) must not ask for trailing: only the mode is
-          emitted, without the Supertrend-flip workflow fields — with the
-          default mode those fields would describe a workflow the configured
-          mode does not request.
-        - ``supertrend_flip`` carries the workflow parameters the replay
-          adapter executes (``shared.trailing.parse_supertrend_flip_plan``);
-          ``tp1_price`` / ``tp1_exit_percent`` travel in the signal metadata.
-          The live path rejects it.
+        ``none`` (default) must not ask for trailing: only the mode is
+        emitted. A removed mode can never reach this point — the constructor
+        refuses it.
         """
-        if self.trailing_mode == TRAILING_MODE_SUPERTREND_FLIP:
-            return {
-                "mode": self.trailing_mode,
-                "breakeven_after_tp1": True,
-                "activation_phase": "wait_for_first_green_after_tp1",
-                "exit_phase": "exit_on_first_red_after_activation",
-                "supertrend_period": self.supertrend_period,
-                "supertrend_multiplier": self.supertrend_multiplier,
-            }
         if self.trailing_mode == TRAILING_MODE_PERCENT:
             return {
                 "mode": self.trailing_mode,
@@ -225,10 +210,9 @@ class RamJetSignalProcessor:
         latest_supertrend_green = bool(frame["supertrend"].iloc[-1])
         # False while the frame is shorter than the Supertrend warm-up: in that
         # regime supertrend=False means "unknown", not "bearish", so consumers
-        # of supertrend_green_at_entry / the trailing flip workflow must not
-        # read a direction into it. _calculate_supertrend always sets the
-        # marker, so a missing column is unexpected and stays fail-closed
-        # instead of silently reporting ready.
+        # of supertrend_green_at_entry must not read a direction into it.
+        # _calculate_supertrend always sets the marker, so a missing column is
+        # unexpected and stays fail-closed instead of silently reporting ready.
         supertrend_ready = (
             bool(frame["supertrend_ready"].iloc[-1])
             if "supertrend_ready" in frame.columns
@@ -297,8 +281,8 @@ def calculate_supertrend(df: pd.DataFrame, period: int, multiplier: float) -> pd
     depends on bars ``0..N`` only, so it may be computed once over a whole
     series without lookahead.
 
-    Consumers outside the processor (the replay adapter's ``supertrend_flip``
-    workflow, issue #168) call this so the processor and the executing paths
-    can never drift apart onto two different Supertrend definitions.
+    Kept as the single Supertrend definition so anything that needs the
+    indicator shares one implementation instead of drifting onto two
+    different definitions.
     """
     return RamJetSignalProcessor._calculate_supertrend(df, period, multiplier)

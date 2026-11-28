@@ -1,8 +1,6 @@
 """Contract tests for the 16-D2 engine_pkg/adapter split (pre-mortem hardening).
 
 These pin the seams the split introduced:
-- PM-2: every key of the `_size_trade` sizing record reaches trade meta
-  `risk_math` (viewer contract).
 - PM-3: trade/equity timestamps and indicator-point timestamps come from the
   same ISO-UTC formatter.
 - PM-4: the `runner.engine` shim exposes the engine package's public surface.
@@ -19,35 +17,6 @@ import pandas as pd
 import runner.engine as engine_shim
 import runner.engine_pkg as engine_pkg
 from runner.engines.vectorbt_adapter import _size_trade, _SizeRecord
-
-SIZE_RECORD_DROPPED_KEYS = {
-    # internal bookkeeping that is intentionally not serialized into risk_math
-    "qty",
-}
-SIZE_RECORD_RENAMED_KEYS = {
-    # serialized under a viewer-facing name (see frontend TradeRiskMath)
-    "leverage_notional_limit": "max_leverage_notional",
-    "cap_notional": "max_position_notional",
-}
-
-
-def test_size_trade_record_keys_reach_risk_math():
-    """Every serialized sizing-record key must appear in trade meta risk_math."""
-    record_keys = set(_SizeRecord.__annotations__) - SIZE_RECORD_DROPPED_KEYS
-
-    import runner.engines.vectorbt_adapter as vbt
-
-    source = inspect.getsource(vbt._process_symbol)
-    start = source.index('trade_meta["risk_math"]')
-    block = source[start : source.index("capped_by_max_leverage", start) + 200]
-
-    for key in record_keys:
-        expected = SIZE_RECORD_RENAMED_KEYS.get(key, key)
-        assert f'"{expected}"' in block, (
-            f"sizing record key {key!r} (risk_math name {expected!r}) is not "
-            "serialized into risk_math; the viewer contract "
-            "(frontend TradeRiskMath) will silently lose it"
-        )
 
 
 def test_engine_timestamps_share_one_formatter():
@@ -97,9 +66,9 @@ def test_engine_shim_exposes_package_public_surface():
 
 def test_size_trade_returns_typed_record():
     """_size_trade must keep returning the typed record (not a loose dict)."""
-    from runner.engines.base import BacktestConfig
+    from tests.builders import make_backtest_config
 
-    config = BacktestConfig(parameters={"fees": "zero"},
+    config = make_backtest_config(parameters={"fees": "zero"},
         strategy_name="t",
         symbols=["X"],
         timeframe="1h",

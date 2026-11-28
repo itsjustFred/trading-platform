@@ -22,6 +22,7 @@ from live_runner.deployment_policy import (
     signal_source_can_trade,
     untradeable_signal_source_reason,
 )
+from tests.conftest import sandboxed_env
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -107,6 +108,7 @@ def test_preflights_import_the_policy_not_the_daemon() -> None:
             capture_output=True,
             text=True,
             timeout=120,
+            env=sandboxed_env(),
         )
         assert result.returncode == 0, f"{module}: {result.stderr[-2000:]}"
 
@@ -134,5 +136,6 @@ def test_the_db_preflight_stays_a_sqlite_only_import() -> None:
         capture_output=True,
         text=True,
         timeout=120,
+        env=sandboxed_env(),
     )
     assert result.returncode == 0, result.stderr[-2000:]

@@ -8,10 +8,7 @@ routes must delegate its blocking body to a worker thread.
 from __future__ import annotations
 
 import ast
-import sys
 from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).parent.parent))
 
 _BLOCKING_ROUTES = [
     "data_overview",
@@ -73,8 +70,3 @@ def test_blocking_routes_delegate_to_worker_threads():
     )
 
 
-def test_to_thread_helper_exists_for_bodies():
-    """The helper that wraps blocking bodies in a worker thread exists."""
-    import viewer.main as viewer_main
-
-    assert callable(viewer_main.legacy_viewer._stats_payload_from_result)

@@ -63,6 +63,15 @@ logger = logging.getLogger(__name__)
 #: parameter: strategy ``parameters`` must not rewrite engine risk policy.
 TRADE_ENGINE_MAX_POSITIONS = 5
 
+#: The native backtest engine's per-trade notional ceiling, as a fraction of
+#: balance. It deliberately differs from the live default
+#: (``RiskConfig.max_notional_per_trade`` = 0.20): the backtest engine's
+#: leverage/margin policy is applied afterwards on free margin (#347), so this
+#: config value is a documented fallback rather than an active cap. Whether the
+#: backtest should use the live 0.20 instead is an OPEN maintainer decision
+#: (improvement-run G03, #431, #318) — the value is unchanged on purpose.
+BACKTEST_MAX_NOTIONAL_PER_TRADE = 1.0
+
 
 def _floor_to_lot_grid(size: float, lot_step: float) -> float:
     """Largest multiple of ``lot_step`` at or below ``size``, up to the snap band (#151, #278).
@@ -297,7 +306,7 @@ class TradeEngine:
                 max_total_exposure=total_exposure,
                 max_positions=max_positions,
                 default_sl_atr_multiplier=2.0,
-                max_notional_per_trade=1.0,
+                max_notional_per_trade=BACKTEST_MAX_NOTIONAL_PER_TRADE,
                 allow_fallback_stop=bool(self.config.allow_fallback_stop),
                 reject_missing_stop=bool(self.config.reject_missing_stop),
             )
@@ -406,7 +415,7 @@ class TradeEngine:
         # "take_profit" and "tp_price" are two spellings of the SAME plain
         # take-profit level (#237), so a row carrying both must produce a
         # single "tp" candidate. The canonical spelling wins — the alias order
-        # every other level resolver uses (``risk.live._LIVE_TP_KEYS``, the
+        # every other level resolver uses (``risk.signal_levels.TP_METADATA_KEYS``,
         # comparison/extraction helpers) — and the winner must not depend on
         # the signal frame's column order. Appending one candidate per column
         # made two levels named "tp" for the one intended level, so the row's
@@ -601,6 +610,11 @@ class TradeEngine:
                     else order.stop_price
                 )
                 if trigger_price is not None:
+                    # Deliberately not ``RiskEngine.fallback_stop``: this is an
+                    # exposure ESTIMATE from the order's own trigger level, not
+                    # a protective stop. The percent rule only applies when the
+                    # trigger sits at the reference price (kept as its own
+                    # behaviour; see improvement-run G03).
                     direction_sign = 1.0 if order.direction == "LONG" else -1.0
                     risk_distance = abs(float(reference_price) - float(trigger_price))
                     if risk_distance <= 0:
@@ -1169,13 +1183,12 @@ class TradeEngine:
         size_from_stop = stop_loss if stop_loss is not None else sizing_only_stop
         exposure_stop = size_from_stop
         if exposure_stop is None and self._risk_enabled and self.config.allow_fallback_stop:
-            direction_sign = 1.0 if direction == "LONG" else -1.0
-            fallback_distance = (
-                float(stop_distance)
-                if stop_distance is not None and stop_distance > 0
-                else entry_price * self._risk_engine.config.fallback_stop_pct
+            # One fallback-stop computation for the whole engine path (G03).
+            exposure_stop = self._risk_engine.fallback_stop(
+                action=direction,
+                entry_price=entry_price,
+                stop_distance=stop_distance,
             )
-            exposure_stop = entry_price - direction_sign * fallback_distance
         qty = self._calculate_position_size(
             entry_price=entry_price,
             stop_loss_price=size_from_stop,
@@ -1498,14 +1511,12 @@ class TradeEngine:
                 # bar's close, so re-derive it here from the actual fill
                 # (contract §4: "2% of entry").
                 if order.stop_loss is None and not getattr(order, "_sizing_only_stop", False):
-                    direction_sign = 1.0 if order.direction == "LONG" else -1.0
-                    fallback_distance = (
-                        float(order.stop_distance)
-                        if order.stop_distance is not None and order.stop_distance > 0
-                        else float(fill_price) * self._risk_engine.config.fallback_stop_pct
-                    )
-                    order._sizing_stop_loss = (
-                        float(fill_price) - direction_sign * fallback_distance
+                    # Same fallback arithmetic as the creation-time estimate
+                    # and the sizing engine (G03), re-derived from the fill.
+                    order._sizing_stop_loss = self._risk_engine.fallback_stop(
+                        action=order.direction,
+                        entry_price=float(fill_price),
+                        stop_distance=order.stop_distance,
                     )
                 if (
                     order.order_type == OrderType.MARKET

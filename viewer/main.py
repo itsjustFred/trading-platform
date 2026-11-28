@@ -42,7 +42,7 @@ from fastapi import (
     WebSocketDisconnect,
 )
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, ValidationError
 from pydantic import Field as PydanticField
 from sentry_sdk.integrations.fastapi import FastApiIntegration
@@ -253,7 +253,7 @@ SERVICE_NOT_FOUND_DETAIL = "Service not found"
 PORTFOLIOS_DIR = DATA_DIR / "portfolios"
 STRATEGIES_DIR = DEFAULT_STRATEGIES_DIR
 REACT_DIST = PROJECT_ROOT / "frontend" / "dist"
-STATIC_DIR = REACT_DIST if REACT_DIST.exists() else Path(__file__).resolve().parent / "static"
+STATIC_DIR = REACT_DIST
 _STATIC_ASSET_SUFFIXES = {
     ".js",
     ".mjs",
@@ -1845,6 +1845,14 @@ async def static_spa_middleware(request: Request, call_next):
         index_file = STATIC_DIR / "index.html"
         if index_file.exists():
             return FileResponse(index_file)
+        return HTMLResponse(
+            "<!doctype html><title>Trading Platform</title>"
+            "<h1>Frontend not built</h1>"
+            "<p>The React frontend has not been built. Run "
+            "<code>npm run build</code> in <code>frontend/</code>, or use the "
+            "Vite dev server for development.</p>",
+            status_code=503,
+        )
     return await call_next(request)
 
 
