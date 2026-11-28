@@ -1034,10 +1034,12 @@ def _control_adapter(*, orders=(), positions=()):
     from ctrader_open_api.messages.OpenApiMessages_pb2 import (
         ProtoOACancelOrderReq,
         ProtoOAClosePositionReq,
+        ProtoOAExecutionEvent,
         ProtoOAOrderErrorEvent,
         ProtoOAReconcileRes,
     )
     from ctrader_open_api.messages.OpenApiModelMessages_pb2 import (
+        ProtoOAExecutionType,
         ProtoOAOrderStatus,
         ProtoOAOrderType,
         ProtoOAPositionStatus,
@@ -1056,11 +1058,16 @@ def _control_adapter(*, orders=(), positions=()):
     adapter._ProtoOAPositionStatus = ProtoOAPositionStatus
     adapter._ProtoOAReconcileRes = ProtoOAReconcileRes
     adapter._ProtoOAOrderErrorEvent = ProtoOAOrderErrorEvent
+    adapter._ProtoOAExecutionEvent = ProtoOAExecutionEvent
+    adapter._ProtoOAExecutionType = ProtoOAExecutionType
     adapter.sent: list[Any] = []
     adapter.refuse: set[int] = set()
     # Targets answered with a real `ProtoOAOrderErrorEvent` (how cTrader reports a trading
     # refusal: a *successful* response, not a `ProtoOAErrorRes`).
     adapter.refuse_event: dict[int, str] = {}
+    # Targets answered with a real `ProtoOAExecutionEvent` (the other refusal
+    # payload cTrader correlates to the request by clientMsgId).
+    adapter.exec_event: dict[int, Any] = {}
 
     snapshot = ProtoOAReconcileRes()
     for order in orders:
@@ -1074,6 +1081,8 @@ def _control_adapter(*, orders=(), positions=()):
     async def _send(request, **_kwargs):
         adapter.sent.append(request)
         target = int(getattr(request, "orderId", 0) or getattr(request, "positionId", 0) or 0)
+        if target in adapter.exec_event:
+            return adapter.exec_event[target]
         if target in adapter.refuse:
             raise CTraderApiError("ORDER_REJECTED", f"refused {target}")
         if target in adapter.refuse_event:
@@ -1329,6 +1338,32 @@ def test_a_cancel_refused_with_an_order_error_event_is_a_failure() -> None:
     assert outcome.complete is False
 
 
+def test_a_refusal_shaped_response_fails_closed_when_the_error_class_is_unloaded() -> None:
+    """With `_ProtoOAOrderErrorEvent` unset, isinstance cannot rule a refusal out.
+
+    A real `ProtoOAOrderErrorEvent` carries `errorCode` and no
+    `executionType` (its `description` may be unset), so a response with
+    `errorCode` alone must still count as a refusal rather than passing as
+    a completed control.
+    """
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOAOrderType
+
+    adapter = _control_adapter(
+        orders=[
+            _order(611, ProtoOAOrderType.LIMIT),
+            _order(612, ProtoOAOrderType.LIMIT),
+        ]
+    )
+    adapter._ProtoOAOrderErrorEvent = None
+    adapter.exec_event[611] = SimpleNamespace(errorCode="ORDER_NOT_FOUND")
+
+    outcome = _run(adapter.cancel_open_orders())
+
+    assert outcome.completed == 1
+    assert outcome.failed == ("611",)
+    assert outcome.complete is False
+
+
 def test_orphaned_protection_cancel_refused_with_an_order_error_event_is_a_failure() -> None:
     from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOAOrderType
 
@@ -1341,6 +1376,517 @@ def test_orphaned_protection_cancel_refused_with_an_order_error_event_is_a_failu
 
     assert outcome.completed == 0
     assert outcome.failed == ("701",)
+    assert outcome.complete is False
+
+
+# ─── Execution-event refusals on the control sweeps (#439) ────────────────────
+#
+# cTrader answers a refused CancelOrderReq/ClosePositionReq/AmendPositionSLTPReq
+# either with a ProtoOAOrderErrorEvent (covered above) or with a correlated
+# ProtoOAExecutionEvent whose executionType is ORDER_REJECTED or
+# ORDER_CANCEL_REJECTED. Reading either as success is how a refused cancel
+# leaves an order working, a refused flatten leaves a position open, or a
+# refused amend is recorded as applied while the broker kept the old SL/TP.
+
+
+def _execution_event(execution_type: int, *, order_id: int = 0):
+    """A real `ProtoOAExecutionEvent` refusal payload."""
+    from ctrader_open_api.messages.OpenApiMessages_pb2 import ProtoOAExecutionEvent
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import (
+        ProtoOAOrder,
+        ProtoOAOrderStatus,
+    )
+
+    event = ProtoOAExecutionEvent(
+        ctidTraderAccountId=46736452,
+        executionType=execution_type,
+        errorCode="TRADING_BAD_VOLUME",
+    )
+    if order_id:
+        event.order.CopyFrom(
+            ProtoOAOrder(
+                orderId=order_id,
+                orderStatus=ProtoOAOrderStatus.ORDER_STATUS_REJECTED,
+            )
+        )
+    return event
+
+
+def _execution_type(name: str) -> int:
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOAExecutionType
+
+    return int(getattr(ProtoOAExecutionType, name))
+
+
+def test_execution_type_classifier_covers_every_proto_member() -> None:
+    """Every loaded member lands in exactly one explicit set - no substring rules."""
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOAExecutionType
+
+    from live_runner.ctrader_adapter import (
+        _NON_REJECTION_EXECUTION_TYPES,
+        _REJECTION_EXECUTION_TYPES,
+        CTraderLiveAdapter,
+    )
+
+    members = CTraderLiveAdapter._execution_type_members(ProtoOAExecutionType)
+    assert members, "proto enum member extraction returned nothing"
+    names = {name for name, _ in members}
+    unclassified = (
+        names - _NON_REJECTION_EXECUTION_TYPES - _REJECTION_EXECUTION_TYPES
+    )
+    assert not unclassified, (
+        "new ProtoOAExecutionType members need a refusal/non-rejection "
+        f"decision: {sorted(unclassified)}"
+    )
+    assert not (_NON_REJECTION_EXECUTION_TYPES & _REJECTION_EXECUTION_TYPES), (
+        "a member cannot be both a refusal and a non-rejection"
+    )
+
+
+def test_the_known_rejection_values_classify_as_rejections() -> None:
+    """ORDER_REJECTED and ORDER_CANCEL_REJECTED are refusals by explicit name."""
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOAExecutionType
+
+    from live_runner.ctrader_adapter import CTraderLiveAdapter
+
+    adapter = CTraderLiveAdapter.__new__(CTraderLiveAdapter)
+    adapter._ProtoOAExecutionType = ProtoOAExecutionType
+    for name in ("ORDER_REJECTED", "ORDER_CANCEL_REJECTED"):
+        event = SimpleNamespace(
+            ctidTraderAccountId=46736452,
+            executionType=int(getattr(ProtoOAExecutionType, name)),
+        )
+        assert adapter._execution_event_rejection(event) == (name, False)
+
+
+def test_a_cancel_refused_with_order_cancel_rejected_is_a_failure() -> None:
+    """ORDER_CANCEL_REJECTED means the order is still working: failed, not done."""
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOAOrderType
+
+    adapter = _control_adapter(
+        orders=[
+            _order(801, ProtoOAOrderType.LIMIT),
+            _order(802, ProtoOAOrderType.LIMIT),
+        ]
+    )
+    adapter.exec_event[801] = _execution_event(
+        _execution_type("ORDER_CANCEL_REJECTED"), order_id=801
+    )
+
+    outcome = _run(adapter.cancel_open_orders())
+
+    assert outcome.completed == 1
+    assert outcome.failed == ("801",)
+    assert outcome.complete is False
+    assert sorted(int(request.orderId) for request in adapter.sent) == [801, 802]
+
+
+def test_a_cancel_refused_with_order_rejected_is_a_failure() -> None:
+    """ORDER_REJECTED on a cancel request is a refusal too, not a cancel."""
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOAOrderType
+
+    adapter = _control_adapter(
+        orders=[
+            _order(811, ProtoOAOrderType.LIMIT),
+            _order(812, ProtoOAOrderType.LIMIT),
+        ]
+    )
+    adapter.exec_event[811] = _execution_event(
+        _execution_type("ORDER_REJECTED"), order_id=811
+    )
+
+    outcome = _run(adapter.cancel_open_orders())
+
+    assert outcome.completed == 1
+    assert outcome.failed == ("811",)
+    assert outcome.complete is False
+
+
+def test_a_flatten_refused_with_a_rejected_execution_event_is_a_failure() -> None:
+    """A refused close keeps the position treated as open and alerts."""
+    adapter = _control_adapter(
+        positions=[_position(821, 1000), _position(822, 1000)]
+    )
+    adapter.exec_event[821] = _execution_event(
+        _execution_type("ORDER_REJECTED"), order_id=821
+    )
+
+    outcome = _run(adapter.close_all_positions())
+
+    assert outcome.completed == 1
+    assert outcome.failed == ("821",)
+    assert outcome.complete is False
+    assert sorted(int(r.positionId) for r in adapter.sent) == [821, 822]
+
+
+def test_a_flatten_refused_with_order_cancel_rejected_is_a_failure() -> None:
+    adapter = _control_adapter(positions=[_position(831, 1000)])
+    adapter.exec_event[831] = _execution_event(
+        _execution_type("ORDER_CANCEL_REJECTED"), order_id=831
+    )
+
+    outcome = _run(adapter.close_all_positions())
+
+    assert outcome.completed == 0
+    assert outcome.failed == ("831",)
+    assert outcome.complete is False
+
+
+def test_normal_execution_events_still_count_as_success() -> None:
+    """A classified non-rejection execution event changes nothing."""
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOAOrderType
+
+    adapter = _control_adapter(
+        orders=[_order(841, ProtoOAOrderType.LIMIT)],
+        positions=[_position(842, 1000)],
+    )
+    adapter.exec_event[841] = _execution_event(
+        _execution_type("ORDER_CANCELLED"), order_id=841
+    )
+    adapter.exec_event[842] = _execution_event(
+        _execution_type("ORDER_FILLED"), order_id=842
+    )
+
+    cancel_outcome = _run(adapter.cancel_open_orders())
+    flatten_outcome = _run(adapter.close_all_positions())
+
+    assert cancel_outcome.completed == 1 and cancel_outcome.complete is True
+    assert flatten_outcome.completed == 1 and flatten_outcome.complete is True
+
+
+def test_an_unclassifiable_execution_event_is_unknown_and_the_cancel_sweep_continues() -> None:
+    """An unreadable execution type is unknown per item, never done - and the
+    sweep still cancels the remaining orders: closing what can be closed is
+    the safety action, and the unknown item is retried on the next pass."""
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOAOrderType
+
+    adapter = _control_adapter(
+        orders=[
+            _order(851, ProtoOAOrderType.LIMIT),
+            _order(852, ProtoOAOrderType.LIMIT),
+        ]
+    )
+    adapter._ProtoOAExecutionType = None  # enum not loaded: unclassifiable
+    adapter.exec_event[851] = _execution_event(
+        _execution_type("ORDER_CANCELLED"), order_id=851
+    )
+
+    outcome = _run(adapter.cancel_open_orders())
+
+    assert outcome.completed == 1
+    assert outcome.unknown == ("851",)
+    assert outcome.failed == ()
+    assert outcome.complete is False
+    assert sorted(int(request.orderId) for request in adapter.sent) == [851, 852]
+
+
+def test_an_unclassifiable_execution_event_is_unknown_and_the_flatten_continues() -> None:
+    """Same rule on the flatten: the position after the unreadable answer is
+    still sent a close - a halted sweep must not strand open exposure."""
+    adapter = _control_adapter(positions=[_position(861, 1000), _position(862, 1000)])
+    adapter._ProtoOAExecutionType = None
+    adapter.exec_event[861] = _execution_event(
+        _execution_type("ORDER_FILLED"), order_id=861
+    )
+
+    outcome = _run(adapter.close_all_positions())
+
+    assert outcome.completed == 1
+    assert outcome.unknown == ("861",)
+    assert outcome.failed == ()
+    assert outcome.complete is False
+    assert sorted(int(r.positionId) for r in adapter.sent) == [861, 862]
+
+
+def test_an_unclassifiable_orphaned_protection_cancel_is_unknown_and_continues() -> None:
+    """The orphan sweep records the unreadable cancel as unknown and still
+    attempts the remaining protections."""
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOAOrderType
+
+    adapter = _control_adapter(
+        orders=[
+            _order(895, ProtoOAOrderType.STOP_LOSS_TAKE_PROFIT, position_id=999),
+            _order(896, ProtoOAOrderType.STOP_LOSS_TAKE_PROFIT, position_id=998),
+        ]
+    )
+    adapter._ProtoOAExecutionType = None
+    adapter.exec_event[895] = _execution_event(
+        _execution_type("ORDER_CANCELLED"), order_id=895
+    )
+
+    outcome = _run(adapter.cancel_orphaned_protections())
+
+    assert outcome.completed == 1
+    assert outcome.unknown == ("895",)
+    assert outcome.failed == ()
+    assert outcome.complete is False
+    assert sorted(int(request.orderId) for request in adapter.sent) == [895, 896]
+
+
+def test_an_execution_type_outside_the_enum_is_unclassifiable() -> None:
+    """A value the loaded enum does not know may be a future rejection type:
+    it lands in ``unknown`` - never done, never refused - and the sweep still
+    attempts the remaining orders."""
+    from types import SimpleNamespace
+
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOAOrderType
+
+    adapter = _control_adapter(
+        orders=[
+            _order(881, ProtoOAOrderType.LIMIT),
+            _order(882, ProtoOAOrderType.LIMIT),
+        ]
+    )
+    # Duck-typed event + enum: the class is unloaded so the attribute sniff
+    # applies, and 99 is not a member of the loaded enum.
+    adapter._ProtoOAExecutionEvent = None
+    adapter._ProtoOAExecutionType = SimpleNamespace(
+        ORDER_REJECTED=7, ORDER_CANCEL_REJECTED=8, ORDER_FILLED=3
+    )
+    adapter.exec_event[881] = SimpleNamespace(
+        ctidTraderAccountId=46736452, executionType=99, errorCode="FUTURE_TYPE"
+    )
+
+    outcome = _run(adapter.cancel_open_orders())
+
+    assert outcome.completed == 1
+    assert outcome.unknown == ("881",)
+    assert outcome.failed == ()
+    assert outcome.complete is False
+    assert sorted(int(request.orderId) for request in adapter.sent) == [881, 882]
+
+
+def test_a_generic_runtime_error_still_aborts_the_cancel_sweep() -> None:
+    """Only ``CTraderUnknownOutcomeError`` is per-item: any other RuntimeError
+    - including a terminal auth failure - still aborts the sweep."""
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOAOrderType
+
+    adapter = _control_adapter(
+        orders=[
+            _order(895, ProtoOAOrderType.LIMIT),
+            _order(896, ProtoOAOrderType.LIMIT),
+        ]
+    )
+
+    async def _unknown(order_id: int) -> None:
+        raise RuntimeError(f"outcome of cancelling {order_id} is unknown")
+
+    adapter._cancel_order_id = _unknown
+
+    with pytest.raises(RuntimeError, match="unknown"):
+        _run(adapter.cancel_open_orders())
+    # The second order was never attempted.
+    assert adapter.sent == []
+
+
+def test_a_generic_runtime_error_still_aborts_the_flatten() -> None:
+    """Same invariant on the flatten path: a non-outcome RuntimeError aborts."""
+    adapter = _control_adapter(positions=[_position(897, 1000)])
+
+    async def _send_unknown(request: Any, **_kwargs: Any) -> Any:
+        raise RuntimeError("close outcome is unknown")
+
+    adapter._send_request_with_refresh_retry = _send_unknown
+
+    with pytest.raises(RuntimeError, match="unknown"):
+        _run(adapter.close_all_positions())
+
+
+def test_a_generic_runtime_error_still_aborts_the_orphaned_protection_sweep() -> None:
+    """Only the dedicated unknown-outcome error continues; a plain
+    RuntimeError still propagates here too."""
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOAOrderType
+
+    adapter = _control_adapter(
+        orders=[_order(899, ProtoOAOrderType.STOP_LOSS_TAKE_PROFIT, position_id=999)]
+    )
+
+    async def _unknown(order_id: int) -> None:
+        raise RuntimeError("cancel outcome is unknown")
+
+    adapter._cancel_order_id = _unknown
+
+    with pytest.raises(RuntimeError, match="unknown"):
+        _run(adapter.cancel_orphaned_protections())
+
+
+def test_an_execution_event_with_a_zero_type_is_unclassifiable_not_an_error() -> None:
+    """`executionType=0` is not None: the event still reaches the classifier.
+
+    With the error-event class unloaded, an `errorCode` + `executionType=0`
+    response is an execution event with an unreadable type -> unknown
+    outcome, never the definite-refusal branch (which requires
+    executionType absent) and never counted done.
+    """
+    from types import SimpleNamespace
+
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOAOrderType
+
+    adapter = _control_adapter(
+        orders=[_order(893, ProtoOAOrderType.LIMIT)]
+    )
+    adapter._ProtoOAOrderErrorEvent = None
+    adapter._ProtoOAExecutionEvent = None
+    adapter._ProtoOAExecutionType = SimpleNamespace(
+        ORDER_REJECTED=7, ORDER_CANCEL_REJECTED=8, ORDER_FILLED=3
+    )
+    adapter.exec_event[893] = SimpleNamespace(
+        ctidTraderAccountId=46736452, executionType=0, errorCode="UNSET"
+    )
+
+    outcome = _run(adapter.cancel_open_orders())
+
+    assert outcome.completed == 0
+    assert outcome.unknown == ("893",)
+    assert outcome.failed == ()
+    assert outcome.complete is False
+
+
+def test_an_execution_type_alias_with_an_unknown_name_is_unclassifiable() -> None:
+    """A number shared by a known non-rejection and an unknown name fails closed.
+
+    The non-rejection side is a subset check: every name the value resolves
+    to must be a known non-rejection, so `{ORDER_FILLED, FUTURE_OUTCOME}`
+    is unclassifiable rather than a pass.
+    """
+    from types import SimpleNamespace
+
+    from live_runner.ctrader_adapter import CTraderLiveAdapter
+
+    adapter = CTraderLiveAdapter.__new__(CTraderLiveAdapter)
+    adapter._ProtoOAExecutionType = SimpleNamespace(
+        ORDER_FILLED=3, FUTURE_OUTCOME=3
+    )
+    event = SimpleNamespace(ctidTraderAccountId=46736452, executionType=3)
+
+    assert adapter._execution_event_rejection(event) == (None, True)
+
+
+def test_an_execution_type_unknown_to_this_build_is_unclassifiable_on_the_wire() -> None:
+    """A future enum member arrives in the unknown fields and reads as the
+    ORDER_ACCEPTED default: presence must decide, on every response path.
+
+    protobuf moves an enum value it cannot name into the message's unknown
+    fields, so ``HasField('executionType')`` is False and the typed attribute
+    reports 2 - a classified non-rejection. Reading the attribute alone would
+    pass a future rejection type as a success, the exact #439 failure, so an
+    absent-or-unknown ``executionType`` is unclassifiable on the classifier,
+    the control path and the submit path alike.
+    """
+    from ctrader_open_api.messages.OpenApiMessages_pb2 import ProtoOAExecutionEvent
+
+    from live_runner.ctrader_adapter import CTraderUnknownOutcomeError
+
+    adapter = _control_adapter()
+    # ctidTraderAccountId=1, executionType=99: a member this build cannot name.
+    event = ProtoOAExecutionEvent()
+    event.ParseFromString(b"\x10\x01\x18\x63")
+    assert event.HasField("executionType") is False
+    assert int(event.executionType) == _execution_type("ORDER_ACCEPTED")
+
+    assert adapter._execution_event_rejection(event) == (None, True)
+    with pytest.raises(CTraderUnknownOutcomeError, match="could not be classified"):
+        adapter._raise_for_refused_control_response(event)
+    with pytest.raises(RuntimeError, match="could not be classified"):
+        adapter._raise_for_refused_submit_response(event, object())
+
+
+def test_an_execution_event_without_an_account_id_still_classifies() -> None:
+    """`executionType` alone marks an execution event when the class is unloaded.
+
+    Requiring `ctidTraderAccountId` too would let a partially-populated event
+    bypass classification entirely and pass as a completed cancel.
+    """
+    from types import SimpleNamespace
+
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOAOrderType
+
+    adapter = _control_adapter(
+        orders=[_order(871, ProtoOAOrderType.LIMIT)]
+    )
+    adapter._ProtoOAExecutionEvent = None
+    adapter._ProtoOAExecutionType = SimpleNamespace(
+        ORDER_REJECTED=7, ORDER_CANCEL_REJECTED=8, ORDER_FILLED=3
+    )
+    adapter.exec_event[871] = SimpleNamespace(executionType=99)
+
+    outcome = _run(adapter.cancel_open_orders())
+
+    assert outcome.completed == 0
+    assert outcome.unknown == ("871",)
+    assert outcome.failed == ()
+    assert outcome.complete is False
+
+
+def test_an_empty_error_code_still_counts_as_a_refusal() -> None:
+    """`errorCode=""` is present, not absent: presence (`is not None`) decides."""
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOAOrderType
+
+    adapter = _control_adapter(
+        orders=[
+            _order(615, ProtoOAOrderType.LIMIT),
+            _order(616, ProtoOAOrderType.LIMIT),
+        ]
+    )
+    adapter._ProtoOAOrderErrorEvent = None
+    adapter.exec_event[615] = SimpleNamespace(errorCode="")
+
+    outcome = _run(adapter.cancel_open_orders())
+
+    assert outcome.completed == 1
+    assert outcome.failed == ("615",)
+    assert outcome.complete is False
+
+
+def test_an_unclassifiable_execution_event_is_not_misread_as_an_order_error() -> None:
+    """`errorCode` + `description` + `executionType` is an execution event.
+
+    Even with `_ProtoOAOrderErrorEvent` unloaded, a response exposing
+    `executionType` must reach the execution classifier: an unreadable type
+    is an unknown outcome (the `unknown` bucket), never a definite refusal.
+    """
+    from types import SimpleNamespace
+
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOAOrderType
+
+    adapter = _control_adapter(
+        orders=[_order(891, ProtoOAOrderType.LIMIT)]
+    )
+    adapter._ProtoOAOrderErrorEvent = None
+    adapter._ProtoOAExecutionEvent = None  # partial proto load: attr sniff
+    adapter._ProtoOAExecutionType = SimpleNamespace(
+        ORDER_REJECTED=7, ORDER_CANCEL_REJECTED=8, ORDER_FILLED=3
+    )
+    adapter.exec_event[891] = SimpleNamespace(
+        ctidTraderAccountId=46736452,
+        executionType=99,
+        errorCode="FUTURE_TYPE",
+        description="also carries a description",
+    )
+
+    outcome = _run(adapter.cancel_open_orders())
+
+    assert outcome.completed == 0
+    assert outcome.unknown == ("891",)
+    assert outcome.failed == ()
+    assert outcome.complete is False
+
+
+def test_an_orphaned_protection_cancel_rejected_is_a_failure() -> None:
+    """The same refusal check covers every `_cancel_order_id` caller."""
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOAOrderType
+
+    adapter = _control_adapter(
+        orders=[_order(871, ProtoOAOrderType.STOP_LOSS_TAKE_PROFIT, position_id=999)],
+    )
+    adapter.exec_event[871] = _execution_event(
+        _execution_type("ORDER_CANCEL_REJECTED"), order_id=871
+    )
+
+    outcome = _run(adapter.cancel_orphaned_protections())
+
+    assert outcome.completed == 0
+    assert outcome.failed == ("871",)
     assert outcome.complete is False
 
 
@@ -1537,6 +2083,13 @@ def test_describe_reports_a_clean_sweep_differently_from_a_partial_one() -> None
     failed_only = ControlOutcome(completed=0, failed=("42",))
     assert failed_only.complete is False
     assert "nothing outstanding" not in failed_only.describe()
+
+    unknown_only = ControlOutcome(completed=0, unknown=("77",))
+    assert unknown_only.complete is False
+    description = unknown_only.describe()
+    assert "nothing outstanding" not in description, description
+    assert "unknown" in description, description
+    assert "77" in description, description
 
 
 # ─── #121 review: what an exit needs to know before it is sized ──────────────

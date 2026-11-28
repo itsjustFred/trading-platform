@@ -6105,7 +6105,7 @@ def test_ctrader_close_all_sends_full_unfloored_position_volume() -> None:
     adapter._ProtoOAClosePositionReq = _Req
     adapter.ctid_trader_account_id = 1
     adapter._send_request_with_refresh_retry = _send
-    adapter._raise_if_order_error_event = lambda _r: None
+    adapter._raise_for_refused_control_response = lambda _r: None
 
     asyncio.run(adapter.close_all_positions())
 

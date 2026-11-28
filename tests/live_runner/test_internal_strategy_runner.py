@@ -2190,6 +2190,48 @@ def test_strategy_exit_survives_a_failed_entry_cancel(
     assert (str(deployment.id), "entry_cancel:AAPL") in runner._reported
 
 
+def test_strategy_exit_reports_an_unknown_entry_cancel_outcome(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An unclassifiable cancel answer is ``unknown``, not done: the warning
+    must name it alongside unidentified/failed so a possibly-working entry
+    order is never silently left resting past the exit."""
+    import logging
+
+    import live_runner.internal_strategy_runner as runner_mod
+    from live_runner.base_adapter import ControlOutcome
+
+    class _UnknownCancelAdapter(FakeAdapter):
+        async def cancel_orders(self, order_refs, *, symbol):
+            return ControlOutcome(completed=1, unknown=("sig-open",))
+
+    monkeypatch.setattr(
+        runner_mod,
+        "list_live_deployment_unfilled_entry_order_refs",
+        lambda deployment_id, symbol=None: {"sig-open", "bo-open"},
+    )
+    path = _strategy_file(tmp_path, META)
+    sent, submit = _collect()
+    runner = _runner(submit, path=path, module=_module_with(_exit_only_strategy))
+    deployment = _deployment()
+
+    with caplog.at_level(logging.WARNING):
+        asyncio.run(
+            runner.run_once(
+                [deployment],
+                {"acct-1": _UnknownCancelAdapter()},
+                now=BASE + timedelta(seconds=70),
+            )
+        )
+
+    assert len(sent) == 1
+    assert any(
+        "uncancelled" in record.getMessage() and "sig-open" in str(record.data)
+        for record in caplog.records
+        if hasattr(record, "data")
+    )
+
+
 def test_strategy_exit_with_no_working_entries_skips_cancel(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

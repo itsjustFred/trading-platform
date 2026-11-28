@@ -86,12 +86,18 @@ def _wire_send(adapter: CTraderLiveAdapter, state: dict) -> None:
 def _wire_amend_types(adapter: CTraderLiveAdapter) -> None:
     from ctrader_open_api.messages.OpenApiMessages_pb2 import (
         ProtoOAAmendPositionSLTPReq,
+        ProtoOAExecutionEvent,
         ProtoOAOrderErrorEvent,
     )
-    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOATradeSide
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import (
+        ProtoOAExecutionType,
+        ProtoOATradeSide,
+    )
 
     adapter._ProtoOAAmendPositionSLTPReq = ProtoOAAmendPositionSLTPReq
     adapter._ProtoOAOrderErrorEvent = ProtoOAOrderErrorEvent
+    adapter._ProtoOAExecutionEvent = ProtoOAExecutionEvent
+    adapter._ProtoOAExecutionType = ProtoOAExecutionType
     adapter._ProtoOATradeSide = ProtoOATradeSide
 
 
@@ -303,6 +309,116 @@ def test_amend_order_error_event_is_a_refusal() -> None:
     amendment = adapter.amend_protective_stop(stop, 1.08500)
     with pytest.raises(CTraderApiError, match="TRADING_BAD_STOPS"):
         asyncio.run(amendment)
+
+
+def _amend_execution_event(execution_type: int):
+    """A real `ProtoOAExecutionEvent` correlated to the amend request."""
+    from ctrader_open_api.messages.OpenApiMessages_pb2 import ProtoOAExecutionEvent
+
+    return ProtoOAExecutionEvent(
+        ctidTraderAccountId=46736452,
+        executionType=execution_type,
+        errorCode="TRADING_BAD_STOPS",
+    )
+
+
+def _execution_type(name: str) -> int:
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOAExecutionType
+
+    return int(getattr(ProtoOAExecutionType, name))
+
+
+def test_amend_rejected_execution_event_is_a_refusal() -> None:
+    """#439: a rejected amend must fail, never read as applied.
+
+    The proto has no amend-specific rejection type, so a refused
+    ``ProtoOAAmendPositionSLTPReq`` surfaces as ORDER_REJECTED or
+    ORDER_CANCEL_REJECTED; either is a definite refusal - the broker changed
+    nothing and the previous stop stays in force.
+    """
+    for rejection in ("ORDER_REJECTED", "ORDER_CANCEL_REJECTED"):
+        adapter = _adapter()
+        position = _position(stop_loss=1.08000)
+        state = _amend_state(adapter, [position])
+
+        def _reject(_request, _rejection=rejection):
+            return _amend_execution_event(_execution_type(_rejection))
+
+        state["on_send"] = _reject
+        stop = ProtectiveStop(
+            order_id="7", symbol="EURUSD", side="sell", stop_price=1.08000
+        )
+
+        amendment = adapter.amend_protective_stop(stop, 1.08500)
+        with pytest.raises(CTraderApiError, match="TRADING_BAD_STOPS"):
+            asyncio.run(amendment)
+        # The broker snapshot never changed: the previous stop stays in force.
+        assert position.stopLoss == pytest.approx(1.08000)
+
+
+def test_amend_unclassifiable_execution_event_fails_closed(monkeypatch) -> None:
+    """An execution event whose type cannot be read is unknown, not applied.
+
+    Conservative for the amend path: the send error goes to broker-state
+    confirmation, which cannot see the requested stop and raises - the old
+    SL/TP stays recorded.
+    """
+    import live_runner.ctrader_adapter as ctrader_adapter
+
+    monkeypatch.setattr(ctrader_adapter, "_AMEND_CONFIRM_INTERVAL_SECONDS", 0.001)
+    adapter = _adapter()
+    position = _position(stop_loss=1.08000)
+    state = _amend_state(adapter, [position])
+    adapter._ProtoOAExecutionType = None  # enum not loaded: unclassifiable
+
+    def _unreadable(_request):
+        return _amend_execution_event(_execution_type("ORDER_FILLED"))
+
+    state["on_send"] = _unreadable
+    stop = ProtectiveStop(
+        order_id="7", symbol="EURUSD", side="sell", stop_price=1.08000
+    )
+
+    amendment = adapter.amend_protective_stop(stop, 1.08500)
+    with pytest.raises(RuntimeError, match="did not confirm"):
+        asyncio.run(amendment)
+    assert position.stopLoss == pytest.approx(1.08000)
+
+
+def test_amend_non_rejection_execution_event_still_confirms() -> None:
+    """A normal execution event (e.g. ORDER_REPLACED) is not a refusal."""
+    adapter = _adapter()
+    position = _position(stop_loss=1.08000)
+    state = _amend_state(adapter, [position])
+
+    def _applied(_request):
+        position.stopLoss = 1.08500
+        return _amend_execution_event(_execution_type("ORDER_REPLACED"))
+
+    state["on_send"] = _applied
+    stop = ProtectiveStop(
+        order_id="7", symbol="EURUSD", side="sell", stop_price=1.08000
+    )
+
+    result = asyncio.run(adapter.amend_protective_stop(stop, 1.08500))
+    assert result.stop_price == pytest.approx(1.08500)
+
+
+def test_amend_position_tp_rejected_execution_event_is_a_refusal() -> None:
+    """The TP amend shares `_send_amend_position_request`: same refusal rule."""
+    adapter = _adapter()
+    position = _position(stop_loss=1.08000, take_profit=None)
+    state = _amend_state(adapter, [position])
+
+    def _reject(_request):
+        return _amend_execution_event(_execution_type("ORDER_REJECTED"))
+
+    state["on_send"] = _reject
+
+    amendment = adapter.amend_position_take_profit(7, 1.10000)
+    with pytest.raises(CTraderApiError, match="TRADING_BAD_STOPS"):
+        asyncio.run(amendment)
+    assert position.stopLoss == pytest.approx(1.08000)
 
 
 def test_amend_timeout_with_confirmed_state_still_succeeds() -> None:

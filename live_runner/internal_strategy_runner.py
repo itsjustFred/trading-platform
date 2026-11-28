@@ -817,7 +817,7 @@ class InternalStrategyRunner:
                 level="warning",
             )
             return
-        if outcome.unidentified or outcome.failed:
+        if outcome.unidentified or outcome.failed or outcome.unknown:
             logger.warning(
                 "Internal strategy exit left working entry orders uncancelled",
                 extra={
@@ -826,6 +826,7 @@ class InternalStrategyRunner:
                         "symbol": symbol,
                         "unidentified": list(outcome.unidentified),
                         "failed": list(outcome.failed),
+                        "unknown": list(outcome.unknown),
                     }
                 },
             )

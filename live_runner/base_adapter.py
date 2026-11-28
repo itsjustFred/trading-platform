@@ -355,6 +355,12 @@ class ControlOutcome:
                       incomplete (the cancel was accepted), but such an order may still
                       fill in a cancel/fill race, so a STOPPED deployment must not be
                       stamped enforced while any remain. Empty for brokers with no such state.
+    ``unknown``       items whose outcome could not be classified - the request may or
+                      may not have landed (e.g. a response whose type this client cannot
+                      name). Its own bucket, deliberately not ``failed``: the broker did
+                      not refuse anything, it answered in a way that cannot be read. The
+                      item is retried like a failure but an operator can tell "the broker
+                      said no" from "we do not know".
 
     ``complete`` is the contract: a caller may only treat the account as stopped/flat when the
     sweep was complete. A partial sweep must be retried or escalated, never recorded as enforced.
@@ -366,11 +372,12 @@ class ControlOutcome:
     unidentified: tuple[str, ...] = ()
     failed: tuple[str, ...] = ()
     pending_cancel: tuple[str, ...] = ()
+    unknown: tuple[str, ...] = ()
 
     @property
     def complete(self) -> bool:
         """Whether every item the adapter could see was acted on successfully."""
-        return not self.unidentified and not self.failed
+        return not self.unidentified and not self.failed and not self.unknown
 
     def describe(self) -> str:
         """A one-line summary for logs and operator messages."""
@@ -378,7 +385,8 @@ class ControlOutcome:
             return f"{self.completed} completed, nothing outstanding"
         return (
             f"{self.completed} completed, {len(self.unidentified)} unidentifiable "
-            f"{sorted(self.unidentified)}, {len(self.failed)} refused {sorted(self.failed)}"
+            f"{sorted(self.unidentified)}, {len(self.failed)} refused {sorted(self.failed)}, "
+            f"{len(self.unknown)} unknown {sorted(self.unknown)}"
         )
 
 
