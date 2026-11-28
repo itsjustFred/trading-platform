@@ -5,8 +5,11 @@ Ported from the out-of-repo ``fetch_bi5.py``. Layout::
     <raw_dir>/<SYM>/<SIDE>/<YYYY>/<MM>/<DD>.bi5   (MM 1-based)
 
 A 0-byte file means Dukascopy returned an empty body / 404 (no data that
-day). The cache is resumable: existing files are skipped, so a rerun after an
-interruption only fetches what is missing.
+day). The cache is *not* final within the fetch window: every day in
+``[start, end)`` is re-downloaded on each run, so a day that was empty or
+partially published earlier is overwritten with whatever Dukascopy serves
+now. Empty responses get one confirmation retry before being cached, so a
+transient empty body is not mistaken for a closed market.
 """
 
 from __future__ import annotations
@@ -17,8 +20,11 @@ import os
 from datetime import date, timedelta
 from pathlib import Path
 
-URL = "http://datafeed.dukascopy.com/datafeed/{sym}/{y}/{m0:02d}/{d:02d}/{side}_candles_min_1.bi5"
+URL = "https://datafeed.dukascopy.com/datafeed/{sym}/{y}/{m0:02d}/{d:02d}/{side}_candles_min_1.bi5"
 SIDES = ("BID", "ASK")
+
+#: Seconds to wait before the single confirmation retry of an empty response.
+EMPTY_CONFIRM_DELAY = 3.0
 
 
 def _day_path(raw: Path, sym: str, side: str, day: date) -> Path:
@@ -26,17 +32,22 @@ def _day_path(raw: Path, sym: str, side: str, day: date) -> Path:
 
 
 def jobs(raw: Path, start: date, end: date, syms: list[str]):
-    """Yield ``(url, out_path)`` for every missing ``sym/side/day`` file."""
+    """Yield ``(url, out_path)`` for every ``sym/side/day`` in ``[start, end)``.
+
+    Every file in the window is refetched: the window is bounded by the
+    caller (the last published day onward, or the explicit ``--start`` /
+    ``--full`` range), so re-downloading it is cheap and guarantees late-
+    published bars and recovered empty days are picked up.
+    """
     for sym in syms:
         for side in SIDES:
             day = start
             while day < end:
                 out = _day_path(raw, sym, side, day)
-                if not out.exists():
-                    yield (
-                        URL.format(sym=sym, y=day.year, m0=day.month - 1, d=day.day, side=side),
-                        out,
-                    )
+                yield (
+                    URL.format(sym=sym, y=day.year, m0=day.month - 1, d=day.day, side=side),
+                    out,
+                )
                 day += timedelta(days=1)
 
 
@@ -52,30 +63,47 @@ class FetchStats:
         return self.ok + self.empty
 
 
+async def _get_body(session, url: str) -> bytes:
+    """GET ``url``; returns the raw body (b"" for 404/empty), validating lzma."""
+    async with session.get(url, timeout=_client_timeout()) as r:
+        body = await r.read()
+        if r.status == 404:
+            return b""
+        if r.status != 200:
+            raise RuntimeError(f"HTTP {r.status}")
+        if not body:
+            return b""
+        if body.lstrip()[:1] == b"<":
+            raise RuntimeError("HTML body")
+        lzma.decompress(body)  # validate
+        return body
+
+
+def _store_body(body: bytes, out: Path, st: FetchStats) -> None:
+    out.parent.mkdir(parents=True, exist_ok=True)
+    tmp = out.with_suffix(".tmp")
+    tmp.write_bytes(body)
+    os.replace(tmp, out)
+    if body:
+        st.ok += 1
+    else:
+        st.empty += 1
+
+
 async def _fetch_one(session, url: str, out: Path, st: FetchStats) -> None:
     delay = 2.0
     for attempt in range(12):
         try:
-            async with session.get(url, timeout=_client_timeout()) as r:
-                body = await r.read()
-                if r.status == 404:
-                    body = b""
-                elif r.status != 200:
-                    raise RuntimeError(f"HTTP {r.status}")
-                elif body:
-                    if body.lstrip()[:1] == b"<":
-                        raise RuntimeError("HTML body")
-                    lzma.decompress(body)  # validate
-            out.parent.mkdir(parents=True, exist_ok=True)
-            tmp = out.with_suffix(".tmp")
-            tmp.write_bytes(body)
-            os.replace(tmp, out)
-            if body:
-                st.ok += 1
-            else:
-                st.empty += 1
+            body = await _get_body(session, url)
+            if not body:
+                # An empty body may be a closed market *or* a transient miss:
+                # confirm once before caching the day as empty.
+                await asyncio.sleep(EMPTY_CONFIRM_DELAY)
+                body = await _get_body(session, url)
+            _store_body(body, out, st)
             return
-        except Exception:  # noqa: BLE001 - retry everything, give up loudly
+        except Exception:
+            # Retry everything, give up loudly via st.failed.
             st.retries += 1
             if attempt >= 11:
                 st.failed.append(url)
@@ -122,10 +150,12 @@ def fetch_bi5_range(
     *,
     concurrency: int = 8,
 ) -> FetchStats:
-    """Fetch every missing daily ``{BID,ASK}_candles_min_1.bi5`` for the range.
+    """Fetch every daily ``{BID,ASK}_candles_min_1.bi5`` for the range.
 
-    ``end`` is exclusive. Returns stats; ``st.failed`` lists URLs that never
-    succeeded — callers must treat a non-empty list as an incomplete fetch.
+    ``end`` is exclusive. Every file in the window is (re)downloaded — the
+    cache is a scratch area, not a record of what was once true. Returns
+    stats; ``st.failed`` lists URLs that never succeeded — callers must
+    treat a non-empty list as an incomplete fetch.
     """
     todo = list(jobs(raw_dir, start, end, symbols))
     st = FetchStats()

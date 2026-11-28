@@ -314,28 +314,40 @@ mirrored to the `tp-ohlcv` R2 bucket:
 <root>/<SYM>/<SYM>_<TF>.parquet     TF in M1 M5 M15 H1 H4 D1 W1
 ```
 
-Each symbol entry in `manifest.json` records `dukascopy_symbol`,
-`decimal_factor`, per-file `rows`/`first`/`last`, and `missing_days_bid` /
+Each symbol entry in `manifest.json` records `asset_class`, `region`,
+`source_symbol`, `dukascopy_symbol`, `decimal_factor`, per-file
+`rows`/`first`/`last` under `files`, and `missing_days_bid` /
 `missing_days_ask`.
 
 ### Layout
 
 - `data_tools/dukascopy/fetch.py` — daily `m1` `.bi5` candle download
-  (`BID`/`ASK`) into `<raw_dir>/<SYM>/<SIDE>/<YYYY>/<MM>/<DD>.bi5`; resumable,
-  404/empty body stored as a 0-byte file.
+  (`BID`/`ASK`) into `<raw_dir>/<SYM>/<SIDE>/<YYYY>/<MM>/<DD>.bi5` over HTTPS;
+  every day in the fetch window is re-requested (the raw cache is scratch,
+  not final), and an empty body is only cached after a confirmation retry.
 - `data_tools/dukascopy/convert.py` — bi5 decode, flat-minute dropping,
   M1 → higher-timeframe resampling (W1 bins run Sunday 00:00 UTC → Sunday,
   left-labelled), and the outer bid/ask join into `bid_*`/`ask_*` columns.
 - `data_tools/dukascopy/validate.py` — dataset contract enforced before
   anything is published: UTC `timestamp`, strictly increasing unique bars,
-  no NaN, `ask >= bid`, and `low <= open, close <= high` on both sides.
+  no NaN in a fully-required column, `ask >= bid`, and
+  `low <= open, close <= high` on both sides. Minutes where exactly one side
+  traded (NaN on the other) are counted per symbol and reported, not failed.
+- `data_tools/dukascopy/calendar.py` — empirical market-closed calendar used
+  by gap validation: days inside the fetch window with no bars on either
+  side (or only one side) fail the run unless the market is closed
+  (weekend, holiday recurrence, year-end, …).
 - `data_tools/dukascopy/pipeline.py` — `update_dataset()`: reads `last` from
   the manifest, fetches through the last complete UTC day, appends M1 without
   seam duplicates, re-resamples higher timeframes from the first affected
   bin, validates, then publishes staged files atomically with `manifest.json`
-  written last. `--full` rebuilds from 2015-01-01.
-- `data_tools/dukascopy/upload.py` — SigV4-signed S3 client for R2; uploads
-  changed files first and `manifest.json` last, HEAD-verifying sizes.
+  written last. Leftover `*.tmp` publish files and manifest/file drift are
+  detected and repaired or fail loudly. `--full` rebuilds every symbol from
+  2015-01-01, bypassing the stored M1 and raw cache.
+- `data_tools/dukascopy/upload.py` — SigV4-signed S3 client for R2;
+  manifest-driven and idempotent: every listed object is HEAD-compared by
+  size, missing/drifted objects are PUT and re-verified, and
+  `manifest.json` is always uploaded last.
 
 ### CLI and scheduling
 
@@ -344,12 +356,20 @@ python -m data_tools.dukascopy update --root /path/to/dukascopy [--upload]
 ```
 
 `--symbols`, `--full`, `--start`, `--end`, `--raw-dir`, `--concurrency` are
-also supported. The weekly scheduler job `dukascopy_update`
-(`scheduler/jobs/dukascopy_update.py`) runs the same pipeline; configure it
-with a `dukascopy` section (`root`, optional `symbols`, `upload`, `raw_dir`).
+also supported; `python -m data_tools.dukascopy download …` forwards to the
+native downloader unchanged. The pipeline is intentionally **not** a
+scheduler job — it is run standalone (weekly, Sunday night UTC) so its
+multi-GB peak memory never lands in the live-trading daemon:
+
+```cron
+# /etc/cron.d/dukascopy — weekly Sunday 22:00 UTC
+0 22 * * 0  deploy  cd /opt/trading-platform && .venv/bin/python -m data_tools.dukascopy update --root /mnt/block-volume-data/dukascopy --upload >> /var/log/dukascopy-update.log 2>&1
+```
+
 Failures and incomplete fetches emit `data.alert` records that reach the
 Discord ops webhook (`OPS_ALERT_WEBHOOK_URL`) when the alert sink is
-installed.
+installed; `.env` is loaded via `shared.constants` before the sink is
+configured.
 
 ### R2 upload environment
 

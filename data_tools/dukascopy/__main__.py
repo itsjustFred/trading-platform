@@ -47,6 +47,8 @@ def _emit_alert(message: str, **extra) -> None:
 
 
 def cmd_update(args: argparse.Namespace) -> int:
+    # Load .env the way the platform does before reading alert/upload config.
+    import shared.constants  # noqa: F401
     from data_tools.dukascopy import pipeline, upload
 
     _alert_sink()
@@ -74,7 +76,7 @@ def cmd_update(args: argparse.Namespace) -> int:
             print(f"MANIFEST_INCONSISTENT: {problems[:5]}", file=sys.stderr)
             return 1
         if args.upload:
-            uploaded = upload.upload_dataset(args.root, report.published)
+            uploaded = upload.upload_dataset(args.root)
             print(f"uploaded {len(uploaded)} objects to R2")
         for s in report.symbols:
             print(f"{s.symbol}: {s.status} (+{s.new_m1_rows} M1 rows)")
@@ -110,23 +112,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="Mirror changed files to R2 after publish",
     )
     up.set_defaults(func=cmd_update)
-
-    dl = sub.add_parser("download", help="On-demand downloader (viewer/auto-download path)")
-    dl.add_argument("args", nargs=argparse.REMAINDER)
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(message)s")
     parser = build_parser()
-    args = parser.parse_args(argv)
-    if args.command == "download":
-        # Reuse the native downloader CLI unchanged.
-        sys.argv = ["dukascopy-native", *args.args]
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] == "download":
+        # Reuse the native downloader CLI unchanged; its options are not
+        # declared here, so dispatch before argparse sees them.
+        sys.argv = ["dukascopy-native", *argv[1:]]
         from data_tools.dukascopy import native
 
         native.main()
         return 0
+    args = parser.parse_args(argv)
     return args.func(args)
 
 

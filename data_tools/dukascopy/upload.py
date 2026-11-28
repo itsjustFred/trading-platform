@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 import logging
 import os
 from datetime import datetime, timezone
@@ -157,43 +158,52 @@ class R2Client:
         return int(length) if length is not None else None
 
 
-def ordered_upload_paths(published: list[str]) -> tuple[list[str], str | None]:
-    """Split published rel-paths into (data files, manifest name or None).
+def dataset_upload_plan(root: str | Path) -> tuple[list[str], str]:
+    """``(data keys, manifest key)`` the remote mirror should hold.
 
-    ``manifest.json`` is always uploaded last regardless of input order.
+    Derived from ``manifest.json`` — every file it lists plus the manifest
+    itself — so a rerun after a partial upload re-sends whatever is missing
+    or size-drifted instead of trusting a publish list that only covers the
+    latest run.
     """
-    data = [p for p in published if p != MANIFEST_NAME]
-    manifest = MANIFEST_NAME if MANIFEST_NAME in published else None
-    return data, manifest
+    root = Path(root)
+    manifest = json.loads((root / MANIFEST_NAME).read_text())
+    data: list[str] = []
+    for symbol, entry in manifest.items():
+        if not isinstance(entry, dict):
+            continue
+        data.extend(f"{symbol}/{fname}" for fname in (entry.get("files") or {}))
+    return sorted(data), MANIFEST_NAME
 
 
 def upload_dataset(
     root: str | Path,
-    published: list[str],
     *,
     client: R2Client | None = None,
     env: dict[str, str] | None = None,
     log: Callable[[str], None] = logger.info,
 ) -> list[str]:
-    """Upload ``published`` files (paths relative to ``root``) to R2.
+    """Mirror the dataset to R2, decided from local vs remote state.
 
-    Data files go first, ``manifest.json`` last; every object is HEAD-verified
-    against the local size. Returns the list of uploaded keys. Raises on the
-    first failure — callers must treat that as an incomplete mirror.
+    Every file listed in ``manifest.json`` is HEAD-checked against the remote
+    object size; missing or size-drifted objects are PUT and re-verified.
+    ``manifest.json`` is always uploaded last, after every data file it lists
+    is confirmed present — a reader never sees a manifest pointing at objects
+    that are not there. Safe to re-run: matching objects are skipped.
+    Returns the list of uploaded keys. Raises on the first failure.
     """
     root = Path(root)
     if client is None:
         client = R2Client(r2_config_from_env(env))
 
-    data_files, manifest = ordered_upload_paths(published)
-    ordered = list(data_files)
-    if manifest:
-        ordered.append(manifest)
-
+    data_files, manifest_key = dataset_upload_plan(root)
     uploaded: list[str] = []
-    for rel in ordered:
+    for rel in data_files:
         local = root / rel
         size = local.stat().st_size
+        if client.head_size(rel) == size:
+            log(f"unchanged {rel} ({size} bytes)")
+            continue
         client.put_file(local, rel)
         remote_size = client.head_size(rel)
         if remote_size != size:
@@ -202,4 +212,15 @@ def upload_dataset(
             )
         uploaded.append(rel)
         log(f"uploaded {rel} ({size} bytes)")
+
+    manifest_local = root / manifest_key
+    client.put_file(manifest_local, manifest_key)
+    remote_size = client.head_size(manifest_key)
+    if remote_size != manifest_local.stat().st_size:
+        raise RuntimeError(
+            f"R2 size mismatch for {manifest_key}: "
+            f"local {manifest_local.stat().st_size} != remote {remote_size}"
+        )
+    uploaded.append(manifest_key)
+    log(f"uploaded {manifest_key}")
     return uploaded

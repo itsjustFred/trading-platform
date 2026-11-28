@@ -158,9 +158,13 @@ def combine_sides(bid: pd.DataFrame, ask: pd.DataFrame) -> pd.DataFrame:
     """Outer-join per-side frames into the published two-sided column layout."""
     for df in (bid, ask):
         df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
-    joined = bid.set_index("timestamp").join(
-        ask.set_index("timestamp"), how="outer", lsuffix="_bid", rsuffix="_ask"
-    )
+    joined = bid.merge(
+        ask,
+        on="timestamp",
+        how="outer",
+        validate="one_to_one",
+        suffixes=("_bid", "_ask"),
+    ).sort_values("timestamp")
     rename = {f"{c}_{side}": f"{side}_{c}" for side in ("bid", "ask") for c in OHLCV}
     joined = joined.rename(columns=rename).sort_index()
     return joined.reset_index()[M1_COLUMNS]
