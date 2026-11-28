@@ -49,6 +49,7 @@ from runner.engines.vectorbt_adapter import (
     _frozen_signal_exit_fill as _vbt_frozen_fill,
 )
 from shared.models import Trade, TradeExit
+from tests.builders import make_backtest_config
 
 # --------------------------------------------------------------------------- #
 # shared primitives
@@ -93,7 +94,7 @@ class TestContractPrimitives:
             )
 
     def test_signal_exit_fill_default_is_next_open(self):
-        assert BacktestConfig(
+        assert make_backtest_config(
             strategy_name="x",
             symbols=["X"],
             timeframe="1h",
@@ -101,7 +102,7 @@ class TestContractPrimitives:
             end_date="2024-01-02",
         ).signal_exit_fill == "next_open"
         for legacy in ("close", "Next_Open"):
-            assert BacktestConfig(
+            assert make_backtest_config(
                 strategy_name="x",
                 symbols=["X"],
                 timeframe="1h",
@@ -178,7 +179,7 @@ def _native(
         "parameters": {"fees": "zero", "slippage": "none", **(parameters or {})},
     }
     payload.update(config_kwargs)
-    return TradeEngine(BacktestConfig(**payload), symbol="T").run(frame, strategy_fn)
+    return TradeEngine(make_backtest_config(**payload), symbol="T").run(frame, strategy_fn)
 
 
 class TestNativeGapThroughProtectiveLevels:
@@ -370,7 +371,7 @@ class TestNativeSignalExitNextOpen:
             exits.iloc[3] = True
             return entries, exits, {"direction": pd.Series("LONG", index=df.index)}, []
 
-        cfg = BacktestConfig(
+        cfg = make_backtest_config(
             strategy_name="reverse",
             symbols=["T"],
             timeframe="1h",
@@ -727,7 +728,7 @@ class TestPyneCoreContainment:
 
 class TestFrozenEnginesRefuseNextOpen:
     def _config(self, fill: str) -> BacktestConfig:
-        return BacktestConfig(
+        return make_backtest_config(
             strategy_name="frozen",
             symbols=["T"],
             timeframe="1h",

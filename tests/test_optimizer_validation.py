@@ -12,7 +12,6 @@ Covers:
 
 from __future__ import annotations
 
-import re
 from pathlib import Path
 
 import optuna
@@ -918,7 +917,7 @@ def test_reported_split_geometry_matches_the_applied_split():
     assert last_fold_end <= pd.Timestamp(split.validation["end"])
 
 
-def test_run_optimization_forwards_the_configured_embargo():
+def test_run_optimization_forwards_the_configured_embargo(monkeypatch, tmp_path: Path):
     """Wiring guard: `run_optimization` must forward `config.embargo_pct`.
 
     Testing `_split_backtest_period` alone does not cover this: the bug it
@@ -926,15 +925,39 @@ def test_run_optimization_forwards_the_configured_embargo():
     caller never passed the configured value, so the optimizer ran contiguous
     windows and the diagnostics described a gap that did not exist.
     """
-    import inspect
-
-    source = inspect.getsource(optimizer_module.run_optimization)
-    call = re.search(r"_split_backtest_period\((.*?)\)\s*\n", source, re.S)
-    assert call is not None, "run_optimization no longer calls _split_backtest_period"
-    assert "embargo_pct" in call.group(1), (
-        "run_optimization must pass embargo_pct into _split_backtest_period; "
-        "without it the embargo is never applied to the windows that run"
+    from tests.test_optimizer_three_way import (
+        _config as _three_way_config,
     )
+    from tests.test_optimizer_three_way import (
+        _patch_environment as _patch_three_way_environment,
+    )
+
+    config = _three_way_config(embargo_pct=0.05)
+    environment = _patch_three_way_environment(
+        monkeypatch,
+        tmp_path,
+        config=config,
+        metrics={
+            "train": {1: 2.0, 2: 1.0},
+            "validation": {1: 1.0, 2: 2.0},
+            "test": {1: 3.0, 2: 0.5},
+        },
+    )
+    calls = environment["calls"]
+    split = environment["split"]
+
+    run_optimization(config)
+
+    # The patched runner only accepts the embargoed three-way windows, so a
+    # dropped embargo_pct makes every backtest call raise before this point.
+    assert calls, "no backtest ran"
+    for earlier_end, later_start in (
+        (split.train["end"], split.validation["start"]),
+        (split.validation["end"], split.test["start"]),
+    ):
+        assert pd.Timestamp(later_start) - pd.Timestamp(earlier_end) > pd.Timedelta(0), (
+            "the configured embargo must produce a real gap between segments"
+        )
 
 # ─── Legacy signal_exit_fill default (review of #208) ───────────────────────
 

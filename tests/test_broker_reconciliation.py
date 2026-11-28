@@ -27,7 +27,8 @@ from shared.database import (
     set_live_deployment_entries_halt,
     update_live_deployment_status,
 )
-from shared.models import LiveDeploymentConfig, LiveExecution, LiveSignal
+from shared.models import LiveDeploymentConfig, LiveExecution
+from tests.builders import make_live_deployment, make_live_signal
 from tests.conftest import seed_live_deployments
 
 ACCOUNT_ID = "acct-recon"
@@ -79,7 +80,7 @@ class FakeAdapter:
 def _deployment(
     *, status: str = "ACTIVE", settings: dict | None = None, deployment_id: str = DEPLOYMENT_ID
 ) -> LiveDeploymentConfig:
-    return LiveDeploymentConfig(
+    return make_live_deployment(
         id=UUID(deployment_id),
         strategy_name="recon-strategy",
         account_id=ACCOUNT_ID,
@@ -126,7 +127,7 @@ def test_clean_account_reconciles_and_writes_report(isolated_db, tmp_path) -> No
     database, _engine, _data_dir = isolated_db
     _seed_db(database)
     signal_id, _ = save_live_signal(
-        LiveSignal(
+        make_live_signal(
             id=uuid4(),
             deployment_id=DEPLOYMENT_ID,
             symbol="AAPL",
@@ -164,7 +165,7 @@ def test_position_mismatch_halts_entries_only_after_two_consecutive_passes(
     database, _engine, _data_dir = isolated_db
     _seed_db(database)
     signal_id, _ = save_live_signal(
-        LiveSignal(
+        make_live_signal(
             id=uuid4(),
             deployment_id=DEPLOYMENT_ID,
             symbol="AAPL",
@@ -212,7 +213,7 @@ def test_clean_pass_resets_the_mismatch_streak(isolated_db, tmp_path) -> None:
     database, _engine, _data_dir = isolated_db
     _seed_db(database)
     signal_id, _ = save_live_signal(
-        LiveSignal(
+        make_live_signal(
             id=uuid4(),
             deployment_id=DEPLOYMENT_ID,
             symbol="AAPL",
@@ -268,7 +269,7 @@ def test_missing_working_order_and_untracked_order_are_findings(
     database, _engine, _data_dir = isolated_db
     _seed_db(database)
     signal_id, _ = save_live_signal(
-        LiveSignal(
+        make_live_signal(
             id=uuid4(),
             deployment_id=DEPLOYMENT_ID,
             symbol="AAPL",
@@ -308,7 +309,7 @@ def test_missing_protective_stop_is_a_finding(isolated_db, tmp_path) -> None:
     database, _engine, _data_dir = isolated_db
     _seed_db(database)
     signal_id, _ = save_live_signal(
-        LiveSignal(
+        make_live_signal(
             id=uuid4(),
             deployment_id=DEPLOYMENT_ID,
             symbol="AAPL",
@@ -360,7 +361,7 @@ def _unfilled_signal(
     symbol: str = "AAPL",
 ) -> str:
     signal_id, _ = save_live_signal(
-        LiveSignal(
+        make_live_signal(
             id=uuid4(),
             deployment_id=deployment_id,
             symbol=symbol,
@@ -592,7 +593,7 @@ def test_clean_pass_releases_a_reconciler_entry_halt(isolated_db, tmp_path) -> N
     database, _engine, _data_dir = isolated_db
     _seed_db(database)
     signal_id, _ = save_live_signal(
-        LiveSignal(
+        make_live_signal(
             id=uuid4(),
             deployment_id=DEPLOYMENT_ID,
             symbol="AAPL",
@@ -685,7 +686,7 @@ def test_partially_filled_ioc_with_cancelled_remainder_is_not_a_finding(
     database, _engine, _data_dir = isolated_db
     _seed_db(database)
     signal_id, _ = save_live_signal(
-        LiveSignal(
+        make_live_signal(
             id=uuid4(),
             deployment_id=DEPLOYMENT_ID,
             symbol="AAPL",
@@ -767,7 +768,7 @@ def _filled_entry_signal(
     broker_order_id: str,
 ) -> str:
     signal_id, _ = save_live_signal(
-        LiveSignal(
+        make_live_signal(
             id=uuid4(),
             deployment_id=deployment_id,
             symbol=symbol,
@@ -1000,7 +1001,7 @@ def test_disagreeing_qty_keys_keep_the_expectation(
     database, _engine, _data_dir = isolated_db
     _seed_db(database)
     signal_id, _ = save_live_signal(
-        LiveSignal(
+        make_live_signal(
             id=uuid4(),
             deployment_id=DEPLOYMENT_ID,
             symbol="ETHUSD",
@@ -1115,7 +1116,7 @@ def test_halt_is_written_and_audited_only_on_transition(
     database, _engine, _data_dir = isolated_db
     _seed_db(database)
     signal_id, _ = save_live_signal(
-        LiveSignal(
+        make_live_signal(
             id=uuid4(),
             deployment_id=DEPLOYMENT_ID,
             symbol="AAPL",

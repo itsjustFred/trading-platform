@@ -19,6 +19,7 @@ from live_runner.signal_sources.discord_source import (
     DiscordSignalSource,
     parse_trade_signal_from_message,
 )
+from tests.conftest import sandboxed_env
 
 
 @pytest.fixture(autouse=True)
@@ -3923,6 +3924,7 @@ class TestAuthorDiscoveryRecord:
             ["git", "check-ignore", "-v", default],
             capture_output=True,
             text=True,
+            env=sandboxed_env(),
         )
         assert probe.returncode == 0, (
             f"the default record path {default!r} is NOT gitignored, so an "

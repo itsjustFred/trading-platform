@@ -43,6 +43,7 @@ from shared.models import (
     LiveExecution,
     LiveSignal,
 )
+from tests.builders import make_live_signal
 
 ACCOUNT = "alpaca-acc-124"
 DEPLOYMENT = "dep-alpaca-124"
@@ -91,7 +92,7 @@ def _order_id(label: str) -> str:
 
 
 def _signal(database, *, symbol: str = "AAPL", action: str = "buy", deployment: str = DEPLOYMENT):
-    signal = LiveSignal(
+    signal = make_live_signal(
         deployment_id=deployment,
         symbol=symbol,
         action=action,

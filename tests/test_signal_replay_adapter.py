@@ -614,3 +614,8 @@ def test_replay_fallback_stop_entry_bounded_by_leverage(
     )
     assert len(result.trades) == 1
     assert result.trades[0].quantity == pytest.approx(expected_notional / 100.5, rel=0.01)
+    # The stopless signal keeps the engine-resolved fallback stop (ATR 0.05 ×
+    # 2.0 = 0.1 below the 100.0 fill) on the opened position. Reading the
+    # signal back instead would leave the position unprotected (G03).
+    assert result.trades[0].meta["signal_stop_loss"] == pytest.approx(99.9)
+    assert result.trades[0].meta["final_stop_loss"] == pytest.approx(99.9)

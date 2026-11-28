@@ -10,16 +10,16 @@ import pandas as pd
 import pytest
 
 from runner.engine import TradeEngine
-from runner.engines.base import BacktestConfig
 from runner.engines.pynecore_adapter import _csv_trade_direction
 from runner.engines.vectorbt_adapter import _normalize_direction_value
 from shared.database import _build_backtest_trades
 from shared.models import normalize_direction_value
+from tests.builders import make_backtest_config
 from tests.helpers import with_zero_fees
 
 
 def _engine(tmp_path) -> TradeEngine:
-    cfg = BacktestConfig(
+    cfg = make_backtest_config(
         **with_zero_fees(
             {
                 "strategy_name": "probe",

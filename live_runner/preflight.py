@@ -19,6 +19,7 @@ from live_runner.alpaca_adapter import AlpacaLiveAdapter, resolve_alpaca_credent
 from live_runner.config_parser import parse_live_deployments_config
 from live_runner.credential_env import (
     overlay_process_env,
+    parse_bool_env,
     read_accounts_env_file,
     resolve_accounts_env_path,
 )
@@ -109,30 +110,6 @@ class _LookupRecorder(Mapping[str, str]):
         return len(self._values)
 
 
-_TRUE_BOOL_TOKENS = frozenset({"1", "true", "yes", "y", "on"})
-_FALSE_BOOL_TOKENS = frozenset({"0", "false", "no", "n", "off"})
-
-
-def _parse_bool_env(name: str, value: str | None, *, default: bool) -> bool:
-    """Strictly parse a boolean env var.
-
-    Missing value -> default. Recognized true/false tokens (case-insensitive,
-    stripped) parse accordingly. Anything else raises so a malformed value can
-    never implicitly select live trading.
-    """
-    if value is None:
-        return default
-    token = value.strip().lower()
-    if token in _TRUE_BOOL_TOKENS:
-        return True
-    if token in _FALSE_BOOL_TOKENS:
-        return False
-    valid = ", ".join(sorted(_TRUE_BOOL_TOKENS | _FALSE_BOOL_TOKENS))
-    raise ValueError(
-        f"Invalid boolean value for {name}: {value!r}. Valid values are: {valid}."
-    )
-
-
 def _resolve_ctrader_credentials(
     env_values: Mapping[str, str],
 ) -> tuple[str, str, str, str, bool] | None:
@@ -142,7 +119,7 @@ def _resolve_ctrader_credentials(
     refresh_token = str(env_values.get("CTRADER_REFRESH_TOKEN", "")).strip()
     if not app_id or not app_secret or not access_token:
         return None
-    demo = _parse_bool_env("CTRADER_DEMO", env_values.get("CTRADER_DEMO"), default=True)
+    demo = parse_bool_env("CTRADER_DEMO", env_values.get("CTRADER_DEMO"), default=True)
     return app_id, app_secret, access_token, refresh_token, demo
 
 

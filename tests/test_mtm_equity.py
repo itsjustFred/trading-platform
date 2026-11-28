@@ -44,6 +44,7 @@ from runner.engines.mtm_equity import (
 from runner.engines.native_adapter import NativeAdapter
 from runner.stats import compute_stats, compute_stats_for_result
 from shared.models import EquityPoint, Trade, TradeExit
+from tests.builders import make_backtest_config
 
 pytestmark = pytest.mark.filterwarnings("ignore::DeprecationWarning")
 
@@ -476,7 +477,7 @@ def _strategy(tmp_path: Path) -> Path:
 
 
 def _config(tmp_path: Path, symbols: list[str]) -> BacktestConfig:
-    return BacktestConfig(
+    return make_backtest_config(
         strategy_name="hold_through_crash",
         symbols=symbols,
         timeframe="1d",

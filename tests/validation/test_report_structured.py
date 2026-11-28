@@ -50,15 +50,6 @@ def generate_json_report(*args, **kwargs):
 
 
 class TestJsonReportBasics:
-    def test_generate_json_report_returns_valid_json(self):
-        ref_trade = _make_trade(trade_id=1)
-        ref = _make_reference([ref_trade])
-        platform = _make_platform_result([_make_trade(trade_id=10)])
-
-        json_str = generate_json_report(ref, platform)
-        data = json.loads(json_str)
-        assert isinstance(data, dict)
-
     def test_report_has_required_top_level_keys(self):
         ref_trade = _make_trade(trade_id=1)
         ref = _make_reference([ref_trade])
