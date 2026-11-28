@@ -6,11 +6,19 @@ scoped to the native engine and signal replay (the engines #318 keeps;
 LEAN stays import-only).
 
 - FX/CFD asset classes: the spread comes from bid/ask bar data where
-  available (MT5-tester-like: buys pay the ask, sells receive the bid),
-  otherwise a configured fixed-bps fallback applies.
+  available (MT5-tester-like: buys pay the ask, sells receive the bid).
+  Since #472 the native engine already prices those sides into the fill
+  itself on two-sided frames, so this model stands down there
+  (``fill_side="ask"``); on one-sided frames — and for signal replay,
+  which has no ask-side fills — it still lifts buys by the quoted spread
+  or falls back to a configured fixed-bps cost.
 - Stocks/crypto: a configurable fixed bps default per asset class.
-- ``slippage: "none"`` is the explicit parity opt-out that reproduces the
-  pre-#130 gross-fill behaviour bit-for-bit.
+- ``slippage: "none"`` is the explicit parity opt-out: on single-price
+  frames it reproduces the pre-#130 gross-fill behaviour bit-for-bit.
+  On two-sided frames it does NOT — since #472 the fills themselves are
+  ask/bid-denominated there (the quoted spread lives inside the fill
+  price), so ``none`` still diverges from the old gross fills by exactly
+  the quoted spread.
 
 Every run records the resolved model in ``meta.data["slippage"]`` — the
 recording is mandatory even when the resolved model is ``none``.
@@ -31,7 +39,7 @@ import math
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-import pandas as pd
+from runner.engines._shared import bar_spread_units
 
 __all__ = [
     "BarSpreadSlippage",
@@ -54,9 +62,10 @@ class SlippageModel(Protocol):
     a buy fills higher, a sell fills lower. ``bar`` is the OHLCV row the
     fill was priced from (``None`` when unavailable — spread models then
     use their configured bps fallback). ``fill_side`` is ``"ask"`` when the
-    fill price is already denominated on the ask side (an ``ask_ohlc``
-    ask-triggered SHORT exit), ``None`` otherwise; models that price off
-    the bar spread use it to avoid charging the spread twice.
+    fill price is already denominated on the ask side (every buy fill the
+    native engine produces since #472, e.g. an ask-triggered SHORT exit),
+    ``None`` otherwise; models that price off the bar spread use it to
+    avoid charging the spread twice.
     """
 
     def slip_price(
@@ -142,11 +151,13 @@ _BPS_SPELLINGS = frozenset({"bps", "fixed", "fixed_bps"})
 #: Legacy per-bar spread surcharge columns (``spread_price_col`` strategy
 #: param) already price the quoted spread for the fills they cover, so
 #: when it is configured the auto model must not add the bar spread a
-#: second time and degrades to the fixed-bps leg. ``ask_ohlc`` does NOT
-#: degrade the model: it only moves SHORT stop/TP *triggers* onto the ask
-#: side, and ask-triggered exits pass ``fill_side="ask"`` so the spread is
-#: not charged twice on those legs either.
-_EXTERNAL_SPREAD_PARAMS = ("spread_price_col",)
+#: second time and degrades to the fixed-bps leg. Since #472 the quoted
+#: spread on a two-sided frame lives inside the fill prices themselves
+#: (ask open / ask level), and ask-side fills pass ``fill_side="ask"`` so
+#: the bar-spread model does not charge it a second time on those legs.
+#: Any future external spread-surcharge parameter must be added here or the
+#: two-sided strip in TradeEngine._resolve_two_sided_slippage will not see it.
+EXTERNAL_SPREAD_PARAMS = ("spread_price_col",)
 
 #: Engines that apply a fill-price slippage model (#130 scope: the native
 #: engine and signal replay — the engines #318 keeps). Every other engine
@@ -167,62 +178,6 @@ def _positive_float(value: Any, *, field: str) -> float:
     if math.isnan(parsed) or parsed in (float("inf"), float("-inf")):
         raise ValueError(f"Invalid {field}: {value!r}")
     return parsed
-
-
-def _bar_numeric_values(bar: Any) -> dict[str, float]:
-    """Lowercased column name -> float value for every numeric bar field."""
-    if bar is None:
-        return {}
-    try:
-        items = bar.items() if hasattr(bar, "items") else []
-    except (AttributeError, TypeError):
-        return {}
-    values: dict[str, float] = {}
-    for key, raw in items:
-        if raw is None or (isinstance(raw, float) and pd.isna(raw)):
-            continue
-        try:
-            values[str(key).lower()] = float(raw)
-        except (TypeError, ValueError):
-            continue
-    return values
-
-
-def _median_sorted(values: list[float]) -> float:
-    mid = len(values) // 2
-    if len(values) % 2:
-        return values[mid]
-    return (values[mid - 1] + values[mid]) / 2.0
-
-
-def _bar_spread_units(bar: Any) -> float | None:
-    """Per-bar ask-minus-bid spread in price units, or ``None``.
-
-    Canonical OHLC is the bid-side series (``normalize_ohlcv_frame`` fills
-    it from ``bid_*`` and the MT5-chart convention treats bid as the
-    reference). For each canonical field with an ``ask_*`` counterpart the
-    positive difference is a quoted spread observation; the median of the
-    available observations is used so one stale column cannot dominate.
-    Non-positive differences (ask-side canonical data where ``ask_*``
-    merely repeats the canonical series) are ignored — they carry no
-    spread information and must not produce a negative adjustment.
-    """
-    values = _bar_numeric_values(bar)
-    if not values:
-        return None
-    diffs: list[float] = []
-    for field in ("open", "high", "low", "close"):
-        ask = values.get(f"ask_{field}")
-        bid = values.get(field)
-        if ask is None or bid is None:
-            continue
-        diff = ask - bid
-        if diff > 0 and pd.notna(diff):
-            diffs.append(diff)
-    if not diffs:
-        return None
-    diffs.sort()
-    return _median_sorted(diffs)
 
 
 @dataclass(frozen=True)
@@ -292,12 +247,15 @@ class FixedBpsSlippage:
 class BarSpreadSlippage:
     """Spread from the bar's bid/ask columns, fixed-bps fallback.
 
-    MT5-tester-like and matching the engine's existing ``spread_price_col``
+    MT5-tester-like and matching the engine's ``spread_price_col``
     convention: canonical OHLC is the BID series, so a buy fills at the ask
-    (``price + spread``) while a sell fills at the bid (``price`` unchanged)
-    — the spread is charged once per round trip, on the buy side only. When
-    the bar carries no usable ``ask_*`` columns the configured
-    ``default_bps`` applies symmetrically per side instead.
+    while a sell fills at the bid — the spread is charged once per round
+    trip, on the buy side only. Since #472 the native engine passes every
+    buy fill already ask-denominated (``fill_side="ask"``), so on a
+    two-sided frame this model returns the price unchanged and the spread
+    is paid exactly once, inside the fill. When the bar carries no usable
+    ``ask_*`` columns the configured ``default_bps`` applies symmetrically
+    per side instead.
     """
 
     default_bps: float
@@ -320,13 +278,13 @@ class BarSpreadSlippage:
     ) -> float:
         if side not in ("buy", "sell"):
             raise ValueError(f"side must be 'buy' or 'sell', got {side!r}")
-        spread = _bar_spread_units(bar)
+        spread = bar_spread_units(bar)
         if spread is not None:
             # Bid-referenced bar: buys lift to the ask, sells stay on the
             # bid — the quoted spread is paid once, by the buy side. An
-            # ask-triggered fill (``fill_side="ask"``: an ``ask_ohlc``
-            # SHORT stop/TP whose level already sits on the ask) must not
-            # pay it a second time.
+            # ask-denominated fill (``fill_side="ask"``: since #472 every
+            # buy fill the native engine produces on a two-sided frame)
+            # must not pay it a second time.
             if side == "buy":
                 if fill_side == "ask":
                     return float(price)
@@ -421,8 +379,12 @@ def _auto_model(params: dict[str, Any], asset_class: str) -> SlippageModel:
     if ac in FX_SPREAD_ASSET_CLASSES:
         bps = _class_default_bps(ac, params)
         # A run that already prices the spread through the legacy
-        # spread_price_col / ask_ohlc parameters must not pay it twice.
-        if any(params.get(key) for key in _EXTERNAL_SPREAD_PARAMS):
+        # spread_price_col parameter must not pay it twice. (On a frame
+        # with usable ask quote columns the native engine strips
+        # spread_price_col before resolving — see
+        # TradeEngine._resolve_two_sided_slippage — so this degrade only
+        # fires on one-sided frames.)
+        if any(params.get(key) for key in EXTERNAL_SPREAD_PARAMS):
             return FixedBpsSlippage(bps=bps, asset_class=ac)
         return BarSpreadSlippage(default_bps=bps, asset_class=ac)
     # Recognized-but-unmapped class: no per-class cost exists, so the run
@@ -465,8 +427,9 @@ def _spread_model(
 ) -> SlippageModel:
     fallback = _spread_fallback_bps(params, asset_class, bps_override)
     # Same double-count guard as the auto model: a run that already prices
-    # the spread through spread_price_col / ask_ohlc must not pay it twice.
-    if any(params.get(key) for key in _EXTERNAL_SPREAD_PARAMS):
+    # the spread through spread_price_col must not pay it twice (native
+    # strips the param on frames with usable ask columns before resolving).
+    if any(params.get(key) for key in EXTERNAL_SPREAD_PARAMS):
         return FixedBpsSlippage(bps=fallback, asset_class=asset_class)
     return BarSpreadSlippage(default_bps=fallback, asset_class=asset_class)
 

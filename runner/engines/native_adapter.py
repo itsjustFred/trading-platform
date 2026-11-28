@@ -12,6 +12,7 @@ from runner.approval_gate import require_generated_strategy_approval
 from runner.engine import TradeEngine
 from runner.engines import contract
 from runner.engines._drawings import _normalize_drawings
+from runner.engines._shared import frame_has_ask_side
 from runner.engines.base import (
     NATIVE_TRAILING_SL_PARAM,
     BacktestConfig,
@@ -25,7 +26,6 @@ from runner.engines.mtm_equity import (
     closes_from_frame,
     describe_basis,
 )
-from runner.slippage import BarSpreadSlippage
 from shared.constants import DATA_DIR
 from shared.models import BacktestMeta, BacktestResult
 
@@ -219,19 +219,16 @@ class NativeAdapter(EngineAdapter):
                 asset_class=asset_class,
             )
             symbol_result = engine.run(data, strategy_module.generate_signals)
-            # #130: report the basis the resolved model actually prices
-            # on — "bid_ask" only when the bar-spread model can use the
-            # ask columns; fixed/none models fill on the canonical (bid)
-            # series even when ask columns happen to be present.
-            has_two_sided = any(
-                str(col).startswith("ask_") for col in data.columns
-            )
-            price_basis = (
-                "bid_ask"
-                if has_two_sided
-                and isinstance(engine.slippage_model, BarSpreadSlippage)
-                else ("bid" if has_two_sided else "single_price")
-            )
+            # #472: the fill basis is a property of the DATA, not the
+            # slippage model — on a two-sided frame buys fill at the ask and
+            # SHORT stops/TPs trigger on the ask whatever the resolved model
+            # is, so "bid_ask" whenever the frame carries usable ask quote
+            # columns (an ``ask_volume`` column or an all-NaN ask column
+            # does not make the fills two-sided). The model only adds its
+            # own cost on top (fixed bps) or stands down (bar spread: the
+            # quoted spread is already inside the fill).
+            has_two_sided = frame_has_ask_side(data)
+            price_basis = "bid_ask" if has_two_sided else "single_price"
             slippage_models[symbol] = {
                 **engine.slippage_model.describe(),
                 "price_basis": price_basis,

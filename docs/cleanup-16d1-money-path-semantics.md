@@ -192,7 +192,8 @@ creation-price estimate forever.
 actually fill. MARKET re-sizes at the next-bar open (creation sizing is only
 the pending estimate); LIMIT/STOP/STOP_LIMIT re-size from their fill price
 at fill (the level, or the bar open for a stop that gaps through — for a
-LONG that open fill is `open + spread`, the same ask a MARKET buy pays). Quantities
+LONG that open fill is the ask a MARKET buy pays — `open + spread` on a
+one-sided frame, the bar's `ask_open` on a two-sided one since #472). Quantities
 across order types are now computed from the same rule:
 quantity = sizing rule evaluated at the fill price.
 

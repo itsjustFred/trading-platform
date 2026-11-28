@@ -1435,26 +1435,9 @@ def _ask_stop_strategy(df, params):
     return entries, exits, {"direction": direction, "sl_price": sl}, []
 
 
-def test_short_stop_uses_ask_high_when_enabled():
-    engine = TradeEngine(
-        BacktestConfig(risk_per_trade_pct=0.01,
-            strategy_name="test",
-            symbols=["T"],
-            timeframe="1m",
-            start_date="2024-01-01",
-            end_date="2024-01-02",
-            initial_capital=100_000.0,
-            parameters={"fees": "zero", "slippage": "none", "ask_ohlc": True},
-        ),
-        symbol="T",
-    )
-    result = engine.run(_ask_stop_frame(), _ask_stop_strategy)
-    assert len(result.trades) == 1
-    assert result.trades[0].exits[0].reason == "stop_loss"
-    assert result.trades[0].exits[0].price == 101.0
-
-
-def test_short_stop_stays_bid_based_by_default():
+def test_short_stop_uses_ask_high_by_default():
+    # #472: ask-side triggers need no strategy parameter — a two-sided frame
+    # always triggers a SHORT stop on the ask.
     engine = TradeEngine(
         BacktestConfig(risk_per_trade_pct=0.01,
             strategy_name="test",
@@ -1468,8 +1451,29 @@ def test_short_stop_stays_bid_based_by_default():
         symbol="T",
     )
     result = engine.run(_ask_stop_frame(), _ask_stop_strategy)
-    # Bid high (100.5) never reaches the 101 stop -> no exit, position open
-    # until end_of_data.
+    assert len(result.trades) == 1
+    assert result.trades[0].exits[0].reason == "stop_loss"
+    assert result.trades[0].exits[0].price == 101.0
+
+
+def test_short_stop_stays_bid_based_without_ask_columns():
+    # A frame with no ask data has ask == bid, so the same stop (101) needs the
+    # bid high to reach it. Bid high (100.5) never does -> the position runs to
+    # end_of_data.
+    engine = TradeEngine(
+        BacktestConfig(risk_per_trade_pct=0.01,
+            strategy_name="test",
+            symbols=["T"],
+            timeframe="1m",
+            start_date="2024-01-01",
+            end_date="2024-01-02",
+            initial_capital=100_000.0,
+            parameters={"fees": "zero", "slippage": "none"},
+        ),
+        symbol="T",
+    )
+    frame = _ask_stop_frame().drop(columns=["ask_high", "ask_low"])
+    result = engine.run(frame, _ask_stop_strategy)
     assert len(result.trades) == 1
     assert result.trades[0].exits[0].reason == "end_of_data"
 
@@ -1543,9 +1547,10 @@ def _short_spread_stop_strategy(df, params):
     return entries, exits, {"direction": direction, "stop_loss": stop}, []
 
 
-def test_short_stop_fill_adds_spread():
-    # A-H7: SHORT stop fills buy the ask (stop level + spread), LONG stops
-    # sell the bid (level as-is).
+def test_short_stop_fill_is_the_ask_level():
+    # #472: a SHORT stop level is ask-denominated — the ask reaching the level
+    # fills AT the level, never level + spread. The bid high (106) plus the
+    # 0.5 spread reaches the 105 stop, so the exit is 105.0.
     engine = TradeEngine(
         BacktestConfig(risk_per_trade_pct=0.01,
             strategy_name="test",
@@ -1563,7 +1568,7 @@ def test_short_stop_fill_adds_spread():
     trade = result.trades[0]
     assert trade.entry_price == 100.0
     assert trade.exits[0].reason == "stop_loss"
-    assert trade.exits[0].price == 105.0 + 0.5
+    assert trade.exits[0].price == 105.0
 
 
 def test_explicit_fees_reduce_net_pnl():

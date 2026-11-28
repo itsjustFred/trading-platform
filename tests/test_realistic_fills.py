@@ -825,23 +825,27 @@ class TestGapIsTheFirstEvent:
 
 
 # --------------------------------------------------------------------------- #
-# SHORT protective exits buy the ask (native)
+# SHORT protective exits use the ask side (native, #472)
 # --------------------------------------------------------------------------- #
 
 _SPREAD = 0.4
-# (stop, tp, bar, expected fill = base + spread). The last case gaps just
-# through the target (opens 89.8 below the 90 target) by less than the spread:
-# the fill at the ask (90.2) is WORSE than the target. That is realistic - a
-# gap fill is a market fill at the available price.
+# (stop, tp, bar, expected fill). The level is ask-denominated: it triggers
+# when the ASK reaches it and fills AT it, so no spread is added on top.
+# A gap is judged on the ask side too — a bid open below the target is not a
+# gap when the ask open is still above it.
 _SHORT_SPREAD_CASES = [
-    (105.0, None, (110.0, 112.0, 109.0, 111.0), 110.0 + _SPREAD),  # gap through stop
-    (105.0, None, (101.0, 106.0, 100.5, 104.0), 105.0 + _SPREAD),  # stop touch
-    (120.0, 90.0, (95.0, 96.0, 88.0, 89.0), 90.0 + _SPREAD),  # target touch
-    (120.0, 90.0, (89.8, 90.0, 88.0, 89.0), 89.8 + _SPREAD),  # gap through target
+    (105.0, None, (110.0, 112.0, 109.0, 111.0), 110.0 + _SPREAD),  # ask gaps stop
+    (105.0, None, (101.0, 106.0, 100.5, 104.0), 105.0),  # ask touches stop
+    (120.0, 90.0, (95.0, 96.0, 88.0, 89.0), 90.0),  # ask touches target
+    # Bid open 89.8 is past the 90 target but the ask open (90.2) is not —
+    # no gap on the ask side, the ask low reaches the level, fill is the
+    # level itself.
+    (120.0, 90.0, (89.8, 90.0, 88.0, 89.0), 90.0),  # bid gaps, ask does not
+    (120.0, 90.0, (89.4, 90.0, 88.0, 89.0), 89.8),  # ask gaps target
 ]
 
 
-class TestShortProtectiveFillsCarryTheSpread:
+class TestShortProtectiveFillsUseTheAskSide:
     @pytest.mark.parametrize(("stop", "tp", "bar", "fill"), _SHORT_SPREAD_CASES)
     def test_native(self, stop, tp, bar, fill):
         result = _native(
